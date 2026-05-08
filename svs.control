@@ -1,0 +1,5 @@
+comment = 'SVS Vamana index access method for pgvector'
+default_version = '0.1.0'
+requires = 'vector'
+relocatable = false
+module_pathname = '$libdir/svs'

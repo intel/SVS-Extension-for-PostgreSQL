@@ -1,0 +1,31 @@
+# shellcheck shell=bash
+
+BASE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+# Set PG_CONFIG to an existing pg_config binary to skip building PostgreSQL.
+# If PG_CONFIG is unset, install_postgres.sh will build it from source.
+PGSQL_REPO=https://github.com/postgres/postgres.git
+PGSQL_VERSION=REL_18_1
+PGSQL_SRC_DIR=${BASE_DIR}/postgres
+PGSQL_INSTALL_DIR=${BASE_DIR}/pgsql_install
+PG_CONFIG=${PGSQL_INSTALL_DIR}/bin/pg_config
+
+# ── SVS library ───────────────────────────────────────────────────────────────
+SVS_REPO=https://github.com/intel/ScalableVectorSearch.git
+SVS_BRANCH=dev/c-api
+SVS_SRC_DIR=${BASE_DIR}/ScalableVectorSearch
+SVS_BUILD_DIR=${SVS_SRC_DIR}/build
+SVS_INSTALL_DIR=${BASE_DIR}/svs_install
+
+# ── vanilla pgvector (provides vector/halfvec types) ─────────────────────────
+PGV_VANILLA_REPO=https://github.com/pgvector/pgvector.git
+PGV_VANILLA_TAG=v0.8.2
+PGV_VANILLA_DIR=${BASE_DIR}/pgvector-vanilla
+
+# ── svs extension ─────────────────────────────────────────────────────────────
+# Defaults to the repository root (two levels above this config file).
+# Set SVS_EXT_REPO and SVS_EXT_BRANCH to clone a fresh copy elsewhere.
+SVS_EXT_DIR=${BASE_DIR}/../..
+SVS_EXT_REPO=
+SVS_EXT_BRANCH=
