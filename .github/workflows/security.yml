@@ -1,0 +1,18 @@
+name: Security Scanning
+on: [pull_request, push]
+
+jobs:
+  security:
+    runs-on: ["innersource.prod.amr.dind"]
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: intel-innersource/applications.security.monitoring.cas@v3
+        with:
+          sdl-api-key: ${{ secrets.SDL_API_KEY }}
+          sdl-project-id: ${{ secrets.SDL_PROJECT_ID }}
+          sdl-idsid-value: ${{ secrets.SDL_IDSID }}
+          itsf-username: ${{ secrets.ITSF_USERNAME }}
+          itsf-password: ${{ secrets.ITSF_PASSWORD }}
