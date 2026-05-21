@@ -45,14 +45,13 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
+	VamanaWorkerAssertDatabase();
 	if (!VamanaWorkerIsAvailable())
-	{
-		ereport(WARNING,
-				(errmsg("vamana index %u: vacuum skipped -- background worker unavailable",
-						relid),
-				 errhint("Set vamana.worker_enabled = on and restart PostgreSQL.")));
-		return stats;
-	}
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("vamana background worker unavailable; cannot vacuum index \"%s\"",
+						RelationGetRelationName(index)),
+				 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
 
 	cache = VamanaGetCache(relid);
 
@@ -73,8 +72,8 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		if (tidMappingCapacity <= 0)
 		{
 			ereport(LOG,
-					(errmsg("vamana index %u: vacuum skipped -- metapage reports zero TID map capacity",
-							relid)));
+					(errmsg("vamana index \"%s\": vacuum skipped -- metapage reports zero TID map capacity",
+							RelationGetRelationName(index))));
 			return stats;
 		}
 
@@ -85,8 +84,8 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		{
 			pfree(tidMapping);
 			ereport(LOG,
-					(errmsg("vamana index %u: vacuum skipped -- on-disk TID map not available",
-							relid)));
+					(errmsg("vamana index \"%s\": vacuum skipped -- on-disk TID map not available",
+							RelationGetRelationName(index))));
 			return stats;
 		}
 	}
@@ -122,8 +121,8 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			if (!VamanaWorkerSubmitDelete(relid, deadIds + submitted, batch))
 			{
 				ereport(WARNING,
-						(errmsg("vamana index %u: BGW delete failed during vacuum (batch at offset %d)",
-								relid, submitted)));
+						(errmsg("vamana index \"%s\": BGW delete failed during vacuum (batch at offset %d)",
+								RelationGetRelationName(index), submitted)));
 				break;
 			}
 			submitted += batch;
@@ -184,8 +183,8 @@ vamanavacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			{
 				if (!VamanaWorkerSubmitMaintenance(relid, VAMANA_MAINTENANCE_CONSOLIDATE))
 					ereport(WARNING,
-							(errmsg("vamana index %u: BGW consolidate failed during vacuum cleanup",
-									relid)));
+							(errmsg("vamana index \"%s\": BGW consolidate failed during vacuum cleanup",
+									RelationGetRelationName(index))));
 
 				if (cache->numVectors > 0 &&
 					vamana_compact_threshold_pct < 100 &&
@@ -193,8 +192,8 @@ vamanavacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 				{
 					if (!VamanaWorkerSubmitMaintenance(relid, VAMANA_MAINTENANCE_COMPACT))
 						ereport(WARNING,
-								(errmsg("vamana index %u: BGW compact failed during vacuum cleanup",
-										relid)));
+								(errmsg("vamana index \"%s\": BGW compact failed during vacuum cleanup",
+										RelationGetRelationName(index))));
 				}
 			}
 		}
@@ -209,8 +208,8 @@ vamanavacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			{
 				if (!VamanaWorkerSubmitMaintenance(relid, VAMANA_MAINTENANCE_CONSOLIDATE))
 					ereport(WARNING,
-							(errmsg("vamana index %u: BGW consolidate failed during vacuum cleanup",
-									relid)));
+							(errmsg("vamana index \"%s\": BGW consolidate failed during vacuum cleanup",
+									RelationGetRelationName(index))));
 
 				if (meta.numVectors > 0 &&
 					vamana_compact_threshold_pct < 100 &&
@@ -218,37 +217,10 @@ vamanavacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 				{
 					if (!VamanaWorkerSubmitMaintenance(relid, VAMANA_MAINTENANCE_COMPACT))
 						ereport(WARNING,
-								(errmsg("vamana index %u: BGW compact failed during vacuum cleanup",
-										relid)));
+								(errmsg("vamana index \"%s\": BGW compact failed during vacuum cleanup",
+										RelationGetRelationName(index))));
 				}
 			}
-		}
-	}
-
-	/*
-	 * Safety net for direct mode (worker off): if a freshly rebuilt index was
-	 * never saved to disk (vamanaendscan's deferred save failed), persist it
-	 * now.  needsSave lives in the per-process cache, so this only fires when
-	 * INSERT, SELECT, and VACUUM share the same backend.
-	 */
-	if (!VamanaWorkerIsAvailable() && VamanaCacheGetNeedsSave(relid))
-	{
-		cache = VamanaGetCache(relid);
-
-		if (cache != NULL && cache->svsIndex != NULL)
-		{
-			PG_TRY();
-			{
-				VamanaSaveIndexToDisk(index, cache->svsIndex, MAIN_FORKNUM);
-			}
-			PG_CATCH();
-			{
-				FlushErrorState();
-				ereport(WARNING,
-						(errmsg("vamana index %u: vacuum save to disk failed",
-								relid)));
-			}
-			PG_END_TRY();
 		}
 	}
 

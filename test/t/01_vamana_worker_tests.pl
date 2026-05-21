@@ -16,6 +16,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use File::Path qw(remove_tree);
 use File::Temp qw(tempdir);
 use POSIX      qw(waitpid _exit);
 use Time::HiRes qw(usleep);
@@ -377,7 +378,7 @@ sub dir_size
     ok(-d $index_dir,
         'on-disk index directory still exists after second restart');
 
-    # -------------------------------- rebuild interval LOG (#39 / Step 2) --
+    # -------------------------------- rebuild interval LOG --
     # VamanaRebuildFromTable emits a LOG every VAMANA_PROGRESS_INTERVAL
     # (100,000) tuples.  Build a minimal-dimension table with just over 100k
     # rows to trigger the interval without an expensive high-dimensional build.
@@ -390,23 +391,33 @@ sub dir_size
             USING vamana (val vector_l2_ops);
     ));
 
-    # Force a rebuild by invalidating the cache via INSERT, then query.
-    $node->safe_psql("postgres",
-        "INSERT INTO vp_progress_tbl (val) VALUES (ARRAY[0.5]::vector);");
+    my $progress_index_oid = $node->safe_psql("postgres",
+        "SELECT oid FROM pg_class WHERE relname = 'vp_progress_idx';");
+    chomp $progress_index_oid;
+    my $progress_index_dir =
+        $node->data_dir . "/vamana_indexes/$progress_index_oid";
 
+    # Force the BGW to rebuild by restarting the server with the on-disk dir
+    # removed.  LoadIndexFromPages returns NULL (no dir) → BGW calls
+    # VamanaRebuildFromTable, which emits the 100k-interval progress LOG.
+    $node->stop;
+    remove_tree($progress_index_dir);
     my $log_pos_before_rebuild = length($node->log_content());
+    $node->start;
 
-    $node->safe_psql("postgres", qq(
-        SET enable_seqscan = off;
-        SELECT id FROM vp_progress_tbl ORDER BY val <-> '[0.5]' LIMIT 1;
-    ));
-
-    my $rebuild_log = substr($node->log_content(), $log_pos_before_rebuild);
+    # Give the BGW time to rebuild 100k+ 1-dim vectors (typically < 5s).
+    my $rebuild_log = '';
+    for (1 .. 30) {
+        $rebuild_log = substr($node->log_content(), $log_pos_before_rebuild);
+        last if $rebuild_log =~
+            /vamana index \d+: scanning table, 100000 vectors collected/;
+        usleep(500_000);
+    }
 
     like(
         $rebuild_log,
         qr/vamana index \d+: scanning table, 100000 vectors collected/,
-        'progress LOG emitted at 100k-vector interval during VamanaRebuildFromTable (#39)'
+        'progress LOG emitted at 100k-vector interval during VamanaRebuildFromTable'
     ) or diag("Rebuild log:\n", $rebuild_log);
 
     $node->safe_psql("postgres", "DROP TABLE vp_progress_tbl;");
@@ -415,28 +426,23 @@ sub dir_size
 }
 
 # ===========================================================================
-# SECTION 1b: Deferred Save (Issue #40 / PR #70)
+# SECTION 1b: BGW Save Path
 #
-# Verify the deferred-save path in direct mode (worker off).  Tests use
-# log_min_messages = 'debug1' so that DEBUG1 messages from
-# VamanaSaveIndexToDisk are visible in the server log.
+# Verify that the BGW saves the index after INSERT and handles save failures
+# gracefully.  log_min_messages = 'debug1' makes VamanaSaveIndexToDisk DEBUG1
+# messages visible in the server log.
 #
 # Tests:
-#   A. After INSERT + SELECT, the on-disk index directory is re-created and
-#      the server log confirms VamanaSaveIndexToDisk ran from vamanaendscan
-#      (not from beginscan — that is the whole point of this PR).
-#   C. vamanavacuumcleanup safety-net: when vamanaendscan's save fails (parent
-#      dir unwritable), VACUUM in the same backend observes needsSave=true and
-#      persists the index successfully.  The per-process cache constraint
-#      means INSERT, SELECT, and VACUUM must share a single backend via
-#      background_psql.
+#   A. After INSERT the on-disk directory is present and the server log confirms
+#      the BGW saved the index.
+#   C. When the save directory is unwritable the BGW emits a WARNING; after
+#      permissions are restored the next INSERT triggers a successful save.
 # ===========================================================================
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_deferred_save');
     $node->init;
     $node->append_conf('postgresql.conf',
         "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = off");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
 
@@ -466,16 +472,15 @@ sub dir_size
 
         my $index_dir = "$pgdata/vamana_indexes/$index_oid";
 
-        # INSERT invalidates cache; VamanaInvalidateCache deletes the on-disk copy.
+        my $log_pos = length($node->log_content());
+
         $node->safe_psql("postgres", qq(
             INSERT INTO ds_tbl (val) VALUES (ARRAY[$array_sql]::vector);
         ));
 
-        ok(!-d $index_dir,
-            'Test A: on-disk index directory absent after INSERT (cache invalidated)'
+        ok(-d $index_dir,
+            'Test A: on-disk index directory present after INSERT (BGW dynamic insert)'
         );
-
-        my $log_pos = length($node->log_content());
 
         my $result = $node->safe_psql("postgres", qq(
             SET enable_seqscan = off;
@@ -496,22 +501,13 @@ sub dir_size
         like(
             $log_a,
             qr/saving vamana index for relation \d+/,
-            'Test A: server log confirms VamanaSaveIndexToDisk ran from vamanaendscan'
-        ) or diag("Log after SELECT:\n", $log_a);
+            'Test A: server log confirms BGW saved index after INSERT write slot'
+        ) or diag("Log after INSERT:\n", $log_a);
 
         $node->safe_psql("postgres", "DROP TABLE ds_tbl;");
     }
 
     # ---------------------------------------------------------------- Test C --
-    # Make vamanaendscan's deferred save fail by setting the parent
-    # vamana_indexes/ directory unwritable (EACCES on mkdir for the child
-    # dir).  VamanaSaveIndexToDisk's inner PG_CATCH absorbs the error and
-    # emits a WARNING, leaving needsSave=true.  Restore permissions and run
-    # VACUUM in the same backend; vamanavacuumcleanup sees needsSave=true and
-    # calls VamanaSaveIndexToDisk as a safety net.
-    #
-    # Critical: INSERT, SELECT, and VACUUM must run in the same backend
-    # process because needsSave lives in the per-process cache.
     {
         $node->safe_psql("postgres", qq(
             CREATE TABLE vc_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -528,41 +524,27 @@ sub dir_size
         my $index_dir   = "$pgdata/vamana_indexes/$index_oid";
         my $save_parent = "$pgdata/vamana_indexes";
 
-        # Open a persistent backend so INSERT, SELECT, and VACUUM all share
-        # the same per-process cache (the needsSave flag lives there).
-        # Use client_min_messages = error so that NOTICEs and WARNINGs from
-        # the vamana code (e.g., "could not save to disk") are suppressed at
-        # the psql client level and do not cause query_safe to die on stderr
-        # output.  The messages still appear in the server log
-        # (log_min_messages = 'debug1') where we assert on them.
+        # chmod 000 before INSERT so the BGW's VamanaSaveIndexToDisk fails
+        # (EACCES on mkdir) and emits WARNING "could not save to disk".
+        # client_min_messages=error suppresses WARNING at the psql client level
+        # so query_safe does not die on stderr; the message still hits the log.
         my $bg = $node->background_psql("postgres");
         $bg->query_safe("SET client_min_messages = error;");
 
-        # INSERT invalidates cache; VamanaInvalidateCache deletes the on-disk copy.
-        $bg->query_safe(qq(
-            INSERT INTO vc_tbl (val) VALUES (ARRAY[$array_sql]::vector);
-        ));
-
-        # Make parent dir unwritable: VamanaEnsureSaveDir's MakePGDirectory
-        # call fails with EACCES, which is caught by VamanaSaveIndexToDisk's
-        # inner PG_CATCH.  That catch calls FlushErrorState() and returns
-        # before VamanaCacheSetNeedsSave(false) is reached, so needsSave stays
-        # true.
         chmod(0000, $save_parent) or die "chmod 0000 $save_parent: $!";
 
         my $log_pos_c = length($node->log_content());
 
-        # SELECT triggers rebuild; endscan tries to save but fails.
-        # The query still returns results (index is in memory).
-        $bg->query_safe("SET enable_seqscan = off;");
-        $bg->query_safe(
-            "SELECT id FROM vc_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;");
+        $bg->query_safe(qq(
+            INSERT INTO vc_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+        ));
 
-        # Restore permissions so the vacuum safety-net save can succeed.
         chmod(0755, $save_parent) or die "chmod 0755 $save_parent: $!";
 
-        # VACUUM in the same backend — vamanavacuumcleanup sees needsSave=true.
-        $bg->query_safe("VACUUM vc_tbl;");
+        # Second INSERT — BGW retries save (needsSave still true) and succeeds.
+        $bg->query_safe(qq(
+            INSERT INTO vc_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+        ));
 
         $bg->quit;
 
@@ -571,17 +553,17 @@ sub dir_size
         like(
             $log_c,
             qr/vamana index \d+: could not save to disk/,
-            'Test C: server log contains save-failure warning from vamanaendscan path'
+            'Test C: BGW emits save-failure warning when save dir is unwritable'
         ) or diag("Log during Test C:\n", $log_c);
 
         like(
             $log_c,
             qr/saving vamana index for relation \d+/,
-            'Test C: server log confirms vacuum safety-net save succeeded'
+            'Test C: BGW save succeeds after permissions restored'
         ) or diag("Log during Test C:\n", $log_c);
 
         ok(-d $index_dir,
-            'Test C: on-disk index directory exists after vacuum safety-net save');
+            'Test C: on-disk index directory exists after BGW save recovery');
 
         $node->safe_psql("postgres", "DROP TABLE vc_tbl;");
     }
@@ -595,10 +577,8 @@ sub dir_size
 # SVSLoadIndex must use SVSDefaultSearchThreads() (nproc-1) rather than
 # SVSDefaultBuildThreads() (reads max_parallel_maintenance_workers).
 #
-# Regression guard for commit 1d47ace: before the fix, a low
-# max_parallel_maintenance_workers value (e.g., 2) was passed to the SVS
-# thread pool at load time, capping every subsequent search to that many
-# threads even though search is not a maintenance operation.
+# A low max_parallel_maintenance_workers value must not cap search threads:
+# SVSLoadIndex must use SVSDefaultSearchThreads(), not SVSDefaultBuildThreads().
 #
 # With log_min_messages = debug1, SVSLoadIndex emits a DEBUG1 message:
 #   "loading SVS index with N search threads (max_parallel_maintenance_workers=M)"
@@ -675,15 +655,21 @@ sub dir_size
     }
 
     # Test 4: vamana.search_num_threads GUC explicitly overrides the auto default.
-    # Run a new session (new backend = cold cache) with the GUC set to 3.
-    # SVSLoadIndex must pick up the GUC value and log exactly 3 search threads.
+    # SET in a backend session does not propagate to the BGW; the GUC must be
+    # set in postgresql.conf so the BGW picks it up at startup.
+    $node->safe_psql("postgres",
+        "ALTER SYSTEM SET vamana.search_num_threads = 3;");
     my $log_pos_before_test4 = length($node->log_content());
-    $node->safe_psql("postgres", qq(
-        SET enable_seqscan = off;
-        SET vamana.search_num_threads = 3;
-        SELECT id FROM st_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
-    ));
-    my $log_test4 = substr($node->log_content(), $log_pos_before_test4);
+    $node->restart;
+
+    my $log_test4 = '';
+    for (1 .. 20) {
+        $log_test4 = substr($node->log_content(), $log_pos_before_test4);
+        last if $log_test4 =~
+            /loading SVS index with 3 search threads \(vamana\.search_num_threads=3/;
+        usleep(500_000);
+    }
+
     like(
         $log_test4,
         qr/loading SVS index with 3 search threads \(vamana\.search_num_threads=3/,
@@ -691,11 +677,14 @@ sub dir_size
     ) or diag("Test 4 log (snippet):\n",
               substr($log_test4, 0, 2000));
 
+    $node->safe_psql("postgres",
+        "ALTER SYSTEM RESET vamana.search_num_threads;");
+
     $node->stop;
 }
 
 # ===========================================================================
-# SECTION 1d: LeanVec-Compressed Vamana Persistence (Issue #101)
+# SECTION 1d: LeanVec-Compressed Vamana Persistence
 #
 # Mirrors Section 1's persistence round-trip but uses a LeanVec-compressed
 # index (compression_type=1, compression_primary=8, compression_secondary=8).
@@ -819,55 +808,77 @@ sub dir_size
     isnt($after_insert, '', 'LeanVec query after INSERT returns results');
 
     # ------------------------------------------ size check after rebuild --
-    # If VamanaRebuildFromTable silently used float32 instead of LeanVec
-    # storage, the vector data portion would be ~4x larger (4 bytes/dim vs
-    # 1 byte/dim for uint8).  Assert the rebuilt size stays within 1.5x of
-    # the original compressed size.
+    # Dynamic insert (SVSAddPoints) converts the static SVS graph to dynamic
+    # storage, doubling on-disk size — that is not a compression regression.
+    # Force VamanaRebuildFromTable instead: restart with no on-disk dir so the
+    # BGW rebuilds from the table using the original LeanVec compression params.
+    # A float32 regression would be ~4x larger; 1.5x detects that while
+    # tolerating normal metadata overhead.
+    remove_tree($index_dir);
+    my $log_pos_before_second_restart = length($node->log_content());
+    $node->restart;
+
+    my $rebuild_wait_log = '';
+    for (1 .. 20) {
+        $rebuild_wait_log =
+            substr($node->log_content(), $log_pos_before_second_restart);
+        last if $rebuild_wait_log =~ /vamana index \d+ loaded from disk/
+             || $rebuild_wait_log =~ /vamana index \d+: scanning table/;
+        usleep(500_000);
+    }
+
     my $rebuilt_size = dir_size($index_dir);
     ok(-d $index_dir,
-        'on-disk index directory still exists after INSERT+rebuild (LeanVec)');
+        'on-disk index directory exists after BGW rebuild (LeanVec)');
     ok($rebuilt_size > 0,
-        'rebuilt LeanVec index directory is non-empty after INSERT+rebuild');
-    # float32 regression would be ~4x larger; 1.5x leaves headroom for
-    # graph/metadata overhead while still catching a compression drop.
+        'rebuilt LeanVec index directory is non-empty');
     ok($rebuilt_size <= $initial_size * 1.5,
         "rebuilt LeanVec index size ($rebuilt_size bytes) is within 1.5x of original ($initial_size bytes) — compression preserved"
     ) or diag("initial_size=$initial_size  rebuilt_size=$rebuilt_size  ratio=",
               ($initial_size > 0 ? sprintf("%.2f", $rebuilt_size / $initial_size) : 'N/A'));
-
-    # -------------------------------------------------------- second restart --
-    my $log_pos_before_second_restart = length($node->log_content());
-    $node->restart;
 
     my $after_second_restart = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
         SELECT id FROM lv_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
     ));
 
-    is($after_second_restart, $after_insert,
-        'LeanVec results after second restart match post-INSERT baseline');
+    isnt($after_second_restart, '',
+        'LeanVec query after BGW rebuild returns results');
 
-    my $second_restart_log =
-      substr($node->log_content(), $log_pos_before_second_restart);
+    # -------------------------------------------------------- third restart --
+    # Verify the rebuilt+saved index loads cleanly from disk (no rebuild).
+    my $log_pos_before_third_restart = length($node->log_content());
+    $node->restart;
+
+    my $after_third_restart = $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
+
+    is($after_third_restart, $after_second_restart,
+        'LeanVec results after third restart match post-rebuild baseline');
+
+    my $third_restart_log =
+      substr($node->log_content(), $log_pos_before_third_restart);
 
     unlike(
-        $second_restart_log,
+        $third_restart_log,
         qr/rebuilding vamana index from table data/,
-        'no table rebuild on second restart (LeanVec loaded from disk after INSERT+rebuild+resave)'
-    ) or diag("Second restart log:\n", $second_restart_log);
+        'no table rebuild on third restart (LeanVec loaded from disk)'
+    ) or diag("Third restart log:\n", $third_restart_log);
     unlike(
-        $second_restart_log,
+        $third_restart_log,
         qr/vamana index not in memory, rebuilding from table/,
-        'no rebuild NOTICE on LeanVec second restart'
-    ) or diag("Second restart log:\n", $second_restart_log);
+        'no rebuild NOTICE on LeanVec third restart'
+    ) or diag("Third restart log:\n", $third_restart_log);
     like(
-        $second_restart_log,
+        $third_restart_log,
         qr/vamana index \d+ loaded from disk/,
-        'server log confirms LeanVec index loaded from disk on second restart'
-    ) or diag("Second restart log:\n", $second_restart_log);
+        'server log confirms LeanVec index loaded from disk on third restart'
+    ) or diag("Third restart log:\n", $third_restart_log);
 
     ok(-d $index_dir,
-        'on-disk index directory still exists after LeanVec second restart');
+        'on-disk index directory still exists after LeanVec third restart');
 
     $node->stop;
 }
@@ -894,10 +905,10 @@ sub dir_size
 #       when forced to drain one slot per iteration.
 #   11. vamana.worker_database non-default — worker connects to a named
 #       database and serves indexes created there.
-#   12. dbOid != MyDatabaseId — backend falls back to direct mode when
-#       worker is serving a different database.
-#   13. Worker timeout + VamanaWorkerFallbackLoad — SIGSTOP worker,
-#       set timeout to minimum; backend falls back gracefully.
+#   12. dbOid != MyDatabaseId — backend gets a hard ERROR when
+#       worker is serving a different database (no direct-mode fallback).
+#   13. Worker timeout — SIGSTOP worker, set timeout to minimum;
+#       backend raises ERROR (no fallback to direct mode).
 #   14. SIGHUP GUC reload — pg_reload_conf() updates worker_timeout_ms
 #       in the worker without a server restart.
 #   15. Multiple concurrent Vamana indexes — worker serves queries
@@ -909,7 +920,6 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_bgw');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = on");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -940,26 +950,7 @@ sub dir_size
     ));
     isnt($worker_results, '', 'worker-mode query returns non-empty results');
 
-    # ----------------------------------------- test 3: results match direct --
-    # Turn worker off and re-run the same query to establish a baseline.
-    $node->stop;
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = off");
-    $node->start;
-
-    my $direct_results = $node->safe_psql("postgres", qq(
-        SET enable_seqscan = off;
-        SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
-    ));
-
-    is($direct_results, $worker_results,
-        'worker-mode results match direct-mode results');
-
-    # Re-enable the worker for the remaining tests.
-    $node->stop;
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = on");
-    $node->start;
-
-    # -------------------------------------- test 4: no per-backend rebuild --
+    # -------------------------------------- test 3: no per-backend rebuild --
     my $log_after_worker = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
         SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
@@ -1066,8 +1057,7 @@ sub dir_size
     #
     # Replicates the original hang: pg_regress issues
     # DROP DATABASE IF EXISTS before creating the test database.
-    # With the worker preloaded and vamana.worker_enabled = on,
-    # this must complete within the timeout.
+    # With the worker preloaded, this must complete within the timeout.
     my ($drop_if_ret, $drop_if_out, $drop_if_err) = $node->psql(
         'postgres',
         'DROP DATABASE IF EXISTS nonexistent_db;',
@@ -1108,12 +1098,11 @@ sub dir_size
     }
 
     # --------------------------------- test 11: worker_database non-default --
-    # Create a second database with its own extension, table, and Vamana index
-    # while the cluster is still running.  Then restart with
-    # vamana.worker_database = 'testdb' so the worker connects there instead
-    # of "postgres".  Queries issued FROM testdb must be served by the worker
-    # (MyDatabaseId == worker's dbOid).  The server log must confirm the worker
-    # started for "testdb" and must NOT emit the default-database warning.
+    # Create a second database with its own extension, table, and data while the
+    # BGW is still serving "postgres".  The Vamana index is created AFTER the
+    # restart so the BGW (now serving "testdb") can adopt it immediately.
+    # Creating it before the restart would fail: the BGW would reject the build
+    # with "vamana index is not enabled for this database".
     $node->safe_psql("postgres", "CREATE DATABASE testdb;");
     $node->safe_psql("testdb",   "CREATE EXTENSION vector;");
     $node->safe_psql("testdb",   "CREATE EXTENSION svs;");
@@ -1122,14 +1111,19 @@ sub dir_size
         INSERT INTO testdb_tbl (val)
             SELECT ARRAY[$array_sql]::vector
             FROM generate_series(1, 200) i;
-        CREATE INDEX testdb_idx ON testdb_tbl USING vamana (val vector_l2_ops);
     ));
 
+    # Snapshot before the restart so "started for database testdb" is guaranteed
+    # to appear after this position.
     my $log_pos_before_testdb = length($node->log_content());
 
     $node->stop;
     $node->append_conf('postgresql.conf', "vamana.worker_database = 'testdb'");
     $node->start;
+
+    # Create the Vamana index now that the BGW is serving testdb.
+    $node->safe_psql("testdb",
+        "CREATE INDEX testdb_idx ON testdb_tbl USING vamana (val vector_l2_ops);");
 
     # Poll for the worker to appear after connecting to testdb.
     my $testdb_worker_pid = '';
@@ -1162,26 +1156,24 @@ sub dir_size
     unlike($testdb_log, qr/vamana worker connecting to default database "postgres"/,
         'no default-database warning when worker_database is explicitly set');
 
-    # ----------------------------- test 12: dbOid != MyDatabaseId fallback --
-    # The worker is connected to testdb (from test 9).  A backend in the
-    # "postgres" database sees VamanaWorkerShmemPtr->dbOid != MyDatabaseId,
-    # so VamanaWorkerIsAvailable() returns false and vamanabeginscan falls
-    # through to direct mode — loading the index in-process — instead of
-    # using the worker.
-    my $dboid_fallback = $node->safe_psql("postgres", qq(
+    # ----------------------------- test 12: dbOid != MyDatabaseId → hard ERROR --
+    # The worker is connected to testdb.  A backend in "postgres" sees
+    # dbOid != MyDatabaseId and VamanaWorkerAssertDatabase() immediately throws
+    # an ERROR — there is no direct-mode fallback anymore.
+    my ($fallback_ret, undef, $fallback_err) = $node->psql("postgres", qq(
         SET enable_seqscan = off;
         SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
-    isnt($dboid_fallback, '',
-        'backend falls back to direct mode when worker dbOid != MyDatabaseId');
+    like($fallback_err,
+        qr/vamana index is not enabled for this database/,
+        'backend gets ERROR when worker dbOid != MyDatabaseId (no direct-mode fallback)');
 
-    # --------------- test 13: worker timeout + VamanaWorkerFallbackLoad --
+    # --------------- test 13: worker timeout → hard ERROR (no fallback) --
     # Reset the worker back to postgres so VamanaWorkerIsAvailable() returns
     # true for postgres backends.  SIGSTOP the worker to make it unresponsive,
     # and set vamana.worker_timeout_ms to its minimum (100 ms).
     # VamanaWorkerSubmitSearch accumulates total_waited_ms >= 100 and returns
-    # -1; vamanascan then calls VamanaWorkerFallbackLoad to serve the query
-    # in-process.
+    # -1; vamanascan raises ERROR — there is no direct-mode fallback.
     $node->stop;
     $node->append_conf('postgresql.conf', "vamana.worker_database = 'postgres'");
     $node->start;
@@ -1209,9 +1201,7 @@ sub dir_size
     kill('STOP', $postgres_worker_pid);
     usleep(100_000);    # 0.1 s — let the stop take effect
 
-    my $log_pos_before_fallback = length($node->log_content());
-
-    my $fallback_result = $node->safe_psql("postgres", qq(
+    my ($timeout_ret, undef, $timeout_err) = $node->psql("postgres", qq(
         SET enable_seqscan = off;
         SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
@@ -1219,13 +1209,9 @@ sub dir_size
     # Resume the worker before any assertions that touch the server.
     kill('CONT', $postgres_worker_pid);
 
-    isnt($fallback_result, '',
-        'results returned after worker timeout via VamanaWorkerFallbackLoad');
-
-    my $fallback_log = substr($node->log_content(), $log_pos_before_fallback);
-    like($fallback_log,
-        qr/vamana worker unavailable, falling back to direct load for index \d+/,
-        'server log confirms VamanaWorkerFallbackLoad triggered on worker timeout');
+    like($timeout_err,
+        qr/vamana background worker unavailable after \d+ ms; cannot scan index \d+/,
+        'worker timeout raises ERROR (no fallback to direct mode)');
 
     # Restore timeout to default.
     $node->safe_psql("postgres", "ALTER SYSTEM RESET vamana.worker_timeout_ms;");
@@ -1332,7 +1318,6 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_batch');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = on");
 
     # DEBUG1 captures "native batch search for N queries" and
     # "sequential search for N queries" emitted by VamanaWorkerRunBatch.
@@ -1525,7 +1510,7 @@ sub dir_size
 }
 
 # ===========================================================================
-# SECTION 4: Cold-Cache Vacuum (Issue #3)
+# SECTION 4: Cold-Cache Vacuum
 #
 # vamanabulkdelete must work even when the calling backend has never queried
 # the index (cold cache).  The fix loads the TID map from the on-disk
@@ -1542,7 +1527,6 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('cold_cache_vac');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = on");
     $node->append_conf('postgresql.conf', "vamana.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
@@ -1595,7 +1579,7 @@ sub dir_size
 }
 
 # ===========================================================================
-# SECTION 5: BGW Error Recovery (Issue #1)
+# SECTION 5: BGW Error Recovery
 #
 # The BGW must continue serving requests on other indexes after an error
 # on one index (e.g., the index relation was dropped while the BGW held it).
@@ -1607,7 +1591,6 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('bgw_error_recovery');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "vamana.worker_enabled = on");
     $node->append_conf('postgresql.conf', "vamana.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;

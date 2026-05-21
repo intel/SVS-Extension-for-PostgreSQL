@@ -33,16 +33,7 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	if (isnull[0])
 		return false;
 
-	if (!vamana_worker_enabled || !VamanaWorkerIsAvailable())
-	{
-		/*
-		 * Direct mode (worker off or not yet running): invalidate the cache
-		 * so the next query triggers a full rebuild.  The rebuild path is the
-		 * safe fallback when incremental insert is unavailable.
-		 */
-		VamanaInvalidateCache(relid);
-		return true;
-	}
+	VamanaWorkerWaitUntilAvailable(relid, "insert into");
 
 	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
 

@@ -37,8 +37,9 @@ int			vamana_search_window_size = VAMANA_DEFAULT_SEARCH_WINDOW;
 int			vamana_search_num_threads = 0;
 int			vamana_compact_threshold_pct = 10;
 
-bool		vamana_worker_enabled = false;
 int			vamana_worker_timeout_ms = 5000;
+int			vamana_worker_startup_timeout_ms = 60000;
+int			vamana_worker_restart_time = 5;
 int			vamana_max_batch_size = 0;
 char	   *vamana_worker_database = NULL;
 
@@ -110,17 +111,6 @@ VamanaInit(void)
 		GucContext	worker_startup_ctx = process_shared_preload_libraries_in_progress
 			? PGC_POSTMASTER : PGC_SIGHUP;
 
-		DefineCustomBoolVariable("vamana.worker_enabled",
-								 "Enable background worker for Vamana index searches",
-								 "When on, a single background process holds the SVS index and "
-								 "serves all backends.  Requires shared_preload_libraries = 'svs'."
-								 " Changing this requires a server restart to take effect.",
-								 &vamana_worker_enabled,
-								 false,
-								 worker_startup_ctx,
-								 0,
-								 NULL, NULL, NULL);
-
 		DefineCustomStringVariable("vamana.worker_database",
 								   "Database the background worker connects to for catalog access",
 								   "Must be the database where the vector extension and Vamana indexes "
@@ -132,13 +122,32 @@ VamanaInit(void)
 								   worker_startup_ctx,
 								   0,
 								   NULL, NULL, NULL);
+
+		DefineCustomIntVariable("vamana.worker_restart_time",
+								"Seconds to wait before restarting the background worker after a crash",
+								"Set to -1 to disable automatic restart (BGW_NEVER_RESTART). "
+								"Requires a server restart to take effect.",
+								&vamana_worker_restart_time,
+								5, -1, 300,
+								worker_startup_ctx,
+								0,
+								NULL, NULL, NULL);
 	}
 
 	DefineCustomIntVariable("vamana.worker_timeout_ms",
-							"Milliseconds to wait for background worker response before falling back",
+							"Milliseconds to wait for background worker IPC response",
 							NULL,
 							&vamana_worker_timeout_ms,
 							5000, 100, 60000,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("vamana.worker_startup_timeout_ms",
+							"Milliseconds to wait for the background worker to finish startup before erroring",
+							"Increase this if the server has many large indexes or slow disk.",
+							&vamana_worker_startup_timeout_ms,
+							60000, 1000, 300000,
 							PGC_SIGHUP,
 							0,
 							NULL, NULL, NULL);
@@ -173,9 +182,7 @@ VamanaInit(void)
 	if (process_shared_preload_libraries_in_progress)
 	{
 		VamanaWorkerInstallHooks();
-
-		if (vamana_worker_enabled)
-			VamanaWorkerRegister();
+		VamanaWorkerRegister();
 	}
 
 	/*

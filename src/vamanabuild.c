@@ -307,7 +307,12 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		ereport(NOTICE,
 				(errmsg("no vectors to index, skipping SVS build")));
 
-		/* Invalidate any cached index to ensure stale data isn't used */
+		/*
+		 * Flush before invalidating: VamanaInvalidateCache signals the BGW,
+		 * which may immediately open the new relfilenode.  RBM_NORMAL
+		 * requires the page to already be on disk.
+		 */
+		FlushRelationBuffers(index);
 		VamanaInvalidateCache(RelationGetRelid(index));
 
 		goto cleanup;
@@ -394,28 +399,34 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		/* Serialize index to disk so the BGW can adopt it. */
 		SerializeIndexToPages(&buildstate, cachedIndex);
 
+		/*
+		 * Fail immediately if the worker is running for a different database —
+		 * this is a permanent misconfiguration and the index will never be
+		 * usable here.
+		 */
+		VamanaWorkerAssertDatabase();
+
 		if (VamanaWorkerIsAvailable())
 		{
 			/*
-			 * Ask the BGW to load the saved index as the canonical handle.
-			 * The backend's local copy is evicted after the ADOPT succeeds so
-			 * only one owner of the SVSIndexHandle exists.
+			 * Signal the BGW to reload this index asynchronously.  We still
+			 * hold AccessExclusiveLock, so the BGW cannot open the relation
+			 * until this transaction commits.
 			 */
-			if (VamanaWorkerSubmitAdopt(relid))
-				VamanaEvictCacheEntry(relid);
-			else
-				ereport(WARNING,
-						(errmsg("vamana index %u: BGW adopt failed; "
-								"index will be reloaded on next query", relid)));
+			VamanaWorkerSignalReload(relid);
+			VamanaEvictCacheEntry(relid);
 		}
 		else
 		{
 			/*
-			 * Worker not available: keep the local cache warm and signal a
-			 * reload when the worker comes up.
+			 * BGW not yet up (narrow startup race on first CREATE INDEX).
+			 * The index was saved to disk; the BGW will adopt it when it
+			 * finishes loading all indexes at startup.
 			 */
-			if (!AmBackgroundWorkerProcess() && vamana_worker_enabled)
-				VamanaWorkerSignalReload(relid);
+			ereport(WARNING,
+					(errmsg("vamana index \"%s\": background worker not yet available; "
+							"index will be adopted by the worker on startup",
+							RelationGetRelationName(index))));
 		}
 	}
 
@@ -458,6 +469,9 @@ vamanabuildempty(Relation index)
 
 	InitBuildState(&buildstate, NULL, index, indexInfo, INIT_FORKNUM);
 	CreateMetaPage(&buildstate);
+
+	/* RBM_NORMAL requires the page on disk; flush before any reader opens this fork. */
+	FlushRelationBuffers(index);
 
 	MemoryContextDelete(buildstate.buildCtx);
 	MemoryContextDelete(buildstate.tmpCtx);

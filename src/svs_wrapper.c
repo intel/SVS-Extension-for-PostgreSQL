@@ -1,8 +1,5 @@
 /*
- * SVS C API Wrapper for pgvector
- *
- * This wrapper provides a simplified interface to Intel's Scalable Vector Search (SVS)
- * library, adapting it for use within PostgreSQL's extension framework.
+ * svs_wrapper.c
  */
 
 #include "postgres.h"

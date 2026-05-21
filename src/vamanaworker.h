@@ -29,7 +29,6 @@ typedef void *SVSIndexHandle;
 #define VAMANA_SLOTKIND_INSERT      1
 #define VAMANA_SLOTKIND_DELETE      2
 #define VAMANA_SLOTKIND_MAINTENANCE 3	/* consolidate / compact */
-#define VAMANA_SLOTKIND_ADOPT       4	/* hand off a freshly-built index */
 
 /* Maintenance sub-operations (valid when slotKind == VAMANA_SLOTKIND_MAINTENANCE) */
 #define VAMANA_MAINTENANCE_CONSOLIDATE 0
@@ -163,8 +162,9 @@ typedef struct VamanaWorkerShmem
 	 */
 } VamanaWorkerShmem;
 
-extern bool  vamana_worker_enabled;
 extern int	 vamana_worker_timeout_ms;
+extern int	 vamana_worker_startup_timeout_ms;
+extern int	 vamana_worker_restart_time;
 extern int	 vamana_max_batch_size;
 extern char *vamana_worker_database;
 
@@ -194,11 +194,11 @@ bool	VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 bool	VamanaWorkerSubmitDelete(Oid indexRelid,
 								 const size_t *externalIds, int nIds);
 bool	VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op);
-bool	VamanaWorkerSubmitAdopt(Oid indexRelid);
+void	VamanaReleaseIndexLock(Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
 bool	VamanaWorkerIsAvailable(void);
-
-SVSIndexHandle VamanaWorkerFallbackLoad(Relation indexRelation);
+void	VamanaWorkerAssertDatabase(void);
+void	VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation);
 
 float		  *VamanaWorkerSlotQueryVec(int slotIdx);
 ItemPointer	   VamanaWorkerSlotResults(int slotIdx);

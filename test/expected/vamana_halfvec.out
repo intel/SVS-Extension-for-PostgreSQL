@@ -2,10 +2,9 @@ SET enable_seqscan = off;
 -- L2
 CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+SET client_min_messages = error;
 CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
-NOTICE:  buffered 3 vectors for SVS index build
-NOTICE:  building SVS index with 3 vectors of dimension 3
-NOTICE:  SVS index built successfully
+RESET client_min_messages;
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
@@ -32,9 +31,6 @@ TRUNCATE t;
 NOTICE:  buffered 0 vectors for SVS index build
 NOTICE:  no vectors to index, skipping SVS build
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
-WARNING:  no vectors found in table for index rebuild
-WARNING:  no SVS index available for scan
-HINT:  Index may need to be rebuilt with REINDEX
  id | val 
 ----+-----
 (0 rows)

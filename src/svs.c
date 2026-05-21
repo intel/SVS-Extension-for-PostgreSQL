@@ -1,17 +1,9 @@
 /*
  * svs.c
  *
- * PostgreSQL extension entry point for the standalone SVS Vamana index.
- *
- * This file provides PG_MODULE_MAGIC and _PG_init() for the svs extension.
- * In the patch-based delivery (pgvector-intel-innersource), VamanaInit() is
- * called from pgvector's own _PG_init() in vector.c.  Here it is called from
- * this extension's own _PG_init(), making the extension fully self-contained.
- *
- * The extension requires pgvector (CREATE EXTENSION vector) to be installed
- * first; see svs.control.  pgvector provides:
- *   - the vector / halfvec data types (vector.h is installed as a public header)
- *   - the distance operator classes referenced by the Vamana operator classes
+ * Requires pgvector (CREATE EXTENSION vector) to be installed first.
+ * pgvector supplies the vector/halfvec data types and the distance operator
+ * classes referenced by the Vamana operator classes.
  */
 
 #include "postgres.h"

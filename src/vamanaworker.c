@@ -22,6 +22,7 @@
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
@@ -226,14 +227,11 @@ VamanaWorkerShmemStartup(void)
 	}
 	else
 	{
-		/*
-		 * Shared memory already initialised (e.g. postmaster restart without
-		 * reinit).  Re-register the tranche name so this process knows the
-		 * ID.
-		 */
 		VamanaIndexLockTranche = LWLockNewTrancheId();
 		LWLockRegisterTranche(VamanaIndexLockTranche,
 							  VamanaIndexLockTrancheName);
+		/* Clear stale latch ownership from a previous worker instance. */
+		InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
 	}
 
 	LWLockRelease(AddinShmemInitLock);
@@ -286,12 +284,12 @@ VamanaWorkerRegister(void)
 	memset(&bgw, 0, sizeof(bgw));
 	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana background worker");
 	snprintf(bgw.bgw_type, BGW_MAXLEN, "vamana background worker");
-	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "vector");
+	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "svs");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "VamanaWorkerMain");
 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
 	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	bgw.bgw_restart_time = 1;	/* restart 1s after crash */
+	bgw.bgw_restart_time = vamana_worker_restart_time;
 	bgw.bgw_main_arg = (Datum) 0;
 	bgw.bgw_notify_pid = 0;
 
@@ -352,12 +350,7 @@ VamanaGetIndexLock(Oid relid)
 	return &VamanaWorkerShmemPtr->indexLocks[free_slot].lock;
 }
 
-/*
- * Release the lock slot for a dropped index.
- * Currently unused; will be called from the DROP INDEX hook in a follow-on.
- */
-pg_attribute_unused()
-static void
+void
 VamanaReleaseIndexLock(Oid relid)
 {
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
@@ -446,10 +439,24 @@ VamanaWorkerGetOrLoadIndex(Oid relid)
 	if (!needsRebuild)
 		return index;
 
+	/*
+	 * Acquire AccessShareLock non-blocking before opening the relation.
+	 * A background worker must never block on a relation-level lock: if DDL
+	 * (DROP TABLE, TRUNCATE) holds AccessExclusiveLock on a related relation,
+	 * blocking here creates a lock-ordering cycle and deadlock.  This mirrors
+	 * the autovacuum pattern of using ConditionalLockRelationOid.
+	 */
+	if (!ConditionalLockRelationOid(relid, AccessShareLock))
+	{
+		ereport(LOG,
+				(errmsg("vamana worker: index %u locked by DDL, skipping reload", relid)));
+		return NULL;
+	}
+
 	/* Open the index relation inside the caller's transaction */
 	PG_TRY();
 	{
-		indexRel = index_open(relid, AccessShareLock);
+		indexRel = index_open(relid, NoLock);
 		index = LoadIndexFromPages(indexRel);
 		if (index == NULL)
 		{
@@ -457,21 +464,31 @@ VamanaWorkerGetOrLoadIndex(Oid relid)
 					(errmsg("vamana worker: no saved copy for index %u, rebuilding", relid)));
 			index = VamanaRebuildFromTable(indexRel);
 
-			/*
-			 * Best-effort: persist the freshly rebuilt index so subsequent
-			 * worker restarts can load it from disk instead of rebuilding
-			 * again.  indexRel is still open and the caller's transaction is
-			 * active, satisfying VamanaSaveIndexToDisk's requirements.  Any
-			 * failure here is non-fatal; the in-memory handle is still
-			 * usable.
-			 */
 			if (index != NULL)
+			{
 				VamanaWorkerTrySaveIndex(indexRel, index, relid);
+			}
+			else
+			{
+				/*
+				 * Table has 0 vectors.  Cache an empty entry so subsequent
+				 * lookups return quickly with 0 results instead of retrying
+				 * the rebuild each time.
+				 */
+				VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+				int		dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
+
+				VamanaCacheIndex(relid, NULL, dims,
+								opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
+								opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
+								NULL, 0, 0, 0, 0);
+			}
 		}
 		index_close(indexRel, AccessShareLock);
 	}
 	PG_CATCH();
 	{
+		UnlockRelationOid(relid, AccessShareLock);
 		FlushErrorState();
 		ereport(WARNING,
 				(errmsg("vamana worker: failed to load index %u", relid)));
@@ -599,19 +616,26 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	}
 
 	/*
-	 * Index-not-loaded: error all slots immediately and return.
+	 * index == NULL: either the table was empty (valid, return 0 results)
+	 * or the index failed to load (error).  Distinguish via the cache:
+	 * an empty-table index is cached with isValid=true and numVectors=0.
 	 */
 	if (index == NULL)
 	{
+		VamanaIndexCache *cache = VamanaGetCache(relid);
+		bool		isEmpty = (cache != NULL && cache->isValid && cache->numVectors == 0);
+
 		for (int i = 0; i < n; i++)
 		{
 			VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
 
 			slot->numResults = 0;
-			snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-					 "vamana worker: index %u not loaded", relid);
+			if (!isEmpty)
+				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+						 "vamana worker: index %u not loaded", relid);
 			pg_write_barrier();
-			pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+			pg_atomic_write_u32(&slot->status,
+								isEmpty ? VAMANA_SLOT_DONE : VAMANA_SLOT_ERROR);
 		}
 		return;
 	}
@@ -619,7 +643,7 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	/*
 	 * Acquire the per-index r/w lock in shared mode for the duration of all
 	 * searches in this batch.  This serializes against concurrent writes
-	 * (INSERT, DELETE, MAINTAIN, ADOPT) that hold LW_EXCLUSIVE.
+	 * (INSERT, DELETE, MAINTENANCE) that hold LW_EXCLUSIVE.
 	 */
 	{
 		LWLock	   *rwlock = VamanaGetIndexLock(relid);
@@ -815,7 +839,7 @@ VamanaWorkerDispatchBatch(int *slotIdxs, int n)
 /*
  * VamanaWorkerProcessWriteSlot
  *
- * Execute a single non-SEARCH slot (INSERT / DELETE / MAINTENANCE / ADOPT)
+ * Execute a single non-SEARCH slot (INSERT / DELETE / MAINTENANCE)
  * under the per-index LW_EXCLUSIVE lock.  Writes DONE or ERROR into the slot
  * status.  SetLatch on the waiting backend is the caller's responsibility.
  *
@@ -1028,31 +1052,6 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 					break;
 				}
 
-			case VAMANA_SLOTKIND_ADOPT:
-				{
-					/*
-					 * The backend has just finished CREATE INDEX / REINDEX,
-					 * saved the index to disk, and evicted its local handle.
-					 * We reload from disk so the canonical handle is now in
-					 * the worker.
-					 */
-					VamanaEvictCacheEntry(relid);
-
-					{
-						SetCurrentStatementStartTimestamp();
-						StartTransactionCommand();
-						PushActiveSnapshot(GetTransactionSnapshot());
-						(void) VamanaWorkerGetOrLoadIndex(relid);
-						PopActiveSnapshot();
-						CommitTransactionCommand();
-					}
-
-					slot->numResults = 0;
-					pg_write_barrier();
-					pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-					break;
-				}
-
 			default:
 				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
 						 "vamana worker: unknown slotKind %u", slot->slotKind);
@@ -1086,6 +1085,49 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 
 	if (rwlock != NULL)
 		LWLockRelease(rwlock);
+
+	/*
+	 * Persist the updated index to disk if any write modified it.  This keeps
+	 * the on-disk copy in sync with the in-memory state so that a reload
+	 * (triggered by SignalReload after CREATE INDEX) sees the latest data.
+	 *
+	 * The LW lock was released above, but write slots are dispatched serially
+	 * (one at a time through VamanaWorkerProcessWriteSlot), so no concurrent
+	 * writer can modify cache->tidMapping here.  If write slots are ever
+	 * parallelized, this will need re-examination.
+	 */
+	if (VamanaCacheGetNeedsSave(relid))
+	{
+		SVSIndexHandle	saveIndex;
+		bool			needsRebuild;
+
+		saveIndex = VamanaGetCachedIndex(relid, &needsRebuild);
+		if (saveIndex != NULL && !needsRebuild)
+		{
+			VamanaIndexCache *cache = VamanaGetCache(relid);
+			Relation		  indexRel;
+
+			SetCurrentStatementStartTimestamp();
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+			indexRel = index_open(relid, AccessShareLock);
+			VamanaWorkerTrySaveIndex(indexRel, saveIndex, relid);
+			if (cache != NULL && cache->tidMapping != NULL &&
+				cache->tidMappingCapacity > 0)
+			{
+				char	savedir[MAXPGPATH];
+
+				VamanaGetIndexSavePath(relid, savedir, sizeof(savedir));
+				if (access(savedir, F_OK) == 0)
+					VamanaSaveTidMapAtomically(relid, cache->tidMapping,
+											   cache->tidMappingCapacity);
+			}
+			index_close(indexRel, AccessShareLock);
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			VamanaCacheSetNeedsSave(relid, false);
+		}
+	}
 }
 
 /*
@@ -1093,7 +1135,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
  *
  * Collect all PENDING slots, transition them to PROCESSING.
  * SEARCH slots are batched and dispatched together via VamanaWorkerDispatchBatch.
- * Write slots (INSERT/DELETE/MAINTENANCE/ADOPT) are processed individually via
+ * Write slots (INSERT/DELETE/MAINTENANCE) are processed individually via
  * VamanaWorkerProcessWriteSlot, which holds LW_EXCLUSIVE for the duration.
  * After all processing, wake every waiting backend.
  */
@@ -1189,8 +1231,7 @@ VamanaWorkerProcessReloads(void)
 	if (pg_atomic_exchange_u32(&VamanaWorkerShmemPtr->reload_all, 0) != 0)
 	{
 		ereport(LOG,
-				(errmsg("vamana worker: reload_all set �119� "
-						"evicting all cached indexes and reloading")));
+				(errmsg("vamana worker: reload_all set, evicting all cached indexes and reloading")));
 		VamanaEvictAllCacheEntries();
 		VamanaWorkerLoadAllIndexes();
 		return;
@@ -1257,6 +1298,8 @@ VamanaWorkerMain(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
+	VamanaWorkerShmemPtr->dbOid = InvalidOid;
+	InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
 	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
 
 	if (strcmp(vamana_worker_database, "postgres") == 0)
@@ -1285,7 +1328,10 @@ VamanaWorkerMain(Datum main_arg)
 		ResetLatch(&VamanaWorkerShmemPtr->workerLatch);
 
 		if (rc & WL_POSTMASTER_DEATH)
+		{
+			DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
 			proc_exit(1);
+		}
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1321,8 +1367,6 @@ VamanaWorkerMain(Datum main_arg)
 bool
 VamanaWorkerIsAvailable(void)
 {
-	if (!vamana_worker_enabled)
-		return false;
 	if (VamanaWorkerShmemPtr == NULL)
 		return false;
 	if (VamanaWorkerShmemPtr->workerPid == 0)
@@ -1330,6 +1374,76 @@ VamanaWorkerIsAvailable(void)
 	if (VamanaWorkerShmemPtr->dbOid != MyDatabaseId)
 		return false;
 	return true;
+}
+
+/*
+ * VamanaWorkerAssertDatabase
+ *
+ * If the background worker is running but serving a different database, throw
+ * an immediate ERROR.  This is a permanent misconfiguration — no amount of
+ * waiting will fix it — so we must not spin.
+ */
+void
+VamanaWorkerAssertDatabase(void)
+{
+	if (VamanaWorkerShmemPtr != NULL &&
+		VamanaWorkerShmemPtr->workerPid != 0 &&
+		VamanaWorkerShmemPtr->dbOid != InvalidOid &&
+		VamanaWorkerShmemPtr->dbOid != MyDatabaseId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("vamana index is not enabled for this database"),
+				 errdetail("The background worker is running for database OID %u, not %u.",
+						   VamanaWorkerShmemPtr->dbOid, MyDatabaseId),
+				 errhint("Set vamana.worker_database to the name of this database and restart the server.")));
+}
+
+/*
+ * VamanaWorkerWaitUntilAvailable
+ *
+ * Spin-wait for the background worker to finish startup.  Once the BGW sets
+ * workerPid in shared memory this returns immediately.  If the worker does not
+ * become available within vamana_worker_startup_timeout_ms milliseconds, an
+ * ERROR is thrown so the caller gets an actionable message rather than silent
+ * data loss or stale results.
+ *
+ * This uses a different timeout than vamana_worker_timeout_ms (IPC response
+ * time) because startup can take well over 5 s when there are many large
+ * indexes to deserialize from disk.
+ */
+void
+VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
+{
+	int			total_waited_ms = 0;
+
+	VamanaWorkerAssertDatabase();
+
+	if (VamanaWorkerIsAvailable())
+		return;
+
+	while (total_waited_ms < vamana_worker_startup_timeout_ms)
+	{
+		long		wait_ms = Min(200, vamana_worker_startup_timeout_ms - total_waited_ms);
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+						 wait_ms,
+						 PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		VamanaWorkerAssertDatabase();
+
+		if (VamanaWorkerIsAvailable())
+			return;
+
+		total_waited_ms += (int) wait_ms;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("vamana background worker unavailable after %d ms; cannot %s index %u",
+					total_waited_ms, operation, indexRelid),
+			 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
 }
 
 /*
@@ -1397,6 +1511,7 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 		   dimensions * sizeof(float));
 
 	slot->indexRelid = indexRelid;
+	slot->slotKind = VAMANA_SLOTKIND_SEARCH;
 	slot->dimensions = dimensions;
 	slot->k = k;
 	slot->searchWindowSize = searchWindowSize;
@@ -1563,7 +1678,7 @@ VamanaWorkerSignalReload(Oid indexRelid)
  * On false the slot is reset to EMPTY and slot->errorMessage is populated.
  */
 static bool
-VamanaWorkerWaitForSlot(VamanaWorkerSlot * slot)
+VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
 {
 	uint32		status;
 	int			total_waited_ms = 0;
@@ -1575,7 +1690,7 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot * slot)
 			int			rc;
 			long		wait_ms;
 
-			wait_ms = Min(1000, vamana_worker_timeout_ms - total_waited_ms);
+			wait_ms = Min(1000, timeout_ms - total_waited_ms);
 			if (wait_ms <= 0)
 				break;
 
@@ -1597,7 +1712,7 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot * slot)
 			if (rc & WL_TIMEOUT)
 			{
 				total_waited_ms += (int) wait_ms;
-				if (total_waited_ms >= vamana_worker_timeout_ms)
+				if (total_waited_ms >= timeout_ms)
 					break;
 			}
 		}
@@ -1642,6 +1757,13 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot * slot)
 			 "vamana worker timed out after %d ms", total_waited_ms);
 	return false;
 }
+
+static inline bool
+VamanaWorkerWaitForSlotIPC(VamanaWorkerSlot *slot)
+{
+	return VamanaWorkerWaitForSlot(slot, vamana_worker_timeout_ms);
+}
+
 
 /*
  * VamanaWorkerClaimSlot
@@ -1731,7 +1853,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
 	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
 
-	ok = VamanaWorkerWaitForSlot(slot);
+	ok = VamanaWorkerWaitForSlotIPC(slot);
 
 	if (!ok)
 		ereport(ERROR,
@@ -1783,7 +1905,7 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
 	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
 
-	ok = VamanaWorkerWaitForSlot(slot);
+	ok = VamanaWorkerWaitForSlotIPC(slot);
 
 	if (!ok)
 	{
@@ -1817,7 +1939,7 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
 	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
 
-	ok = VamanaWorkerWaitForSlot(slot);
+	ok = VamanaWorkerWaitForSlotIPC(slot);
 
 	if (!ok)
 	{
@@ -1828,63 +1950,4 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 	return true;
 }
 
-/*
- * VamanaWorkerSubmitAdopt
- *
- * After CREATE INDEX / REINDEX saves the index to disk, ask the worker to
- * load (adopt) it as the canonical in-memory handle.
- * Returns true on success, false on error.
- */
-bool
-VamanaWorkerSubmitAdopt(Oid indexRelid)
-{
-	VamanaWorkerSlot *slot;
-	bool		ok;
 
-	slot = VamanaWorkerClaimSlot(indexRelid);
-	if (slot == NULL)
-		return false;
-
-	slot->slotKind = VAMANA_SLOTKIND_ADOPT;
-
-	pg_write_barrier();
-	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
-
-	ok = VamanaWorkerWaitForSlot(slot);
-
-	if (!ok)
-	{
-		ereport(WARNING,
-				(errmsg("vamana worker adopt failed: %s", slot->errorMessage)));
-		return false;
-	}
-	return true;
-}
-
-/*
- * VamanaWorkerFallbackLoad
- *
- * Load the SVS index directly into the calling backend process.  Used when
- * the worker is unavailable or a request times out.  Tries LoadIndexFromPages
- * first (fast, disk-based); falls back to VamanaRebuildFromTable.
- *
- * The returned handle is registered in the backend's per-process cache via
- * VamanaCacheIndex so subsequent scans in this session are fast.
- */
-SVSIndexHandle
-VamanaWorkerFallbackLoad(Relation indexRelation)
-{
-	SVSIndexHandle handle;
-
-	handle = LoadIndexFromPages(indexRelation);
-	if (handle != NULL)
-		return handle;
-
-	ereport(LOG,
-			(errmsg("vamana fallback: no saved copy for index %u, rebuilding from table",
-					RelationGetRelid(indexRelation))));
-
-	handle = VamanaRebuildFromTable(indexRelation);
-	return handle;
-}

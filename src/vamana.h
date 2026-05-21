@@ -70,8 +70,8 @@
 #define VAMANA_ALPHA_SCALE						100.0
 #define VAMANA_ALPHA_TO_FLOAT(a)				((float)(a) / VAMANA_ALPHA_SCALE)
 #define VAMANA_INITIAL_BUFFER_CAPACITY			1000
-#define VAMANA_PROGRESS_INTERVAL				100000	/* emit LOG every N tuples during long heap scans, see #39 */
-#define VAMANA_COST_SCALING_FACTOR				0.8		/* see #52 */
+#define VAMANA_PROGRESS_INTERVAL				100000	/* emit LOG every N tuples during long heap scans */
+#define VAMANA_COST_SCALING_FACTOR				0.8		/* empirically tuned index cost multiplier */
 #define VAMANA_LEANVEC_DEFAULT_DIM_DIVISOR		2
 
 #define VAMANA_DEFAULT_LEANVEC_PRIMARY		VAMANA_LEANVEC_UINT8
@@ -268,6 +268,7 @@ void		VamanaEnsureSaveDir(Oid relid);
 void		VamanaDeleteSaveDir(Oid relid);
 void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum);
 bool		VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
+void		VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count);
 void		VamanaInstallObjectAccessHook(void);
 
 /* Dynamic index support */

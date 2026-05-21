@@ -161,7 +161,6 @@ VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions)
 
 /*
  * Build reloptions for Vamana index
- * Note: vamana_relopt_kind is initialized in VamanaInit() in vamana.c
  */
 extern relopt_kind vamana_relopt_kind;
 
@@ -197,7 +196,7 @@ vamanacostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
 
-	/* Placeholder scaling factor: see #52 for proper benchmarking */
+	/* Scale down generic cost estimate to reflect ANN index characteristics */
 	costs.indexTotalCost *= VAMANA_COST_SCALING_FACTOR;
 
 	*indexStartupCost = costs.indexStartupCost;
@@ -362,8 +361,8 @@ VamanaDeleteSaveDir(Oid relid)
  * Ereports ERROR on I/O failure; caller's PG_TRY handles cleanup of the
  * entire save directory.
  */
-static void
-VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int numVectors)
+void
+VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 {
 	char		tidmappath[MAXPGPATH];
 	char		tidmaptmp[MAXPGPATH];
@@ -381,8 +380,8 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int numVector
 				(errcode_for_file_access(),
 				 errmsg("could not create TID map file \"%s\": %m", tidmaptmp)));
 
-	written = fwrite(tidMapping, sizeof(ItemPointerData), numVectors, f);
-	if ((int) written != numVectors)
+	written = fwrite(tidMapping, sizeof(ItemPointerData), count, f);
+	if ((int) written != count)
 	{
 		FreeFile(f);
 		unlink(tidmaptmp);
@@ -910,16 +909,11 @@ VamanaInvalidateCache(Oid indexRelid)
 	VamanaDeleteSaveDir(indexRelid);
 
 	/*
-	 * Signal the background worker to reload this index, if the worker is
-	 * running.  The worker will pick up the new on-disk copy (or rebuild) on
-	 * its next loop iteration.
-	 *
-	 * Avoid signaling when running inside a background worker (including the
-	 * Vamana worker itself) to prevent repeated reload loops.
-	 * AmBackgroundWorkerProcess() is the PG 18 equivalent of
-	 * IsBackgroundWorker.
+	 * Signal the BGW to evict its in-memory copy.  The save directory was
+	 * deleted above, so the BGW will rebuild from the (now empty) table and
+	 * cache a fresh entry.
 	 */
-	if (!AmBackgroundWorkerProcess() && vamana_worker_enabled && VamanaWorkerIsAvailable())
+	if (!AmBackgroundWorkerProcess() && VamanaWorkerIsAvailable())
 		VamanaWorkerSignalReload(indexRelid);
 
 	/*
@@ -1018,7 +1012,10 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 
 	/* On relation drop, remove the corresponding vamana save directory. */
 	if (access == OAT_DROP && classId == RelationRelationId)
+	{
 		VamanaDeleteSaveDir(objectId);
+		VamanaReleaseIndexLock(objectId);
+	}
 }
 
 /*
@@ -1149,8 +1146,8 @@ VamanaRebuildFromTable(Relation index)
 			numVectors++;
 
 			/*
-			 * Emit progress LOG at regular intervals so operators can monitor
-			 * long-running rebuilds (see #39).
+			 * Emit progress LOG at regular intervals to surface progress during
+			 * long-running rebuilds.
 			 */
 			if (numVectors % VAMANA_PROGRESS_INTERVAL == 0)
 				ereport(LOG,

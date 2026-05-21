@@ -203,38 +203,8 @@ vamanabeginscan(Relation index, int nkeys, int norderbys)
 
 	VamanaInitSupport(&so->support, index);
 
-	if (vamana_worker_enabled && VamanaWorkerIsAvailable())
-	{
-		/*
-		 * Worker mode: the background worker holds the canonical index
-		 * handle. Set a non-NULL sentinel so the `if (so->svsIndex)` guard in
-		 * vamanarescan() passes; the actual search goes through IPC.
-		 */
-		so->svsIndex = VAMANA_WORKER_HANDLE_SENTINEL;
-	}
-	else
-	{
-		/* Direct mode: load or rebuild the index in this process */
-		bool		needsRebuild;
-
-		so->svsIndex = VamanaGetCachedIndex(RelationGetRelid(index), &needsRebuild);
-
-		if (needsRebuild)
-		{
-			so->svsIndex = LoadIndexFromPages(index);
-
-			if (so->svsIndex == NULL)
-			{
-				ereport(LOG,
-						(errmsg("vamana index not in memory, rebuilding from table")));
-
-				so->svsIndex = VamanaRebuildFromTable(index);
-
-				if (so->svsIndex != NULL)
-					VamanaCacheSetNeedsSave(RelationGetRelid(index), true);
-			}
-		}
-	}
+	VamanaWorkerWaitUntilAvailable(RelationGetRelid(index), "scan");
+	so->svsIndex = VAMANA_WORKER_HANDLE_SENTINEL;
 
 	scan->opaque = so;
 
@@ -298,65 +268,15 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 													  so->distances);
 
 			if (so->numResults < 0)
-			{
-				/*
-				 * Worker failed or timed out.  Fall back to loading the index
-				 * directly into this backend: expensive but correct.
-				 */
-				ereport(WARNING,
-						(errmsg("vamana worker unavailable, falling back to direct load for index %u",
-								so->indexRelid)));
-
-				so->svsIndex = VamanaWorkerFallbackLoad(scan->indexRelation);
-
-				if (so->svsIndex != NULL)
-					so->numResults = SVSSearch(so->indexRelid, so->svsIndex,
-											   queryVec->x, queryVec->dim, k,
-											   so->searchWindowSize,
-											   so->results, so->distances);
-				else
-				{
-					ereport(WARNING,
-							(errmsg("vamana index %u: worker unavailable and fallback load failed; "
-									"returning empty result set", so->indexRelid),
-							 errhint("Run REINDEX on the index to rebuild it.")));
-					so->numResults = 0;
-				}
-			}
-		}
-		else
-		{
-			/* Direct mode: search using the in-process SVS handle */
-			so->numResults = SVSSearch(
-									   so->indexRelid,
-									   so->svsIndex,
-									   queryVec->x,
-									   queryVec->dim,
-									   k,
-									   so->searchWindowSize,
-									   so->results,
-									   so->distances
-				);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("vamana background worker unavailable after waiting up to %d ms; cannot scan index %u",
+								vamana_worker_timeout_ms, so->indexRelid),
+						 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
 		}
 
-		if (so->numResults < 0)
-		{
-			pfree(queryVec);
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("SVS search failed with result %d", so->numResults)));
-		}
 		pfree(queryVec);		/* free the _COPY allocation */
 
-		so->currentResult = 0;
-	}
-	else if (!so->svsIndex)
-	{
-		/* No index loaded - return empty results */
-		ereport(WARNING,
-				(errmsg("no SVS index available for scan"),
-				 errhint("Index may need to be rebuilt with REINDEX")));
-		so->numResults = 0;
 		so->currentResult = 0;
 	}
 }
@@ -398,30 +318,6 @@ void
 vamanaendscan(IndexScanDesc scan)
 {
 	VamanaScanOpaque so = (VamanaScanOpaque) scan->opaque;
-
-	/*
-	 * Deferred save (Issue #40): persist a freshly rebuilt index to disk
-	 * after all query results have been returned.  Skip worker-mode handles
-	 * (the worker saves independently).
-	 */
-	if (so->svsIndex != NULL &&
-		so->svsIndex != VAMANA_WORKER_HANDLE_SENTINEL &&
-		VamanaCacheGetNeedsSave(so->indexRelid))
-	{
-		PG_TRY();
-		{
-			VamanaSaveIndexToDisk(scan->indexRelation, so->svsIndex,
-								  MAIN_FORKNUM);
-		}
-		PG_CATCH();
-		{
-			FlushErrorState();
-			ereport(WARNING,
-					(errmsg("vamana index %u: could not save to disk",
-							so->indexRelid)));
-		}
-		PG_END_TRY();
-	}
 
 	if (so->results)
 	{

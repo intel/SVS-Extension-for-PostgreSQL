@@ -4,7 +4,9 @@ SET enable_seqscan = off;
 
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+SET client_min_messages = error;
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
+RESET client_min_messages;
 
 INSERT INTO t (val) VALUES ('[1,2,4]');
 
