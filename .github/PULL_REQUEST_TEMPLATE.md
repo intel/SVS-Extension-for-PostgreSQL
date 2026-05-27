@@ -52,7 +52,7 @@
 ### Vamana / SVS (if applicable)
 
 - [ ] `make installcheck REGRESS='vamana_vector vamana_halfvec'` passes
-- [ ] On-disk persistence round-trip verified (`test/t/045_vamana_persistence.pl`)
+- [ ] On-disk persistence round-trip verified (`test/t/01_vamana_worker_tests.pl`)
 - [ ] LeanVec / compression paths exercised if compression options were changed
 
 ### Documentation

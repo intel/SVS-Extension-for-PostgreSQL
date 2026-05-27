@@ -24,8 +24,15 @@ WORKSPACE_DIR="$HOME/workspace"
 # POSTGRESQL CONFIGURATION
 # =============================================================================
 
-# PostgreSQL install prefix (set by ./configure --prefix=...)
-PG_INSTALL="$WORKSPACE_DIR/pgv-svs-dev-scripts/pgsql_install"
+# Base data directory, namespaced by OS user to avoid multi-user collisions
+PGV_DATA_DIR="${PGV_DATA_DIR:-/data1/$USER/pgv-dev}"
+
+# PostgreSQL install prefix — validate any pre-set value; fall back to default
+# if it no longer points to a real pg_config (e.g. stale shell export).
+if [ -n "${PG_INSTALL:-}" ] && [ ! -x "$PG_INSTALL/bin/pg_config" ]; then
+    unset PG_INSTALL
+fi
+PG_INSTALL="${PG_INSTALL:-$PGV_DATA_DIR/pgsql_install}"
 
 # Path to pg_config from your PostgreSQL install
 export PG_CONFIG="$PG_INSTALL/bin/pg_config"
@@ -155,7 +162,7 @@ verify_env() {
         echo "  make clean && make -j $(nproc) && make install"
         echo "  make installcheck                         # SQL regression tests"
         echo "  make prove_installcheck                   # all TAP tests"
-        echo "  make prove_installcheck PROVE_TESTS=test/t/045_vamana_worker_tests.pl"
+        echo "  make prove_installcheck PROVE_TESTS=test/t/01_vamana_worker_tests.pl"
         return 0
     else
         echo

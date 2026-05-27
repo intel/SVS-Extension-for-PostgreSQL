@@ -1832,7 +1832,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("vamana index operations require the vamana background worker"),
-				 errhint("Set vamana.worker_enabled = on and restart PostgreSQL.")));
+				 errhint("Ensure svs is in shared_preload_libraries and restart PostgreSQL.")));
 	}
 
 	if (dimensions > VAMANA_MAX_DIM)

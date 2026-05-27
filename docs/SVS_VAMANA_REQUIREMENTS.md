@@ -1,8 +1,8 @@
 # SVS Vamana Index - Requirements Specification
 
 **Project:** pgvector Vamana Index Integration  
-**Version:** 2.0  
-**Date:** February 10, 2026  
+**Version:** 2.1  
+**Date:** May 27, 2026  
 **Status:** Implementation Complete
 
 **Implementation Approach:** Batch Build with SVS-Managed Parallelism
@@ -42,11 +42,12 @@
 
 **Parameters:**
 - `graph_degree` (R): 16-256, default 64
-- `alpha` (α): 1.0-2.0, default 1.2
+- `alpha`: integer -1 to 200 (scaled ×100; e.g., `120` = α 1.20). `-1` = SVS library default
+- `build_window_size`: integer -1 to 1000. `-1` = `2 × graph_degree`
 - `compression_type`: 0=none, 1=leanvec, 2=lvq, default 0
 - `compression_primary`: 4, -4, 8, -8 bits, default 8
 - `compression_secondary`: 4, -4, 8, -8 bits, default 8
-- `leanvec_dims`: reduced dimensions (optional, must be < original dimensions)
+- `leanvec_dims`: -1 to 2000 (reduced dimensions; `-1` = `dimensions / 2`)
 
 **Acceptance Criteria:**
 - All parameters are validated at index creation time using PostgreSQL's built-in validation
@@ -217,18 +218,15 @@
 
 **Acceptance Criteria:**
 
-**Implementation strategy (MVP):**
-- **Incremental insertion** via SVS API: `svs_index_add()`
-- New vectors immediately available in queries
-- Insert performance: <5ms per vector
-- Batched inserts use `svs_index_add_batch()` for efficiency
-
-**Two-tier architecture:**
-1. **Main index**: Built via `svs_vamana_build()` (optimized graph)
-2. **Delta buffer**: New inserts via `svs_index_add()` (integrated into graph)
+**Implementation:**
+- All indexes are born dynamic (built via `svs_index_build_dynamic`); there is no separate static-only path
+- New vectors are added incrementally via the background worker (`VAMANA_SLOTKIND_INSERT` → `SVSAddPoints`)
+- Inserts belonging to aborted transactions are rolled back automatically via the per-transaction undo log (`vamana_undo.c`)
+- Insert visibility is enforced by PostgreSQL heap-level MVCC: although a vector is added to the BGW's in-memory index synchronously during `vamanainsert`, search results are filtered against the heap so concurrent backends only see rows from committed transactions. Inserts from aborted transactions are removed via the per-transaction undo log (`vamana_undo.c`).
+- Insert performance: <5ms per vector (single-threaded)
 
 **Maintenance:**
-- Optional periodic `REINDEX` to optimize graph quality
+- Optional periodic `REINDEX` to restore optimal graph quality after many incremental mutations
 - Recommended when inserts exceed 10-20% of original size
 - Not required for correctness, only for performance optimization
 
@@ -340,15 +338,16 @@
 - Performance optimization on Intel Xeon (AVX-512)
 - Graceful degradation on non-Intel CPUs
 
-#### FR-1.7.3: pgvector Compatibility
+#### FR-1.7.3: pgvector Dependency
 **Priority:** MUST  
-**Description:** Vamana index shall coexist with existing pgvector indexes.
+**Description:** The `svs` extension requires pgvector (`vector` extension) as a prerequisite. pgvector provides the `vector` and `halfvec` types, operator classes, and HNSW/IVFFlat index implementations. The `svs` extension does not bundle pgvector source.
 
 **Acceptance Criteria:**
-- Can create HNSW, IVFFlat, and Vamana on same table
-- Query planner chooses appropriate index
-- Shared operator classes and support functions
-- No conflicts in SQL namespace
+- `svs.control` declares `requires = 'vector'`; `CREATE EXTENSION svs` installs the `vector` dependency automatically
+- Can create HNSW, IVFFlat, and Vamana indexes on the same table
+- Query planner chooses the appropriate index for each query
+- No conflicts in SQL namespace between the two extensions
+- `shared_preload_libraries` must include `vector` before `svs`
 
 #### FR-1.7.4: pg_upgrade Support
 **Priority:** MUST  
@@ -938,3 +937,5 @@
 |---------|------|--------|---------|
 | 1.0 | 2026-01-13 | Architecture Team | Initial draft |
 | 1.1 | 2026-01-13 | Architecture Team | Simplified to batch approach with SVS-managed parallelism |
+| 2.0 | 2026-02-10 | Architecture Team | Expanded MVP: LeanVec compression, incremental INSERT/DELETE |
+| 2.1 | 2026-05-27 | Architecture Team | Reflect three structural changes: (1) svs is now a standalone extension requiring pgvector as a dependency (not a pgvector patch); (2) FR-1.4.1 insert path now routes through background worker with transaction undo log — two-tier delta buffer description removed; (3) FR-1.7.3 reframed as dependency requirement |
