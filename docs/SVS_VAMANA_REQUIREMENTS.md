@@ -79,8 +79,10 @@
 **Acceptance Criteria:**
 
 - Index and all associated data are removed
-- No orphaned files or memory leaks
+- The SVS index directory at `$PGDATA/vamana_indexes/<oid>/` is removed via the object-access hook (`VamanaObjectAccessHook`) triggered by `OAT_DROP`; removal occurs as part of the DROP operation
 - Concurrent queries are handled gracefully
+
+**Known Limitation:** If the server crashes after the catalog entry is removed but before `VamanaDeleteSaveDir` completes, the `$PGDATA/vamana_indexes/<oid>/` directory may be left on disk as an orphan. No startup-time orphan sweep is currently implemented; orphaned directories must be removed manually. See NFR-2.9.1.
 
 ### 1.2 Index Building
 
@@ -128,20 +130,15 @@
 **Description:** Index build shall respect `maintenance_work_mem` for vector buffering.
 
 **Acceptance Criteria:**
-
-**Implementation:**
-1. **Buffer all vectors** from table into memory array
-2. **Check memory limit**: `num_vectors * dimensions * sizeof(float) ≤ maintenance_work_mem`
-3. **Pass to SVS**: `svs_vamana_build(vectors, num_vectors, ..., max_memory=maintenance_work_mem)`
-4. **SVS manages**: Internal memory for graph construction within limit
-5. **Fallback**: If table too large, report error (future: implement batched build)
+- Before allocating the vector buffer, check that `num_vectors * dimensions * sizeof(float) ≤ maintenance_work_mem`; if the table is too large, report an error with a hint to increase `maintenance_work_mem`
+- SVS manages its own internal memory for graph construction
 
 **Memory budget breakdown:**
 - Vector data: `N × D × 4 bytes`
 - SVS graph construction: Managed internally by SVS
 - Output index: Written incrementally to disk
 
-**Reports memory usage via `pg_stat_progress_create_index`**
+**Implementation Status:** The pre-build memory check against `maintenance_work_mem` is not yet implemented. The current code allocates the full vector buffer unconditionally via `MemoryContextAllocHuge` without comparing `dataSize` to `maintenance_work_mem`. SVS manages its own build memory internally and does not accept an external memory limit parameter. Until the check is implemented, builds on very large tables may exhaust server memory without a clean error. See Section 5 (Future Enhancements).
 
 #### FR-1.2.5: Build Progress Reporting
 **Priority:** MUST  
@@ -323,6 +320,8 @@
 
 **Acceptance Criteria:**
 - Compiles and passes tests on PG 12, 13, 14, 15, 16, 17
+
+**Implementation Status:** PG 14–17 tested. PG 12–13 not yet validated. See Section 5 (Future Enhancements).
 - Uses appropriate APIs for each version
 - Backward compatible index format
 
@@ -358,6 +357,8 @@
 - `pg_upgrade` succeeds with Vamana indexes present
 - Indexes remain functional after upgrade
 - No data loss or corruption
+
+**Known Limitation:** `pg_upgrade` copies catalog entries and tablespace files but does not handle extension-specific subdirectories such as `$PGDATA/vamana_indexes/`. Without explicit support in the extension (e.g., a `pg_upgrade` hook or migration script), the SVS index directories will not be carried over and indexes will require a full rebuild after upgrade. This has not yet been verified or implemented. See Section 5 (Future Enhancements). Interim workaround: manually copy `$PGDATA/vamana_indexes/` after `pg_upgrade` completes and before starting the upgraded cluster.
 
 ---
 
@@ -485,12 +486,19 @@
 
 #### NFR-2.3.2: Crash Recovery
 **Priority:** MUST  
-**Requirement:** System shall recover from crashes without data loss.
+**Requirement:** System shall recover from crashes with a consistent index state.
+
+**Storage model:** The SVS index is serialized to `$PGDATA/vamana_indexes/<oid>/` — a filesystem directory outside PostgreSQL's buffer manager. This data is **not WAL-logged**. The PostgreSQL catalog entries (metapage: `hasSavedIndex`, `indexDataBlkno`, `indexDataSize`) are WAL-logged normally.
+
+**Recovery strategy (implemented):** The SVS index directory is treated as a persistent cache. On startup after a crash, the background worker calls `LoadIndexFromPages()` to reload the saved index. If the saved directory is absent or corrupt (e.g., the crash occurred during `SVSSaveIndex`), `VamanaRebuildFromTable()` rebuilds the index from the heap. This means:
+- Crash between the last save and a committed INSERT/DELETE: the index is rebuilt from the heap on next startup; no data is lost from the heap
+- Crash mid-`SVSSaveIndex`: the partial directory is detected as corrupt; rebuild from heap occurs automatically
+- The index is always consistent with the heap after recovery; a rebuild may be required
 
 **Acceptance Criteria:**
-- WAL logging for all index modifications
-- Recovery succeeds after any point of failure
-- Index remains consistent after recovery
+- After any crash, the background worker restarts and the index is available for queries (either from the saved directory or rebuilt from the heap)
+- No manual intervention is required for crash recovery
+- Recovery succeeds regardless of which phase (build, insert, vacuum, save) the crash occurred in
 - No orphaned pages or memory leaks
 
 #### NFR-2.3.3: Concurrent Safety
@@ -668,7 +676,7 @@
 
 **Acceptance Criteria:**
 - Side-by-side comparison guide
-- Parameter mapping (m → graph_degree, ef_construction → search_window_size)
+- Parameter mapping (m → graph_degree, ef_construction → build_window_size)
 - A/B testing support (multiple indexes on same column)
 
 ### 2.8 Dependency Management
@@ -699,6 +707,44 @@
 - Extension loads even if SVS not found
 - Clear error message on CREATE INDEX attempt
 - Alternative: stub implementation for testing
+
+### 2.9 Disaster Recovery and Operational Continuity
+
+#### NFR-2.9.1: Backup
+**Priority:** MUST  
+**Requirement:** Vamana index data must be included in PostgreSQL base backups.
+
+**Background:** The SVS index lives at `$PGDATA/vamana_indexes/<oid>/`, inside the PostgreSQL data directory. `pg_basebackup` and filesystem snapshots taken of `$PGDATA` will include these directories automatically; no special backup procedure is required beyond standard PostgreSQL backup practice.
+
+**Acceptance Criteria:**
+- A `pg_basebackup` of a server with Vamana indexes captures the `vamana_indexes/` subtree
+- Restoring from such a backup results in a fully operational Vamana index without requiring a rebuild
+
+**Known Limitation:** There is no startup-time sweep to remove orphaned `vamana_indexes/<oid>/` directories (entries with no matching catalog OID). These can arise from a crash between catalog removal and `VamanaDeleteSaveDir`. They are harmless but waste disk space; manual removal is required.
+
+#### NFR-2.9.2: Streaming Replication and Standby
+**Priority:** MUST  
+**Requirement:** Vamana index directories must be replicated to standbys via streaming replication.
+
+**Background:** PostgreSQL streaming replication replicates the entire `$PGDATA` tree at the filesystem level. Because `vamana_indexes/` resides under `$PGDATA`, it is included automatically. However, changes to the SVS index files are written directly via `SVSSaveIndex` and are **not WAL-replicated** in real time. Standbys will have the last checkpointed/basebackup state of the index files; in-flight changes since the last save will require a rebuild on the standby after promotion.
+
+**Acceptance Criteria:**
+- After promotion of a physical standby, the Vamana index is available for queries — either from the replicated save directory or via automatic rebuild from the heap
+- No manual index recreation is required after a planned failover
+
+#### NFR-2.9.3: Recovery Point Objective
+**Priority:** SHOULD  
+**Requirement:** The RPO for Vamana index data matches the heap RPO.
+
+**Rationale:** The SVS index is rebuilt from the heap if the saved directory is absent or stale. The heap is WAL-logged and has the PostgreSQL-standard RPO. Therefore, the effective RPO for index data equals the heap RPO — no index data that was committed to the heap can be permanently lost.
+
+#### NFR-2.9.4: Orphan Directory Cleanup
+**Priority:** SHOULD  
+**Requirement:** A mechanism shall be provided to identify and remove orphaned `vamana_indexes/<oid>/` directories.
+
+**Acceptance Criteria:**
+- A utility function or script can compare directories under `$PGDATA/vamana_indexes/` against the current catalog and report directories with no matching index OID
+- Documented procedure for manual cleanup exists in the operator runbook
 
 ---
 
@@ -772,11 +818,11 @@
 - ✅ K-NN search (L2, IP, cosine distances)
 - ✅ Insert support (basic implementation)
 - ✅ Delete support (mark deleted, cleanup via VACUUM)
-- ✅ PostgreSQL 14-17 compatibility
+- ✅ PostgreSQL 14-17 compatibility (PG 12-13 not yet validated)
 - ✅ Linux x86_64 platform (AVX-512 optimized)
 
 **Configuration:**
-- ✅ `maintenance_work_mem` respected during build
+- ⚠️ `maintenance_work_mem` enforcement not yet implemented (pre-build check planned — see FR-1.2.4)
 - ✅ `max_parallel_maintenance_workers` passed to SVS
 - ✅ Index parameters: `graph_degree`, `alpha`, `compression_type`, `compression_primary`, `compression_secondary`, `leanvec_dims`
 - ✅ Runtime parameter: `vamana.search_window_size` (GUC, like `hnsw.ef_search`)
@@ -833,6 +879,15 @@
 ---
 
 ## 5. Future Enhancements
+
+### Known Limitations and Open Items
+
+These are valid requirements that are not yet fully implemented or validated:
+
+- **`maintenance_work_mem` enforcement (FR-1.2.4):** Pre-build check against `maintenance_work_mem` not yet implemented. The vector buffer is currently allocated unconditionally. SVS does not accept an external memory limit parameter. Requires implementation of a size check before `MemoryContextAllocHuge` and a clean error path when the limit is exceeded.
+- **`pg_upgrade` support (FR-1.7.4):** The `$PGDATA/vamana_indexes/` directories are not handled by `pg_upgrade`'s default copy mechanism. Requires design and implementation of an extension hook or migration script. Interim workaround: manual directory copy after upgrade.
+- **PostgreSQL 12–13 validation (FR-1.7.1):** PG 12–13 compatibility has not been tested. Requires a CI test run against PG 12 and 13 before these versions can be confirmed.
+- **Orphan directory cleanup (NFR-2.9.4):** No startup-time sweep to remove orphaned `vamana_indexes/<oid>/` directories. Requires a utility function or script that compares on-disk OIDs against the catalog.
 
 ### Phase 2 Features
 - Batch search API (query multiple vectors at once)
