@@ -74,7 +74,7 @@ VamanaInit(void)
 	add_int_reloption(vamana_relopt_kind, "leanvec_dims", "LeanVec dimensions (-1 = dimensions/2)",
 					  VAMANA_DEFAULT_LEANVEC_DIMS, VAMANA_MIN_LEANVEC_DIMS, VAMANA_MAX_LEANVEC_DIMS, AccessExclusiveLock);
 
-	DefineCustomIntVariable("vamana.search_window_size",
+	DefineCustomIntVariable("svs.search_window_size",
 							"Sets the search window size for vamana index scans",
 							"Valid range is 10-10000. Higher values improve recall but increase latency.",
 							&vamana_search_window_size,
@@ -87,7 +87,7 @@ VamanaInit(void)
 							NULL,
 							NULL);
 
-	DefineCustomIntVariable("vamana.search_num_threads",
+	DefineCustomIntVariable("svs.search_num_threads",
 							"Sets the number of threads SVS uses for index search operations",
 							"0 = auto (nproc-1). Explicit values override auto. "
 							"Lower values reduce oversubscription under concurrent query load; "
@@ -96,7 +96,7 @@ VamanaInit(void)
 							0,	/* default: auto (resolves to nproc-1) */
 							0,	/* min: 0 = auto */
 							1024,	/* max */
-							PGC_USERSET,
+							PGC_SUSET,
 							0,
 							NULL,
 							NULL,
@@ -111,7 +111,7 @@ VamanaInit(void)
 		GucContext	worker_startup_ctx = process_shared_preload_libraries_in_progress
 			? PGC_POSTMASTER : PGC_SIGHUP;
 
-		DefineCustomStringVariable("vamana.worker_database",
+		DefineCustomStringVariable("svs.worker_database",
 								   "Database the background worker connects to for catalog access",
 								   "Must be the database where the vector extension and Vamana indexes "
 								   "are created.  Defaults to \"postgres\"; set this if your indexes "
@@ -123,7 +123,7 @@ VamanaInit(void)
 								   0,
 								   NULL, NULL, NULL);
 
-		DefineCustomIntVariable("vamana.worker_restart_time",
+		DefineCustomIntVariable("svs.worker_restart_time",
 								"Seconds to wait before restarting the background worker after a crash",
 								"Set to -1 to disable automatic restart (BGW_NEVER_RESTART). "
 								"Requires a server restart to take effect.",
@@ -134,7 +134,7 @@ VamanaInit(void)
 								NULL, NULL, NULL);
 	}
 
-	DefineCustomIntVariable("vamana.worker_timeout_ms",
+	DefineCustomIntVariable("svs.worker_timeout_ms",
 							"Milliseconds to wait for background worker IPC response",
 							NULL,
 							&vamana_worker_timeout_ms,
@@ -143,7 +143,7 @@ VamanaInit(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("vamana.worker_startup_timeout_ms",
+	DefineCustomIntVariable("svs.worker_startup_timeout_ms",
 							"Milliseconds to wait for the background worker to finish startup before erroring",
 							"Increase this if the server has many large indexes or slow disk.",
 							&vamana_worker_startup_timeout_ms,
@@ -152,7 +152,7 @@ VamanaInit(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("vamana.max_batch_size",
+	DefineCustomIntVariable("svs.max_batch_size",
 							"Maximum queries per SVS batch call (0 = MaxBackends)",
 							NULL,
 							&vamana_max_batch_size,
@@ -161,7 +161,7 @@ VamanaInit(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("vamana.compact_threshold_pct",
+	DefineCustomIntVariable("svs.compact_threshold_pct",
 							"Percent-deleted threshold that triggers SVS compact during VACUUM cleanup",
 							"0 = compact on every VACUUM with pending deletes. "
 							"100 = disable compact (consolidate still runs). "
@@ -173,7 +173,7 @@ VamanaInit(void)
 							0,
 							NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("vamana");
+	MarkGUCPrefixReserved("svs");
 
 	/*
 	 * Register shared memory and background worker.  Must be done during

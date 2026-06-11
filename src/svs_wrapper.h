@@ -57,6 +57,7 @@ void		SVSBuilderSetThreadpool(SVSBuilderHandle builder, int num_threads);
 int			SVSDefaultBuildThreads(void);
 int			SVSDefaultSearchThreads(void);
 
+void		SVSSetIndexSearchThreads(SVSIndexHandle index, int num_threads);
 void		SVSFreeIndex(SVSIndexHandle index);
 
 int			SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensions, int k, int search_window_size, ItemPointer results, float *distances);

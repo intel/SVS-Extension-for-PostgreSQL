@@ -29,12 +29,17 @@ pgvector is a PostgreSQL extension providing vector similarity search with ACID 
 - K-means implementation in `ivfkmeans.c` uses sampling for large datasets
 - Centers stored on first pages, then data pages organized by cluster
 
-**Vamana** (`src/vamana*.c`, `src/vamana.h`, `src/svs_wrapper.c`):
+**Vamana** (`src/vamana*.c`, `src/vamana.h`, `src/vamanaworker.c`, `src/svs_wrapper.c`):
 - Graph-based ANN index using Intel SVS library with Vamana algorithm
-- Batch build: buffer all vectors from table scan → call SVS `svs_index_build()` → serialize to PostgreSQL pages
-- SVS manages parallelism internally (no manual DSM coordination or LWLocks)
-- On-disk persistence: index data serialized to filesystem via `SVSSaveIndex()`/`SVSLoadIndex()`, with TID mappings stored in PostgreSQL pages
-- Backend-private `VamanaIndexCache` holds the deserialized SVS index in memory per-backend
+- **All operations (search, INSERT, DELETE, VACUUM) go through a single background worker (BGW)** — backends never hold SVS index handles directly
+- BGW registration: `VamanaWorkerRegister()` in `vamanaworker.c`; main loop `VamanaWorkerMain()` runs a 1-second heartbeat cycle processing IPC slots and reload requests
+- IPC: each backend has a `VamanaWorkerSlot` in `VamanaWorkerShmem`; backend writes request, sets status to PENDING, wakes BGW latch, waits on its own latch for DONE/ERROR
+- BGW-private `VamanaIndexCache` (max 8 indexes, FIFO eviction) holds deserialized SVS index handles; backends never access this directly
+- Batch build: buffer all vectors from table scan → call SVS `svs_index_build_dynamic()` → serialize to filesystem; BGW owns all index handles
+- On-disk persistence: index data serialized to filesystem via `SVSSaveIndex()`/`SVSLoadIndex()`, TID mappings in `tidmap.bin`; `VAMANA_SAVE_LOCK_KEY` advisory lock serializes disk saves
+- Searches: backend submits via `VamanaWorkerSubmitSearch()`; BGW batches same-dimension queries via `SVSBatchSearch()` under LW_SHARED per-index lock
+- Writes (INSERT/DELETE): BGW holds LW_EXCLUSIVE per-index lock; per-index `VamanaIndexLockSlot` array (max 64 indexes) lives in shared memory
+- Operator classes support only `<->` (L2), `<#>` (inner product), `<=>` (cosine) — not L1/Hamming/Jaccard
 - Parameters: `graph_degree` (default 64, range 16-256), `alpha` (default -1 = SVS default, range -1 to 200, scaled by 100), `build_window_size` (default -1 = 2×graph_degree, range -1 to 1000), `search_window_size` (GUC + reloption, default 100, range 10-10000)
 - Compression: `compression_type` (0=none, 1=leanvec, 2=lvq), `compression_primary`/`compression_secondary` (4=UINT4, -4=INT4, 8=UINT8, -8=INT8), `leanvec_dims` (default -1 = dimensions/2)
 - Support functions: `VAMANA_DISTANCE_PROC=1`, `VAMANA_NORM_PROC=2`, `VAMANA_TYPE_INFO_PROC=3`
@@ -42,7 +47,6 @@ pgvector is a PostgreSQL extension providing vector similarity search with ACID 
 - Metapage format: `VamanaMetaPageData` with magic number, version, dimensions, parameters, and `hasSavedIndex` flag
 - Indexes are built as **dynamic** (mutable) using `svs_index_build_dynamic`, enabling incremental INSERT and DELETE+VACUUM without full REINDEX
 - Metapage fields: `nextExternalId`, `numDeleted`, `tidMappingCapacity` track dynamic index state
-- `VAMANA_DYNAMIC_WRITE_LOCK_KEY` advisory lock serializes concurrent inserts and vacuum deletes
 
 ## Build System & Testing
 
@@ -60,7 +64,7 @@ Auto-vectorization is enabled (`-march=native -ftree-vectorize`). Use `OPTFLAGS=
 ### Test Patterns
 - **SQL regression**: `test/sql/*.sql` → expected output in `test/expected/*.out`
 - **Perl TAP tests**: Use `PostgreSQL::Test::Cluster` for WAL replication, recall testing, and vacuum scenarios
-- Test naming: number prefix indicates execution order (e.g., `001_ivfflat_wal.pl`, `012_hnsw_vector_build_recall.pl`)
+- Test naming: two-digit prefix indicates execution order (e.g., `01_vamana_persistence.pl`, `02_vamana_bgw_core.pl`)
 - Recall tests verify approximate nearest neighbor accuracy after index operations
 - WAL tests create primary/replica setup with streaming replication to verify generic xlog records
 
@@ -100,7 +104,7 @@ Delete comments that restate the code. Keep comments for non-obvious invariants,
 
 ### GUC Parameters
 - `hnsw.ef_search`, `ivfflat.probes`: Runtime query tuning (set per query/session)
-- `vamana.search_window_size`: Runtime query tuning for Vamana scan search window (default 100, range 10-10000); forwarded to SVS via `svs_search_params_create_vamana()` on every search call
+- `svs.search_window_size`: Runtime query tuning for Vamana scan search window (default 100, range 10-10000); forwarded to SVS via `svs_search_params_create_vamana()` on every search call
 - `hnsw.iterative_scan`, `ivfflat.iterative_scan`: Enable relaxed ORDER BY semantics for LIMIT queries
 - `maintenance_work_mem`: Controls in-memory graph size during index builds
 
@@ -109,10 +113,11 @@ Delete comments that restate the code. Keep comments for non-obvious invariants,
 ### SVS Vamana Integration
 - Third index access method following HNSW/IVFFlat patterns, fully functional
 - Uses Intel SVS C API for AVX-512 optimizations on Xeon processors
+- **All SVS index access is mediated by a single BGW** (`vamanaworker.c`); backends communicate via shared-memory IPC slots — they never call SVS functions directly
 - Batch build approach: SVS manages parallelism internally, simpler than HNSW's manual DSM coordination
-- Implementation files: `src/vamana.c`, `src/vamanabuild.c`, `src/vamanascan.c`, `src/vamanainsert.c`, `src/vamanautils.c`, `src/vamanavacuum.c`, `src/svs_wrapper.c`
-- Incremental INSERT support: uses `svs_index_build_dynamic` / `svs_index_dynamic_add_points` so new rows are searchable immediately without `REINDEX`
-- Incremental DELETE support: `VACUUM` calls `svs_index_dynamic_delete_points` + consolidate/compact to remove dead tuples from the graph
+- Implementation files: `src/vamana.c`, `src/vamanabuild.c`, `src/vamanascan.c`, `src/vamanainsert.c`, `src/vamanautils.c`, `src/vamanavacuum.c`, `src/vamanaworker.c`, `src/svs_wrapper.c`
+- Incremental INSERT support: backend submits via `VamanaWorkerSubmitInsert()`; BGW calls `SVSAddPoints()` under LW_EXCLUSIVE lock; new rows are searchable immediately without `REINDEX`
+- Incremental DELETE support: `VACUUM` calls `VamanaWorkerSubmitDelete()` in batches; BGW calls `SVSDeletePoints()` + consolidate/compact to remove dead tuples from the graph
 - SVS C API details, available functions, and known gaps: see `.github/prompts/svs-api-reference.prompt.md`
 
 ## Common Development Tasks

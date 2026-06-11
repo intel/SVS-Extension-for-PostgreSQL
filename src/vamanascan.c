@@ -25,7 +25,7 @@
  *  - if no saved file exists (hasSavedIndex == false, or directory absent)
  *  - if loading fails (logs a WARNING and returns NULL so caller can fall back)
  *
- * On success the index is registered in the backend cache via VamanaCacheIndex.
+ * On success the index is registered in the worker's cache via VamanaCacheIndex.
  */
 SVSIndexHandle
 LoadIndexFromPages(Relation index)
@@ -61,12 +61,9 @@ LoadIndexFromPages(Relation index)
 	if (stat(savepath, &st) != 0 || !S_ISDIR(st.st_mode))
 	{
 		/*
-		 * Clear stale flag so future reads skip the check.  Two backends
-		 * could both observe hasSavedIndex=true, both find the directory
-		 * absent, and both call VamanaSetHasSavedIndex(false).  The double
-		 * write is idempotent and harmless. MAIN_FORKNUM is safe here: temp
-		 * relations are never serialized to vamana_indexes/, so this recovery
-		 * path is unreachable for temp indexes.
+		 * Clear stale flag so future reads skip the check.  MAIN_FORKNUM is
+		 * safe here: temp relations are never serialized to vamana_indexes/,
+		 * so this recovery path is unreachable for temp indexes.
 		 */
 		VamanaSetHasSavedIndex(index, false, MAIN_FORKNUM);
 		ereport(DEBUG1,
@@ -121,8 +118,8 @@ LoadIndexFromPages(Relation index)
 		return NULL;
 
 	/*
-	 * Restore the TID mapping from the sidecar file written at save time. The
-	 * capacity includes holes for soft-deleted entries.
+	 * Restore the TID mapping from the sidecar file written at save time.
+	 * The capacity includes holes for soft-deleted entries.
 	 */
 	if (tidMappingCapacity > 0)
 	{
@@ -187,7 +184,7 @@ vamanabeginscan(Relation index, int nkeys, int norderbys)
 	so->distances = NULL;
 
 	/*
-	 * Determine search window size: 1) GUC vamana.search_window_size 2) index
+	 * Determine search window size: 1) GUC svs.search_window_size 2) index
 	 * reloption search_window_size
 	 */
 	opts = (VamanaOptions *) index->rd_options;

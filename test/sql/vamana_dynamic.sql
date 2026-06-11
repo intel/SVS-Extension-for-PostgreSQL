@@ -86,8 +86,8 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id LIMIT 2;
 
 DROP TABLE t;
 
--- vamana.compact_threshold_pct: compact on every VACUUM with pending deletes
-SET vamana.compact_threshold_pct = 0;
+-- svs.compact_threshold_pct: compact on every VACUUM with pending deletes
+SET svs.compact_threshold_pct = 0;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]'), ('[4,4,4]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
@@ -96,10 +96,10 @@ DELETE FROM t WHERE id = 3;
 VACUUM t;
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id LIMIT 3;
 DROP TABLE t;
-RESET vamana.compact_threshold_pct;
+RESET svs.compact_threshold_pct;
 
--- vamana.compact_threshold_pct: 100 disables compact (consolidate still runs)
-SET vamana.compact_threshold_pct = 100;
+-- svs.compact_threshold_pct: 100 disables compact (consolidate still runs)
+SET svs.compact_threshold_pct = 100;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]'), ('[4,4,4]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
@@ -108,12 +108,12 @@ DELETE FROM t WHERE id IN (2, 3, 4);
 VACUUM t;
 SELECT * FROM t ORDER BY val <-> '[0,0,0]', id;
 DROP TABLE t;
-RESET vamana.compact_threshold_pct;
+RESET svs.compact_threshold_pct;
 
--- vamana.compact_threshold_pct: out-of-range values rejected
-SET vamana.compact_threshold_pct = -1;
-SET vamana.compact_threshold_pct = 101;
-SHOW vamana.compact_threshold_pct;
+-- svs.compact_threshold_pct: out-of-range values rejected
+SET svs.compact_threshold_pct = -1;
+SET svs.compact_threshold_pct = 101;
+SHOW svs.compact_threshold_pct;
 
 -- -------------------------------------------------------------------------
 -- Transactional rollback (undo-on-abort)
@@ -190,3 +190,40 @@ ROLLBACK;
 -- Only the original 3 rows should be searchable
 SELECT count(*) FROM (SELECT * FROM t_undo ORDER BY val <-> '[0,0,0]' LIMIT 2000) sub;
 DROP TABLE t_undo;
+
+-- -------------------------------------------------------------------------
+-- #92: TRUNCATE must not leave stale cache — post-TRUNCATE query returns empty.
+-- -------------------------------------------------------------------------
+CREATE TABLE t_trunc (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t_trunc (val) VALUES ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]');
+CREATE INDEX ON t_trunc USING vamana (val vector_l2_ops);
+
+-- Warm the cache
+SELECT count(*) FROM (SELECT * FROM t_trunc ORDER BY val <-> '[1,1,1]' LIMIT 10) sub;
+
+TRUNCATE t_trunc;
+
+-- After TRUNCATE the index is empty; query must return 0 rows.
+SELECT count(*) FROM (SELECT * FROM t_trunc ORDER BY val <-> '[1,1,1]' LIMIT 10) sub;
+
+DROP TABLE t_trunc;
+
+-- -------------------------------------------------------------------------
+-- #42: SVSLoadDynamicIndex build-window fallback must match build-time logic.
+-- When build_window_size is unset (0) and search_window_size is non-zero,
+-- the load path must use graph_degree*2, not search_window_size.
+-- -------------------------------------------------------------------------
+CREATE TABLE t_loadwin (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t_loadwin (val) VALUES ('[1,0,0]'), ('[0,1,0]'), ('[0,0,1]'), ('[1,1,0]'), ('[0,1,1]');
+CREATE INDEX ON t_loadwin USING vamana (val vector_l2_ops) WITH (search_window_size = 20);
+
+-- Warm cache and verify initial results.
+SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5) sub;
+
+-- REINDEX forces a cold reload through SVSLoadDynamicIndex.
+REINDEX INDEX CONCURRENTLY t_loadwin_val_idx;
+
+-- Results must be unchanged after reload.
+SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5) sub;
+
+DROP TABLE t_loadwin;

@@ -43,3 +43,25 @@ CREATE OPERATOR CLASS halfvec_cosine_ops
 	OPERATOR 1 <=> (halfvec, halfvec) FOR ORDER BY float_ops,
 	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
 	FUNCTION 2 l2_norm(halfvec);
+
+-- Observability
+
+CREATE FUNCTION pg_stat_vamana_worker()
+	RETURNS TABLE (
+		worker_pid          int,
+		db_oid              oid,
+		reload_queue_depth  int,
+		active_slot_count   int,
+		reload_all          bool,
+		heartbeat_ts        timestamptz,
+		slot_index          int,
+		slot_status         text,
+		index_relid         oid,
+		slot_kind           text,
+		error_message       text
+	)
+	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker'
+	LANGUAGE C STRICT;
+
+CREATE VIEW pg_stat_vamana_worker AS
+	SELECT * FROM pg_stat_vamana_worker();

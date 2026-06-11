@@ -7,11 +7,17 @@ OBJS = src/svs.o \
        src/vamana.o \
        src/vamana_undo.o \
        src/vamanabuild.o \
+       src/vamanacache.o \
+       src/vamanaio.o \
        src/vamanainsert.o \
        src/vamanascan.o \
        src/vamanautils.o \
        src/vamanavacuum.o \
        src/vamanaworker.o \
+       src/vamanaworkershmem.o \
+       src/vamanaworkerindex.o \
+       src/vamanaworkersearch.o \
+       src/vamanaworkerwrite.o \
        src/svs_wrapper.o
 HEADERS = src/vamana.h src/svs_wrapper.h
 

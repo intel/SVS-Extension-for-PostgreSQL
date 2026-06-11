@@ -48,6 +48,7 @@
 - `compression_primary`: 4, -4, 8, -8 bits, default 8
 - `compression_secondary`: 4, -4, 8, -8 bits, default 8
 - `leanvec_dims`: -1 to 2000 (reduced dimensions; `-1` = `dimensions / 2`)
+- `use_search_history`: boolean, default true
 
 **Acceptance Criteria:**
 - All parameters are validated at index creation time using PostgreSQL's built-in validation
@@ -824,8 +825,8 @@
 **Configuration:**
 - ⚠️ `maintenance_work_mem` enforcement not yet implemented (pre-build check planned — see FR-1.2.4)
 - ✅ `max_parallel_maintenance_workers` passed to SVS
-- ✅ Index parameters: `graph_degree`, `alpha`, `compression_type`, `compression_primary`, `compression_secondary`, `leanvec_dims`
-- ✅ Runtime parameter: `vamana.search_window_size` (GUC, like `hnsw.ef_search`)
+- ✅ Index parameters: `graph_degree`, `alpha`, `build_window_size`, `compression_type`, `compression_primary`, `compression_secondary`, `leanvec_dims`, `use_search_history`
+- ✅ Runtime parameter: `svs.search_window_size` (GUC, like `hnsw.ef_search`)
 
 **Quality:**
 - ✅ Comprehensive documentation with examples

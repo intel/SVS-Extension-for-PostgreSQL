@@ -202,9 +202,10 @@ VamanaXactCallback(XactEvent event, void *arg)
 			}
 
 		case XACT_EVENT_PREPARE:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("vamana index does not support two-phase commit")));
+			if (CurrentUndoLog != NULL && CurrentUndoLog->nEntries > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("vamana index does not support two-phase commit")));
 			break;
 
 		default:

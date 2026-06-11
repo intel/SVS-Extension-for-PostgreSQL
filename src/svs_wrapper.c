@@ -40,7 +40,7 @@ SVSDefaultBuildThreads(void)
 }
 
 /*
- * Use vamana.search_num_threads for search thread count.
+ * Use svs.search_num_threads for search thread count.
  * Zero (default) falls back to nproc-1.  Not governed by
  * max_parallel_maintenance_workers, which is for maintenance only.
  */
@@ -340,6 +340,22 @@ SVSBuilderSetThreadpool(SVSBuilderHandle builder, int num_threads)
 									 error);
 
 	CheckSVSError(error, "setting thread pool on builder");
+	svs_error_free(error);
+#else
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("SVS library support not compiled in")));
+#endif
+}
+
+void
+SVSSetIndexSearchThreads(SVSIndexHandle index, int num_threads)
+{
+#ifdef USE_SVS
+	svs_error_h error = svs_error_create();
+
+	svs_index_set_num_threads((svs_index_h) index, (size_t) num_threads, error);
+	CheckSVSError(error, "setting search threads on index");
 	svs_error_free(error);
 #else
 	ereport(ERROR,
@@ -671,55 +687,66 @@ SVSIndexHandle
 SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 {
 #ifdef USE_SVS
-	SVSAlgorithmHandle algorithm;
-	SVSBuilderHandle builder;
-	SVSStorageHandle storage;
+	SVSAlgorithmHandle algorithm = NULL;
+	SVSBuilderHandle builder = NULL;
+	SVSStorageHandle storage = NULL;
 	svs_index_h loaded;
 	svs_error_h error;
 	int			build_window;
 
-	if (config->build_window_size > 0)
-		build_window = config->build_window_size;
-	else if (config->search_window_size > 0)
-		build_window = config->search_window_size;
-	else
-		build_window = VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
+	build_window = (config->build_window_size > 0) ?
+		config->build_window_size :
+		VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
 
-	algorithm = SVSCreateAlgorithm(config->graph_degree,
-								   build_window,
-								   config->search_window_size,
-								   config->alpha,
-								   false);
-
-	builder = SVSCreateBuilder(config->distance_type,
-							   config->dimensions,
-							   algorithm);
-
-	if (config->compression_type == VAMANA_COMPRESSION_LEANVEC)
-		storage = SVSCreateLeanVecStorage(config->dimensions, config->leanvec_dims,
-										  config->compression_primary,
-										  config->compression_secondary);
-	else
-		storage = SVSCreateSimpleStorage(config->data_type);
-
-	SVSBuilderSetStorage(builder, storage);
+	PG_TRY();
 	{
-		int			search_threads = SVSDefaultSearchThreads();
+		algorithm = SVSCreateAlgorithm(config->graph_degree,
+									   build_window,
+									   config->search_window_size,
+									   config->alpha,
+									   false);
 
-		SVSBuilderSetThreadpool(builder, search_threads);
-		ereport(DEBUG1,
-				(errmsg("loading SVS index with %d search threads "
-						"(vamana.search_num_threads=%d, max_parallel_maintenance_workers=%d)",
-						search_threads, vamana_search_num_threads,
-						max_parallel_maintenance_workers)));
+		builder = SVSCreateBuilder(config->distance_type,
+								   config->dimensions,
+								   algorithm);
+
+		if (config->compression_type == VAMANA_COMPRESSION_LEANVEC)
+			storage = SVSCreateLeanVecStorage(config->dimensions, config->leanvec_dims,
+											  config->compression_primary,
+											  config->compression_secondary);
+		else
+			storage = SVSCreateSimpleStorage(config->data_type);
+
+		SVSBuilderSetStorage(builder, storage);
+		{
+			int			search_threads = SVSDefaultSearchThreads();
+
+			SVSBuilderSetThreadpool(builder, search_threads);
+			ereport(DEBUG1,
+					(errmsg("loading SVS index with %d search threads "
+							"(svs.search_num_threads=%d, max_parallel_maintenance_workers=%d)",
+							search_threads, vamana_search_num_threads,
+							max_parallel_maintenance_workers)));
+		}
+
+		error = svs_error_create();
+		loaded = svs_index_load_dynamic((svs_index_builder_h) builder, path, 0, error);
+
+		SVSFreeBuilder(builder);
+		builder = NULL;
+		SVSFreeAlgorithm(algorithm);
+		algorithm = NULL;
+		SVSFreeStorage(storage);
+		storage = NULL;
 	}
-
-	error = svs_error_create();
-	loaded = svs_index_load_dynamic((svs_index_builder_h) builder, path, 0, error);
-
-	SVSFreeBuilder(builder);
-	SVSFreeAlgorithm(algorithm);
-	SVSFreeStorage(storage);
+	PG_CATCH();
+	{
+		SVSFreeBuilder(builder);
+		SVSFreeAlgorithm(algorithm);
+		SVSFreeStorage(storage);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	if (loaded == NULL || !svs_error_ok(error))
 	{

@@ -138,7 +138,7 @@ SVS provides a high-level batch build API with internal parallelism management.
 **Implementation characteristics:**
 - **SVS manages parallelism internally** via threads
 - **No manual shared memory management** required for build
-- **PostgreSQL passes thread count** via `max_parallel_maintenance_workers` for build operations and `vamana.search_num_threads` for search operations
+- **PostgreSQL passes thread count** via `max_parallel_maintenance_workers` for build operations and `svs.search_num_threads` for search operations
 - **Dynamic index:** Uses `svs_index_build_dynamic` to produce a mutable index; INSERT calls `SVSAddPoints` for incremental updates, DELETE + VACUUM calls `SVSDeletePoints` with consolidation and compaction
 - **Must buffer vectors:** All vectors loaded into memory before build
 
@@ -156,18 +156,20 @@ An object-access hook (`VamanaInstallObjectAccessHook`) cleans up the on-disk sa
 
 **Vacuum (`vamanavacuum.c`):** `vamanabulkdelete` iterates the TID mapping, calls PostgreSQL's dead-tuple callback for each live entry, and batches dead IDs to `SVSDeletePoints`. `vamanavacuumcleanup` calls `SVSConsolidate` to patch graph edges around deleted entries, and `SVSCompact` (when the deleted fraction exceeds 10%) to reclaim memory. Both functions update the metapage counters atomically.
 
+**Known Limitation:** `PREPARE TRANSACTION` (two-phase commit / 2PC) is not supported on any transaction that has inserted into a Vamana index. The extension raises `ERRCODE_FEATURE_NOT_SUPPORTED` at prepare time (`vamana_undo.c`, `XACT_EVENT_PREPARE` handler). This is a fundamental constraint of the in-memory undo log design: prepared state cannot be persisted to disk and resumed by a later `COMMIT PREPARED`. Users with `max_prepared_transactions > 0` or distributed 2PC coordinators (e.g., Citus, XA drivers) must avoid issuing `PREPARE TRANSACTION` on transactions that touch Vamana indexes.
+
 ### 4.4 Background Worker
 
 `vamanaworker.c` implements a background process that holds the SVS index permanently and serves all backends via shared memory. The worker is **always registered** when the extension is loaded via `shared_preload_libraries`; there is no opt-in GUC to enable or disable it.
 
 **Architecture:**
-- A single PostgreSQL background worker connects to `vamana.worker_database` at startup and loads all Vamana indexes for that database
+- A single PostgreSQL background worker connects to `svs.worker_database` at startup and loads all Vamana indexes for that database
 - Shared memory region (`VamanaWorkerShmem`) contains a per-backend slot array plus variable-length areas for query vectors, result TIDs, and distances
 - Each slot has a kind (`VAMANA_SLOTKIND_SEARCH`, `_INSERT`, `_DELETE`, `_MAINTENANCE`); backends set the kind and data, set status `PENDING`, and wait on a shared latch
 - The worker drains all pending slots each cycle: SEARCH slots are batched and dispatched to `SVSSearch`; write slots (`INSERT`, `DELETE`, `MAINTENANCE`) are dispatched one at a time via `VamanaWorkerProcessWriteSlot`
-- If the worker is unavailable or startup times out (controlled by `vamana.worker_startup_timeout_ms`), the backend throws an error rather than silently falling back
+- If the worker is unavailable or startup times out (controlled by `svs.worker_startup_timeout_ms`), the backend throws an error rather than silently falling back
 - Per-index LWLocks (`VamanaIndexLockSlot`, up to `VAMANA_MAX_INDEXES = 64` live indexes) serialize concurrent write operations within the worker
-- Crash recovery: the worker restarts automatically after `vamana.worker_restart_time` seconds. While the worker is down, backends that attempt index operations receive an ERROR (no silent fallback). On restart, the worker itself uses `LoadIndexFromPages` (then `VamanaRebuildFromTable` if no saved copy exists) to reload indexes before accepting requests
+- Crash recovery: the worker restarts automatically after `svs.worker_restart_time` seconds. While the worker is down, backends that attempt index operations receive an ERROR (no silent fallback). On restart, the worker itself uses `LoadIndexFromPages` (then `VamanaRebuildFromTable` if no saved copy exists) to reload indexes before accepting requests
 - Reload signaling: backends write to `reloadRequests[]` when their index is invalidated; the worker reloads on its next cycle
 
 **Transaction safety:** Inserts are logged to a per-transaction undo log (`vamana_undo.c`). On ABORT, an XactCallback/SubXactCallback submits BGW DELETE operations for each logged insert, rolling back the in-memory graph state. On COMMIT, the undo log is discarded.
@@ -201,21 +203,21 @@ Two progress phases are reported via `pg_stat_progress_create_index`:
 
 | GUC | Type | Default | Range | Scope | Description |
 |---|---|---|---|---|---|
-| `vamana.search_window_size` | int | 100 | 10–10000 | `PGC_USERSET` | Search window (L) for index scans. Higher values improve recall at the cost of latency. |
-| `vamana.search_num_threads` | int | 0 | 0–1024 | `PGC_USERSET` | Threads SVS uses for search. `0` = auto (`nproc-1`). Lower values reduce oversubscription under concurrent load. |
+| `svs.search_window_size` | int | 100 | 10–10000 | `PGC_USERSET` | Search window (L) for index scans. Higher values improve recall at the cost of latency. |
+| `svs.search_num_threads` | int | 0 | 0–1024 | `PGC_USERSET` | Threads SVS uses for search. `0` = auto (`nproc-1`). Lower values reduce oversubscription under concurrent load. |
 
 ### 5.2 Background Worker Parameters
 
-`vamana.worker_database` and `vamana.worker_restart_time` require a server restart (set before starting PostgreSQL or changed with restart). The timeout GUCs can be updated at runtime via `SIGHUP`.
+`svs.worker_database` and `svs.worker_restart_time` require a server restart (set before starting PostgreSQL or changed with restart). The timeout GUCs can be updated at runtime via `SIGHUP`.
 
 | GUC | Type | Default | Range | Scope | Description |
 |---|---|---|---|---|---|
-| `vamana.worker_database` | string | `"postgres"` | — | `PGC_POSTMASTER` | Database the background worker connects to. Must match the database where Vamana indexes are created. |
-| `vamana.worker_restart_time` | int | 5 | -1–300 | `PGC_POSTMASTER` | Seconds before a crashed worker is restarted. `-1` = `BGW_NEVER_RESTART`. |
-| `vamana.worker_startup_timeout_ms` | int | 60000 | 1000–300000 | `PGC_SIGHUP` | Milliseconds a backend waits for the worker to finish startup before throwing an error. Startup can be slow when many large indexes are deserialized from disk. |
-| `vamana.worker_timeout_ms` | int | 5000 | 100–60000 | `PGC_SIGHUP` | Milliseconds a backend waits for the worker to respond to an IPC request (search or write) before throwing an error. |
-| `vamana.max_batch_size` | int | 0 | 0–1000 | `PGC_SIGHUP` | Maximum queries per SVS batch search call. `0` = `MaxBackends`. |
-| `vamana.compact_threshold_pct` | int | 10 | 0–100 | `PGC_USERSET` | Percent-deleted threshold that triggers SVS compact during VACUUM cleanup. `0` = compact on every VACUUM with pending deletes; `100` = disable compact (consolidate still runs). |
+| `svs.worker_database` | string | `"postgres"` | — | `PGC_POSTMASTER` | Database the background worker connects to. Must match the database where Vamana indexes are created. |
+| `svs.worker_restart_time` | int | 5 | -1–300 | `PGC_POSTMASTER` | Seconds before a crashed worker is restarted. `-1` = `BGW_NEVER_RESTART`. |
+| `svs.worker_startup_timeout_ms` | int | 60000 | 1000–300000 | `PGC_SIGHUP` | Milliseconds a backend waits for the worker to finish startup before throwing an error. Startup can be slow when many large indexes are deserialized from disk. |
+| `svs.worker_timeout_ms` | int | 5000 | 100–60000 | `PGC_SIGHUP` | Milliseconds a backend waits for the worker to respond to an IPC request (search or write) before throwing an error. |
+| `svs.max_batch_size` | int | 0 | 0–1000 | `PGC_SIGHUP` | Maximum queries per SVS batch search call. `0` = `MaxBackends`. |
+| `svs.compact_threshold_pct` | int | 10 | 0–100 | `PGC_USERSET` | Percent-deleted threshold that triggers SVS compact during VACUUM cleanup. `0` = compact on every VACUUM with pending deletes; `100` = disable compact (consolidate still runs). |
 
 ### 5.3 Index Creation Parameters
 
@@ -284,8 +286,8 @@ The background worker is registered automatically when the extension is loaded v
 ```
 # postgresql.conf
 shared_preload_libraries = 'vector,svs'
-vamana.worker_database = 'mydb'          # default: 'postgres'
-vamana.worker_restart_time = 5           # default: 5 seconds
+svs.worker_database = 'mydb'          # default: 'postgres'
+svs.worker_restart_time = 5           # default: 5 seconds
 ```
 
 `vector` must appear before `svs` because `svs` depends on it.
@@ -297,7 +299,7 @@ vamana.worker_restart_time = 5           # default: 5 seconds
 ### 7.1 Optimization Strategies
 1. **AVX-512 SIMD:** SVS automatically uses Intel hardware optimizations when compiled with `-march=native`
 2. **Compression:** Enable LVQ (`compression_type=2`) for memory-constrained systems; LeanVec (`compression_type=1`) for two-level quantization
-3. **Thread count:** Tune `vamana.search_num_threads` to match workload; `0` auto-selects `nproc-1`
+3. **Thread count:** Tune `svs.search_num_threads` to match workload; `0` auto-selects `nproc-1`
 4. **Background worker:** Load the extension via `shared_preload_libraries` to amortize index load cost across all backends; the worker is always-on when loaded this way
 5. **Incremental writes:** Inserts update the graph incrementally; periodic `REINDEX` restores optimal graph quality after many mutations
 
@@ -326,7 +328,7 @@ Inserts are applied incrementally via `SVSAddPoints` and are immediately searcha
 | Shared memory for build | Required | Not required |
 | Persistent index cache | No | Yes (optional background worker) |
 | **Build params** | `m`, `ef_construction` | `graph_degree`, `build_window_size` (`alpha` for pruning) |
-| **Query param** | `hnsw.ef_search` (GUC) | `vamana.search_window_size` (GUC) |
+| **Query param** | `hnsw.ef_search` (GUC) | `svs.search_window_size` (GUC) |
 | **Supported types** | vector, halfvec, bit, sparsevec | vector, halfvec |
 
 **Parameter Migration Guide:**
@@ -335,7 +337,7 @@ Inserts are applied incrementally via `SVSAddPoints` and are immediately searcha
 |---|---|---|
 | `m` | `graph_degree` | Max graph degree (R); Vamana default 64 |
 | `ef_construction` | `build_window_size` | Build-time search beam width (L); `-1` = `2 × graph_degree` |
-| `hnsw.ef_search` | `vamana.search_window_size` | Search beam width (L); runtime GUC |
+| `hnsw.ef_search` | `svs.search_window_size` | Search beam width (L); runtime GUC |
 | *(no equivalent)* | `alpha` | Vamana-specific pruning aggressiveness (scaled ×100); `-1` uses SVS default |
 
 ## Appendix B. SQL Usage Examples
@@ -354,11 +356,11 @@ CREATE INDEX ON embeddings USING vamana (embedding vector_l2_ops)
 WITH (compression_type = 2);
 
 -- Tune search quality at query time
-SET vamana.search_window_size = 200;
+SET svs.search_window_size = 200;
 SELECT id FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 10;
 
 -- Use more search threads for a single large query
-SET vamana.search_num_threads = 8;
+SET svs.search_num_threads = 8;
 SELECT id FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 10;
 ```
 
@@ -371,8 +373,8 @@ SELECT id FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 10;
 - [x] Custom `leanvec_dims` settings (-1=auto, explicit values)
 - [x] Error validation: out-of-range `compression_type`, `compression_primary`, `compression_secondary`, `leanvec_dims`, `graph_degree`, `alpha`, `build_window_size`, `search_window_size`
 - [x] Unlogged tables
-- [x] Runtime `vamana.search_window_size` tuning (min, max, RESET)
-- [x] `vamana.search_num_threads` GUC correctness
+- [x] Runtime `svs.search_window_size` tuning (min, max, RESET)
+- [x] `svs.search_num_threads` GUC correctness
 - [x] `max_parallel_maintenance_workers` decoupled from search thread count
 - [x] `search_window_size` value forwarded to SVS at query time
 - [x] Index serialization: CREATE INDEX saves to disk; incremental INSERT updates in-memory index
@@ -389,18 +391,18 @@ SELECT id FROM embeddings ORDER BY embedding <-> '[1,2,3]' LIMIT 10;
 - [x] Vacuum safety-net save: `vamanavacuumcleanup` saves when `vamanaendscan` save failed
 - [x] Crash recovery: immediate-stop restart, worker re-launched, queries resume
 - [x] `max_parallel_maintenance_workers` does not cap search thread count (regression for SVSLoadIndex bug; `SVSLoadIndex` has since been removed — dynamic-only)
-- [x] `vamana.search_num_threads` GUC explicitly overrides auto default
+- [x] `svs.search_num_threads` GUC explicitly overrides auto default
 - [x] Background worker visible in `pg_stat_activity`
 - [x] Worker results are correct (query returns expected neighbors)
 - [x] No per-backend index load when worker is running
 - [x] Worker loads index from disk after restart (no table rebuild)
 - [x] Worker reloads index after INSERT signals reload
 - [x] `DROP DATABASE` completes while worker is running (ProcSignalBarrier)
-- [x] `vamana.max_batch_size = 1`: sequential slot draining correct
-- [x] `vamana.worker_database` non-default: worker connects to named database
+- [x] `svs.max_batch_size = 1`: sequential slot draining correct
+- [x] `svs.worker_database` non-default: worker connects to named database
 - [x] `dbOid != MyDatabaseId`: backend receives ERROR with actionable hint
-- [x] Worker timeout: backend receives ERROR after `vamana.worker_timeout_ms` expires
-- [x] SIGHUP GUC reload: `vamana.worker_timeout_ms` updated in worker without restart
+- [x] Worker timeout: backend receives ERROR after `svs.worker_timeout_ms` expires
+- [x] SIGHUP GUC reload: `svs.worker_timeout_ms` updated in worker without restart
 - [x] Multiple concurrent Vamana indexes served by one worker
 - [x] `search_window_size` boundary value (10000) accepted; 10001 rejected by GUC
 - [x] Concurrent queries: correctness and result isolation across backends

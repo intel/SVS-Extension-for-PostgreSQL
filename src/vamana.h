@@ -14,8 +14,7 @@
 #define VAMANA_MAX_DIM 2000
 
 /*
- * Maximum number of SVS index handles cached per process.  Regular backends
- * typically hold one index at a time; the background worker may hold several.
+ * Maximum number of SVS index handles cached per process (background worker).
  */
 #define VAMANA_MAX_CACHED_INDEXES 8
 
@@ -196,7 +195,7 @@ typedef struct VamanaPageOpaqueData
 
 typedef VamanaPageOpaqueData * VamanaPageOpaque;
 
-/* Backend-private index cache (one per backend, not shared) */
+/* Background worker's per-process index cache (not shared memory) */
 typedef struct VamanaIndexCache
 {
 	SVSIndexHandle svsIndex;	/* Cached SVS index */
@@ -266,7 +265,8 @@ SVSDistanceType VamanaGetDistanceMetric(Relation index);
 void		VamanaGetIndexSavePath(Oid relid, char *buf, size_t bufsz);
 void		VamanaEnsureSaveDir(Oid relid);
 void		VamanaDeleteSaveDir(Oid relid);
-void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum);
+void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum,
+								  const VamanaIndexCache *meta);
 bool		VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
 void		VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count);
 void		VamanaInstallObjectAccessHook(void);

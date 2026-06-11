@@ -123,16 +123,16 @@ DETAIL:  Valid values are between "-1" and "200".
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 64, alpha = 120);
 NOTICE:  buffered 0 vectors for SVS index build
 NOTICE:  no vectors to index, skipping SVS build
-SHOW vamana.search_window_size;
- vamana.search_window_size 
----------------------------
+SHOW svs.search_window_size;
+ svs.search_window_size 
+------------------------
  100
 (1 row)
 
-SET vamana.search_window_size = 9;
-ERROR:  9 is outside the valid range for parameter "vamana.search_window_size" (10 .. 10000)
-SET vamana.search_window_size = 10001;
-ERROR:  10001 is outside the valid range for parameter "vamana.search_window_size" (10 .. 10000)
+SET svs.search_window_size = 9;
+ERROR:  9 is outside the valid range for parameter "svs.search_window_size" (10 .. 10000)
+SET svs.search_window_size = 10001;
+ERROR:  10001 is outside the valid range for parameter "svs.search_window_size" (10 .. 10000)
 DROP TABLE t;
 -- compression with LeanVec UINT8
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
@@ -892,7 +892,7 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops);
 NOTICE:  buffered 3 vectors for SVS index build
 NOTICE:  building SVS index with 3 vectors of dimension 3
 NOTICE:  SVS index built successfully
-SET vamana.search_window_size = 50;
+SET svs.search_window_size = 50;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -901,7 +901,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   1 | [0,0,0]
 (3 rows)
 
-SET vamana.search_window_size = 200;
+SET svs.search_window_size = 200;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -910,7 +910,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   1 | [0,0,0]
 (3 rows)
 
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -1016,14 +1016,14 @@ NOTICE:  buffered 50 vectors for SVS index build
 NOTICE:  building SVS index with 50 vectors of dimension 3
 NOTICE:  SVS index built successfully
 -- Both should return non-empty results; COUNT must equal k.
-SET vamana.search_window_size = 10;
+SET svs.search_window_size = 10;
 SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
  count 
 -------
      5
 (1 row)
 
-SET vamana.search_window_size = 500;
+SET svs.search_window_size = 500;
 SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
  count 
 -------
@@ -1031,21 +1031,21 @@ SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) su
 (1 row)
 
 -- Nearest neighbor should be id=25 at both extremes.
-SET vamana.search_window_size = 10;
+SET svs.search_window_size = 10;
 SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
  id 
 ----
  25
 (1 row)
 
-SET vamana.search_window_size = 500;
+SET svs.search_window_size = 500;
 SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
  id 
 ----
  25
 (1 row)
 
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 DROP TABLE t;
 -- max_parallel_maintenance_workers does not limit search
 -- The build thread count (governed by this GUC) must be decoupled from the
@@ -1068,10 +1068,10 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
 DROP TABLE t;
 RESET max_parallel_maintenance_workers;
--- vamana.search_num_threads GUC controls search thread count
+-- svs.search_num_threads GUC controls search thread count
 -- 0 = auto (nproc-1); explicit value overrides auto.
 -- Correctness must be preserved regardless of thread count.
-SET vamana.search_num_threads = 1;
+SET svs.search_num_threads = 1;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
@@ -1086,5 +1086,5 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   1 | [0,0,0]
 (3 rows)
 
-RESET vamana.search_num_threads;
+RESET svs.search_num_threads;
 DROP TABLE t;

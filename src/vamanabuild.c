@@ -12,6 +12,8 @@
 #include "vamanaworker.h"
 
 #include "access/amapi.h"
+#include "access/heapam.h"
+#include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xlog.h"
@@ -21,9 +23,11 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #if PG_VERSION_NUM >= 140000
 #include "utils/backend_progress.h"
@@ -117,12 +121,27 @@ CreateMetaPage(VamanaBuildState * buildstate)
 
 /*
  * Serialize the SVS index to disk and update the metapage.
- * Delegates to VamanaSaveIndexToDisk() in vamanautils.c.
  */
 static void
 SerializeIndexToPages(VamanaBuildState * buildstate, SVSIndexHandle svsIndex)
 {
-	VamanaSaveIndexToDisk(buildstate->index, svsIndex, buildstate->forkNum);
+	VamanaIndexCache meta;
+
+	memset(&meta, 0, sizeof(meta));
+	meta.indexRelid = RelationGetRelid(buildstate->index);
+	meta.svsIndex = svsIndex;
+	meta.isValid = true;
+	meta.dimensions = buildstate->dimensions;
+	meta.graph_degree = buildstate->graph_degree;
+	meta.alpha = VAMANA_ALPHA_TO_FLOAT(buildstate->alpha);
+	meta.tidMapping = buildstate->tidBuffer;
+	meta.numVectors = buildstate->numVectors;
+	meta.tidMappingCapacity = buildstate->numVectors;
+	meta.nextExternalId = (uint64) buildstate->numVectors;
+	meta.numDeleted = 0;
+	meta.needsSave = false;
+
+	VamanaSaveIndexToDisk(buildstate->index, svsIndex, buildstate->forkNum, &meta);
 }
 
 /* Valid compression values (moved from vamana.h: only used here) */
@@ -193,11 +212,11 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 
 	if (buildstate->compression_type == VAMANA_COMPRESSION_LEANVEC)
 	{
-		ValidateCompressionParam(buildstate->compression_primary, "compression_primary");
-		ValidateCompressionParam(buildstate->compression_secondary, "compression_secondary");
-
 		int			primary_bits = abs(buildstate->compression_primary);
 		int			secondary_bits = abs(buildstate->compression_secondary);
+
+		ValidateCompressionParam(buildstate->compression_primary, "compression_primary");
+		ValidateCompressionParam(buildstate->compression_secondary, "compression_secondary");
 
 		if (primary_bits > secondary_bits)
 		{
@@ -381,30 +400,18 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	ereport(NOTICE,
 			(errmsg("SVS index built successfully")));
 
-	VamanaCacheIndex(RelationGetRelid(index), svsIndex,
-					 buildstate.dimensions, buildstate.graph_degree,
-					 VAMANA_ALPHA_TO_FLOAT(buildstate.alpha),
-					 buildstate.tidBuffer, buildstate.numVectors,
-					 buildstate.numVectors, /* tidMappingCapacity */
-					 (uint64) buildstate.numVectors,	/* nextExternalId */
-					 0);		/* numDeleted */
+	/* Serialize index to disk so the BGW can adopt it. */
+	SerializeIndexToPages(&buildstate, svsIndex);
 
-	/* Mark that we should NOT free the svsIndex since it's cached */
+	/*
+	 * Fail immediately if the worker is running for a different database —
+	 * this is a permanent misconfiguration and the index will never be
+	 * usable here.
+	 */
+	VamanaWorkerAssertDatabase();
+
 	{
-		SVSIndexHandle cachedIndex = svsIndex;
 		Oid			relid = RelationGetRelid(index);
-
-		svsIndex = NULL;		/* Don't free in cleanup */
-
-		/* Serialize index to disk so the BGW can adopt it. */
-		SerializeIndexToPages(&buildstate, cachedIndex);
-
-		/*
-		 * Fail immediately if the worker is running for a different database —
-		 * this is a permanent misconfiguration and the index will never be
-		 * usable here.
-		 */
-		VamanaWorkerAssertDatabase();
 
 		if (VamanaWorkerIsAvailable())
 		{
@@ -414,7 +421,6 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			 * until this transaction commits.
 			 */
 			VamanaWorkerSignalReload(relid);
-			VamanaEvictCacheEntry(relid);
 		}
 		else
 		{
@@ -470,9 +476,277 @@ vamanabuildempty(Relation index)
 	InitBuildState(&buildstate, NULL, index, indexInfo, INIT_FORKNUM);
 	CreateMetaPage(&buildstate);
 
-	/* RBM_NORMAL requires the page on disk; flush before any reader opens this fork. */
+	/*
+	 * Flush before invalidating: VamanaInvalidateCache signals the BGW,
+	 * which may immediately open the new relfilenode.  RBM_NORMAL requires
+	 * the page to already be on disk.
+	 */
 	FlushRelationBuffers(index);
+	VamanaInvalidateCache(RelationGetRelid(index));
 
 	MemoryContextDelete(buildstate.buildCtx);
 	MemoryContextDelete(buildstate.tmpCtx);
+}
+
+/*
+ * Rebuild SVS index from table data
+ * This is called when the index is not cached (e.g., after server restart)
+ */
+SVSIndexHandle
+VamanaRebuildFromTable(Relation index)
+{
+	Relation	heap;
+	TableScanDesc heapScan;
+	HeapTuple	tuple;
+	TupleDesc	tupdesc;
+	SVSIndexHandle svsIndex;
+	SVSAlgorithmHandle algorithm;
+	SVSBuilderHandle builder;
+	SVSStorageHandle storage;
+	VamanaOptions *opts;
+	int			dimensions;
+	int			graph_degree;
+	int			alpha;
+	int			buildWindow;
+	int			searchWindow;
+	bool		useSearchHistory;
+	SVSDistanceType distanceType;
+	int			compression_type;
+	int			compression_primary;
+	int			compression_secondary;
+	int			leanvec_dims;
+	Snapshot	snapshot;
+	float	  **vectorBuffer = NULL;
+	ItemPointerData *tidMapping = NULL;
+	int			numVectors = 0;
+	int			bufferCapacity = VAMANA_INITIAL_BUFFER_CAPACITY;
+	int			errorCode = 0;
+	Size		dataSize;
+	float	   *flatData;
+
+	ereport(LOG,
+			(errmsg("rebuilding vamana index from table data")));
+
+	opts = (VamanaOptions *) index->rd_options;
+	dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
+	graph_degree = opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE;
+	alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
+	buildWindow = (opts && opts->build_window_size > 0) ?
+		opts->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(graph_degree);
+	searchWindow = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
+	compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
+	compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_LEANVEC_PRIMARY;
+	compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_LEANVEC_SECONDARY;
+	leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
+
+	distanceType = VamanaGetDistanceMetric(index);
+
+	vectorBuffer = palloc(bufferCapacity * sizeof(float *));
+	tidMapping = palloc(bufferCapacity * sizeof(ItemPointerData));
+
+	/*
+	 * Acquire AccessShareLock on the heap non-blocking.  The BGW must never
+	 * block on a relation-level lock: holding ASL on the index (acquired by
+	 * VamanaWorkerGetOrLoadIndex) while blocking on the heap creates a
+	 * lock-ordering cycle with DROP TABLE, which takes AEL on the heap then
+	 * AEL on the index.  This mirrors the autovacuum pattern.
+	 */
+	if (!ConditionalLockRelationOid(index->rd_index->indrelid, AccessShareLock))
+	{
+		pfree(vectorBuffer);
+		pfree(tidMapping);
+		ereport(LOG,
+				(errmsg("vamana index %u: heap locked by DDL, skipping rebuild",
+						RelationGetRelid(index))));
+		return NULL;
+	}
+
+	heap = table_open(index->rd_index->indrelid, NoLock);
+	tupdesc = RelationGetDescr(heap);
+
+	/*
+	 * Scan table to collect vectors - use an MVCC snapshot to exclude dead
+	 * tuples
+	 */
+	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+	heapScan = table_beginscan(heap, snapshot, 0, NULL);
+
+	while ((tuple = heap_getnext(heapScan, ForwardScanDirection)) != NULL)
+	{
+		Datum	   *values;
+		bool	   *isnull;
+		Vector	   *vec;
+		int			natts = tupdesc->natts;
+		int			vectorAttNum;
+
+		values = (Datum *) palloc(natts * sizeof(Datum));
+		isnull = (bool *) palloc(natts * sizeof(bool));
+
+		heap_deform_tuple(tuple, tupdesc, values, isnull);
+
+		/* Find which attribute is the indexed vector column */
+		vectorAttNum = index->rd_index->indkey.values[0] - 1;	/* Attribute numbers are
+																 * 1-based */
+
+		if (!isnull[vectorAttNum])
+		{
+			if (numVectors >= bufferCapacity)
+			{
+				bufferCapacity *= 2;
+				vectorBuffer = repalloc(vectorBuffer,
+										bufferCapacity * sizeof(float *));
+				tidMapping = repalloc(tidMapping,
+									  bufferCapacity * sizeof(ItemPointerData));
+			}
+
+			/* Store heap TID for mapping */
+			ItemPointerCopy(&tuple->t_self, &tidMapping[numVectors]);
+
+			/*
+			 * Extract vector using _COPY to avoid reading past page-buffer
+			 * boundary.  PG_DETOAST_DATUM for untoasted vectors returns a
+			 * pointer directly into the 8192-byte heap page; memcpy's
+			 * internal 8-byte reads can overshoot the palloc block end.
+			 */
+			vec = (Vector *) PG_DETOAST_DATUM_COPY(values[vectorAttNum]);
+			if (vec->dim != dimensions)
+			{
+				pfree(vec);
+				pfree(values);
+				pfree(isnull);
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_EXCEPTION),
+						 errmsg("vector dimension mismatch: expected %d, got %d", dimensions, vec->dim)));
+			}
+			vectorBuffer[numVectors] = palloc(dimensions * sizeof(float));
+			memcpy(vectorBuffer[numVectors], vec->x, dimensions * sizeof(float));
+			pfree(vec);			/* free the _COPY allocation */
+			numVectors++;
+
+			/*
+			 * Emit progress LOG at regular intervals to surface progress during
+			 * long-running rebuilds.
+			 */
+			if (numVectors % VAMANA_PROGRESS_INTERVAL == 0)
+				ereport(LOG,
+						(errmsg("vamana index %u: scanning table, %d vectors collected",
+								RelationGetRelid(index), numVectors)));
+		}
+
+		pfree(values);
+		pfree(isnull);
+
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	table_endscan(heapScan);
+	UnregisterSnapshot(snapshot);
+	table_close(heap, NoLock);
+	UnlockRelationOid(index->rd_index->indrelid, AccessShareLock);
+
+	if (numVectors == 0)
+	{
+		ereport(WARNING,
+				(errmsg("no vectors found in table for index rebuild")));
+		pfree(tidMapping);
+		pfree(vectorBuffer);
+		return NULL;
+	}
+
+	ereport(NOTICE,
+			(errmsg("collected %d vectors, building SVS index...", numVectors)));
+
+	if (compression_type == VAMANA_COMPRESSION_LEANVEC &&
+		numVectors < 100000)
+	{
+		ereport(WARNING,
+				(errmsg("rebuilding LeanVec index with only %d vectors; "
+						"recall may be poor (recommend >= 100000, minimum 10000)",
+						numVectors)));
+	}
+	else if (compression_type == VAMANA_COMPRESSION_LVQ &&
+			 numVectors < 10000)
+	{
+		ereport(WARNING,
+				(errmsg("rebuilding LVQ index with only %d vectors; "
+						"recall may be poor (recommend >= 10000)",
+						numVectors)));
+	}
+
+	/* Flatten vector data for SVS */
+	dataSize = (Size) numVectors * dimensions * sizeof(float);
+	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
+
+	for (int i = 0; i < numVectors; i++)
+	{
+		memcpy(flatData + (i * dimensions),
+			   vectorBuffer[i],
+			   dimensions * sizeof(float));
+	}
+
+	algorithm = SVSCreateAlgorithm(graph_degree, buildWindow, searchWindow, alpha, useSearchHistory);
+
+	if (compression_type == VAMANA_COMPRESSION_LEANVEC)
+		storage = SVSCreateLeanVecStorage(dimensions, leanvec_dims,
+										  compression_primary, compression_secondary);
+	else
+		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
+
+	builder = SVSCreateBuilder(distanceType, dimensions, algorithm);
+	SVSBuilderSetStorage(builder, storage);
+	SVSBuilderSetThreadpool(builder, SVSDefaultBuildThreads());
+
+	/* Generate sequential external IDs: ids[i] = i */
+	{
+		size_t	   *ids = palloc((size_t) numVectors * sizeof(size_t));
+
+		for (int i = 0; i < numVectors; i++)
+			ids[i] = (size_t) i;
+
+		svsIndex = SVSBuildDynamicIndex(builder, flatData, ids, numVectors, &errorCode);
+		pfree(ids);
+	}
+
+	if (svsIndex == NULL || errorCode != 0)
+	{
+		SVSFreeBuilder(builder);
+		SVSFreeStorage(storage);
+		SVSFreeAlgorithm(algorithm);
+
+		for (int i = 0; i < numVectors; i++)
+			pfree(vectorBuffer[i]);
+		pfree(vectorBuffer);
+		pfree(flatData);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("failed to rebuild vamana index from table"),
+				 errdetail("SVS build failed with error code %d", errorCode)));
+	}
+
+	SVSSetIndexSearchThreads(svsIndex, SVSDefaultSearchThreads());
+
+	/* Cleanup vector buffers and flatData (but keep tidMapping for cache) */
+	SVSFreeBuilder(builder);
+	SVSFreeStorage(storage);
+	SVSFreeAlgorithm(algorithm);
+
+	for (int i = 0; i < numVectors; i++)
+		pfree(vectorBuffer[i]);
+	pfree(vectorBuffer);
+	pfree(flatData);
+
+	ereport(NOTICE,
+			(errmsg("successfully rebuilt vamana index with %d vectors", numVectors)));
+
+	/* Cache the rebuilt index with TID mapping and dynamic fields */
+	VamanaCacheIndex(RelationGetRelid(index), svsIndex, dimensions,
+					 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
+					 numVectors,	/* tidMappingCapacity (fresh rebuild, no
+									 * holes) */
+					 (uint64) numVectors,	/* nextExternalId */
+					 0);		/* numDeleted */
+
+	return svsIndex;
 }

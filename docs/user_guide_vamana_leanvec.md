@@ -78,7 +78,7 @@ SELECT extversion FROM pg_extension WHERE extname = 'svs';
   shared_preload_libraries = 'svs'
   ```
 
-  This is required because the worker registers shared memory segments at server start — actions that cannot be performed after the server is already running. Without this, the extension still works fully (the worker is simply not available and all index searches run in-process).
+  This is required because the worker registers shared memory segments at server start — actions that cannot be performed after the server is already running. Without this, the worker will not start and all index searches will return an error.
 
 ---
 
@@ -139,7 +139,7 @@ These parameters are specified in the `WITH (...)` clause of `CREATE INDEX` and 
 | `graph_degree` | integer | `64` | 16 – 256 | Maximum number of neighbors per graph node. Higher values improve recall but increase build time and memory. |
 | `alpha` | integer | `-1` | -1 – 200 | Graph pruning aggressiveness, stored as `alpha × 100` (e.g., `120` = α 1.20). `-1` uses the SVS library default (~1.2). |
 | `build_window_size` | integer | `-1` | -1 – 1000 | Search window used during graph construction. `-1` defaults to `2 × graph_degree`. |
-| `search_window_size` | integer | `100` | 10 – 10000 | Stored with the index. At query time the `vamana.search_window_size` GUC always governs behavior; because the GUC minimum is 10, this reloption is not used as a query-time fallback in the current implementation. |
+| `search_window_size` | integer | `100` | 10 – 10000 | Stored with the index. At query time the `svs.search_window_size` GUC always governs behavior; because the GUC minimum is 10, this reloption is not used as a query-time fallback in the current implementation. |
 | `use_search_history` | boolean | `true` | — | Maintain a visited-node set during graph search. Keeping this enabled (`true`) improves recall; disabling it may reduce per-query memory usage at some recall cost. Not changeable at query time — must be set at index creation. |
 | `compression_type` | integer | `0` | 0 – 2 | `0` = none, `1` = LeanVec, `2` = LVQ (reserved). |
 | `compression_primary` | integer | `8` | see §5.2 | Primary quantization precision for LeanVec. |
@@ -152,27 +152,27 @@ These are session-scoped GUC parameters that can be changed at any time without 
 
 ```sql
 -- Increase the search window for higher recall (at the cost of latency)
-SET vamana.search_window_size = 200;
+SET svs.search_window_size = 200;
 
 -- Restore to the default (100)
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 ```
 
 Use `SET LOCAL` inside a transaction to apply a setting for a single query only:
 
 ```sql
 BEGIN;
-SET LOCAL vamana.search_window_size = 200;
+SET LOCAL svs.search_window_size = 200;
 SELECT id FROM my_table ORDER BY embedding <=> '[...]' LIMIT 10;
 COMMIT;
 ```
 
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
-| `vamana.search_window_size` | `100` | 10 – 10000 | Number of candidates examined during a search. Higher = better recall, higher latency. |
-| `vamana.search_num_threads` | `0` | 0 – 1024 | Number of SVS threads used per search. `0` = auto (resolves to `nproc - 1`). Set to a lower value to reduce CPU oversubscription in concurrent workloads. |
+| `svs.search_window_size` | `100` | 10 – 10000 | Number of candidates examined during a search. Higher = better recall, higher latency. |
+| `svs.search_num_threads` | `0` | 0 – 1024 | Number of SVS threads used per search. `0` = auto (resolves to `nproc - 1`). Set to a lower value to reduce CPU oversubscription in concurrent workloads. |
 
-> The session GUC takes precedence over the `search_window_size` index reloption whenever it is set. There is currently no special "disable" value (such as `0`); to stop overriding and return to the default behavior, use `RESET vamana.search_window_size`.
+> The session GUC takes precedence over the `search_window_size` index reloption whenever it is set. There is currently no special "disable" value (such as `0`); to stop overriding and return to the default behavior, use `RESET svs.search_window_size`.
 
 ### 4.4 Creating an Index
 
@@ -399,13 +399,13 @@ The core knob is `search_window_size`. A larger value scans more candidates and 
 
 ```sql
 -- Quick experiment: measure recall@10 at three search window sizes
-SET vamana.search_window_size = 50;   -- fast, lower recall
+SET svs.search_window_size = 50;   -- fast, lower recall
 -- run your benchmark query
 
-SET vamana.search_window_size = 100;  -- default
+SET svs.search_window_size = 100;  -- default
 -- run your benchmark query
 
-SET vamana.search_window_size = 200;  -- slower, higher recall
+SET svs.search_window_size = 200;  -- slower, higher recall
 -- run your benchmark query
 ```
 
@@ -442,35 +442,33 @@ CREATE INDEX … USING vamana (…);
 
 ### Background Worker (Advanced)
 
-The extension includes an optional background worker that holds all Vamana indexes in a single process and serves search requests from every backend via shared memory. This avoids per-backend index loads and can significantly improve throughput under high concurrency.
+The extension includes a background worker that holds all Vamana indexes in a single process and serves search requests from every backend via shared memory. This avoids per-backend index loads and can significantly improve throughput under high concurrency.
 
 **Prerequisite:** The background worker only starts when the extension is loaded via `shared_preload_libraries`. Add the following to `postgresql.conf` and restart:
 
 ```
 shared_preload_libraries = 'svs'
-vamana.worker_enabled = on
-vamana.worker_database = 'mydb'   # database where your Vamana indexes live
+svs.worker_database = 'mydb'   # database where your Vamana indexes live
 ```
 
-`shared_preload_libraries` is required because the worker registers shared memory segments and a background process at server start. Loading the extension later via `CREATE EXTENSION` does not start the worker.
+`shared_preload_libraries` is required because the worker registers shared memory segments and a background process at server start. Loading the extension later via `CREATE EXTENSION` does not start the worker. The worker starts automatically when the extension is loaded — no additional flag is needed.
 
-**Startup and fallback GUCs** (`postgresql.conf`, require restart — `PGC_POSTMASTER`):
+**Startup GUCs** (`postgresql.conf`, require restart — `PGC_POSTMASTER`):
 
 | GUC | Default | Description |
 |-----|---------|-------------|
-| `vamana.worker_enabled` | `false` | Enable the background search worker. |
-| `vamana.worker_database` | `'postgres'` | Database the worker connects to. Set this to the database where your Vamana indexes are created; the default `'postgres'` is only correct if that is where your indexes live. |
+| `svs.worker_database` | `'postgres'` | Database the worker connects to. Set this to the database where your Vamana indexes are created; the default `'postgres'` is only correct if that is where your indexes live. |
 
 **Runtime-tunable GUCs** (`postgresql.conf` or `pg_reload_conf()` — `PGC_SIGHUP`, no restart needed):
 
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
-| `vamana.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for the worker before falling back to a direct (in-process) load. |
-| `vamana.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends` (PostgreSQL's configured backend limit). |
+| `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for the worker before returning an error. |
+| `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends` (PostgreSQL's configured backend limit). |
 
-**Fallback behavior:** If the worker does not respond within `vamana.worker_timeout_ms`, the backend automatically falls back to loading and searching the index in-process (the same path used when the worker is disabled). A `LOG`-level message is emitted when the fallback triggers.
+**Timeout behavior:** If the worker does not respond within `svs.worker_timeout_ms`, the backend returns an error.
 
-**Multi-database note:** The worker connects to a single database (`vamana.worker_database`). If you have Vamana indexes in multiple databases, only indexes in the configured database are served by the worker; backends accessing other databases always fall back to in-process search.
+**Multi-database note:** The worker connects to a single database (`svs.worker_database`). Vamana indexes in other databases cannot be searched.
 
 > **Prototype status:** The background worker is not yet recommended for production use. Benchmarking is advised before enabling it.
 
@@ -573,10 +571,10 @@ The extension emits `LOG`-level messages to the PostgreSQL server log during lon
 | Index load triggered (first access / after restart) | `loading vamana index <oid> from "<path>"` |
 | TID map being loaded | `vamana index <oid>: loading TID map for N vectors` |
 | Index fully loaded from disk | `vamana index <oid> loaded from disk (N vectors)` |
-| Cache miss — rebuilding in-process | `vamana index not in memory, rebuilding from table` |
+| BGW cache miss — rebuilding from table | `vamana index not in memory, rebuilding from table` |
 | Rebuild started | `rebuilding vamana index from table data` |
 | Rebuild scan progress (every 100,000 tuples) | `vamana index <oid>: scanning table, N vectors collected` |
-| Worker fallback triggered | `vamana fallback: no saved copy for index <oid>, rebuilding from table` |
+| No saved copy; rebuilding from table | `vamana fallback: no saved copy for index <oid>, rebuilding from table` |
 
 To see these messages in `psql`, ensure your client is connected to a session where `client_min_messages = log` (not the default). They are always written to the PostgreSQL log file regardless of client settings.
 
@@ -662,8 +660,8 @@ RESET enable_seqscan;
 
 ### New rows not appearing in search results after INSERT
 
-**Cause:** If the index was not yet loaded into the backend's cache when the INSERT arrived (e.g., first INSERT after a server restart), the insert falls back to cache invalidation instead of the incremental path. The next query triggers a full rebuild from the table.
-**Fix:** Run a query first to warm the cache, then insert. Alternatively, run `REINDEX INDEX CONCURRENTLY <index_name>;` to rebuild.
+**Cause:** If the index was not yet loaded into the worker's cache when the INSERT arrived (e.g., first INSERT after a server restart), the insert falls back to cache invalidation instead of the incremental path. The next query triggers a full rebuild from the table.
+**Fix:** Run a query first to warm the worker's cache, then insert. Alternatively, run `REINDEX INDEX CONCURRENTLY <index_name>;` to rebuild.
 
 ### Low recall after compression
 
@@ -726,7 +724,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 |----------------|-------------------|-------|
 | `m` | `graph_degree` | Max neighbors per node |
 | `ef_construction` | `build_window_size` | Search window during build |
-| `hnsw.ef_search` (GUC) | `vamana.search_window_size` (GUC) | Runtime query beam width |
+| `hnsw.ef_search` (GUC) | `svs.search_window_size` (GUC) | Runtime query beam width |
 
 ---
 
@@ -739,7 +737,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `graph_degree` | `64` | `16` | `256` | Max neighbors per node |
 | `alpha` | `-1` | `-1` | `200` | Pruning factor × 100; -1 = SVS default |
 | `build_window_size` | `-1` | `-1` | `1000` | Build search window; -1 = 2×graph_degree |
-| `search_window_size` | `100` | `10` | `10000` | Default query window (always governed by `vamana.search_window_size` GUC at runtime) |
+| `search_window_size` | `100` | `10` | `10000` | Default query window (always governed by `svs.search_window_size` GUC at runtime) |
 | `use_search_history` | `true` | — | — | Maintain visited-node set during search; improves recall |
 | `compression_type` | `0` | `0` | `2` | 0=none, 1=leanvec, 2=lvq (reserved) |
 | `compression_primary` | `8` | — | — | One of: 4, -4, 8, -8 |
@@ -750,22 +748,21 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
-| `vamana.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
-| `vamana.search_num_threads` | `0` | `0` | `1024` | SVS threads per search; 0 = auto (nproc-1) |
+| `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
+| `svs.search_num_threads` | `0` | `0` | `1024` | SVS threads per search; 0 = auto (nproc-1) |
 
 ### Server GUC Parameters (require restart — `postgresql.conf` only, `PGC_POSTMASTER`)
 
 | GUC | Default | Notes |
 |-----|---------|-------|
-| `vamana.worker_enabled` | `false` | Enable background search worker |
-| `vamana.worker_database` | `'postgres'` | Database the worker connects to; must match where indexes are created |
+| `svs.worker_database` | `'postgres'` | Database the worker connects to; must match where indexes are created |
 
 ### Runtime-tunable Server GUC Parameters (`PGC_SIGHUP` — reload with `SELECT pg_reload_conf()`)
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
-| `vamana.worker_timeout_ms` | `5000` | `100` | `60000` | Worker response timeout (ms) before in-process fallback |
-| `vamana.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
+| `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker response timeout (ms); exceeded → error |
+| `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
 
 ### Operator Classes
 

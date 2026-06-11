@@ -281,12 +281,12 @@ FROM generate_series(1, 500) i;
 CREATE INDEX ON vg_search_param USING vamana (v vector_l2_ops);
 
 -- Test with different search_window_size values
-SHOW vamana.search_window_size;
-SET vamana.search_window_size = 10;
+SHOW svs.search_window_size;
+SET svs.search_window_size = 10;
 SELECT COUNT(*) FROM (SELECT id FROM vg_search_param ORDER BY v <-> '[0.5,0.5,0.5,0.5]' LIMIT 10) t;
-SET vamana.search_window_size = 100;
+SET svs.search_window_size = 100;
 SELECT COUNT(*) FROM (SELECT id FROM vg_search_param ORDER BY v <-> '[0.5,0.5,0.5,0.5]' LIMIT 10) t;
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 DROP TABLE vg_search_param;
 
 -- -------------------------------------------------------

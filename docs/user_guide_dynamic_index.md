@@ -55,7 +55,7 @@ VACUUM docs;
 
 | Aspect | Behavior |
 |---|---|
-| `INSERT` path | `SVSAddPoints` on the cached index |
+| `INSERT` path | backend submits to BGW → BGW calls `SVSAddPoints` |
 | Next `SELECT` after `INSERT` | Serves from updated graph |
 | `DELETE` + `VACUUM` path | `SVSDeletePoints` + consolidate/compact |
 | Serialization | `svs_index_save_dynamic` (directory on disk) |
@@ -65,16 +65,17 @@ VACUUM docs;
 
 **Edge cases to know about.**
 
-- The first `INSERT` after a cold start (server restart, new backend, stale
-  cache) falls back to cache invalidation; the next query rebuilds and
-  caches a dynamic handle, and subsequent inserts use the fast path.
+- The first `INSERT` after a cold start (server restart or BGW cache miss)
+  blocks until the BGW has the index loaded; if the BGW has not yet loaded
+  the index, the insert waits up to `svs.worker_startup_timeout_ms` before
+  erroring.
 - Writes are serialized per index by a PostgreSQL advisory lock. For
   high-concurrency ingest, concurrent `INSERT`s on the same index are
   throughput-bound by that lock.
 - Deletes are *soft*: `SVSDeletePoints` marks entries deleted and
   `VACUUM`'s cleanup phase runs `SVSConsolidate` (always) and
   `SVSCompact` (only when deletion pressure exceeds
-  `vamana.compact_threshold_pct`, default 10%) to reclaim space.
+  `svs.compact_threshold_pct`, default 10%) to reclaim space.
 - External IDs are never reused. `nextExternalId` in the metapage grows
   monotonically for the life of the index. `REINDEX` resets it.
 
@@ -133,8 +134,8 @@ PostgreSQL-friendly shim (`SVSBuildDynamicIndex`, `SVSAddPoints`,
 ├───────────────────────────────────────────────────────────────┤
 │ vamanainsert.c                                                │
 │   vamanainsert()                                              │
-│     ├─ if cache absent/invalid: invalidate → fall back        │
-│     └─ else: advisory lock, SVSAddPoints, update metapage     │
+│     └─ VamanaWorkerSubmitInsert (BGW: advisory lock,          │
+│         SVSAddPoints, update metapage)                        │
 ├───────────────────────────────────────────────────────────────┤
 │ vamanavacuum.c                                                │
 │   vamanabulkdelete()                                          │
@@ -143,7 +144,7 @@ PostgreSQL-friendly shim (`SVSBuildDynamicIndex`, `SVSAddPoints`,
 │     └─ SVSDeletePoints + metapage update                      │
 │   vamanavacuumcleanup()                                       │
 │     ├─ SVSConsolidate (always if numDeleted > 0)              │
-│     └─ SVSCompact (gated by vamana.compact_threshold_pct)     │
+│     └─ SVSCompact (gated by svs.compact_threshold_pct)     │
 ├───────────────────────────────────────────────────────────────┤
 │ vamanautils.c                                                 │
 │   VamanaRebuildFromTable() ──► SVSBuildDynamicIndex()         │
@@ -187,7 +188,7 @@ typedef struct VamanaMetaPageData
   backends; inserters read it under an advisory lock, pass the value to
   `SVSAddPoints`, and write `value+1` back.
 - `numDeleted` — drives the `SVSCompact` decision threshold (see
-  `vamana.compact_threshold_pct`) and reports deletion pressure.
+  `svs.compact_threshold_pct`) and reports deletion pressure.
 - `tidMappingCapacity` — after deletes, the TID mapping array has
   holes. `numVectors` tracks live entries; `tidMappingCapacity` tracks
   the allocated length (which is what the sidecar `tidmap.bin` file
@@ -196,7 +197,7 @@ typedef struct VamanaMetaPageData
 
 ### 3.3 In-memory cache (`VamanaIndexCache`)
 
-The backend-private cache mirrors the metapage and adds a few runtime
+The BGW's per-process cache mirrors the metapage and adds a few runtime
 fields:
 
 ```c
@@ -220,10 +221,9 @@ typedef struct VamanaIndexCache
 ```
 
 > **Important:** `cache->nextExternalId` is a mirror of the metapage, not
-> authoritative. Inserts always re-read the metapage under the advisory
-> lock before assigning an ID (see `vamanainsert.c:74-75`). This
-> prevents two backends from ever observing the same "next ID" even if
-> their caches fall out of sync.
+> authoritative. The BGW re-reads the metapage under the advisory lock
+> before assigning an ID, ensuring monotonic assignment even if the cached
+> value is stale.
 
 ---
 
@@ -234,29 +234,18 @@ typedef struct VamanaIndexCache
 ```
 vamanainsert(index, values, isnull, heap_tid, ...)
   │
-  ├─ cache = VamanaGetCache(relid)
-  │   └── if NULL/invalid/handle-NULL → VamanaInvalidateCache; return
-  │       (this is the "cold cache" fallback)
-  │
+  ├─ VamanaWorkerWaitUntilAvailable(relid)      // error if BGW not up
   ├─ vec = PG_DETOAST_DATUM_COPY(values[0])     // aligned, standalone palloc
+  ├─ VamanaWorkerSubmitInsert(relid, vec, heap_tid, &externalId)
+  │   BGW side:
+  │     ├─ VamanaDynamicAcquireWriteLock(relid) // blocking advisory lock
+  │     ├─ VamanaReadMetaPage → externalId
+  │     ├─ SVSAddPoints(svsIndex, vec, &externalId, 1)
+  │     ├─ tidMapping[externalId] = heap_tid
+  │     ├─ cache->nextExternalId++, numVectors++, needsSave = true
+  │     └─ VamanaWriteMetaPageDynamic(...)       // WAL-logged, single page
   │
-  ├─ VamanaDynamicAcquireWriteLock(relid)       // blocking advisory lock
-  │
-  ├─ VamanaReadMetaPage(index, &meta)           // authoritative nextExternalId
-  ├─ externalId = meta.nextExternalId
-  │
-  ├─ added = SVSAddPoints(cache->svsIndex, vec->x, &externalId, 1)
-  │   └── on failure → invalidate cache; return
-  │
-  ├─ grow tidMapping if externalId >= capacity (doubling strategy)
-  ├─ tidMapping[externalId] = heap_tid
-  │
-  ├─ cache->nextExternalId = externalId + 1
-  ├─ cache->numVectors++
-  ├─ cache->needsSave = true
-  ├─ VamanaWriteMetaPageDynamic(...)            // WAL-logged, single page
-  │
-  └─ signal the background worker to reload (if enabled)
+  └─ VamanaUndoAppend(relid, externalId)        // for rollback on abort
 ```
 
 Key invariants and observations:
@@ -266,64 +255,47 @@ Key invariants and observations:
   per-index and per-database. It is transaction-scoped (released at
   commit/abort).
 - The lock only serializes **writers on the same index**. Readers are
-  unblocked — `SVSSearch` runs concurrently with writers and sees a
-  coherent snapshot of the SVS graph (SVS internals are thread-safe).
-- `SVSAddPoints` is called **before** any local state is mutated. If it
-  fails, nothing in the cache has moved, so the cheap recovery path of
-  `VamanaInvalidateCache` is safe.
-- `repalloc` of `tidMapping` happens in `TopMemoryContext` so the
-  cache-pinned allocation survives past the inserting transaction.
-  Capacity grows by doubling (never shrinks).
-- The metapage write goes through `GenericXLogFinish`, so the four v2
-  fields update atomically in one WAL record.
+  unblocked — `SVSSearch` runs concurrently with writers (SVS internals
+  are thread-safe).
+- The metapage write goes through `GenericXLogFinish`, so the fields
+  update atomically in one WAL record.
 - `needsSave = true` defers serialization. The actual
-  `VamanaSaveIndexToDisk` call runs later from `vamanaendscan`, the
-  vacuum cleanup path, or the background worker — never from the insert
-  hot path.
+  `VamanaSaveIndexToDisk` call runs from the BGW's maintenance loop,
+  never from the insert hot path.
 
 ### 4.2 DELETE + VACUUM (`vamanavacuum.c`)
 
-`vamanabulkdelete` receives PostgreSQL's dead-tuple callback and walks
-the TID mapping:
+`vamanabulkdelete` receives PostgreSQL's dead-tuple callback, collects
+dead external IDs from the TID map, then submits batched DELETE requests
+to the BGW:
 
 ```
 vamanabulkdelete(info, stats, callback, state)
   │
-  ├─ cache = VamanaGetCache(relid)
-  │   └── if invalid/cold cache → invalidate + NOTICE; return
+  ├─ VamanaWorkerAssertDatabase() + VamanaWorkerIsAvailable() → ERROR if down
   │
-  ├─ VamanaDynamicAcquireWriteLock(relid)
+  ├─ warm path: tidMapping from BGW cache (if isValid)
+  │  cold path: load TID map from on-disk tidmap.bin
   │
-  ├─ deadIds[] = palloc(tidMappingCapacity * size_t)
   ├─ for i in 0 .. tidMappingCapacity-1:
-  │     tip = &tidMapping[i]
-  │     if !ItemPointerIsValid(tip): continue     // already-dead slot
   │     if callback(tip, state):                  // PG says this heap TID is dead
   │         deadIds[numDead++] = i
   │         ItemPointerSetInvalid(tip)            // mark slot immediately
   │
-  ├─ if numDead > 0:
-  │     SVSDeletePoints(cache->svsIndex, deadIds, numDead)
-  │     │   └── on failure → invalidate cache + WARNING; stats returned
-  │     cache->numDeleted += numDead
-  │     cache->numVectors -= numDead
-  │     VamanaWriteMetaPageDynamic(...)
-  │
-  └─ stats->tuples_removed = numDead
-     stats->num_index_tuples = cache->numVectors
+  └─ VamanaWorkerSubmitDelete(relid, deadIds, batch) [batched]
+      BGW side: SVSDeletePoints + VamanaWriteMetaPageDynamic
 ```
 
 `vamanavacuumcleanup` runs after `vamanabulkdelete` completes:
 
-- `SVSConsolidate` is called whenever `numDeleted > 0`. This patches
-  graph edges that used to point at deleted entries so the remaining
-  graph stays connected. Recall of the remaining vectors is preserved.
-- `SVSCompact(index, batchsize=0)` is called **only** when
-  `numDeleted / numVectors > vamana.compact_threshold_pct / 100`
-  (default 10%). Compact physically reclaims slot
-  memory. Crucially, SVS's compact **preserves external IDs**, so the
-  backend's `tidMapping` array does not need to be rewritten.
-- After compact succeeds, `cache->numDeleted` is reset to 0.
+- `VamanaWorkerSubmitMaintenance(CONSOLIDATE)` is sent whenever
+  `numDeleted > 0`. The BGW calls `SVSConsolidate` to patch graph edges
+  that pointed at deleted entries. Recall of the remaining vectors is
+  preserved.
+- `VamanaWorkerSubmitMaintenance(COMPACT)` is sent **only** when
+  `numDeleted / numVectors > svs.compact_threshold_pct / 100`
+  (default 10%). The BGW calls `SVSCompact`, which physically reclaims
+  slot memory while preserving external IDs.
 
 ### 4.3 Why the slot is marked invalid *before* SVS delete succeeds
 
@@ -338,27 +310,20 @@ if (callback(tip, callback_state))
 }
 ```
 
-The `ItemPointerSetInvalid` call runs **before** `SVSDeletePoints`. If
-SVS then fails, the cache is invalidated anyway (the subsequent query
-triggers a rebuild from the heap — the heap already reflects the
-deletion). Leaving the TID valid in the interim would risk returning a
-dead row in a concurrent SELECT that raced the delete path.
+The `ItemPointerSetInvalid` call runs **before** `VamanaWorkerSubmitDelete`.
+If the BGW delete then fails, the heap already reflects the deletion so
+the next rebuild from the heap produces a correct index. Leaving the TID
+valid in the interim would risk returning a dead row in a concurrent
+SELECT that raced the delete path.
 
-### 4.4 Cold-cache fallback (INSERT)
+### 4.4 BGW cold-cache behaviour (INSERT)
 
-`vamanainsert` can observe `cache == NULL || !isValid || svsIndex == NULL`.
-In all three cases it invalidates and returns. The trigger conditions:
-
-1. **`cache == NULL`** — backend is brand-new and has never searched or
-   loaded this index.
-2. **`!cache->isValid`** — a prior invalidation (from a TRUNCATE, DROP,
-   etc.) cleared the slot.
-3. **`cache->svsIndex == NULL`** — the slot exists but the handle has
-   been freed (rare; e.g., mid-eviction).
-
-After the fallback, the next `ORDER BY ... LIMIT` triggers
-`LoadIndexFromPages` → on miss, `VamanaRebuildFromTable`, which builds
-a fresh dynamic index. Subsequent inserts use the fast path.
+`vamanainsert` calls `VamanaWorkerWaitUntilAvailable` before submitting.
+If the BGW is up but has not yet loaded the index (e.g. immediately after
+server restart), the BGW loads it on the first request via
+`VamanaWorkerGetOrLoadIndex`: try `LoadIndexFromPages`, fall back to
+`VamanaRebuildFromTable` if no saved copy exists. Subsequent inserts
+find the index already in the BGW cache and take the fast path.
 
 ---
 
@@ -560,7 +525,7 @@ high, trigger `VACUUM` more frequently.
 
 ### 8.5 Concurrency
 
-- **Readers scale with SVS threads** (`vamana.search_num_threads`,
+- **Readers scale with SVS threads** (`svs.search_num_threads`,
   capped at `nproc-1`). Readers do **not** hold the dynamic write
   lock.
 - **Writers serialize per-index** via
@@ -583,7 +548,7 @@ Dynamic indexes carry a small per-index overhead:
 - The TID mapping grows with `tidMappingCapacity`, not `numVectors`.
   After many deletes without a compact, the sidecar file is sized by
   capacity, not live count. Run `VACUUM` once deletion pressure exceeds
-  `vamana.compact_threshold_pct` (default 10%) to reclaim. Lower the
+  `svs.compact_threshold_pct` (default 10%) to reclaim. Lower the
   threshold for memory-constrained deployments with heavy delete churn;
   raise it to reduce compact frequency in read-heavy workloads that
   tolerate memory overhead.
@@ -605,18 +570,14 @@ Build time for `svs_index_build_dynamic` is dominated by the heap scan
    write workloads should drive ingestion through a single backend that
    batches multi-row `INSERT` statements. The lock is intentional:
    `nextExternalId` must be assigned monotonically.
-2. **Cold-cache fallback on first write.** If no backend has queried
-   the index since server start (or since the last invalidation), the
-   first `INSERT` triggers a full rebuild on the next `SELECT`. Warm
-   the cache with a trivial query at deployment time to avoid this.
-3. **Multi-backend cache coherence.** After an `INSERT`, only the
-   inserting backend's cache reflects the new vector. Other backends
-   see their cached (stale) SVS handle until either (a) the background
-   worker picks up the reload signal, or (b) their cache is
-   invalidated by another event. New rows *are* persisted and
-   discoverable — peer backends simply may not return them until
-   reload. The background worker mitigates this; direct-mode
-   deployments should be aware.
+2. **BGW cold-cache on first write.** If the BGW has not yet loaded the
+   index (e.g. immediately after server restart), the first `INSERT`
+   triggers a synchronous load or rebuild inside the BGW before the
+   insert proceeds. Run a trivial `SELECT` at deployment time to
+   pre-warm the BGW cache.
+3. **BGW reload lag after INSERT.** After an insert the BGW's in-memory
+   graph is updated synchronously (the insert blocks until the BGW ACKs).
+   Subsequent `SELECT`s from any session see the updated graph immediately.
 4. **`REINDEX` resets `nextExternalId`.** This is harmless for
    search but is worth knowing for anyone auditing SVS-level state.
 5. **`TRUNCATE` cache coherence.** See the existing user guide's
@@ -640,14 +601,14 @@ Build time for `svs_index_build_dynamic` is dominated by the heap scan
 -- 1. Build (or migrate) the index
 CREATE INDEX CONCURRENTLY docs_vamana ON docs USING vamana (embedding vector_cosine_ops);
 
--- 2. Warm the cache (one trivial SELECT per backend that will write)
+-- 2. Warm the BGW cache (triggers index load before first INSERT)
 SELECT id FROM docs ORDER BY embedding <=> '[0,0,...]' LIMIT 1;
 
 -- 3. Begin serving writes
 INSERT INTO docs (embedding) VALUES ('[...]');
 ```
 
-### 10.2 Tuning `vamana.compact_threshold_pct`
+### 10.2 Tuning `svs.compact_threshold_pct`
 
 The percent-deleted threshold that triggers `SVSCompact` during VACUUM
 cleanup. Default 10. Range 0-100.
@@ -684,7 +645,7 @@ choose to `REINDEX` if:
 |---|---|
 | Live vs. deleted count | Inspect metapage (currently no SQL-level view; see [§12](#12-reference-new-and-changed-symbols)). |
 | Write serialization pressure | `pg_locks` for advisory locks on `(classid=0, objid=<oid>, objsubid=2)`. |
-| Rebuild frequency | Grep server logs for `rebuilding vamana index from table data`. A dynamic index should see this only on cold start, after restart, or after TRUNCATE/REINDEX. |
+| Rebuild frequency | Grep server logs for `rebuilding vamana index from table data`. A dynamic index should see this only on BGW cold start (after restart or TRUNCATE/REINDEX). |
 | Worker reload signals | Grep for `vamana worker: reloading index` or `vamana worker: reload_all set`. |
 
 ### 10.5 Key log messages
@@ -703,20 +664,18 @@ choose to `REINDEX` if:
 
 ### 11.1 An INSERT does not appear in a SELECT from another session
 
-**Most common cause:** the other backend's cache has a stale SVS
-handle (multi-backend cache coherence, [§9](#9-known-limitations)).
+All inserts go through the BGW synchronously — the inserting session blocks
+until the BGW ACKs. If a SELECT in another session does not return the
+inserted row, the most likely cause is the BGW is not running.
 
-**Check:** is the background worker enabled?
+**Check:** is the background worker running?
 ```sql
-SHOW vamana.worker_enabled;
+SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'vamana background worker';
 ```
 
-**Fix options, in order of preference:**
-1. Enable the worker so reload signals propagate.
-2. Have the other backend reconnect (new backends rebuild the cache on
-   first query, picking up the current save directory or rebuilding
-   from the heap).
-3. Force-invalidate with `REINDEX`.
+**Fix:** ensure the worker is running (load the extension via
+`shared_preload_libraries` and restart). If the worker is running and rows
+are still missing, force a rebuild with `REINDEX INDEX CONCURRENTLY <idx>`.
 
 ### 11.2 A SELECT returns fewer than `LIMIT` rows after many DELETEs
 

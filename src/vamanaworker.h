@@ -23,6 +23,18 @@ typedef void *SVSIndexHandle;
 #define VAMANA_SLOT_ERROR      4
 
 /* -----------------------------------------------------------------------
+ * Slot error category codes
+ *
+ * Set by the BGW in slot->errorCategory on VAMANA_SLOT_ERROR.
+ * Mapped back to a PG errcode by the backend in VamanaWorkerSubmitSearch.
+ * ----------------------------------------------------------------------- */
+#define VAMANA_ERR_NONE         0
+#define VAMANA_ERR_OOM          1	/* ERRCODE_OUT_OF_MEMORY */
+#define VAMANA_ERR_DATA         2	/* ERRCODE_DATA_EXCEPTION (dim mismatch etc.) */
+#define VAMANA_ERR_IO           3	/* ERRCODE_IO_ERROR */
+#define VAMANA_ERR_INTERNAL     4	/* ERRCODE_INTERNAL_ERROR */
+
+/* -----------------------------------------------------------------------
  * Slot kind: what operation this slot carries
  * ----------------------------------------------------------------------- */
 #define VAMANA_SLOTKIND_SEARCH      0
@@ -54,6 +66,9 @@ typedef void *SVSIndexHandle;
  */
 #define VAMANA_MAX_INDEXES 64
 
+/* Heartbeat is written every ~1 s. Three missed beats means the worker is hung. */
+#define VAMANA_HEARTBEAT_STALE_MS  3000
+
 /*
  * Sentinel placed in VamanaScanOpaqueData.svsIndex when the backend is in
  * worker mode.  Non-NULL so the existing `if (so->svsIndex)` guard in
@@ -81,7 +96,8 @@ typedef struct VamanaWorkerSlot
 	int				k;				/* neighbors requested (SEARCH) */
 	int				searchWindowSize;
 	int				numResults;		/* results written by worker (SEARCH / DELETE count) */
-	char			errorMessage[128]; /* set on VAMANA_SLOT_ERROR */
+	char			errorMessage[512]; /* set on VAMANA_SLOT_ERROR */
+	uint8			errorCategory;	/* VAMANA_ERR_* set by BGW on VAMANA_SLOT_ERROR */
 	Latch			latch;			/* InitSharedLatch'd; backend owns while waiting */
 
 	/* Write-path fields (slotKind != VAMANA_SLOTKIND_SEARCH) */
@@ -127,8 +143,7 @@ typedef struct VamanaIndexLockSlot
 
 typedef struct VamanaWorkerShmem
 {
-	/* Database this worker serves; backends fall back to direct load on mismatch. */
-	Oid				dbOid;
+	Oid				dbOid;			/* database this worker serves */
 
 	pid_t			workerPid;
 	Latch			workerLatch;	/* InitSharedLatch'd; worker owns this */
@@ -140,6 +155,9 @@ typedef struct VamanaWorkerShmem
 	 * responds by reloading all cached indexes on its next cycle.
 	 */
 	pg_atomic_uint32 reload_all;
+
+	/* Updated each BGW loop iteration; backends check for hung worker. */
+	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
 
 	int				maxSlots;
 
@@ -174,6 +192,22 @@ Size	VamanaWorkerShmemSize(void);
 void	VamanaWorkerShmemStartup(void);		/* shmem_startup_hook */
 void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_init */
 void	VamanaWorkerRegister(void);			/* called from _PG_init */
+
+/* vamanaworkershmem.c */
+LWLock *VamanaGetIndexLock(Oid relid);
+uint8	VamanaCategorizeSQLState(int sqlerrcode);
+int		VamanaSlotErrcode(uint8 category);
+
+/* vamanaworkerindex.c */
+SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid);
+void	VamanaWorkerLoadAllIndexes(void);
+void	VamanaWorkerResetStaleSlots(void);
+
+/* vamanaworkersearch.c */
+void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);
+
+/* vamanaworkerwrite.c */
+void	VamanaWorkerProcessWriteSlot(int slotIdx);
 
 /* Worker entry point.
  * PG 18 replaced pg_attribute_noreturn() with pg_noreturn (placed before

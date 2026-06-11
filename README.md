@@ -169,17 +169,17 @@ Tune at runtime with `SET`:
 
 | Parameter | Default | Range | Description |
 |---|---|---|---|
-| `vamana.search_window_size` | 100 | 10–10000 | Overrides the index's `search_window_size` for the current session. |
-| `vamana.search_num_threads` | 0 | 0–1024 | Threads for SVS search. 0 = auto (nproc − 1). |
-| `vamana.compact_threshold_pct` | 10 | 0–100 | `VACUUM` triggers a compact pass when soft-deletes exceed this percentage of total vectors. |
+| `svs.search_window_size` | 100 | 10–10000 | Overrides the index's `search_window_size` for the current session. |
+| `svs.search_num_threads` | 0 | 0–1024 | Threads for SVS search. 0 = auto (nproc − 1). |
+| `svs.compact_threshold_pct` | 10 | 0–100 | `VACUUM` triggers a compact pass when soft-deletes exceed this percentage of total vectors. |
 
 ```sql
 -- Trade recall for speed
-SET vamana.search_window_size = 20;
+SET svs.search_window_size = 20;
 SELECT id FROM items ORDER BY embedding <-> query LIMIT 5;
 
 -- Trade speed for recall
-SET vamana.search_window_size = 500;
+SET svs.search_window_size = 500;
 ```
 
 ## Background Worker
@@ -190,16 +190,17 @@ To enable, add to `postgresql.conf`:
 
 ```
 shared_preload_libraries = 'svs'
-vamana.worker_enabled = on
-vamana.worker_database = 'mydb'
+svs.worker_database = 'mydb'
 ```
+
+The worker starts automatically when the extension is loaded — no additional flag is needed.
 
 Additional worker parameters:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `vamana.worker_timeout_ms` | 5000 | ms to wait for worker response before falling back to direct load. |
-| `vamana.max_batch_size` | 0 | Max queries per SVS batch call. 0 = unlimited. |
+| `svs.worker_timeout_ms` | 5000 | ms to wait for worker response before returning an error. |
+| `svs.max_batch_size` | 0 | Max queries per SVS batch call. 0 = unlimited. |
 
 ## Running Tests
 

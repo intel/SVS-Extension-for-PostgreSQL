@@ -249,7 +249,7 @@ void svs_search_results_free(svs_search_results_t results);
 **Wrapper functions:** `SVSSearch`, `SVSBatchSearch`
 
 `svs_index_search` is called in a loop for batch search (one call per query vector).
-`search_window_size` is read from the `vamana.search_window_size` GUC at scan time.
+`search_window_size` is read from the `svs.search_window_size` GUC at scan time.
 
 ### Result accessors
 
@@ -357,7 +357,7 @@ bool svs_index_dynamic_compact(
 **Wrapper function:** `SVSCompact`
 
 Physically reclaims memory for deleted slots. Run only when the deleted fraction
-exceeds `vamana.compact_threshold_pct` (default 10%). SVS preserves external IDs
+exceeds `svs.compact_threshold_pct` (default 10%). SVS preserves external IDs
 during compaction so the `tidMapping` array does not need to be rewritten.
 
 ---

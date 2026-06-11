@@ -140,8 +140,8 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id LIMIT 2;
 (2 rows)
 
 DROP TABLE t;
--- vamana.compact_threshold_pct: compact on every VACUUM with pending deletes
-SET vamana.compact_threshold_pct = 0;
+-- svs.compact_threshold_pct: compact on every VACUUM with pending deletes
+SET svs.compact_threshold_pct = 0;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]'), ('[4,4,4]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
@@ -165,9 +165,9 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id LIMIT 3;
 (3 rows)
 
 DROP TABLE t;
-RESET vamana.compact_threshold_pct;
--- vamana.compact_threshold_pct: 100 disables compact (consolidate still runs)
-SET vamana.compact_threshold_pct = 100;
+RESET svs.compact_threshold_pct;
+-- svs.compact_threshold_pct: 100 disables compact (consolidate still runs)
+SET svs.compact_threshold_pct = 100;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]'), ('[4,4,4]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
@@ -190,15 +190,15 @@ SELECT * FROM t ORDER BY val <-> '[0,0,0]', id;
 (2 rows)
 
 DROP TABLE t;
-RESET vamana.compact_threshold_pct;
--- vamana.compact_threshold_pct: out-of-range values rejected
-SET vamana.compact_threshold_pct = -1;
-ERROR:  -1 is outside the valid range for parameter "vamana.compact_threshold_pct" (0 .. 100)
-SET vamana.compact_threshold_pct = 101;
-ERROR:  101 is outside the valid range for parameter "vamana.compact_threshold_pct" (0 .. 100)
-SHOW vamana.compact_threshold_pct;
- vamana.compact_threshold_pct 
-------------------------------
+RESET svs.compact_threshold_pct;
+-- svs.compact_threshold_pct: out-of-range values rejected
+SET svs.compact_threshold_pct = -1;
+ERROR:  -1 is outside the valid range for parameter "svs.compact_threshold_pct" (0 .. 100)
+SET svs.compact_threshold_pct = 101;
+ERROR:  101 is outside the valid range for parameter "svs.compact_threshold_pct" (0 .. 100)
+SHOW svs.compact_threshold_pct;
+ svs.compact_threshold_pct 
+---------------------------
  10
 (1 row)
 
@@ -317,3 +317,61 @@ SELECT count(*) FROM (SELECT * FROM t_undo ORDER BY val <-> '[0,0,0]' LIMIT 2000
 (1 row)
 
 DROP TABLE t_undo;
+-- -------------------------------------------------------------------------
+-- #92: TRUNCATE must not leave stale cache — post-TRUNCATE query returns empty.
+-- -------------------------------------------------------------------------
+CREATE TABLE t_trunc (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t_trunc (val) VALUES ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]');
+CREATE INDEX ON t_trunc USING vamana (val vector_l2_ops);
+NOTICE:  buffered 3 vectors for SVS index build
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
+-- Warm the cache
+SELECT count(*) FROM (SELECT * FROM t_trunc ORDER BY val <-> '[1,1,1]' LIMIT 10) sub;
+ count 
+-------
+     3
+(1 row)
+
+TRUNCATE t_trunc;
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+-- After TRUNCATE the index is empty; query must return 0 rows.
+SELECT count(*) FROM (SELECT * FROM t_trunc ORDER BY val <-> '[1,1,1]' LIMIT 10) sub;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE t_trunc;
+-- -------------------------------------------------------------------------
+-- #42: SVSLoadDynamicIndex build-window fallback must match build-time logic.
+-- When build_window_size is unset (0) and search_window_size is non-zero,
+-- the load path must use graph_degree*2, not search_window_size.
+-- -------------------------------------------------------------------------
+CREATE TABLE t_loadwin (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t_loadwin (val) VALUES ('[1,0,0]'), ('[0,1,0]'), ('[0,0,1]'), ('[1,1,0]'), ('[0,1,1]');
+CREATE INDEX ON t_loadwin USING vamana (val vector_l2_ops) WITH (search_window_size = 20);
+NOTICE:  buffered 5 vectors for SVS index build
+NOTICE:  building SVS index with 5 vectors of dimension 3
+NOTICE:  SVS index built successfully
+-- Warm cache and verify initial results.
+SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5) sub;
+ count 
+-------
+     5
+(1 row)
+
+-- REINDEX forces a cold reload through SVSLoadDynamicIndex.
+REINDEX INDEX CONCURRENTLY t_loadwin_val_idx;
+NOTICE:  buffered 5 vectors for SVS index build
+NOTICE:  building SVS index with 5 vectors of dimension 3
+NOTICE:  SVS index built successfully
+-- Results must be unchanged after reload.
+SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5) sub;
+ count 
+-------
+     5
+(1 row)
+
+DROP TABLE t_loadwin;

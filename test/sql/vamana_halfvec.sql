@@ -434,13 +434,13 @@ CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
 
-SET vamana.search_window_size = 50;
+SET svs.search_window_size = 50;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
-SET vamana.search_window_size = 200;
+SET svs.search_window_size = 200;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
 DROP TABLE t;

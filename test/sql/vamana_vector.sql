@@ -65,10 +65,10 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = 50);
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = 201);
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 64, alpha = 120);
 
-SHOW vamana.search_window_size;
+SHOW svs.search_window_size;
 
-SET vamana.search_window_size = 9;
-SET vamana.search_window_size = 10001;
+SET svs.search_window_size = 9;
+SET svs.search_window_size = 10001;
 
 DROP TABLE t;
 
@@ -444,13 +444,13 @@ CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
 
-SET vamana.search_window_size = 50;
+SET svs.search_window_size = 50;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
-SET vamana.search_window_size = 200;
+SET svs.search_window_size = 200;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 
 DROP TABLE t;
@@ -520,20 +520,20 @@ INSERT INTO t SELECT i, array_fill(i, ARRAY[3])::vector(3)
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
 
 -- Both should return non-empty results; COUNT must equal k.
-SET vamana.search_window_size = 10;
+SET svs.search_window_size = 10;
 SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
 
-SET vamana.search_window_size = 500;
+SET svs.search_window_size = 500;
 SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
 
 -- Nearest neighbor should be id=25 at both extremes.
-SET vamana.search_window_size = 10;
+SET svs.search_window_size = 10;
 SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
 
-SET vamana.search_window_size = 500;
+SET svs.search_window_size = 500;
 SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
 
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 DROP TABLE t;
 
 -- max_parallel_maintenance_workers does not limit search
@@ -548,13 +548,13 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 DROP TABLE t;
 RESET max_parallel_maintenance_workers;
 
--- vamana.search_num_threads GUC controls search thread count
+-- svs.search_num_threads GUC controls search thread count
 -- 0 = auto (nproc-1); explicit value overrides auto.
 -- Correctness must be preserved regardless of thread count.
-SET vamana.search_num_threads = 1;
+SET svs.search_num_threads = 1;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
-RESET vamana.search_num_threads;
+RESET svs.search_num_threads;
 DROP TABLE t;

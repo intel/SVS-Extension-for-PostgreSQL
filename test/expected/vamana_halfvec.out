@@ -852,7 +852,7 @@ CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
 NOTICE:  buffered 3 vectors for SVS index build
 NOTICE:  building SVS index with 3 vectors of dimension 3
 NOTICE:  SVS index built successfully
-SET vamana.search_window_size = 50;
+SET svs.search_window_size = 50;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -861,7 +861,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   1 | [0,0,0]
 (3 rows)
 
-SET vamana.search_window_size = 200;
+SET svs.search_window_size = 200;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -870,7 +870,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   1 | [0,0,0]
 (3 rows)
 
-RESET vamana.search_window_size;
+RESET svs.search_window_size;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
