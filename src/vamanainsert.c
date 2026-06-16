@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanainsert.c
  *
  * Insert operations for Vamana index.

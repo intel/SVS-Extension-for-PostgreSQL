@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanaworkerwrite.c
  *
  * Worker-side execution of non-SEARCH slots: INSERT, DELETE, MAINTENANCE.

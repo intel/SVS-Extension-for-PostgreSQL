@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
 #ifndef VAMANA_WORKER_H
 #define VAMANA_WORKER_H
 

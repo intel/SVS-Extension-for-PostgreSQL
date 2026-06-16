@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanavacuum.c
  *
  * Vacuum and cleanup operations for Vamana index.

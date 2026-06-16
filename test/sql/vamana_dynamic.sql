@@ -1,3 +1,6 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+
 SET enable_seqscan = off;
 
 -- Incremental INSERT: new rows are searchable without REINDEX or rebuild.

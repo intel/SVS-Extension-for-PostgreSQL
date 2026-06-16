@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanaworker.c
  *
  * Background worker for Vamana index.  A single dedicated process holds the

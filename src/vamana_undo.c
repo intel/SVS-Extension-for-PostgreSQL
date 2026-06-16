@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamana_undo.c
  *
  * Per-transaction undo log for the BGW-mediated write path.

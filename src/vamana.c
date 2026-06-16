@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * Vamana index access method for pgvector
  *
  * This implements a PostgreSQL index access method using Intel's SVS library

@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: PostgreSQL
+
 package VamanaTestUtils;
 
 # Shared helpers and deterministic test data for Vamana TAP tests.

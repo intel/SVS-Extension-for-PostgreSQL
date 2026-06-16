@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanaworkersearch.c
  *
  * Worker-side batch search execution: group pending search slots by index OID

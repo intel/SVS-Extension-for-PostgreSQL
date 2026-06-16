@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: PostgreSQL
+
 # 06_vamana_reload_queue.pl — reload_all overflow when the per-OID reload
 # queue is full.
 #

@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * svs.c
  *
  * Requires pgvector (CREATE EXTENSION vector) to be installed first.

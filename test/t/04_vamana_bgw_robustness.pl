@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: PostgreSQL
+
 # 04_vamana_bgw_robustness.pl — BGW robustness: cold-cache vacuum, error
 # recovery, save lock, relcache invalidation, index lock slot leak,
 # and stale slot cleanup on BGW restart.

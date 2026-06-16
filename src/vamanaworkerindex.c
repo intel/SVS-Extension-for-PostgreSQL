@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanaworkerindex.c
  *
  * Worker-side index lifecycle: load from disk, rebuild from table,

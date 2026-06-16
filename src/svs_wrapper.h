@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
 #ifndef SVS_WRAPPER_H
 #define SVS_WRAPPER_H
 

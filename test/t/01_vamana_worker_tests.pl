@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: PostgreSQL
+
 # 045_vamana_worker_tests.pl
 #
 # Merged test file covering the Vamana persistence and background-worker

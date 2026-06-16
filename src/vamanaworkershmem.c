@@ -1,4 +1,9 @@
 /*
+ * Copyright (C) 2026 Intel Corporation
+ * SPDX-License-Identifier: PostgreSQL
+ */
+
+/*
  * vamanaworkershmem.c
  *
  * Shared memory layout: sizing, initialisation, slot buffer accessors,
