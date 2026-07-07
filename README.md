@@ -24,6 +24,7 @@ A PostgreSQL extension that adds the **Vamana** approximate nearest neighbor (AN
 | Intel SVS C API (`libsvs_c_api.so`) | see [build guide](docs/build_guide/README.md) |
 | GCC | 11+ |
 | CMake | 3.24+ (for building SVS) |
+| `gcovr` | 5.0+ — optional, only for `make coverage` ([coverage guide](docs/dev/CODE_COVERAGE.md)) |
 
 An Intel Xeon processor with AVX-512 is recommended for best performance. The extension works on any x86_64 platform but falls back to scalar code.
 
@@ -37,6 +38,8 @@ Building SVS and the extension involves compiling Intel's SVS C API, then buildi
 make          # build the extension (SVS_INSTALL must point at your SVS install prefix)
 make install
 ```
+
+Coverage instrumentation is opt-in and off by default; build with `make COVERAGE=1` to enable it. See the [coverage guide](docs/dev/CODE_COVERAGE.md).
 
 ## Quick Start
 
