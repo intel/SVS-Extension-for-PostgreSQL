@@ -1,3 +1,5 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
 SET enable_seqscan = off;
 -- L2
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
