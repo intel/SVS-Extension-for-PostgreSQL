@@ -181,6 +181,8 @@ VamanaXactCallback(XactEvent event, void *arg)
 					size_t		batchIds[VAMANA_MAX_DELETE_IDS];
 					int			batchCount = 0;
 					Oid			currentRelid = InvalidOid;
+					Oid			consolidateRelids[VAMANA_MAX_INDEXES];
+					int			nConsolidate = 0;
 
 					qsort(log->entries, log->nEntries,
 						  sizeof(VamanaUndoEntry), undo_entry_cmp_by_relid);
@@ -193,13 +195,40 @@ VamanaXactCallback(XactEvent event, void *arg)
 							if (batchCount > 0)
 								undo_flush_batch(currentRelid, batchIds, batchCount);
 
+							if (OidIsValid(currentRelid) &&
+								(nConsolidate == 0 ||
+								 consolidateRelids[nConsolidate - 1] != currentRelid))
+							{
+								if (nConsolidate < VAMANA_MAX_INDEXES)
+									consolidateRelids[nConsolidate++] = currentRelid;
+							}
+
 							currentRelid = log->entries[i].indexRelid;
 							batchCount = 0;
 						}
 						batchIds[batchCount++] = (size_t) log->entries[i].externalId;
 					}
 					if (batchCount > 0)
+					{
 						undo_flush_batch(currentRelid, batchIds, batchCount);
+						if (OidIsValid(currentRelid) &&
+							(nConsolidate == 0 ||
+							 consolidateRelids[nConsolidate - 1] != currentRelid))
+						{
+							if (nConsolidate < VAMANA_MAX_INDEXES)
+								consolidateRelids[nConsolidate++] = currentRelid;
+						}
+					}
+
+					/*
+					 * Consolidate each affected index to repair the entry point
+					 * if any of the deleted nodes was the graph entry point.
+					 * Without this, searches after a large ROLLBACK hit a deleted
+					 * entry point and SVS returns an error.
+					 */
+					for (int i = 0; i < nConsolidate; i++)
+						VamanaWorkerSubmitMaintenance(consolidateRelids[i],
+													  VAMANA_MAINTENANCE_CONSOLIDATE);
 				}
 
 				CurrentUndoLog = NULL;

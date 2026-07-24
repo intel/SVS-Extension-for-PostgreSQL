@@ -37,8 +37,8 @@ our $array_sql = join(",", ('random()') x $dim);
 our $query_sql    = join(",", map { rand() } 1 .. $dim);
 our $lv_query_sql = join(",", map { rand() } 1 .. $dim);
 
-# Batch section: N distinct query vectors generated after $query_sql so the
-# srand(42) seed produces the same $query_sql as in the original merged file.
+# Batch section: N distinct query vectors generated after $query_sql so that
+# every test file sharing this module's srand(42) seed produces identical vectors.
 our $N = 5;
 our @query_vecs =
   map { join(",", map { sprintf("%.6f", rand()) } 1 .. $dim) } 1 .. $N;

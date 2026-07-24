@@ -42,7 +42,7 @@ The Vamana index is a graph-based approximate nearest neighbor (ANN) index, simi
 - **High recall** at competitive query latencies
 - **AVX-512 optimized** — delivers best throughput on Intel Xeon processors (such as those in AWS `r7i` and `c7i` instance families)
 - **Dynamic index** — the index is built from the initial table data and supports incremental updates: INSERT adds vectors to the live graph immediately via `SVSAddPoints`, and DELETE + VACUUM removes vectors via `SVSDeletePoints` with automatic graph consolidation (see [Section 7](#7-operational-considerations))
-- **On-disk persistence** — the SVS graph is serialized directly to files on the filesystem (via the SVS `save`/`load` API); TID mappings are stored separately in PostgreSQL pages. Both are reloaded automatically on restart
+- **On-disk persistence** — the SVS graph and TID mappings are serialized directly to files on the filesystem (via the SVS `save`/`load` API and atomic checkpoint sequence). Both are reloaded automatically on restart
 
 ### What is LeanVec Compression?
 
@@ -72,13 +72,13 @@ SELECT extversion FROM pg_extension WHERE extname = 'svs';
 
 - An Intel Xeon processor instance is strongly recommended to benefit from AVX-512 optimizations. On AWS, the `r7i`, `c7i`, and `m7i` instance families qualify.
 
-- **Optional — Background Worker:** If you plan to use the background search worker (see [Section 6](#background-worker-advanced)), add `svs` to `shared_preload_libraries` in `postgresql.conf` and restart the server:
+- **Required — Background Worker:** The background worker must be running for all write operations (INSERT, DELETE+VACUUM). Add `svs` to `shared_preload_libraries` in `postgresql.conf` and restart the server:
 
   ```
   shared_preload_libraries = 'svs'
   ```
 
-  This is required because the worker registers shared memory segments at server start — actions that cannot be performed after the server is already running. Without this, the worker will not start and all index searches will return an error.
+  This is required because the worker registers shared memory segments at server start — actions that cannot be performed after the server is already running. Without this, the worker will not start and all index reads and writes will return an error.
 
 ---
 
@@ -112,6 +112,21 @@ FROM documents
 ORDER BY embedding <=> '[0.2, 0.1, ...]'
 LIMIT 5;
 ```
+
+**Behavioral highlights:**
+
+| Aspect | Behavior |
+|---|---|
+| `INSERT` | Vector added to the live graph immediately; next `SELECT` serves from the updated index |
+| `DELETE` + `VACUUM` | Vectors soft-deleted, graph edges patched, memory reclaimed when deletion pressure exceeds threshold |
+| `REINDEX` needed for correctness? | No |
+
+**Edge cases to know about:**
+
+- The first `INSERT` after a server restart blocks until the BGW has loaded all indexes. Run a warmup `SELECT` at startup to pre-warm before writes begin.
+- Writes are serialized per index inside the BGW. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
+- Deletes are soft: `VACUUM` marks entries deleted, patches graph edges, and compacts when deletion pressure exceeds `svs.compact_threshold_pct` (default 10%).
+- External IDs are never reused for the life of the index. `REINDEX` resets the counter.
 
 ---
 
@@ -328,6 +343,26 @@ For a 1536-dimensional `vector` column:
 
 Always measure recall on a representative dataset sample before deploying a heavily compressed index in production.
 
+### Training Data Requirement
+
+LeanVec and LVQ use the vectors present at index creation time as training data for their compression matrices. Building an index on a table with very few rows produces an index with poor recall (no error is raised).
+
+Recommended minimums before `CREATE INDEX`:
+- **LeanVec** (`compression_type = 1`): 100,000 rows (10,000 minimum)
+- **LVQ** (`compression_type = 2`): 10,000 rows
+
+A WARNING is emitted at build time if the row count is below these thresholds. To fix, load more data and run `REINDEX INDEX`.
+
+```sql
+-- Example: WARNING fires because the table has only 100 rows
+CREATE INDEX ON docs USING vamana (embedding vector_cosine_ops)
+  WITH (compression_type = 1);
+-- WARNING:  building LeanVec index with only 100 vectors;
+--           recall may be poor (recommend >= 100000, minimum 10000)
+```
+
+The same WARNING fires during cold-start index rebuilds from the heap.
+
 ### 5.5 Creating a Compressed Index
 
 **Baseline LeanVec (8-bit, auto dimensions):**
@@ -442,7 +477,7 @@ CREATE INDEX … USING vamana (…);
 
 ### Background Worker (Advanced)
 
-The extension includes a background worker that holds all Vamana indexes in a single process and serves search requests from every backend via shared memory. This avoids per-backend index loads and can significantly improve throughput under high concurrency.
+The extension includes a background worker that owns all Vamana index state in a single process. All write operations (INSERT, DELETE+VACUUM via `SVSAddPoints`, `SVSDeletePoints`, consolidate, and compact) are submitted to the BGW by backends via IPC and executed exclusively by the BGW. Search requests are also served through the BGW, avoiding per-backend index loads and enabling high read concurrency.
 
 **Prerequisite:** The background worker only starts when the extension is loaded via `shared_preload_libraries`. Add the following to `postgresql.conf` and restart:
 
@@ -463,6 +498,7 @@ svs.worker_database = 'mydb'   # database where your Vamana indexes live
 
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
+| `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for the worker to finish startup before returning an error. Startup can be slow when many large indexes are deserialized from disk. |
 | `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for the worker before returning an error. |
 | `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends` (PostgreSQL's configured backend limit). |
 
@@ -470,7 +506,6 @@ svs.worker_database = 'mydb'   # database where your Vamana indexes live
 
 **Multi-database note:** The worker connects to a single database (`svs.worker_database`). Vamana indexes in other databases cannot be searched.
 
-> **Prototype status:** The background worker is not yet recommended for production use. Benchmarking is advised before enabling it.
 
 ---
 
@@ -506,11 +541,11 @@ VACUUM performs three operations on the index:
 REINDEX INDEX CONCURRENTLY documents_vamana_idx;
 ```
 
-**Cold-cache fallback:** If an INSERT arrives before any query has loaded the index into memory (e.g., immediately after a server restart), the insert falls back to cache invalidation and the next query triggers a full rebuild. Subsequent inserts then use the incremental path.
+**Cold-cache fallback:** On BGW startup, the worker loads all indexes from disk and replays committed operations from the replication slot before accepting any requests. An INSERT that arrives while the BGW is still starting up blocks on `VamanaWorkerWaitUntilAvailable` until the BGW signals it is ready. If no saved index exists on disk, the BGW rebuilds from the heap before marking itself available.
 
 ### TRUNCATE
 
-> **Known limitation (see [issue #92](https://github.com/intel-innersource/applications.databases.postgresql.pgvector-optimizations/issues/92)):** `TRUNCATE` resets the index metapage but does **not** invalidate the in-memory Vamana index cache. Backends that have the index cached will continue to query the stale pre-TRUNCATE SVS index, which can return incorrect results.
+> **Known limitation:** `TRUNCATE` resets the index metapage but does **not** invalidate the in-memory Vamana index cache. The BGW will continue to serve queries from the stale pre-TRUNCATE SVS index, which can return incorrect results.
 
 After `TRUNCATE`, run `REINDEX` to flush the cache and restore correct behavior:
 
@@ -520,6 +555,37 @@ REINDEX INDEX documents_vamana_idx;
 ```
 
 Until the bug is fixed, do not rely on post-TRUNCATE queries returning empty results without a preceding `REINDEX`.
+
+### Typical Deployment Flow
+
+```sql
+-- 1. Build the index
+CREATE INDEX CONCURRENTLY docs_vamana ON docs USING vamana (embedding vector_cosine_ops);
+
+-- 2. Warm the BGW cache before first INSERT
+SELECT id FROM docs ORDER BY embedding <=> '[0,0,...]' LIMIT 1;
+
+-- 3. Begin serving writes
+INSERT INTO docs (embedding) VALUES ('[...]');
+```
+
+### Tuning `svs.compact_threshold_pct`
+
+The percent-deleted threshold that triggers `SVSCompact` during VACUUM cleanup. Default 10. Range 0–100.
+
+- **0**: compact on every VACUUM with any pending deletes. Tightest memory footprint; highest VACUUM cost.
+- **10** (default): compact once deleted entries exceed 10% of live vectors. Balances memory and VACUUM cost.
+- **100**: disable compact entirely. Consolidate still runs (graph recall is preserved) but memory for deleted slots is never reclaimed without `REINDEX`.
+
+Lower for memory-constrained deployments with heavy delete churn. Raise for write-heavy workloads where VACUUM latency matters more than memory. Change takes effect on the next `VACUUM` — no restart required.
+
+### When to REINDEX
+
+You do **not** need periodic `REINDEX` for correctness. You might still choose to `REINDEX` if:
+
+- Autovacuum has not run for an extended period and the deleted fraction is unusually high.
+- You have observed measurable recall drop in production after a long write horizon. Vamana graphs accumulate a small amount of topological debt over many incremental inserts; a fresh build produces the optimal graph for the current data.
+- You need to change a build-time parameter (`graph_degree`, `compression_type`, etc.).
 
 ### VACUUM
 
@@ -531,7 +597,7 @@ VACUUM ANALYZE documents;
 
 ### Disk Space for On-Disk Persistence
 
-The Vamana index graph is serialized directly to files on the filesystem (not PostgreSQL data pages). TID mappings are stored in PostgreSQL pages separately. Disk space usage approximately scales as:
+The Vamana index graph and TID mappings are serialized directly to files on the filesystem. Disk space usage approximately scales as:
 
 ```
 Disk ≈ N × graph_degree × 8 bytes (neighbor list)
@@ -542,7 +608,7 @@ With LeanVec compression, the stored element size is much smaller than `D × 4 b
 
 ### PostgreSQL Restart / Crash Recovery
 
-The SVS index is automatically reloaded from disk on first access after a restart. There is no data loss. The first query on each backend after a restart will incur a one-time load latency proportional to index size.
+On BGW startup after a restart or crash, the worker loads the last checkpoint from disk and replays any committed operations recorded in the replication slot since that checkpoint. This happens before the BGW accepts any backend requests, so the index is fully consistent by the time the first query or insert arrives. There is no data loss for committed transactions.
 
 ---
 
@@ -606,6 +672,15 @@ FROM pg_class
 WHERE relname = 'documents_vamana_idx';
 ```
 
+### Write and Vacuum Activity
+
+| What | How |
+|---|---|
+| Live vs. deleted vector count | No SQL-level view currently; monitor via server log messages below. |
+| Write serialization pressure | Query `pg_stat_activity` for `wait_event_type = 'LWLock'` and `wait_event = 'vamana_index_rwlock'`; backends waiting on this are queued behind an in-progress write. |
+| Rebuild frequency | Look for `rebuilding vamana index from table data` in server logs. A healthy dynamic index sees this only on BGW cold start after a restart or REINDEX. |
+| Checkpoint activity | Look for slot advance log messages; infrequent checkpoints indicate low write volume. |
+
 ---
 
 ## 9. Troubleshooting
@@ -660,8 +735,8 @@ RESET enable_seqscan;
 
 ### New rows not appearing in search results after INSERT
 
-**Cause:** If the index was not yet loaded into the worker's cache when the INSERT arrived (e.g., first INSERT after a server restart), the insert falls back to cache invalidation instead of the incremental path. The next query triggers a full rebuild from the table.
-**Fix:** Run a query first to warm the worker's cache, then insert. Alternatively, run `REINDEX INDEX CONCURRENTLY <index_name>;` to rebuild.
+**Cause:** The BGW must be running and have finished loading all indexes before it can accept inserts. If the BGW is unavailable, the backend returns an ERROR rather than silently dropping the insert.
+**Fix:** Ensure the BGW is running (`shared_preload_libraries = 'vector,svs'`). If the server just restarted, the first INSERT blocks until the BGW finishes startup (controlled by `svs.worker_startup_timeout_ms`). If the timeout is exceeded, increase it or investigate slow index loading.
 
 ### Low recall after compression
 
@@ -670,8 +745,8 @@ RESET enable_seqscan;
 
 ### Slow first query after restart
 
-**Cause:** The index graph is loaded from disk on first access.  
-**Fix:** "Warm up" the index after restart by running a representative query:
+**Cause:** The BGW loads all indexes from disk and replays the replication slot at startup. Until startup completes, backends queue on their IPC latches.
+**Fix:** Warm up by running a representative query after the server is ready:
 
 ```sql
 -- Warm-up query (results can be discarded)
@@ -679,6 +754,38 @@ SELECT id FROM documents
 ORDER BY embedding <=> '[0,0,0,…]'
 LIMIT 1;
 ```
+
+### INSERT does not appear in a SELECT from another session
+
+**Cause:** All inserts go through the BGW synchronously — the inserting session blocks until the BGW ACKs. If a SELECT in another session does not return the inserted row, the most likely cause is the BGW is not running.
+
+**Check:** is the background worker running?
+```sql
+SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'vamana background worker';
+```
+
+**Fix:** ensure the worker is running (load the extension via `shared_preload_libraries` and restart). If the worker is running and rows are still missing, force a rebuild with `REINDEX INDEX CONCURRENTLY <idx>`.
+
+### SELECT returns fewer than `LIMIT` rows after many DELETEs
+
+**Cause:** Deleted vectors are soft-deleted and filtered at query time. The returned count can be less than `k` until VACUUM runs consolidation.
+**Fix:** Run `VACUUM` to trigger consolidate. If underfill persists after VACUUM, check server logs for `SVS consolidate failed` warnings. If consolidation keeps failing, run `REINDEX INDEX CONCURRENTLY <idx>`.
+
+### INSERT throughput drops at high concurrency
+
+**Cause:** Writes are serialized per index inside the BGW. Throughput is bounded by single-threaded SVS add.
+
+**Fix:**
+- Batch rows in multi-row `INSERT` statements from a single backend.
+- Consider splitting logically independent datasets across multiple table partitions — each partition has its own index and its own serialization domain.
+
+### SVSAddPoints failure warning in server log
+
+When `SVSAddPoints` fails, the insert invalidates the cache and returns success to the client — no user-visible error is raised. If you see `WARNING: SVS dynamic add points failed:` frequently in the server log, capture the SVS error message. It typically indicates dimension mismatch or an out-of-memory condition.
+
+### "Index will be rebuilt from table on next query" NOTICE after VACUUM
+
+This notice fires when VACUUM runs but the BGW has not yet loaded the index (e.g., immediately after a server restart before the BGW finishes startup). The BGW loads all indexes from disk and replays the replication slot at startup; once startup completes, subsequent VACUUM operations use the normal incremental path. If you see this notice persistently, verify the BGW is running and check server logs for startup errors.
 
 ---
 
@@ -761,8 +868,15 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
+| `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Worker startup timeout (ms); exceeded → error |
 | `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker response timeout (ms); exceeded → error |
 | `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
+| `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
+| `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
+| `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |
+| `svs.checkpoint_min_ops` | `10000` | — | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
+| `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set |
+| `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set |
 
 ### Operator Classes
 

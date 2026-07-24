@@ -34,6 +34,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_stale_slots');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->start;
 
@@ -92,6 +95,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('cold_cache_vac');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
@@ -138,6 +144,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('bgw_error_recovery');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
@@ -185,87 +194,6 @@ use VamanaTestUtils qw(:all);
 }
 
 # ===========================================================================
-# Save advisory lock released after mutation, not at transaction end
-#
-# Two backends each INSERT into separate indexes in long-running transactions.
-# Both must complete within the timeout; if either blocks for the full sleep
-# duration, the lock is held too long.
-# ===========================================================================
-{
-    my $node = PostgreSQL::Test::Cluster->new('vamana_save_lock');
-    $node->init;
-    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
-    $node->start;
-
-    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
-    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
-
-    my $sl_dim  = 4;
-    my $sl_seed = join(",", ('random()') x $sl_dim);
-    $node->safe_psql('postgres', qq{
-        CREATE TABLE t_lock_a (id serial PRIMARY KEY, val vector($sl_dim));
-        INSERT INTO t_lock_a (val) SELECT ARRAY[$sl_seed]::vector FROM generate_series(1,5);
-        CREATE INDEX ON t_lock_a USING vamana (val vector_l2_ops);
-
-        CREATE TABLE t_lock_b (id serial PRIMARY KEY, val vector($sl_dim));
-        INSERT INTO t_lock_b (val) SELECT ARRAY[$sl_seed]::vector FROM generate_series(1,5);
-        CREATE INDEX ON t_lock_b USING vamana (val vector_l2_ops);
-    });
-
-    my $worker_up = 0;
-    for (1 .. 30) {
-        usleep(500_000);
-        my $pid = $node->safe_psql('postgres',
-            "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
-        chomp $pid;
-        if ($pid =~ /^\d+$/) { $worker_up = 1; last; }
-    }
-    ok($worker_up, 'vamana background worker is running');
-
-    my $tmpdir = File::Temp::tempdir(CLEANUP => 1);
-    my @pids;
-    for my $tbl (qw(t_lock_a t_lock_b)) {
-        my $vec = join(",", map { sprintf("%.4f", rand()) } 1 .. $sl_dim);
-        my $pid = fork();
-        die "fork: $!" unless defined $pid;
-        if ($pid == 0) {
-            eval {
-                $node->safe_psql('postgres', qq{
-                    BEGIN;
-                    INSERT INTO $tbl (val) VALUES (ARRAY[$vec]::vector);
-                    PERFORM pg_sleep(3);
-                    COMMIT;
-                });
-            };
-            _exit(0);
-        }
-        push @pids, $pid;
-    }
-
-    my $start    = time();
-    my $all_done = 1;
-    for my $pid (@pids) {
-        my $remaining = 10 - (time() - $start);
-        if ($remaining <= 0) { $all_done = 0; last; }
-        local $SIG{ALRM} = sub { $all_done = 0; };
-        alarm(int($remaining));
-        waitpid($pid, 0);
-        alarm(0);
-    }
-
-    # Reap any children the timed loop did not wait for, so they cannot
-    # inherit the test process state and run further test code.
-    for my $pid (@pids) { waitpid($pid, POSIX::WNOHANG()) }
-
-    ok($all_done,
-        'concurrent saves on separate indexes complete without blocking each other');
-
-    $node->stop;
-}
-
-# ===========================================================================
 # BGW evicts cache after VACUUM FULL / CLUSTER
 #
 # VACUUM FULL and CLUSTER replace the heap relfilenode without calling any
@@ -276,6 +204,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_relcache_inval');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->start;
 
@@ -335,6 +266,100 @@ use VamanaTestUtils qw(:all);
 }
 
 # ===========================================================================
+# CLUSTER + crash + replay: no stale-slot straddle across the rewrite
+#
+# CLUSTER/VACUUM FULL hold AccessExclusiveLock on the table for the duration
+# of the rewrite, and vamanabuild()'s table_index_build_scan runs under that
+# lock against current heap state. Every row committed before the rewrite
+# starts is captured directly by the rewrite's own synchronous scan -- there
+# is no concurrent writer window, since the lock blocks all writers. Any row
+# a later replay pass would skip on relfilenode mismatch is necessarily
+# already in the graph via the rebuild. This test locks in that guarantee:
+# the row count must hold across the rewrite and a crash/restart with no
+# code-level rescue (no rebuild-from-heap fallback needed -- the graph loads
+# straight from the disk save the rewrite itself wrote).
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_cluster_crash_replay');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+
+    my $rw_dim = 8;
+    my $rw_seed = join(",", ('random()') x $rw_dim);
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE rw_tbl (id serial PRIMARY KEY, val vector($rw_dim));
+        CREATE INDEX rw_idx ON rw_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($node, 30);
+
+    # checkpoint_min_ops=999999 keeps these entirely un-checkpointed: the
+    # slot has not advanced past these rows when the rewrite happens.
+    for my $i (1 .. 5)
+    {
+        $node->safe_psql('postgres',
+            "INSERT INTO rw_tbl (val) VALUES (ARRAY[$rw_seed]::vector);");
+    }
+    wait_for_worker($node, 30);
+
+    my $before = 0;
+    for (1 .. 20)
+    {
+        usleep(500_000);
+        $before = $node->safe_psql('postgres', qq{
+            SELECT count(*) FROM (
+                SELECT * FROM rw_tbl
+                ORDER BY val <-> ARRAY[$rw_seed]::vector LIMIT 10
+            ) sub;
+        });
+        chomp $before;
+        last if $before == 5;
+    }
+    is($before, 5, 'baseline 5 rows searchable before the rewrite');
+
+    # CLUSTER rewrites the heap and the vamana index -> new relfilenode.
+    # vamanabuild() runs its own synchronous scan of current heap state under
+    # the AccessExclusiveLock CLUSTER holds, capturing all 5 rows directly and
+    # serializing that graph to disk.
+    $node->safe_psql('postgres', "CLUSTER rw_tbl USING rw_tbl_pkey;");
+
+    # Crash before any other path could touch the slot or metapage.
+    $node->stop('immediate');
+    $node->start;
+
+    my $post_crash_pid = wait_for_worker($node, 20);
+    ok($post_crash_pid =~ /^\d+$/,
+        "vamana background worker running after crash recovery (pid=$post_crash_pid)");
+
+    my $after = -1;
+    for (1 .. 20)
+    {
+        usleep(500_000);
+        $after = $node->safe_psql('postgres', qq{
+            SELECT count(*) FROM (
+                SELECT * FROM rw_tbl
+                ORDER BY val <-> ARRAY[$rw_seed]::vector LIMIT 10
+            ) sub;
+        });
+        chomp $after;
+        last if $after == 5;
+    }
+    is($after, 5,
+        'rows committed before a mid-pass CLUSTER survive crash + replay');
+
+    $node->stop;
+}
+
+# ===========================================================================
 # indexLocks[] slots freed on DROP INDEX
 #
 # VamanaWorkerShmem.indexLocks[] has VAMANA_MAX_INDEXES (64) slots.
@@ -345,6 +370,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_lock_leak');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'warning'");
     $node->start;
@@ -395,8 +423,6 @@ use VamanaTestUtils qw(:all);
         'no lock slot exhaustion after 64 CREATE+DROP cycles'
     ) or diag(
         "WARNING found — DROP INDEX does not release the indexLocks[] slot.\n"
-      . "Fix: make VamanaReleaseIndexLock non-static, declare it in vamanaworker.h,\n"
-      . "and call it from VamanaObjectAccessHook when access == OAT_DROP.\n"
       . "Log excerpt:\n",
         substr($leak_log, 0, 2000)
     );
@@ -422,6 +448,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_cancel_wait');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->start;
 

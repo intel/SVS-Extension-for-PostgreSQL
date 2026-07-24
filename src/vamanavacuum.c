@@ -48,12 +48,23 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 
 	VamanaWorkerAssertDatabase();
+
+	/*
+	 * BGW unavailability is transient.  Dead vectors are MVCC-invisible and do
+	 * not affect query correctness, so deferring removal is safe.  Blocking
+	 * VACUUM entirely would be worse than the temporary search quality
+	 * degradation caused by leaving dead vectors in the graph.
+	 */
 	if (!VamanaWorkerIsAvailable())
-		ereport(ERROR,
+	{
+		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("vamana background worker unavailable; cannot vacuum index \"%s\"",
+				 errmsg("vamana index \"%s\": background worker unavailable; dead vector removal skipped",
 						RelationGetRelationName(index)),
-				 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
+				 errhint("Dead vectors accumulate in the index graph and may degrade search quality. "
+						 "They will be removed when the background worker restarts and vacuum runs again.")));
+		return stats;
+	}
 
 	VamanaReadMetaPage(index, &meta);
 	tidMappingCapacity = (int) meta.tidMappingCapacity;

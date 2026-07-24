@@ -1,14 +1,12 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 045_vamana_worker_tests.pl
+# Test file covering the Vamana persistence and background-worker feature
+# set, organized into sections:
 #
-# Merged test file covering the Vamana persistence and background-worker
-# feature set.  Previously split across four files:
-#
-#   045_vamana_persistence.pl       -> Section 1: Index persistence
-#   046_vamana_background_worker.pl -> Section 2: Background worker (14 tests)
-#   047_vamana_batch_search.pl      -> Section 3: Native SVS batch search
+#   Section 1: Index persistence
+#   Section 2: Background worker
+#   Section 3: Native SVS batch search
 #
 # Each section spins up its own PostgreSQL cluster so configuration
 # differences (worker on/off, log_min_messages level) are fully isolated.
@@ -205,10 +203,9 @@ sub dir_size
 #
 # Verify that a Vamana index survives a server restart.
 #
-# Before the serialization feature, every cold cache miss triggered a full
-# table rebuild (~500s for large datasets).  After the fix, the index is saved
-# to $PGDATA/vamana_indexes/<oid>/ on CREATE INDEX and loaded from disk on the
-# first post-restart query, skipping the rebuild.
+# The index is saved to $PGDATA/vamana_indexes/<oid>/ on CREATE INDEX and
+# loaded from disk on the first post-restart query, avoiding a full table
+# rebuild.
 #
 # Tests:
 #   1. Query results after a restart match the pre-restart baseline.
@@ -225,6 +222,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_persist');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf',
         # LOG severity sits above NOTICE in PostgreSQL's ordering, so
         # 'notice' captures both NOTICE and LOG messages in the server log.
@@ -429,152 +429,6 @@ sub dir_size
 }
 
 # ===========================================================================
-# SECTION 1b: BGW Save Path
-#
-# Verify that the BGW saves the index after INSERT and handles save failures
-# gracefully.  log_min_messages = 'debug1' makes VamanaSaveIndexToDisk DEBUG1
-# messages visible in the server log.
-#
-# Tests:
-#   A. After INSERT the on-disk directory is present and the server log confirms
-#      the BGW saved the index.
-#   C. When the save directory is unwritable the BGW emits a WARNING; after
-#      permissions are restored the next INSERT triggers a successful save.
-# ===========================================================================
-{
-    my $node = PostgreSQL::Test::Cluster->new('vamana_deferred_save');
-    $node->init;
-    $node->append_conf('postgresql.conf',
-        "shared_preload_libraries = 'svs'");
-    $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
-    $node->start;
-
-    my $pgdata = $node->data_dir;
-
-    $node->safe_psql("postgres", "CREATE EXTENSION vector;");
-    $node->safe_psql("postgres", "CREATE EXTENSION svs;");
-
-    # ---------------------------------------------------------------- Test A --
-    # INSERT invalidates the cache (VamanaInvalidateCache deletes the on-disk
-    # copy).  The subsequent SELECT (a new backend, cold cache) rebuilds the
-    # index from the table, then vamanaendscan saves it before returning
-    # command-complete.  We verify the on-disk directory is re-created and that
-    # the server log confirms VamanaSaveIndexToDisk executed.
-    {
-        $node->safe_psql("postgres", qq(
-            CREATE TABLE ds_tbl (id serial PRIMARY KEY, val vector($dim));
-            INSERT INTO ds_tbl (val)
-                SELECT ARRAY[$array_sql]::vector
-                FROM generate_series(1, 200) i;
-            CREATE INDEX ds_idx ON ds_tbl USING vamana (val vector_l2_ops);
-        ));
-
-        my $index_oid = $node->safe_psql("postgres",
-            "SELECT oid FROM pg_class WHERE relname = 'ds_idx';");
-        chomp $index_oid;
-
-        my $index_dir = "$pgdata/vamana_indexes/$index_oid";
-
-        my $log_pos = length($node->log_content());
-
-        $node->safe_psql("postgres", qq(
-            INSERT INTO ds_tbl (val) VALUES (ARRAY[$array_sql]::vector);
-        ));
-
-        ok(-d $index_dir,
-            'Test A: on-disk index directory present after INSERT (BGW dynamic insert)'
-        );
-
-        my $result = $node->safe_psql("postgres", qq(
-            SET enable_seqscan = off;
-            SELECT id FROM ds_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
-        ));
-
-        isnt($result, '', 'Test A: SELECT after INSERT returns results');
-
-        ok(-d $index_dir,
-            'Test A: on-disk index directory re-created after SELECT (deferred save)'
-        );
-
-        my @saved_files = glob("$index_dir/*");
-        ok(scalar @saved_files > 0,
-            'Test A: on-disk index directory is non-empty after deferred save');
-
-        my $log_a = substr($node->log_content(), $log_pos);
-        like(
-            $log_a,
-            qr/saving vamana index for relation \d+/,
-            'Test A: server log confirms BGW saved index after INSERT write slot'
-        ) or diag("Log after INSERT:\n", $log_a);
-
-        $node->safe_psql("postgres", "DROP TABLE ds_tbl;");
-    }
-
-    # ---------------------------------------------------------------- Test C --
-    {
-        $node->safe_psql("postgres", qq(
-            CREATE TABLE vc_tbl (id serial PRIMARY KEY, val vector($dim));
-            INSERT INTO vc_tbl (val)
-                SELECT ARRAY[$array_sql]::vector
-                FROM generate_series(1, 200) i;
-            CREATE INDEX vc_idx ON vc_tbl USING vamana (val vector_l2_ops);
-        ));
-
-        my $index_oid = $node->safe_psql("postgres",
-            "SELECT oid FROM pg_class WHERE relname = 'vc_idx';");
-        chomp $index_oid;
-
-        my $index_dir   = "$pgdata/vamana_indexes/$index_oid";
-        my $save_parent = "$pgdata/vamana_indexes";
-
-        # chmod 000 before INSERT so the BGW's VamanaSaveIndexToDisk fails
-        # (EACCES on mkdir) and emits a LOG message.
-        # client_min_messages=error suppresses client-level noise so
-        # query_safe does not die on stderr; the message still hits the log.
-        my $bg = $node->background_psql("postgres");
-        $bg->query_safe("SET client_min_messages = error;");
-
-        chmod(0000, $save_parent) or die "chmod 0000 $save_parent: $!";
-
-        my $log_pos_c = length($node->log_content());
-
-        $bg->query_safe(qq(
-            INSERT INTO vc_tbl (val) VALUES (ARRAY[$array_sql]::vector);
-        ));
-
-        chmod(0755, $save_parent) or die "chmod 0755 $save_parent: $!";
-
-        # Second INSERT — BGW retries save (needsSave still true) and succeeds.
-        $bg->query_safe(qq(
-            INSERT INTO vc_tbl (val) VALUES (ARRAY[$array_sql]::vector);
-        ));
-
-        $bg->quit;
-
-        my $log_c = substr($node->log_content(), $log_pos_c);
-
-        like(
-            $log_c,
-            qr/vamana index \d+: (?:periodic save|save after rebuild) failed, will retry/,
-            'Test C: BGW logs save failure when save dir is unwritable'
-        ) or diag("Log during Test C:\n", $log_c);
-
-        like(
-            $log_c,
-            qr/saving vamana index for relation \d+/,
-            'Test C: BGW save succeeds after permissions restored'
-        ) or diag("Log during Test C:\n", $log_c);
-
-        ok(-d $index_dir,
-            'Test C: on-disk index directory exists after BGW save recovery');
-
-        $node->safe_psql("postgres", "DROP TABLE vc_tbl;");
-    }
-
-    $node->stop;
-}
-
-# ===========================================================================
 # SECTION 1c: max_parallel_maintenance_workers does not limit search threads
 #
 # SVSLoadIndex must use SVSDefaultSearchThreads() (nproc-1) rather than
@@ -595,6 +449,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_search_threads');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "max_parallel_maintenance_workers = 2");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
@@ -710,6 +567,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_leanvec_persist');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -853,6 +713,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_bgw');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -1010,9 +873,9 @@ sub dir_size
         'pg_regress-style CREATE then DROP DATABASE completes with worker running');
 
     # ------------------------------------------ test 10: max_batch_size = 1 --
-    # Cap the worker to draining one slot per iteration.  A bug in the
-    # batch-cap logic (e.g. draining 0 slots instead of 1) would cause every
-    # query to hang until the worker timeout.  Three sequential queries through
+    # Cap the worker to draining one slot per iteration.  The batch cap must
+    # drain at least one slot per iteration, or every query would hang until
+    # the worker timeout.  Three sequential queries through
     # separate connections force three distinct worker iterations.
     $node->stop;
     $node->append_conf('postgresql.conf', "svs.max_batch_size = 1");
@@ -1251,6 +1114,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('vamana_batch');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
 
     # DEBUG1 captures "native batch search for N queries" and
     # "sequential search for N queries" emitted by VamanaWorkerRunBatch.
@@ -1457,6 +1323,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('cold_cache_vac');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
@@ -1521,6 +1390,9 @@ sub dir_size
     my $node = PostgreSQL::Test::Cluster->new('bgw_error_recovery');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;

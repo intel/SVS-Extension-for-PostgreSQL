@@ -25,6 +25,9 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
     my $node = PostgreSQL::Test::Cluster->new('vamana_reload_queue');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 16");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->start;
 

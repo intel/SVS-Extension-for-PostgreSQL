@@ -46,6 +46,7 @@ typedef void *SVSIndexHandle;
 #define VAMANA_SLOTKIND_INSERT      1
 #define VAMANA_SLOTKIND_DELETE      2
 #define VAMANA_SLOTKIND_MAINTENANCE 3	/* consolidate / compact */
+#define VAMANA_SLOTKIND_LOAD        4	/* load index from save dir into BGW cache */
 
 /* Maintenance sub-operations (valid when slotKind == VAMANA_SLOTKIND_MAINTENANCE) */
 #define VAMANA_MAINTENANCE_CONSOLIDATE 0
@@ -203,6 +204,9 @@ LWLock *VamanaGetIndexLock(Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
 int		VamanaSlotErrcode(uint8 category);
 
+/* vamanaworker.c */
+extern bool vamana_eviction_suppressed;
+
 /* vamanaworkerindex.c */
 SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid);
 void	VamanaWorkerLoadAllIndexes(void);
@@ -213,6 +217,7 @@ void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);
 
 /* vamanaworkerwrite.c */
 void	VamanaWorkerProcessWriteSlot(int slotIdx);
+void	VamanaWorkerProcessLoadSlot(int slotIdx);
 
 /* Worker entry point.
  * PG 18 replaced pg_attribute_noreturn() with pg_noreturn (placed before
@@ -233,6 +238,15 @@ bool	VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 bool	VamanaWorkerSubmitDelete(Oid indexRelid,
 								 const size_t *externalIds, int nIds);
 bool	VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op);
+bool	VamanaWorkerSubmitLoad(Oid indexRelid,
+							   int dimensions, int graph_degree, int alpha,
+							   int search_window_size, int build_window_size,
+							   int compression_type, int compression_primary,
+							   int compression_secondary, int leanvec_dims,
+							   int distance_type,
+							   int numVectors, int tidMappingCapacity,
+							   uint64 nextExternalId, int numDeleted,
+							   Oid heapRelid, int vectorAttNum);
 void	VamanaReleaseIndexLock(Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
 bool	VamanaWorkerIsAvailable(void);
@@ -242,5 +256,35 @@ void	VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation);
 float		  *VamanaWorkerSlotQueryVec(int slotIdx);
 ItemPointer	   VamanaWorkerSlotResults(int slotIdx);
 float		  *VamanaWorkerSlotDistances(int slotIdx);
+
+/*
+ * Parameters for VAMANA_SLOTKIND_LOAD, packed into the queryVec buffer.
+ *
+ * The backend fills this before setting the slot PENDING; the BGW reads it
+ * inside VamanaWorkerProcessLoadSlot to load the index from its save directory
+ * without opening the index relation (which the backend holds AEL on).
+ *
+ * Size check: sizeof(VamanaLoadParams) must fit in float[VAMANA_MAX_DIM].
+ * float[2000] = 8000 bytes; this struct is ~72 bytes — well within budget.
+ */
+typedef struct VamanaLoadParams
+{
+	int			dimensions;
+	int			graph_degree;
+	int			alpha;				/* int-encoded; convert with VAMANA_ALPHA_TO_FLOAT */
+	int			search_window_size;
+	int			build_window_size;
+	int			compression_type;
+	int			compression_primary;
+	int			compression_secondary;
+	int			leanvec_dims;
+	int			distance_type;		/* cast to SVSDistanceType in the BGW */
+	int			numVectors;
+	int			tidMappingCapacity;
+	uint64		nextExternalId;
+	int			numDeleted;
+	Oid			heapRelid;			/* heap relation OID (for replay decoder) */
+	int			vectorAttNum;		/* 0-based heap attribute number of the vector column */
+} VamanaLoadParams;
 
 #endif							/* VAMANA_WORKER_H */

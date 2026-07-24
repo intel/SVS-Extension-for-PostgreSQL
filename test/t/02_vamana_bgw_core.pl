@@ -20,6 +20,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_bgw');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -100,6 +103,41 @@ use VamanaTestUtils qw(:all);
 
         unlike($burst_log, qr/loading vamana index \d+ from/,
             'no disk load during concurrent query burst — cache was warm at dispatch');
+    }
+
+    # SLOTKIND_LOAD: cache warm after CREATE INDEX — first INSERT must not
+    # trigger a cold load.  The BGW guarantees the cache is warm before
+    # vamanabuild returns, so the first INSERT slot must not emit
+    # "loading vamana index %u from" before calling SVSAddPoints.
+    {
+        $node->safe_psql("postgres", qq(
+            CREATE TABLE warm_tbl (id serial PRIMARY KEY, val vector($dim));
+            INSERT INTO warm_tbl (val)
+                SELECT ARRAY[$array_sql]::vector
+                FROM generate_series(1, 50) i;
+        ));
+
+        my $log_pos_before_create = length($node->log_content());
+
+        $node->safe_psql("postgres",
+            "CREATE INDEX warm_idx ON warm_tbl USING vamana (val vector_l2_ops);");
+
+        my $log_pos_after_create = length($node->log_content());
+
+        $node->safe_psql("postgres", qq(
+            INSERT INTO warm_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+        ));
+
+        my $insert_log = substr($node->log_content(), $log_pos_after_create);
+        unlike($insert_log, qr/loading vamana index \d+ from/,
+            'first INSERT after CREATE INDEX does not trigger a cold BGW cache load');
+
+        my $warm_result = $node->safe_psql("postgres", qq(
+            SET enable_seqscan = off;
+            SELECT id FROM warm_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+        ));
+        isnt($warm_result, '',
+            'search returns results after first INSERT on freshly built index');
     }
 
     $node->safe_psql("postgres", qq(

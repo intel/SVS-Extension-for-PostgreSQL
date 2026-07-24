@@ -286,8 +286,9 @@ bool svs_index_dynamic_add_points(
 
 **Wrapper function:** `SVSAddPoints`
 
-Called from `vamanainsert.c` under a per-index advisory lock
-(`VAMANA_DYNAMIC_WRITE_LOCK_KEY`). External IDs are assigned monotonically from
+Invoked by the background worker (`vamanaworkerwrite.c`) while holding the
+per-index LWLock in exclusive mode (`VamanaGetIndexLock(relid)`, tranche
+`vamana_index_rwlock`). External IDs are assigned monotonically from
 `nextExternalId` on the metapage, preventing collisions across backends.
 
 ### Delete vectors

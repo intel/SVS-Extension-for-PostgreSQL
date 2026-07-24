@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "vamana.h"
+#include "vamana_replication.h"
 #include "vamanaworker.h"
 #include "svs_wrapper.h"
 
@@ -54,6 +55,21 @@ VamanaClearCacheEntry(VamanaIndexCache *entry)
 	}
 	entry->isValid = false;
 	entry->needsSave = false;
+
+	if (entry->tidToExternalId != NULL)
+	{
+		hash_destroy(entry->tidToExternalId);
+		entry->tidToExternalId = NULL;
+	}
+
+	VamanaReplicationClose(entry->replicationSlot);
+	entry->replicationSlot = NULL;
+	entry->lastReplayLsn = InvalidXLogRecPtr;
+	entry->lastReplayWalEnd = InvalidXLogRecPtr;
+	entry->opsSinceCheckpoint = 0;
+	entry->lastWriteTime = 0;
+	entry->lastCheckpointTime = 0;
+	entry->checkpointInProgress = false;
 }
 
 /*
@@ -150,7 +166,6 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	else
 		entry->tidMapping = NULL;
 
-	/* Store index handle and metadata */
 	entry->svsIndex = svsIndex;
 	entry->indexRelid = indexRelid;
 	entry->dimensions = dimensions;
@@ -162,9 +177,109 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	entry->numDeleted = numDeleted;
 	entry->isValid = true;
 
+	/*
+	 * Build the reverse TID → externalId hash from the tidMapping we just
+	 * copied, and reconcile numVectors against it.
+	 *
+	 * The tidMapping and SVS graph are a single checkpoint snapshot; the
+	 * metapage numVectors is bumped per operation and so leads that snapshot
+	 * after a crash between checkpoints.  The live entries in the map are the
+	 * authoritative count for the loaded graph, so derive numVectors from them
+	 * rather than trusting the metapage.  Post-checkpoint operations are
+	 * replayed from WAL afterward, which carries the count forward.
+	 *
+	 * nextExternalId is deliberately NOT reconciled: it is monotonic and
+	 * written in the same transaction as each id assignment, so it is always at
+	 * least maxExternalId + 1.  Lowering it would let a later insert reuse an id
+	 * still held by a soft-deleted graph point.  The Assert documents the
+	 * invariant that makes trusting the metapage value safe.
+	 */
+	entry->tidToExternalId = NULL;
+	if (entry->tidMapping != NULL && capacity > 0)
+	{
+		HASHCTL		hctl;
+		MemoryContext oldCtx;
+		int			liveCount = 0;
+		uint64		maxExternalId PG_USED_FOR_ASSERTS_ONLY = 0;
+
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize   = sizeof(ItemPointerData);
+		hctl.entrysize = sizeof(ItemPointerData) + sizeof(uint64);
+		hctl.hcxt      = TopMemoryContext;
+
+		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+		entry->tidToExternalId = hash_create("vamana tidToExternalId",
+											 capacity > 0 ? capacity : 64,
+											 &hctl,
+											 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		MemoryContextSwitchTo(oldCtx);
+
+		for (int i = 0; i < capacity; i++)
+		{
+			ItemPointerData *tip = &entry->tidMapping[i];
+
+			/* Empty slots hold an invalid TID; a real heap TID never does. */
+			if (!ItemPointerIsValid(tip))
+				continue;
+
+			{
+				bool		found;
+				uint64		eid = (uint64) i;
+				char	   *hentry = (char *) hash_search(entry->tidToExternalId,
+														  tip,
+														  HASH_ENTER,
+														  &found);
+
+				if (!found)
+					memcpy(hentry + sizeof(ItemPointerData), &eid, sizeof(uint64));
+			}
+
+			liveCount++;
+			maxExternalId = (uint64) i;
+		}
+
+		Assert(liveCount == 0 || maxExternalId < nextExternalId);
+		entry->numVectors = liveCount;
+	}
+
+	entry->replicationSlot = NULL;
+	entry->lastReplayLsn = InvalidXLogRecPtr;
+	entry->lastReplayWalEnd = InvalidXLogRecPtr;
+	entry->opsSinceCheckpoint = 0;
+	entry->lastWriteTime = 0;
+	entry->lastCheckpointTime = GetCurrentTimestamp();
+	entry->checkpointInProgress = false;
+
 	ereport(DEBUG1,
 			(errmsg("cached vamana index for relation %u (%d dimensions, degree %d)",
 					indexRelid, dimensions, graph_degree)));
+}
+
+/*
+ * Drop both directions of the TID map for one external id.
+ *
+ * The forward map (tidMapping) and reverse map (tidToExternalId) must stay in
+ * sync: a stale reverse entry left behind after a delete resolves a reused TID
+ * to a dead external id, misfiling the next insert.  Callers invoke this after
+ * the point has been removed from the SVS index.  Safe to call for an id that
+ * is out of range or already invalid.
+ */
+void
+VamanaCacheForgetExternalId(VamanaIndexCache *cache, size_t externalId)
+{
+	ItemPointerData tid;
+
+	if (externalId >= (size_t) cache->tidMappingCapacity)
+		return;
+
+	tid = cache->tidMapping[externalId];
+	if (!ItemPointerIsValid(&tid))
+		return;
+
+	if (cache->tidToExternalId != NULL)
+		hash_search(cache->tidToExternalId, &tid, HASH_REMOVE, NULL);
+
+	ItemPointerSetInvalid(&cache->tidMapping[externalId]);
 }
 
 /*
@@ -287,6 +402,29 @@ VamanaEvictAllCacheEntries(void)
 }
 
 /*
+ * Fill `out` with the OIDs of all currently valid cache entries.
+ * Returns the number written; callers must size `out` to VAMANA_MAX_CACHED_INDEXES.
+ *
+ * Taking a snapshot of OIDs before iterating lets callers call VamanaGetCache()
+ * per-entry without holding any lock, and gracefully handles mid-loop evictions
+ * (VamanaGetCache returns NULL for a stale OID).
+ */
+int
+VamanaGetAllCachedRelids(Oid *out, int maxout)
+{
+	int			n = 0;
+
+	for (int i = 0; i < vamanaCacheUsed && n < maxout; i++)
+	{
+		VamanaIndexCache *entry = vamanaCacheSlots[i];
+
+		if (entry != NULL && entry->isValid)
+			out[n++] = entry->indexRelid;
+	}
+	return n;
+}
+
+/*
  * VamanaEvictCacheEntry - worker-safe cache eviction.
  *
  * Frees the in-process SVS handle and TID mapping for the given index and
@@ -307,6 +445,20 @@ VamanaEvictCacheEntry(Oid indexRelid)
 			(errmsg("evicting vamana cache entry for relation %u", indexRelid)));
 
 	VamanaClearCacheEntry(entry);
+}
+
+/*
+ * Discard cached, on-disk, and slot state so the index is rebuilt from the
+ * heap on next access.  Deletes the save dir (unlike VamanaEvictCacheEntry) so
+ * the stale copy is not reloaded.  The slot drop no-ops while the slot is
+ * active, so the caller must release it first.
+ */
+void
+VamanaForceHeapRebuild(Oid indexRelid)
+{
+	VamanaReplicationDropIfExists(MyDatabaseId, indexRelid);
+	VamanaDeleteSaveDir(indexRelid);
+	VamanaEvictCacheEntry(indexRelid);
 }
 
 /* Previous hook in the chain (NULL if none installed before us) */
@@ -331,6 +483,7 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	{
 		VamanaDeleteSaveDir(objectId);
 		VamanaReleaseIndexLock(objectId);
+		VamanaReplicationDropIfExists(MyDatabaseId, objectId);
 	}
 }
 

@@ -20,8 +20,9 @@
  *
  * On transaction COMMIT: the log is discarded.
  *
- * Subtransactions: VamanaUndoAppendSub() tags the entry with the current
- * subxid so VamanaSubXactCallback can roll back only the aborting sub.
+ * Subtransactions: each entry recorded by VamanaUndoAppend() carries the
+ * current subxid so VamanaSubXactCallback can roll back only the aborting
+ * subtransaction's entries.
  */
 
 void	VamanaUndoAppend(Oid indexRelid, uint64 externalId);

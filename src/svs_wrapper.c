@@ -631,12 +631,13 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 	if (!ok || !svs_error_ok(error))
 	{
 		const char *msg = svs_error_get_message(error);
+		char	   *saved = pstrdup(msg ? msg : "unknown error");
 
 		svs_error_free(error);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to save SVS index to \"%s\": %s",
-						path, msg ? msg : "unknown error")));
+						path, saved)));
 		return -1;				/* unreachable */
 	}
 

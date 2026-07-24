@@ -149,7 +149,7 @@ SerializeIndexToPages(VamanaBuildState * buildstate, SVSIndexHandle svsIndex)
 	VamanaSaveIndexToDisk(buildstate->index, svsIndex, buildstate->forkNum, &meta);
 }
 
-/* Valid compression values (moved from vamana.h: only used here) */
+/* Valid compression values; used only in this file */
 static const int VAMANA_VALID_COMPRESSION_VALUES[] = {
 	VAMANA_LEANVEC_UINT4,
 	VAMANA_LEANVEC_INT4,
@@ -415,25 +415,52 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	VamanaWorkerAssertDatabase();
 
+	/*
+	 * Synchronous warm-up: send a LOAD slot to the BGW so the index is in
+	 * the worker cache before this transaction commits.  We read the
+	 * authoritative values back from the metapage rather than using
+	 * buildstate fields directly, because
+	 * SerializeIndexToPages may have adjusted counters.
+	 *
+	 * leanvec_dims and distance_type are not stored on the metapage; read
+	 * them from storage options / the AM support function.
+	 */
 	{
-		Oid			relid = RelationGetRelid(index);
+		Oid				relid = RelationGetRelid(index);
+		VamanaMetaPageData meta;
+		VamanaOptions  *opts = (VamanaOptions *) index->rd_options;
+
+		VamanaReadMetaPage(index, &meta);
 
 		if (VamanaWorkerIsAvailable())
 		{
-			/*
-			 * Signal the BGW to reload this index asynchronously.  We still
-			 * hold AccessExclusiveLock, so the BGW cannot open the relation
-			 * until this transaction commits.
-			 */
-			VamanaWorkerSignalReload(relid);
+			if (!VamanaWorkerSubmitLoad(
+					relid,
+					(int) meta.dimensions,
+					(int) meta.graph_degree,
+					(int) meta.alpha,
+					opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW,
+					(opts && opts->build_window_size > 0) ? opts->build_window_size : 0,
+					(int) meta.compression_type,
+					(int) meta.compression_primary,
+					(int) meta.compression_secondary,
+					opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS,
+					(int) VamanaGetDistanceMetric(index),
+					(int) meta.numVectors,
+					(int) meta.tidMappingCapacity,
+					meta.nextExternalId,
+					(int) meta.numDeleted,
+					RelationGetRelid(heap),
+					index->rd_index->indkey.values[0] - 1))
+			{
+				ereport(WARNING,
+						(errmsg("vamana index \"%s\": background worker load failed; "
+								"index will be adopted by the worker on startup",
+								RelationGetRelationName(index))));
+			}
 		}
 		else
 		{
-			/*
-			 * BGW not yet up (narrow startup race on first CREATE INDEX).
-			 * The index was saved to disk; the BGW will adopt it when it
-			 * finishes loading all indexes at startup.
-			 */
 			ereport(WARNING,
 					(errmsg("vamana index \"%s\": background worker not yet available; "
 							"index will be adopted by the worker on startup",

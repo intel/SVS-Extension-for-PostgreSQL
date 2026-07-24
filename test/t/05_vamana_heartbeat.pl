@@ -23,6 +23,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_heartbeat');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->start;
 

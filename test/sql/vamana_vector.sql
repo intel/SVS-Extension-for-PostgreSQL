@@ -499,7 +499,7 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
 
--- rebuild preserves compression_type (issue #94)
+-- rebuild preserves compression_type
 -- VamanaRebuildFromTable must use LeanVec storage, not hardcoded FP32.
 
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
@@ -513,7 +513,7 @@ DROP TABLE t;
 
 -- search_window_size forwarding to SVS
 -- Verify that the GUC value is actually forwarded to svs_index_search() at query
--- time (issue #49).  Build a dataset large enough that search_window_size has a
+-- time.  Build a dataset large enough that search_window_size has a
 -- meaningful effect, then query with the minimum and a large value and confirm
 -- both return the expected nearest neighbors.
 
@@ -541,8 +541,7 @@ DROP TABLE t;
 
 -- max_parallel_maintenance_workers does not limit search
 -- The build thread count (governed by this GUC) must be decoupled from the
--- search thread count.  Setting it to 1 must not prevent correct search results
--- (regression guard for the SVSLoadIndex thread-pool bug).
+-- search thread count.  Setting it to 1 must not prevent correct search results.
 SET max_parallel_maintenance_workers = 1;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');

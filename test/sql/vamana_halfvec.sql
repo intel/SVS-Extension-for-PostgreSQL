@@ -490,7 +490,7 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
 
--- rebuild preserves compression_type (issue #94)
+-- rebuild preserves compression_type
 -- VamanaRebuildFromTable must use LeanVec storage, not hardcoded FP32.
 
 CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));

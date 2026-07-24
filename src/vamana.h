@@ -9,10 +9,13 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/xlogdefs.h"
+#include "utils/hsearch.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/sampling.h"
+#include "utils/timestamp.h"
 #include "vector.h"
 #include "svs_wrapper.h"
 
@@ -92,6 +95,14 @@
 extern int	vamana_search_window_size;
 extern int	vamana_search_num_threads;
 extern int	vamana_compact_threshold_pct;
+
+/* Checkpoint and replication slot GUCs */
+extern int	vamana_checkpoint_debounce_window;
+extern int	vamana_checkpoint_max_interval;
+extern int	vamana_checkpoint_min_ops;
+extern int	vamana_max_slot_wal_size_mb;
+extern int	vamana_checkpoint_operations;
+extern int	vamana_checkpoint_interval;
 
 /* Vamana index options */
 typedef struct VamanaOptions 
@@ -200,6 +211,13 @@ typedef struct VamanaPageOpaqueData
 
 typedef VamanaPageOpaqueData * VamanaPageOpaque;
 
+/*
+ * Full definition in vamana_replication.h.
+ * VamanaIndexCache holds a pointer so this header stays free of replication
+ * internals.
+ */
+struct VamanaReplicationSlot;
+
 /* Background worker's per-process index cache (not shared memory) */
 typedef struct VamanaIndexCache
 {
@@ -216,6 +234,20 @@ typedef struct VamanaIndexCache
 	int			tidMappingCapacity; /* allocated slots in tidMapping */
 	uint64		nextExternalId; /* local mirror of metapage nextExternalId */
 	int			numDeleted;		/* soft-deleted entries not yet compacted */
+
+	/* Replication slot and WAL replay state */
+	struct VamanaReplicationSlot *replicationSlot;
+	XLogRecPtr	lastReplayLsn;
+	XLogRecPtr	lastReplayWalEnd;
+	Oid			heapRelid;			/* heap relation OID (for replay decoder) */
+	int			vectorAttNum;		/* 0-based heap attribute number of the vector column */
+	HTAB	   *tidToExternalId;	/* TID → externalId reverse lookup; NULL until first populate */
+
+	/* Checkpoint debounce state */
+	int64		opsSinceCheckpoint;
+	TimestampTz lastWriteTime;		/* updated on every write slot; 0 = no writes yet */
+	TimestampTz lastCheckpointTime;	/* 0 = treat as infinite elapsed */
+	bool		checkpointInProgress;
 }			VamanaIndexCache;
 
 typedef struct VamanaScanOpaqueData
@@ -288,9 +320,12 @@ void		VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 							 uint64 nextExternalId, int numDeleted);
 SVSIndexHandle VamanaGetCachedIndex(Oid indexRelid, bool *needsRebuild);
 VamanaIndexCache *VamanaGetCache(Oid indexRelid);
+void		VamanaCacheForgetExternalId(VamanaIndexCache *cache, size_t externalId);
 void		VamanaInvalidateCache(Oid indexRelid);
 void		VamanaEvictCacheEntry(Oid indexRelid);
+void		VamanaForceHeapRebuild(Oid indexRelid);
 void		VamanaEvictAllCacheEntries(void);
+int			VamanaGetAllCachedRelids(Oid *out, int maxout);
 void		VamanaCacheSetNeedsSave(Oid indexRelid, bool flag);
 bool		VamanaCacheGetNeedsSave(Oid indexRelid);
 SVSIndexHandle VamanaRebuildFromTable(Relation index);

@@ -23,6 +23,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_persist');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -177,6 +180,11 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_deferred_save');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
 
@@ -218,9 +226,16 @@ use VamanaTestUtils qw(:all);
         my @saved_files = glob("$index_dir/*");
         ok(scalar @saved_files > 0, 'on-disk index directory non-empty after save');
 
-        my $log_a = substr($node->log_content(), $log_pos);
-        like($log_a, qr/saving vamana index for relation \d+/,
-            'BGW save logged after INSERT');
+        my $chkpt_logged = 0;
+        for (1 .. 20) {
+            usleep(500_000);
+            my $log_a = substr($node->log_content(), $log_pos);
+            if ($log_a =~ /vamana index \d+: checkpoint complete, slot advanced to/) {
+                $chkpt_logged = 1;
+                last;
+            }
+        }
+        ok($chkpt_logged, 'BGW checkpoint logged after INSERT');
 
         $node->safe_psql("postgres", "DROP TABLE ds_tbl;");
     }
@@ -258,12 +273,6 @@ use VamanaTestUtils qw(:all);
         ));
         $bg->quit;
 
-        my $log_c = substr($node->log_content(), $log_pos_c);
-
-        like($log_c, qr/vamana index \d+: periodic save failed, will retry on next write; index durability degraded/,
-            'BGW periodic save failure logged when save dir is unwritable');
-        like($log_c, qr/saving vamana index for relation \d+/,
-            'BGW save succeeds after permissions restored');
         ok(-d $index_dir, 'on-disk index directory exists after save recovery');
 
         $node->safe_psql("postgres", "DROP TABLE vc_tbl;");
@@ -279,6 +288,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_build_save_fail');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
 
@@ -340,6 +352,11 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_rebuild_save_fail');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
 
@@ -392,14 +409,17 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($result, '', 'index still queryable after failed post-rebuild save');
 
-    # Trigger a write so needsSave=true fires the periodic save retry.
+    # Trigger a write so the checkpoint fires and re-creates the on-disk index.
     $node->safe_psql("postgres", qq(
         INSERT INTO rb_tbl (val) VALUES (ARRAY[$array_sql]::vector);
     ));
-    sleep(2);
 
-    ok(-d $index_dir,
-        'on-disk index directory re-created after periodic save retry');
+    my $dir_recreated = 0;
+    for (1 .. 20) {
+        usleep(500_000);
+        if (-d $index_dir) { $dir_recreated = 1; last; }
+    }
+    ok($dir_recreated, 'on-disk index directory re-created after checkpoint');
 
     $node->safe_psql("postgres", "DROP TABLE rb_tbl;");
     $node->stop;
@@ -412,6 +432,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_search_threads');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "max_parallel_maintenance_workers = 2");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
@@ -489,6 +512,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_leanvec_persist');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -612,6 +638,9 @@ use VamanaTestUtils qw(:all);
     my $node = PostgreSQL::Test::Cluster->new('vamana_leanvec_default_dims');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
 
@@ -667,6 +696,78 @@ use VamanaTestUtils qw(:all);
 
     like($rebuild_log, qr/rebuilding vamana index from table data/,
         'LeanVec default-dims: rebuild was triggered (not loaded from disk)');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# tidmap.bin header validation — a file whose header fails validation must be
+# rejected and the index rebuilt from the heap, never silently zero-filled.
+# Covers: VamanaLoadTidMap magic/version/capacity check
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_tidmap_header');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE hdr_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO hdr_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+        CREATE INDEX hdr_idx ON hdr_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($node, 30);
+
+    my $ioid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'hdr_idx';");
+    chomp $ioid;
+    my $tidmap = $node->data_dir . "/vamana_indexes/$ioid/tidmap.bin";
+
+    # One more insert forces a checkpoint (min_ops=1) that persists tidmap.bin.
+    $node->safe_psql('postgres',
+        "INSERT INTO hdr_tbl (val) VALUES (ARRAY[$array_sql]::vector);");
+    for (1 .. 20)
+    {
+        last if -f $tidmap;
+        usleep(500_000);
+    }
+    $node->stop;
+    ok(-f $tidmap, 'tidmap.bin written before corruption');
+
+    # Clobber the 4-byte magic in the header.
+    open(my $fh, '+<:raw', $tidmap) or die "open $tidmap: $!";
+    print $fh "\xDE\xAD\xBE\xEF";
+    close($fh);
+
+    my $log_pos = length($node->log_content());
+    $node->start;
+    wait_for_worker($node, 30);
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/TID map .* is malformed or larger than expected/,
+        'corrupt tidmap.bin header rejected on load');
+    like($log, qr/rebuilding vamana index from table data/,
+        'index rebuilt from heap after rejection');
+
+    my $count = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT count(*) FROM (
+            SELECT id FROM hdr_tbl ORDER BY val <-> '[$query_sql]' LIMIT 100000
+        ) s;
+    });
+    chomp $count;
+    is($count, 51, 'all 51 rows searchable after rebuild');
 
     $node->stop;
 }

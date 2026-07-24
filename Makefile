@@ -8,6 +8,8 @@ MODULE_big = svs
 DATA = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/svs.o \
        src/vamana.o \
+       src/vamana_replication.o \
+       src/vamana_checkpoint.o \
        src/vamana_undo.o \
        src/vamanabuild.o \
        src/vamanacache.o \
@@ -65,6 +67,10 @@ SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Expose the build's injection-point setting to TAP tests (fault-path tests
+# skip themselves when it is not 'yes').
+export enable_injection_points
 
 # for Mac
 ifeq ($(PROVE),)

@@ -97,155 +97,193 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	 * Acquire the per-index r/w lock in shared mode for the duration of all
 	 * searches in this batch.  This serializes against concurrent writes
 	 * (INSERT, DELETE, MAINTENANCE) that hold LW_EXCLUSIVE.
+	 *
+	 * PG_TRY catches any ereport(ERROR) from the SVS library (e.g. a deleted
+	 * entry point that survived a ROLLBACK before consolidate could repair it).
+	 * Without this, an uncaught ERROR propagates to the BGW top-level handler
+	 * and kills the worker.
 	 */
 	{
 		LWLock	   *rwlock = VamanaGetIndexLock(relid);
+		bool		batch_done = false;
 
 		if (rwlock != NULL)
 			LWLockAcquire(rwlock, LW_SHARED);
 
-		/*
-		 * Native batch path: if all slots share the same k and dimensions,
-		 * pack query vectors into one buffer and call SVSBatchSearch once.
-		 * Far more efficient than N sequential single-query calls.  Falls
-		 * back to the sequential loop when n==1 or slots have heterogeneous
-		 * k/dimensions.
-		 */
-		if (n > 1)
+		PG_TRY();
 		{
-			VamanaWorkerSlot *first = &VamanaWorkerShmemPtr->slots[slotIdxs[0]];
-			int			k0 = first->k;
-			int			dims0 = first->dimensions;
-			bool		uniform = true;
-
-			for (int i = 1; i < n; i++)
+			/*
+			 * Native batch path: if all slots share the same k and dimensions,
+			 * pack query vectors into one buffer and call SVSBatchSearch once.
+			 * Far more efficient than N sequential single-query calls.  Falls
+			 * back to the sequential loop when n==1 or slots have heterogeneous
+			 * k/dimensions.
+			 */
+			if (n > 1)
 			{
-				VamanaWorkerSlot *s = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+				VamanaWorkerSlot *first = &VamanaWorkerShmemPtr->slots[slotIdxs[0]];
+				int			k0 = first->k;
+				int			dims0 = first->dimensions;
+				bool		uniform = true;
 
-				if (s->k != k0 || s->dimensions != dims0 ||
-					s->searchWindowSize != first->searchWindowSize)
+				for (int i = 1; i < n; i++)
 				{
-					uniform = false;
-					break;
+					VamanaWorkerSlot *s = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+
+					if (s->k != k0 || s->dimensions != dims0 ||
+						s->searchWindowSize != first->searchWindowSize)
+					{
+						uniform = false;
+						break;
+					}
+				}
+
+				if (uniform)
+				{
+					int			k = k0;
+					int			dims = dims0;
+					float	   *queryBuf;
+					int		   *nrBuf;
+					ItemPointerData *resBuf;
+					float	   *distBuf;
+					int			total;
+
+					ereport(DEBUG1,
+							(errmsg("vamana worker: native batch search for %d queries "
+									"(index %u, k=%d, dims=%d)",
+									n, relid, k, dims)));
+
+					queryBuf = palloc((size_t) n * dims * sizeof(float));
+					nrBuf = palloc(n * sizeof(int));
+					resBuf = palloc((size_t) n * k * sizeof(ItemPointerData));
+					distBuf = palloc((size_t) n * k * sizeof(float));
+
+					for (int i = 0; i < n; i++)
+						memcpy(queryBuf + (size_t) i * dims,
+							   VamanaWorkerSlotQueryVec(slotIdxs[i]),
+							   dims * sizeof(float));
+
+					total = SVSBatchSearch(relid, index,
+										   queryBuf, n,
+										   dims, k,
+										   first->searchWindowSize,
+										   resBuf, distBuf,
+										   nrBuf);
+
+					for (int i = 0; i < n; i++)
+					{
+						int			slotIdx = slotIdxs[i];
+						VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+
+						if (total >= 0)
+						{
+							int			nr = nrBuf[i];
+							ItemPointer resptr = VamanaWorkerSlotResults(slotIdx);
+							float	   *distptr = VamanaWorkerSlotDistances(slotIdx);
+
+							if (nr > 0)
+							{
+								memcpy(resptr, resBuf + (size_t) i * k,
+									   nr * sizeof(ItemPointerData));
+								memcpy(distptr, distBuf + (size_t) i * k,
+									   nr * sizeof(float));
+							}
+							slot->numResults = nr;
+							pg_write_barrier();
+							pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+						}
+						else
+						{
+							slot->numResults = 0;
+							snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+									 "SVS batch search failed");
+							slot->errorCategory = VAMANA_ERR_INTERNAL;
+							pg_write_barrier();
+							pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+						}
+					}
+
+					pfree(queryBuf);
+					pfree(nrBuf);
+					pfree(resBuf);
+					pfree(distBuf);
+
+					batch_done = true;
 				}
 			}
 
-			if (uniform)
+			if (!batch_done)
 			{
-				int			k = k0;
-				int			dims = dims0;
-				float	   *queryBuf;
-				int		   *nrBuf;
-				ItemPointerData *resBuf;
-				float	   *distBuf;
-				int			total;
-
+				/*
+				 * Sequential fallback: n==1, or slots have heterogeneous
+				 * k/dimensions.
+				 */
 				ereport(DEBUG1,
-						(errmsg("vamana worker: native batch search for %d queries "
-								"(index %u, k=%d, dims=%d)",
-								n, relid, k, dims)));
-
-				queryBuf = palloc((size_t) n * dims * sizeof(float));
-				nrBuf = palloc(n * sizeof(int));
-				resBuf = palloc((size_t) n * k * sizeof(ItemPointerData));
-				distBuf = palloc((size_t) n * k * sizeof(float));
-
-				for (int i = 0; i < n; i++)
-					memcpy(queryBuf + (size_t) i * dims,
-						   VamanaWorkerSlotQueryVec(slotIdxs[i]),
-						   dims * sizeof(float));
-
-				total = SVSBatchSearch(relid, index,
-									   queryBuf, n,
-									   dims, k,
-									   first->searchWindowSize,
-									   resBuf, distBuf,
-									   nrBuf);
+						(errmsg("vamana worker: sequential search for %d %s (index %u)",
+								n,
+								(n == 1) ? "query" : "queries (heterogeneous k/dims)",
+								relid)));
 
 				for (int i = 0; i < n; i++)
 				{
 					int			slotIdx = slotIdxs[i];
 					VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+					float	   *qvec = VamanaWorkerSlotQueryVec(slotIdx);
+					ItemPointer resptr = VamanaWorkerSlotResults(slotIdx);
+					float	   *distptr = VamanaWorkerSlotDistances(slotIdx);
+					int			nr;
 
-					if (total >= 0)
-					{
-						int			nr = nrBuf[i];
-						ItemPointer resptr = VamanaWorkerSlotResults(slotIdx);
-						float	   *distptr = VamanaWorkerSlotDistances(slotIdx);
+					nr = SVSSearch(relid, index,
+								   qvec, slot->dimensions,
+								   slot->k, slot->searchWindowSize,
+								   resptr, distptr);
 
-						if (nr > 0)
-						{
-							memcpy(resptr, resBuf + (size_t) i * k,
-								   nr * sizeof(ItemPointerData));
-							memcpy(distptr, distBuf + (size_t) i * k,
-								   nr * sizeof(float));
-						}
-						slot->numResults = nr;
-						pg_write_barrier();
-						pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-					}
-					else
+					slot->numResults = (nr >= 0) ? nr : 0;
+
+					if (nr < 0)
 					{
-						slot->numResults = 0;
 						snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-								 "SVS batch search failed");
+								 "SVS search failed with code %d", nr);
 						slot->errorCategory = VAMANA_ERR_INTERNAL;
-						pg_write_barrier();
-						pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
 					}
+
+					pg_write_barrier();
+					pg_atomic_write_u32(&slot->status,
+										(nr >= 0) ? VAMANA_SLOT_DONE : VAMANA_SLOT_ERROR);
 				}
-
-				pfree(queryBuf);
-				pfree(nrBuf);
-				pfree(resBuf);
-				pfree(distBuf);
-
-				if (rwlock != NULL)
-					LWLockRelease(rwlock);
-				return;
 			}
+
+			if (rwlock != NULL)
+				LWLockRelease(rwlock);
 		}
-
-		/*
-		 * Sequential fallback: n==1, or slots have heterogeneous
-		 * k/dimensions.
-		 */
-		ereport(DEBUG1,
-				(errmsg("vamana worker: sequential search for %d %s (index %u)",
-						n,
-						(n == 1) ? "query" : "queries (heterogeneous k/dims)",
-						relid)));
-
-		for (int i = 0; i < n; i++)
+		PG_CATCH();
 		{
-			int			slotIdx = slotIdxs[i];
-			VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
-			float	   *qvec = VamanaWorkerSlotQueryVec(slotIdx);
-			ItemPointer resptr = VamanaWorkerSlotResults(slotIdx);
-			float	   *distptr = VamanaWorkerSlotDistances(slotIdx);
-			int			nr;
+			ErrorData  *edata;
 
-			nr = SVSSearch(relid, index,
-						   qvec, slot->dimensions,
-						   slot->k, slot->searchWindowSize,
-						   resptr, distptr);
+			if (rwlock != NULL)
+				LWLockRelease(rwlock);
 
-			slot->numResults = (nr >= 0) ? nr : 0;
+			edata = CopyErrorData();
+			FlushErrorState();
 
-			if (nr < 0)
+			ereport(LOG,
+					(errmsg("vamana worker: search error on index %u: %s",
+							relid, edata->message ? edata->message : "unknown")));
+			FreeErrorData(edata);
+
+			for (int i = 0; i < n; i++)
 			{
+				VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+
+				slot->numResults = 0;
 				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-						 "SVS search failed with code %d", nr);
+						 "vamana worker: search error on index %u", relid);
 				slot->errorCategory = VAMANA_ERR_INTERNAL;
+				pg_write_barrier();
+				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
 			}
-
-			pg_write_barrier();
-			pg_atomic_write_u32(&slot->status,
-								(nr >= 0) ? VAMANA_SLOT_DONE : VAMANA_SLOT_ERROR);
 		}
-
-		if (rwlock != NULL)
-			LWLockRelease(rwlock);
+		PG_END_TRY();
 	}
 }
 

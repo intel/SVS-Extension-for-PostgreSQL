@@ -48,6 +48,13 @@ int			vamana_worker_restart_time = 5;
 int			vamana_max_batch_size = 0;
 char	   *vamana_worker_database = NULL;
 
+int			vamana_checkpoint_debounce_window = 300;
+int			vamana_checkpoint_max_interval = 3600;
+int			vamana_checkpoint_min_ops = 10000;
+int			vamana_max_slot_wal_size_mb = 10240;	/* 10 GB */
+int			vamana_checkpoint_operations = -1;		/* -1 = off (simple count-based trigger) */
+int			vamana_checkpoint_interval = -1;		/* -1 = off (simple time-based trigger) */
+
 relopt_kind vamana_relopt_kind;
 
 void
@@ -176,6 +183,73 @@ VamanaInit(void)
 							10, 0, 100,
 							PGC_USERSET,
 							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.checkpoint_debounce_window",
+							"Seconds of write inactivity to wait before triggering a checkpoint after a burst",
+							"Works with svs.checkpoint_min_ops: both must be satisfied before a checkpoint "
+							"fires (AND-logic). Prevents expensive checkpoints during brief idle gaps in "
+							"otherwise active workloads.",
+							&vamana_checkpoint_debounce_window,
+							300, 0, 86400,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.checkpoint_max_interval",
+							"Maximum seconds between checkpoints when svs.checkpoint_min_ops is met",
+							"Safety net for sustained-write workloads that never go quiet: ensures the "
+							"replication slot advances and WAL does not accumulate unboundedly even if "
+							"the debounce window never fires.",
+							&vamana_checkpoint_max_interval,
+							3600, 1, 86400,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.checkpoint_min_ops",
+							"Minimum number of index operations required before a checkpoint is eligible",
+							"Acts as a filter in the AND-logic debounce: prevents costly full-graph saves "
+							"for trivial write volumes where replaying from the slot on restart would be "
+							"cheaper than the checkpoint itself.",
+							&vamana_checkpoint_min_ops,
+							10000, 0, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.max_slot_wal_size",
+							"Maximum replication slot WAL lag in megabytes before dropping and rebuilding from heap",
+							"If the slot falls this far behind (BGW down, infrequent checkpoints, or long "
+							"transactions), the slot is dropped and the index is rebuilt from the heap on "
+							"next BGW startup to bound disk usage.",
+							&vamana_max_slot_wal_size_mb,
+							10240, 64, MAX_KILOBYTES,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	/*
+	 * Simple count/time-based checkpoint triggers, independent of debounce logic.
+	 * -1 (off) means the AND-logic debounce controls checkpoint timing.
+	 * Setting either to a positive value activates simple OR-logic behavior instead.
+	 */
+	DefineCustomIntVariable("svs.checkpoint_operations",
+							"Operation count trigger for checkpoint (-1 = off; independent of debounce logic)",
+							NULL,
+							&vamana_checkpoint_operations,
+							-1, -1, INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.checkpoint_interval",
+							"Time-based trigger for checkpoint in seconds (-1 = off; independent of debounce logic)",
+							NULL,
+							&vamana_checkpoint_interval,
+							-1, -1, 86400,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
 							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("svs");

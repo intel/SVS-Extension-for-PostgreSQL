@@ -32,6 +32,9 @@ sub make_search_sql
     my $node = PostgreSQL::Test::Cluster->new('vamana_batch');
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
     $node->start;
 

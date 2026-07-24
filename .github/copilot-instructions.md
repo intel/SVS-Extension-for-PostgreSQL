@@ -36,7 +36,7 @@ pgvector is a PostgreSQL extension providing vector similarity search with ACID 
 - IPC: each backend has a `VamanaWorkerSlot` in `VamanaWorkerShmem`; backend writes request, sets status to PENDING, wakes BGW latch, waits on its own latch for DONE/ERROR
 - BGW-private `VamanaIndexCache` (max 8 indexes, FIFO eviction) holds deserialized SVS index handles; backends never access this directly
 - Batch build: buffer all vectors from table scan → call SVS `svs_index_build_dynamic()` → serialize to filesystem; BGW owns all index handles
-- On-disk persistence: index data serialized to filesystem via `SVSSaveIndex()`/`SVSLoadIndex()`, TID mappings in `tidmap.bin`; `VAMANA_SAVE_LOCK_KEY` advisory lock serializes disk saves
+- On-disk persistence: index data serialized to filesystem via `SVSSaveIndex()`/`SVSLoadIndex()`, TID mappings in `tidmap.bin`; disk saves run inside write processing while the BGW holds the exclusive per-index LWLock, so no separate save lock is needed
 - Searches: backend submits via `VamanaWorkerSubmitSearch()`; BGW batches same-dimension queries via `SVSBatchSearch()` under LW_SHARED per-index lock
 - Writes (INSERT/DELETE): BGW holds LW_EXCLUSIVE per-index lock; per-index `VamanaIndexLockSlot` array (max 64 indexes) lives in shared memory
 - Operator classes support only `<->` (L2), `<#>` (inner product), `<=>` (cosine) — not L1/Hamming/Jaccard

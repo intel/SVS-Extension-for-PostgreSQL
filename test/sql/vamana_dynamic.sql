@@ -195,7 +195,7 @@ SELECT count(*) FROM (SELECT * FROM t_undo ORDER BY val <-> '[0,0,0]' LIMIT 2000
 DROP TABLE t_undo;
 
 -- -------------------------------------------------------------------------
--- #92: TRUNCATE must not leave stale cache — post-TRUNCATE query returns empty.
+-- TRUNCATE must not leave stale cache — post-TRUNCATE query returns empty.
 -- -------------------------------------------------------------------------
 CREATE TABLE t_trunc (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t_trunc (val) VALUES ('[1,1,1]'), ('[2,2,2]'), ('[3,3,3]');
@@ -212,7 +212,7 @@ SELECT count(*) FROM (SELECT * FROM t_trunc ORDER BY val <-> '[1,1,1]' LIMIT 10)
 DROP TABLE t_trunc;
 
 -- -------------------------------------------------------------------------
--- #42: SVSLoadDynamicIndex build-window fallback must match build-time logic.
+-- SVSLoadDynamicIndex build-window fallback must match build-time logic.
 -- When build_window_size is unset (0) and search_window_size is non-zero,
 -- the load path must use graph_degree*2, not search_window_size.
 -- -------------------------------------------------------------------------

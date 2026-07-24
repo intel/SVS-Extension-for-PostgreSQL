@@ -27,6 +27,26 @@
 #include <sys/stat.h>
 
 /*
+ * On-disk header prefixing the sidecar TID-map file.  Records the slot count
+ * so the loader can reject a file written at a different capacity or format
+ * instead of silently zero-filling a short read.  Bump the version on any
+ * format change.
+ */
+#define VAMANA_TIDMAP_MAGIC		0x53565354	/* "SVST" */
+#define VAMANA_TIDMAP_VERSION	1
+
+typedef struct VamanaTidMapHeader
+{
+	uint32		magic;
+	uint32		version;
+	uint32		capacity;		/* ItemPointerData slots following the header */
+	uint32		reserved;		/* zero; pads to 8-byte alignment */
+} VamanaTidMapHeader;
+
+StaticAssertDecl(sizeof(VamanaTidMapHeader) == 16,
+				 "VamanaTidMapHeader size changed — update readers/writers");
+
+/*
  * Construct the save-directory path for a vamana index.
  * Convention: $PGDATA/vamana_indexes/<relid>/
  */
@@ -81,7 +101,8 @@ VamanaDeleteSaveDir(Oid relid)
 
 /*
  * Write the TID mapping for a vamana index to a sidecar file inside its
- * save directory.  Uses a write-to-tmp-then-rename pattern so a crash
+ * save directory.  The file is a VamanaTidMapHeader followed by <count>
+ * ItemPointerData slots.  Uses a write-to-tmp-then-rename pattern so a crash
  * mid-write does not leave a partial file that looks valid.
  *
  * Ereports ERROR on I/O failure; caller's PG_TRY handles cleanup of the
@@ -93,7 +114,7 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 	char		tidmappath[MAXPGPATH];
 	char		tidmaptmp[MAXPGPATH];
 	FILE	   *f;
-	size_t		written;
+	VamanaTidMapHeader header;
 
 	snprintf(tidmappath, sizeof(tidmappath),
 			 "%s/vamana_indexes/%u/tidmap.bin", DataDir, relid);
@@ -106,8 +127,13 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 				(errcode_for_file_access(),
 				 errmsg("could not create TID map file \"%s\": %m", tidmaptmp)));
 
-	written = fwrite(tidMapping, sizeof(ItemPointerData), count, f);
-	if ((int) written != count)
+	header.magic = VAMANA_TIDMAP_MAGIC;
+	header.version = VAMANA_TIDMAP_VERSION;
+	header.capacity = (uint32) count;
+	header.reserved = 0;
+
+	if (fwrite(&header, sizeof(header), 1, f) != 1 ||
+		(int) fwrite(tidMapping, sizeof(ItemPointerData), count, f) != count)
 	{
 		FreeFile(f);
 		unlink(tidmaptmp);
@@ -134,12 +160,16 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 /*
  * Read back the sidecar TID-mapping file for a vamana index.
  *
- * tidMappingCapacity is the number of slots to read (>= numVectors; includes
- * holes for soft-deleted entries).
+ * The file was written at the last checkpoint and holds header.capacity slots.
+ * tidMappingCapacity is the caller's current slot count from the metapage,
+ * which is bumped on every insert and so may exceed the file's capacity when
+ * inserts have occurred since that checkpoint.  Those extra slots are recent
+ * inserts replayed from WAL, not persisted state; they are initialized to the
+ * invalid TID here so the caller sees them as empty holes.
  *
- * Returns true and fills tidMapping[0..tidMappingCapacity-1] on success.
- * Returns false (triggering caller to rebuild) if the file is absent or
- * has an unexpected size.
+ * Returns true and fills all of tidMapping[0..tidMappingCapacity-1] on success.
+ * Returns false (triggering caller to rebuild from the heap) if the file is
+ * absent, unreadable, malformed, truncated, or larger than the metapage claims.
  *
  * tidMapping must be pre-allocated with at least tidMappingCapacity elements.
  */
@@ -148,7 +178,7 @@ VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 {
 	char		tidmappath[MAXPGPATH];
 	FILE	   *f;
-	size_t		nread;
+	VamanaTidMapHeader header;
 
 	snprintf(tidmappath, sizeof(tidmappath),
 			 "%s/vamana_indexes/%u/tidmap.bin", DataDir, relid);
@@ -164,17 +194,35 @@ VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 		return false;
 	}
 
-	nread = fread(tidMapping, sizeof(ItemPointerData), tidMappingCapacity, f);
-	FreeFile(f);
-
-	if ((int) nread != tidMappingCapacity)
+	if (fread(&header, sizeof(header), 1, f) != 1 ||
+		header.magic != VAMANA_TIDMAP_MAGIC ||
+		header.version != VAMANA_TIDMAP_VERSION ||
+		header.capacity > (uint32) tidMappingCapacity)
 	{
+		FreeFile(f);
 		ereport(WARNING,
-				(errmsg("vamana index %u: TID map \"%s\" has wrong size "
-						"(expected %d entries), will rebuild",
+				(errmsg("vamana index %u: TID map \"%s\" is malformed or larger "
+						"than expected (%d slots), will rebuild",
 						relid, tidmappath, tidMappingCapacity)));
 		return false;
 	}
+
+	if (fread(tidMapping, sizeof(ItemPointerData), header.capacity, f)
+		!= header.capacity)
+	{
+		FreeFile(f);
+		ereport(WARNING,
+				(errmsg("vamana index %u: TID map \"%s\" is truncated "
+						"(expected %u slots), will rebuild",
+						relid, tidmappath, header.capacity)));
+		return false;
+	}
+
+	FreeFile(f);
+
+	/* Slots past the persisted set are WAL-replayed inserts: mark them empty. */
+	for (int i = (int) header.capacity; i < tidMappingCapacity; i++)
+		ItemPointerSetInvalid(&tidMapping[i]);
 
 	return true;
 }
