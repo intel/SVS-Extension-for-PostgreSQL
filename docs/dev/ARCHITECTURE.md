@@ -124,13 +124,15 @@ SVS provides a high-level batch build API with internal parallelism management.
 
 After the SVS batch build completes, the index is serialized to a directory on the filesystem using `VamanaGetIndexSavePath()`. The path is keyed by the index's relation OID. The metapage stores `hasSavedIndex`, `indexDataBlkno`, and `indexDataSize` to track serialization state. Immediately after serialization, `vamanabuild` creates a logical replication slot (`vamana_<db>_<idx>`) with `confirmed_flush_lsn` set to the current WAL flush position. This anchors the slot LSN to the exact point where the on-disk state is complete, ensuring crash recovery replays only changes committed after that point.
 
-On BGW startup, `LoadIndexFromPages()` attempts to read each saved index from disk before accepting any requests. If no saved copy exists, `VamanaRebuildFromTable()` performs an in-memory rebuild from the heap.
+On BGW startup, `LoadIndexFromPages()` attempts to read each saved index from disk before accepting any requests. If no saved copy exists, `VamanaRebuildFromTable()` performs an in-memory rebuild from the heap. Loading also restores the TID map sidecar file (`tidmap.bin`, one `ItemPointerData` per allocated slot, written atomically via temp-file + rename) and the metapage's dynamic-index fields (`tidMappingCapacity`, `nextExternalId`, `numDeleted`) into the in-memory cache. `hasSavedIndex` and the dynamic fields are flipped to their final values together, in a single WAL-logged transaction, only after the on-disk files are durable.
 
 An object-access hook (`VamanaInstallObjectAccessHook`) cleans up the on-disk save directory when an index or its parent table is dropped.
 
 ### 4.3 Insert and Vacuum Behavior
 
-**Inserts:** `vamanainsert` routes the insert through the background worker (slot kind `VAMANA_SLOTKIND_INSERT`). The worker calls `SVSAddPoints` to add the new vector incrementally to the live in-memory index. External IDs are allocated from a counter held in the BGW's in-memory cache (`cache->nextExternalId`); the latest value is written back to the metapage by `VamanaWriteMetaPageDynamic` so the counter survives restart. The inserting backend records the new external ID in the per-transaction undo log (`VamanaUndoAppend`); on transaction ABORT, the registered XactCallback submits a BGW DELETE for each logged ID to roll back the in-memory graph state. All indexes are born dynamic; there is no static-only fallback path for inserts.
+**Inserts:** `vamanainsert` calls `VamanaWorkerWaitUntilAvailable` before submitting, then routes the insert through the background worker (slot kind `VAMANA_SLOTKIND_INSERT`). The worker calls `SVSAddPoints` to add the new vector incrementally to the live in-memory index. External IDs are allocated from a counter held in the BGW's in-memory cache (`cache->nextExternalId`); the latest value is written back to the metapage by `VamanaWriteMetaPageDynamic` so the counter survives restart. The inserting backend records the new external ID in the per-transaction undo log (`VamanaUndoAppend`); on transaction ABORT, the registered XactCallback submits a BGW DELETE for each logged ID to roll back the in-memory graph state. All indexes are born dynamic; there is no static-only fallback path for inserts.
+
+If the worker is up but hasn't loaded a given index yet (e.g. immediately after server restart, before `LoadAllIndexes` reaches it), the first insert against that index triggers a synchronous load via `VamanaWorkerGetOrLoadIndex`: try `LoadIndexFromPages`, falling back to `VamanaRebuildFromTable` if no saved copy exists. Subsequent inserts find the index already cached and take the fast path.
 
 **Vacuum:** `vamanabulkdelete` iterates the TID mapping, calls PostgreSQL's dead-tuple callback for each live entry, and batches dead IDs to the BGW via `VamanaWorkerSubmitDelete`. `vamanavacuumcleanup` submits `CONSOLIDATE` and `COMPACT` requests to the BGW via `VamanaWorkerSubmitMaintenance`. The BGW calls `SVSDeletePoints`, `SVSConsolidate`, and `SVSCompact` respectively, and updates the metapage counters atomically after each operation.
 
@@ -146,7 +148,7 @@ The background worker implements a background process that holds the SVS index p
 - Each slot has a kind (`VAMANA_SLOTKIND_SEARCH`, `_INSERT`, `_DELETE`, `_MAINTENANCE`); backends set the kind and data, set status `PENDING`, and wait on a shared latch
 - The worker drains all pending slots each cycle: SEARCH slots are batched and dispatched to `SVSSearch`; write slots (`INSERT`, `DELETE`, `MAINTENANCE`) are dispatched one at a time via `VamanaWorkerProcessWriteSlot`
 - If the worker is unavailable or startup times out (controlled by `svs.worker_startup_timeout_ms`), the backend throws an error rather than silently falling back
-- Per-index LWLocks (`VamanaIndexLockSlot`, up to `VAMANA_MAX_INDEXES = 64` live indexes) serialize concurrent write operations within the worker
+- Per-index LWLocks (`VamanaIndexLockSlot`, up to `VAMANA_MAX_INDEXES = 64` live indexes) serialize concurrent write operations within the worker. Writers acquire the lock `LW_EXCLUSIVE`; searches acquire it `LW_SHARED`, so concurrent searches proceed together and only block against an in-progress writer on the same index
 - Crash recovery: the worker restarts automatically after `svs.worker_restart_time` seconds. While the worker is down, backends that attempt index operations receive an ERROR (no silent fallback). On restart, the worker loads the last checkpoint from disk, opens the persisted replication slot, and replays all committed changes from the slot's `restart_lsn` forward before accepting any requests
 - Reload signaling: for edge cases such as TRUNCATE or REINDEX, backends write to `reloadRequests[]` to signal index invalidation; the worker performs a full reload on its next cycle. Normal write-path state synchronization uses replication slot replay, not reload signals
 
@@ -174,6 +176,25 @@ Vamana indexes support `vector` (float32) and `halfvec` (float16) types. `sparse
 Two progress phases are reported via `pg_stat_progress_create_index`:
 1. `PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE` — initializing build state
 2. `PROGRESS_VAMANA_PHASE_LOAD` — scanning heap and accumulating vectors
+
+### 4.7 Dynamic Index Internals
+
+Dynamic behavior is split across the same files listed in §3.1: `vamanabuild.c` builds via `SVSBuildDynamicIndex`; `vamanainsert.c`'s `vamanainsert` routes through `VamanaWorkerSubmitInsert`; `vamanavacuum.c`'s `vamanabulkdelete` and `vamanavacuumcleanup` route through `VamanaWorkerSubmitDelete` and `VamanaWorkerSubmitMaintenance`; `vamanautils.c` holds `VamanaRebuildFromTable` and `VamanaWriteMetaPageDynamic`; and `vamanascan.c`'s `LoadIndexFromPages` calls `SVSLoadDynamicIndex`, with `SVSSearch` skipping any slot marked `InvalidItemPointer` (soft-delete).
+
+**Metapage fields.** Beyond the static-index fields, the metapage (`VamanaMetaPageData`) carries three fields specific to dynamic indexes: `nextExternalId`, `numDeleted`, and `tidMappingCapacity`.
+
+- `nextExternalId` — SVS external IDs must be unique for the life of the index. The metapage is the single source of truth across backends; the BGW reads it while holding the exclusive per-index LWLock, passes the value to `SVSAddPoints`, and writes `value+1` back.
+- `numDeleted` — drives the `SVSCompact` decision threshold (`svs.compact_threshold_pct`) and reports deletion pressure.
+- `tidMappingCapacity` — after deletes, the TID mapping array has holes. `numVectors` tracks live entries; `tidMappingCapacity` tracks the allocated length, which is what the sidecar `tidmap.bin` file serializes. Search bounds-checks against the capacity, then filters out `InvalidItemPointer` slots.
+
+**In-memory cache.** The BGW's per-process cache (`VamanaIndexCache`) mirrors the metapage and adds runtime-only fields (`svsIndex`, `isValid`, `memCtx`, `tidMapping`, `needsSave`). Its `nextExternalId` is a mirror of the metapage, not authoritative — the BGW re-reads the metapage while holding the exclusive per-index LWLock before assigning an ID, so assignment stays monotonic even if the cached value is stale.
+
+### 4.8 Read Path and Soft-Delete Semantics
+
+`SVSSearch` is the query-time hot path; two changes affect reads under dynamic indexes:
+
+- **Bounds check widened to `tidMappingCapacity`.** Static indexes always had `numVectors == tidMappingCapacity`. Dynamic indexes can have `tidMappingCapacity > numVectors` because deleted slots stay allocated (as holes) until compaction, so SVS may return indices up to the full capacity. The search loop in `svs_wrapper.c` bounds-checks against `cachedIndex->tidMappingCapacity` rather than `numVectors`.
+- **Soft-delete filtering.** The search loop skips any slot whose TID is `InvalidItemPointer`. This is the read-side half of the bulk-delete protocol (§5.2): between VACUUM's write-lock release and the next `SVSConsolidate`, SVS may still surface deleted vectors as candidates, and this filter ensures they never reach the client. Because the filter can drop results, the loop tracks a separate "surviving results" counter rather than reusing the raw SVS result index — the returned result count may be less than the requested `k`, matching the existing pgvector contract for sparse result sets.
 
 ---
 
@@ -273,6 +294,8 @@ vamanabulkdelete():
 vamanavacuumcleanup():
   submit CONSOLIDATE/COMPACT             ──► SVSConsolidate() / SVSCompact()
 ```
+
+`vamanabulkdelete` marks each dead TID's slot `InvalidItemPointer` itself, before submitting the batched delete to the BGW — not after the BGW's `SVSDeletePoints` call succeeds. If the BGW delete then fails, the heap already reflects the deletion, so the next rebuild from the heap is still correct; leaving the TID valid in the interim would risk a concurrent SELECT returning a dead row that raced the delete path.
 
 ### 5.3 Recovery Path (Crash Restart)
 
