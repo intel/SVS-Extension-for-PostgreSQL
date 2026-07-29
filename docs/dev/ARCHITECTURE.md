@@ -9,6 +9,7 @@
 6. [GUC Parameters](#guc-parameters)
 7. [Integration Points](#integration-points)
 8. [Performance Considerations](#performance-considerations)
+9. [Security Objectives](#security-objectives)
 
 ---
 
@@ -788,4 +789,42 @@ Inserts are applied incrementally via `SVSAddPoints` and are immediately searcha
 The TID mapping array is sized by `tidMappingCapacity`, not by the live vector count `numVectors`. After deletions, the capacity grows monotonically until `SVSCompact` reclaims the deleted slots. In workloads with high delete churn and infrequent compaction, the TID mapping and its on-disk sidecar can be significantly larger than the live vector count alone would suggest. Lowering `svs.compact_threshold_pct` reduces this overhead at the cost of more frequent compaction during VACUUM.
 
 In addition to the graph edges and stored vectors, the SVS dynamic index maintains a small amount of per-vector bookkeeping (delete flags, insertion metadata). This overhead is small relative to the graph itself but grows linearly with `tidMappingCapacity`.
+
+---
+
+## 9. Security Objectives
+
+This section summarizes the security objectives for each extension-managed asset, derived from a formal threat model using DREAD scoring.
+
+### 9.1 Asset Security Properties
+
+| Asset | Confidentiality | Integrity | Availability |
+|---|---|---|---|
+| Vamana metapage and TID mapping pages | — | Required (page checksums) | Required |
+| Serialized SVS index directory (`$PGDATA/vamana_indexes/<oid>/`) | Required (contains embeddings) | Required | Required |
+| Extension binaries (`svs.so`, `svs.control`, SQL scripts) | — | Required (RPATH integrity) | — |
+| Intel SVS shared library (`libsvs_c_api.so`) | Required (proprietary) | Required | — |
+| Per-transaction undo log (`vamana_undo.c`) | — | Required | Required (bounded growth) |
+| BGW main loop (single process) | — | Required | Required (restart recovery) |
+| BGW index cache (`VamanaIndexCache`) | Required (embeddings in memory) | Required | — |
+| Per-index logical replication slot (`pg_replslot/vamana_*`) | — | Required | Required (WAL retention bound) |
+
+### 9.2 Key Security Properties
+
+**Confidentiality.** Stored embeddings (on disk in `$PGDATA/vamana_indexes/` and in BGW memory) are protected by PostgreSQL's `$PGDATA` permissions posture (postmaster umask `0700`). The extension does not implement independent access control on the index save directory in this release. SVS error strings contain only metadata (operation names, error codes, dimensions), not vector values; this assumption is revalidated on each SVS library version bump.
+
+**Integrity.** The SVS wrapper trust boundary (`svs_wrapper.c`) validates output-buffer bounds before returning results to backends. Input-buffer sizing is a caller responsibility documented in `svs_wrapper.h`. The atomic 5-phase checkpoint sequence ensures on-disk state is never partial. The replication slot mechanism guarantees crash recovery replays only committed transactions (reorder buffer filtering).
+
+**Availability.** The per-transaction undo log is bounded to prevent memory-DoS from large transactions. BGW saturation from concurrent high-`search_window_size` queries is bounded by `svs.worker_timeout_ms` (converts hangs to ERRORs). The BGW restarts automatically after crashes with bounded replay cost from the replication slot.
+
+### 9.3 Accepted Residuals
+
+The following risks are accepted with documented rationale:
+
+| Risk | Severity | Disposition |
+|---|---|---|
+| BGW saturation via `search_window_size = 10000` + connection flood | High | Accepted as bounded: `worker_timeout_ms` converts hangs to ERRORs; `search_window_size` GUC bounded 10-10000. |
+| CREATE INDEX OOM on oversized table | Medium | Backend-local failure; postmaster not impacted. A pre-flight `maintenance_work_mem` gate is planned for a future release. |
+| BGW crash amplification (reload time proportional to index size) | Medium | Accepted as known. Reload time is linear in total serialized index size; documented in deployment guidance. |
+| MKL CPU-feature environment variable forcing SIGILL on incompatible hardware | Medium | Accepted: operator environment is trusted configuration. See the User Guide for AVX-512 requirements. |
 

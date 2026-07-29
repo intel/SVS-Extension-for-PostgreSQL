@@ -23,6 +23,7 @@
    - 6.1 [Background Worker (Advanced)](#background-worker-advanced)
 7. [Operational Considerations](#7-operational-considerations)
    - 7.1 [TRUNCATE](#truncate)
+   - 7.2 [Security and Deployment Notes](#security-and-deployment-notes)
 8. [Monitoring](#8-monitoring)
    - 8.1 [Server Log Messages](#server-log-messages)
 9. [Troubleshooting](#9-troubleshooting)
@@ -609,6 +610,38 @@ With LeanVec compression, the stored element size is much smaller than `D × 4 b
 ### PostgreSQL Restart / Crash Recovery
 
 On BGW startup after a restart or crash, the worker loads the last checkpoint from disk and replays any committed operations recorded in the replication slot since that checkpoint. This happens before the BGW accepts any backend requests, so the index is fully consistent by the time the first query or insert arrives. There is no data loss for committed transactions.
+
+### Security and Deployment Notes
+
+This section describes security-relevant deployment considerations that operators should be aware of.
+
+#### On-Disk Index Protection
+
+The serialized SVS index directory (`$PGDATA/vamana_indexes/<oid>/`) contains raw embedding vectors. Its confidentiality and integrity are protected by PostgreSQL's `$PGDATA` permission posture: the postmaster process umask applies `0700` to all directories under `$PGDATA`, including the Vamana index save directory. The extension does not enforce permissions independently.
+
+**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE` is a **silent no-op** for Vamana indexes in the current release (v0.1). This limitation is tracked for resolution in v0.2.
+
+Operators who require encryption-at-rest for embedding data should use full-disk or volume-level encryption on the filesystem backing `$PGDATA`.
+
+#### WAL Configuration Requirement
+
+The background worker requires `wal_level = logical` in `postgresql.conf`. If `wal_level` is set to a lower value (`replica` or `minimal`), the BGW emits `FATAL` at startup and enters a crash-restart loop (`svs.worker_restart_time` interval). The postmaster is not affected, but all Vamana index operations (search, insert, delete) will fail with "background worker unavailable" errors until the configuration is corrected and the server is restarted.
+
+```
+# Required in postgresql.conf
+wal_level = logical
+```
+
+#### Standby Replication Slot Configuration
+
+On a standby server using a Vamana replication slot, `hot_standby_feedback` must be set to `on`:
+
+```
+# Required on standby servers with Vamana indexes
+hot_standby_feedback = on
+```
+
+If `hot_standby_feedback = off`, the primary may remove WAL segments that the standby's Vamana replication slot still needs. PostgreSQL silently invalidates the slot and emits only a WARNING in the standby's server log. After invalidation, the standby BGW cannot replay committed changes, and a full index rebuild from the heap is required the next time the standby BGW restarts. Monitor standby logs for `replication slot ... has been invalidated` warnings.
 
 ---
 
