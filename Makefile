@@ -23,8 +23,9 @@ OBJS = src/svs.o \
        src/vamanaworkerindex.o \
        src/vamanaworkersearch.o \
        src/vamanaworkerwrite.o \
-       src/svs_wrapper.o
-HEADERS = src/vamana.h src/svs_wrapper.h
+       src/svs_wrapper.o \
+       src/vamana_databases.o
+HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))

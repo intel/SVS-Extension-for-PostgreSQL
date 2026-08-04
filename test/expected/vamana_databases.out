@@ -1,0 +1,51 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+-- Table shape, including both triggers' declared firing conditions
+\d vamana_databases
+                Table "public.vamana_databases"
+       Column       |  Type   | Collation | Nullable | Default 
+--------------------+---------+-----------+----------+---------
+ datname            | name    |           | not null | 
+ enabled            | boolean |           | not null | true
+ graph_memory_mb    | integer |           |          | 
+ total_memory_mb    | integer |           |          | 
+ search_num_threads | integer |           |          | 
+Indexes:
+    "vamana_databases_pkey" PRIMARY KEY, btree (datname)
+Triggers:
+    vamana_databases_changed AFTER INSERT OR DELETE OR UPDATE ON vamana_databases FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_notify()
+    vamana_databases_queue_reservation AFTER INSERT OR UPDATE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation()
+
+-- INSERT/UPDATE/DELETE succeed; the row-level trigger is declared AFTER
+-- INSERT OR UPDATE only, so DELETE below cannot invoke it.
+INSERT INTO vamana_databases (datname) VALUES ('dbA'), ('dbB'), ('dbC');
+UPDATE vamana_databases SET enabled = false WHERE datname IN ('dbA', 'dbB', 'dbC');
+DELETE FROM vamana_databases WHERE datname = 'dbA';
+-- Placeholder columns accept NULL and non-NULL values
+INSERT INTO vamana_databases (datname) VALUES ('dbD');
+INSERT INTO vamana_databases (datname, graph_memory_mb, total_memory_mb, search_num_threads)
+	VALUES ('dbE', 512, 4096, 8);
+SELECT datname, graph_memory_mb, total_memory_mb, search_num_threads
+	FROM vamana_databases ORDER BY datname;
+ datname | graph_memory_mb | total_memory_mb | search_num_threads 
+---------+-----------------+-----------------+--------------------
+ dbB     |                 |                 |                   
+ dbC     |                 |                 |                   
+ dbD     |                 |                 |                   
+ dbE     |             512 |            4096 |                  8
+(4 rows)
+
+-- TRUNCATE is revoked from PUBLIC; the table owner retains it
+CREATE ROLE vamana_databases_test_nonowner NOLOGIN;
+SET ROLE vamana_databases_test_nonowner;
+TRUNCATE vamana_databases;
+ERROR:  permission denied for table vamana_databases
+RESET ROLE;
+DROP ROLE vamana_databases_test_nonowner;
+TRUNCATE vamana_databases;
+SELECT count(*) FROM vamana_databases;
+ count 
+-------
+     0
+(1 row)
+

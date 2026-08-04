@@ -47,6 +47,45 @@ CREATE OPERATOR CLASS halfvec_cosine_ops
 	FUNCTION 1 halfvec_negative_inner_product(halfvec, halfvec),
 	FUNCTION 2 l2_norm(halfvec);
 
+-- Per-database enablement catalog
+
+CREATE TABLE vamana_databases (
+	datname             name    PRIMARY KEY,
+	enabled             bool    NOT NULL DEFAULT true,
+
+	-- Placeholders for a future resource-management phase; NULL means
+	-- "use the GUC default." Nullable with no default so activating them
+	-- later needs no ALTER TABLE.
+	graph_memory_mb     int,
+	total_memory_mb     int,
+	search_num_threads  int
+);
+
+CREATE FUNCTION vamana_databases_notify() RETURNS trigger
+	LANGUAGE plpgsql AS
+$$
+BEGIN
+	PERFORM pg_notify('vamana_databases_changed', '');
+	RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER vamana_databases_changed
+	AFTER INSERT OR UPDATE OR DELETE ON vamana_databases
+	FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_notify();
+
+CREATE FUNCTION vamana_databases_queue_reservation() RETURNS trigger
+	AS 'MODULE_PATHNAME', 'vamana_databases_queue_reservation' LANGUAGE C;
+
+CREATE TRIGGER vamana_databases_queue_reservation
+	AFTER INSERT OR UPDATE ON vamana_databases
+	FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation();
+
+-- TRUNCATE bypasses DELETE triggers; block it since no role has a
+-- legitimate reason to bulk-wipe this table. The owner retains TRUNCATE
+-- regardless of this revoke.
+REVOKE TRUNCATE ON vamana_databases FROM PUBLIC;
+
 -- Observability
 
 CREATE FUNCTION pg_stat_vamana_worker()
