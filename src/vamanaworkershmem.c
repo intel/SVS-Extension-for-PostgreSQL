@@ -28,8 +28,17 @@
  * Module-level state
  * ----------------------------------------------------------------------- */
 
-/* Pointer to the shared memory region (all processes) */
+/* The per-database control-block array (all processes) */
+VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr = NULL;
+
+/*
+ * Convenience pointer to this worker's control block.  Until the launcher
+ * (M4) assigns entries per database, the single worker uses entry 0.
+ */
 VamanaWorkerShmem *VamanaWorkerShmemPtr = NULL;
+
+/* Named LWLock tranche backing the array-wide reservation lock. */
+static const char *const VamanaWorkerHeaderLockName = "vamana_worker_header";
 
 /* Hook chains (set by VamanaWorkerInstallHooks, used by hook functions) */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -45,19 +54,20 @@ static const char *const VamanaIndexLockTrancheName = "vamana_index_rwlock";
 /* -----------------------------------------------------------------------
  * Shared memory accessors
  *
- * Variable-length data is stored immediately after the slot-header array:
+ * The slot region is a separate shared-memory allocation (see "Shared
+ * memory sizing and initialisation" below), laid out as:
  *   [slots[maxSlots]] [queryVecs[maxSlots][MAX_DIM]] [results[...]] [dists[...]]
+ * `VamanaWorkerShmemPtr->slots` points at its start.
  * ----------------------------------------------------------------------- */
 
 /*
- * Byte offset from the start of shmem to the beginning of the
- * variable-length data area.
+ * Byte offset from the start of the slot region to its variable-length
+ * data area.
  */
 static inline size_t
 VamanaWorkerVarDataOffset(void)
 {
-	return offsetof(VamanaWorkerShmem, slots) +
-		(size_t) VamanaWorkerShmemPtr->maxSlots * sizeof(VamanaWorkerSlot);
+	return (size_t) VamanaWorkerShmemPtr->maxSlots * sizeof(VamanaWorkerSlot);
 }
 
 float *
@@ -66,7 +76,7 @@ VamanaWorkerSlotQueryVec(int slotIdx)
 	size_t		offset = VamanaWorkerVarDataOffset() +
 		(size_t) slotIdx * VAMANA_MAX_DIM * sizeof(float);
 
-	return (float *) ((char *) VamanaWorkerShmemPtr + offset);
+	return (float *) ((char *) VamanaWorkerShmemPtr->slots + offset);
 }
 
 ItemPointer
@@ -77,7 +87,7 @@ VamanaWorkerSlotResults(int slotIdx)
 		(size_t) maxSlots * VAMANA_MAX_DIM * sizeof(float) +
 		(size_t) slotIdx * VAMANA_MAX_SEARCH_WINDOW * sizeof(ItemPointerData);
 
-	return (ItemPointer) ((char *) VamanaWorkerShmemPtr + offset);
+	return (ItemPointer) ((char *) VamanaWorkerShmemPtr->slots + offset);
 }
 
 float *
@@ -89,36 +99,53 @@ VamanaWorkerSlotDistances(int slotIdx)
 		(size_t) maxSlots * VAMANA_MAX_SEARCH_WINDOW * sizeof(ItemPointerData) +
 		(size_t) slotIdx * VAMANA_MAX_SEARCH_WINDOW * sizeof(float);
 
-	return (float *) ((char *) VamanaWorkerShmemPtr + offset);
+	return (float *) ((char *) VamanaWorkerShmemPtr->slots + offset);
 }
 
 /* -----------------------------------------------------------------------
  * Shared memory sizing and initialisation
+ *
+ * Two independently allocated regions, following the same pattern PG core
+ * uses for PGPROC's fast-path lock arrays: a fixed-size control block, and
+ * a separate flat region for the data that scales with MaxBackends. A
+ * struct cannot embed a member that is itself variable-length, so the
+ * per-backend slots and their query-vector/result/distance buffers cannot
+ * live inside VamanaWorkerShmem.
  * ----------------------------------------------------------------------- */
 
-Size
-VamanaWorkerShmemSize(void)
+/*
+ * Size of one database's flat backend-IPC region: the VamanaWorkerSlot
+ * array followed by its query-vector, result-TID, and distance buffers,
+ * each scaled by MaxBackends.
+ */
+static Size
+VamanaWorkerSlotRegionSize(void)
 {
-	Size		header;
 	Size		perSlotVar;
 
-	/*
-	 * Header = fixed VamanaWorkerShmem fields + MaxBackends slot entries (via
-	 * FLEXIBLE_ARRAY_MEMBER).
-	 */
-	header = add_size(offsetof(VamanaWorkerShmem, slots),
-					  mul_size(MaxBackends, sizeof(VamanaWorkerSlot)));
-
-	/*
-	 * Variable-length data per slot: query vector + result TIDs + distances.
-	 */
 	perSlotVar = add_size(
 						  mul_size(VAMANA_MAX_DIM, sizeof(float)),	/* query vec */
 						  add_size(
 								   mul_size(VAMANA_MAX_SEARCH_WINDOW, sizeof(ItemPointerData)), /* TIDs */
 								   mul_size(VAMANA_MAX_SEARCH_WINDOW, sizeof(float)))); /* dists */
 
-	return add_size(header, mul_size(MaxBackends, perSlotVar));
+	return add_size(mul_size(MaxBackends, sizeof(VamanaWorkerSlot)),
+					mul_size(MaxBackends, perSlotVar));
+}
+
+/* Size of the control-block array: header plus max_vamana_databases entries. */
+static Size
+VamanaWorkerHeaderSize(void)
+{
+	return add_size(offsetof(VamanaWorkerShmemHeader, slots),
+					mul_size(max_vamana_databases, sizeof(VamanaWorkerShmem)));
+}
+
+Size
+VamanaWorkerShmemSize(void)
+{
+	return add_size(VamanaWorkerHeaderSize(),
+					mul_size(max_vamana_databases, VamanaWorkerSlotRegionSize()));
 }
 
 /*
@@ -129,66 +156,210 @@ VamanaWorkerShmemSize(void)
  * lives in shared memory; failing to do so causes undefined behavior on
  * first WaitLatch/SetLatch.
  */
+static void
+VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
+{
+	entry->dbOid = InvalidOid;
+	entry->workerPid = 0;
+	entry->maxSlots = MaxBackends;
+	entry->slots = (VamanaWorkerSlot *) slotRegion;
+
+	InitSharedLatch(&entry->workerLatch);
+
+	for (int i = 0; i < MaxBackends; i++)
+	{
+		VamanaWorkerSlot *slot = &entry->slots[i];
+
+		pg_atomic_init_u32(&slot->status, VAMANA_SLOT_EMPTY);
+		InitSharedLatch(&slot->latch);
+	}
+
+	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
+		pg_atomic_init_u32(&entry->reloadRequests[i].relid, 0);
+
+	pg_atomic_init_u32(&entry->reload_all, 0);
+	pg_atomic_init_u64(&entry->heartbeat_ts, 0);
+	pg_atomic_init_u32(&entry->indexCount, 0);
+
+	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
+	{
+		VamanaIndexLockSlot *ls = &entry->indexLocks[i];
+
+		pg_atomic_init_u32(&ls->relid, 0);
+		LWLockInitialize(&ls->lock, VamanaIndexLockTranche);
+	}
+}
+
 void
 VamanaWorkerShmemStartup(void)
 {
 	bool		found;
+	bool		slotsFound;
+	char	   *slotRegionBase;
+	Size		slotRegionStride = VamanaWorkerSlotRegionSize();
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
-	VamanaWorkerShmemPtr = ShmemInitStruct("VamanaWorkerShmem",
-										   VamanaWorkerShmemSize(), &found);
+	/*
+	 * The per-index r/w lock tranche is process-local state (a tranche id
+	 * plus a registered name), so it must be (re)established in every
+	 * process that attaches, whether or not it created the segment.
+	 */
+	VamanaIndexLockTranche = LWLockNewTrancheId();
+	LWLockRegisterTranche(VamanaIndexLockTranche, VamanaIndexLockTrancheName);
+
+	VamanaWorkerShmemHeaderPtr = ShmemInitStruct("VamanaWorkerShmemHeader",
+												 VamanaWorkerHeaderSize(), &found);
+
+	slotRegionBase = ShmemInitStruct("VamanaWorkerSlots",
+									 mul_size(max_vamana_databases, slotRegionStride),
+									 &slotsFound);
+	Assert(found == slotsFound);
+
 	if (!found)
 	{
-		memset(VamanaWorkerShmemPtr, 0, VamanaWorkerShmemSize());
-		VamanaWorkerShmemPtr->dbOid = InvalidOid;
-		VamanaWorkerShmemPtr->workerPid = 0;
-		VamanaWorkerShmemPtr->maxSlots = MaxBackends;
+		memset(VamanaWorkerShmemHeaderPtr, 0, VamanaWorkerHeaderSize());
+		memset(slotRegionBase, 0,
+			   mul_size(max_vamana_databases, slotRegionStride));
 
-		InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
+		VamanaWorkerShmemHeaderPtr->lock =
+			&(GetNamedLWLockTranche(VamanaWorkerHeaderLockName))->lock;
+		VamanaWorkerShmemHeaderPtr->numSlots = max_vamana_databases;
+		VamanaWorkerShmemHeaderPtr->numActive = 0;
 
-		for (int i = 0; i < MaxBackends; i++)
-		{
-			VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[i];
-
-			pg_atomic_init_u32(&slot->status, VAMANA_SLOT_EMPTY);
-			InitSharedLatch(&slot->latch);
-		}
-
-		for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
-			pg_atomic_init_u32(&VamanaWorkerShmemPtr->reloadRequests[i].relid, 0);
-
-		pg_atomic_init_u32(&VamanaWorkerShmemPtr->reload_all, 0);
-		pg_atomic_init_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
-
-		/*
-		 * Initialise per-index r/w lock slots.  The tranche is registered
-		 * once here; the LWLockInitialize calls below bind each lock to it.
-		 */
-		VamanaIndexLockTranche = LWLockNewTrancheId();
-		LWLockRegisterTranche(VamanaIndexLockTranche,
-							  VamanaIndexLockTrancheName);
-		for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
-		{
-			VamanaIndexLockSlot *ls = &VamanaWorkerShmemPtr->indexLocks[i];
-
-			pg_atomic_init_u32(&ls->relid, 0);
-			LWLockInitialize(&ls->lock, VamanaIndexLockTranche);
-		}
+		for (int db = 0; db < max_vamana_databases; db++)
+			VamanaWorkerInitSlot(&VamanaWorkerShmemHeaderPtr->slots[db],
+								 slotRegionBase + (Size) db * slotRegionStride);
 	}
 	else
 	{
-		VamanaIndexLockTranche = LWLockNewTrancheId();
-		LWLockRegisterTranche(VamanaIndexLockTranche,
-							  VamanaIndexLockTrancheName);
 		/* Clear stale latch ownership from a previous worker instance. */
-		InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
+		for (int db = 0; db < VamanaWorkerShmemHeaderPtr->numSlots; db++)
+			InitSharedLatch(&VamanaWorkerShmemHeaderPtr->slots[db].workerLatch);
 	}
 
+	/* Single-worker model: bind the convenience pointer to entry 0. */
+	VamanaWorkerShmemPtr = &VamanaWorkerShmemHeaderPtr->slots[0];
+
 	LWLockRelease(AddinShmemInitLock);
+}
+
+/* -----------------------------------------------------------------------
+ * Per-database control-block lookup and reservation
+ *
+ * The array is fixed-size and never reallocated, so a returned entry
+ * pointer is stable for the postmaster's lifetime.  Lookups take the
+ * array-wide lock in shared mode; reservation and release take it in
+ * exclusive mode because they change dbOid and numActive.
+ * ----------------------------------------------------------------------- */
+
+static VamanaWorkerShmem *
+VamanaWorkerFindSlot(Oid dbOid)
+{
+	for (int i = 0; i < VamanaWorkerShmemHeaderPtr->numSlots; i++)
+	{
+		VamanaWorkerShmem *entry = &VamanaWorkerShmemHeaderPtr->slots[i];
+
+		if (entry->dbOid == dbOid)
+			return entry;
+	}
+	return NULL;
+}
+
+/*
+ * Return the control block serving dbOid, or NULL if none is reserved.
+ * The "not found" result is the state M12's CREATE INDEX check treats as
+ * "this database is not enabled for vamana."
+ */
+VamanaWorkerShmem *
+VamanaWorkerLookupSlot(Oid dbOid)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	entry = VamanaWorkerFindSlot(dbOid);
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return entry;
+}
+
+/*
+ * Reserve (or return the existing) control block for dbOid.  Returns NULL
+ * when the array is full (more distinct databases than max_vamana_databases).
+ * The reserved entry has workerPid == 0 until a worker starts for it.
+ */
+VamanaWorkerShmem *
+VamanaWorkerReserveSlot(Oid dbOid)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry == NULL)
+	{
+		entry = VamanaWorkerFindSlot(InvalidOid);
+		if (entry != NULL)
+		{
+			entry->dbOid = dbOid;
+			VamanaWorkerShmemHeaderPtr->numActive++;
+		}
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return entry;
+}
+
+/*
+ * Adjust the live-index counter for dbOid.  Looking up the slot takes the
+ * array-wide lock in shared mode; the increment/decrement itself is a plain
+ * atomic, deliberately outside that lock (see M2 "Locking").  No-op if no
+ * slot is reserved for the database.
+ */
+void
+VamanaWorkerIndexCountAdjust(Oid dbOid, int delta)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+
+	if (entry == NULL)
+		return;
+
+	if (delta >= 0)
+		pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) delta);
+	else
+		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));
+}
+
+/*
+ * Release the control block for dbOid, returning it to the free pool.  The
+ * caller is responsible for ensuring no worker is running against it.
+ */
+void
+VamanaWorkerReleaseSlot(Oid dbOid)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		entry->dbOid = InvalidOid;
+		entry->workerPid = 0;
+		VamanaWorkerShmemHeaderPtr->numActive--;
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
 }
 
 /* -----------------------------------------------------------------------
@@ -214,6 +385,7 @@ VamanaWorkerInstallHooks(void)
 	shmem_request_hook = VamanaWorkerShmemRequest;
 #else
 	RequestAddinShmemSpace(VamanaWorkerShmemSize());
+	RequestNamedLWLockTranche(VamanaWorkerHeaderLockName, 1);
 #endif
 
 	prev_shmem_startup_hook = shmem_startup_hook;
@@ -227,6 +399,7 @@ VamanaWorkerShmemRequest(void)
 	if (prev_shmem_request_hook)
 		prev_shmem_request_hook();
 	RequestAddinShmemSpace(VamanaWorkerShmemSize());
+	RequestNamedLWLockTranche(VamanaWorkerHeaderLockName, 1);
 }
 #endif
 

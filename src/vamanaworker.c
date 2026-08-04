@@ -1208,7 +1208,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
  *  10  error_message         text   (NULL unless status == error)
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_COLS 11
+#define PG_STAT_VAMANA_WORKER_COLS 12
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(pg_stat_vamana_worker);
 Datum
@@ -1222,6 +1222,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	pid_t		workerPid;
 	Oid			dbOid;
 	uint64		heartbeatRaw;
+	uint32		indexCount;
 	int			i;
 
 	InitMaterializedSRF(fcinfo, 0);
@@ -1239,6 +1240,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	maxSlots = VamanaWorkerShmemPtr->maxSlots;
 	reloadAll = (pg_atomic_read_u32(&VamanaWorkerShmemPtr->reload_all) != 0);
 	heartbeatRaw = pg_atomic_read_u64(&VamanaWorkerShmemPtr->heartbeat_ts);
+	indexCount = pg_atomic_read_u32(&VamanaWorkerShmemPtr->indexCount);
 
 	reloadQueueDepth = 0;
 	for (i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
@@ -1307,24 +1309,26 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 		else
 			nulls[5] = true;
 
+		values[6] = Int32GetDatum((int32) indexCount);
+
 		/* slot-level columns */
-		values[6] = Int32GetDatum(i);
-		values[7] = CStringGetTextDatum(statusStr);
+		values[7] = Int32GetDatum(i);
+		values[8] = CStringGetTextDatum(statusStr);
 
 		if (slot->indexRelid != InvalidOid)
-			values[8] = ObjectIdGetDatum(slot->indexRelid);
-		else
-			nulls[8] = true;
-
-		if (kindStr != NULL)
-			values[9] = CStringGetTextDatum(kindStr);
+			values[9] = ObjectIdGetDatum(slot->indexRelid);
 		else
 			nulls[9] = true;
 
-		if (status == VAMANA_SLOT_ERROR && slot->errorMessage[0] != '\0')
-			values[10] = CStringGetTextDatum(slot->errorMessage);
+		if (kindStr != NULL)
+			values[10] = CStringGetTextDatum(kindStr);
 		else
 			nulls[10] = true;
+
+		if (status == VAMANA_SLOT_ERROR && slot->errorMessage[0] != '\0')
+			values[11] = CStringGetTextDatum(slot->errorMessage);
+		else
+			nulls[11] = true;
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

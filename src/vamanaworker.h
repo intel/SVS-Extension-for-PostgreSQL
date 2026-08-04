@@ -130,13 +130,6 @@ typedef struct VamanaWorkerReloadRequest
 } VamanaWorkerReloadRequest;
 
 /*
- * Fixed header of the shared-memory region.
- *
- * The variable-length slot array is a FLEXIBLE_ARRAY_MEMBER; query vectors,
- * result TIDs, and distances are in three separate arrays immediately after
- * the slot array.  Use VamanaWorkerSlotQueryVec() etc. to locate them.
- */
-/*
  * Per-index reader/writer lock entry.  LW_SHARED for searches; LW_EXCLUSIVE
  * for writes (INSERT, DELETE, CONSOLIDATE, COMPACT, ADOPT).  Keyed by a
  * stable slot index assigned when the BGW first loads each index.
@@ -147,11 +140,27 @@ typedef struct VamanaIndexLockSlot
 	LWLock			lock;			/* the actual r/w lock */
 } VamanaIndexLockSlot;
 
+/*
+ * Per-database control block.
+ *
+ * One entry per database served by a worker, held in the fixed-size
+ * VamanaWorkerShmemHeader array below.  `dbOid == InvalidOid` marks a free
+ * entry; `workerPid == 0` marks an entry that is reserved (or whose worker
+ * crashed) but has no live worker process.  These two states are distinct:
+ * "no entry for this database" versus "entry exists, worker not up".
+ *
+ * The per-backend request slots, and their query-vector/result-TID/distance
+ * buffers, are not embedded here: each is variable-length (scaled by
+ * MaxBackends), and a struct containing one cannot itself be made fixed-size.
+ * They live in a separate shared-memory allocation reached through `slots`;
+ * use VamanaWorkerSlotQueryVec() etc. to locate the buffers that follow
+ * slots[maxSlots] in that allocation.
+ */
 typedef struct VamanaWorkerShmem
 {
-	Oid				dbOid;			/* database this worker serves */
+	Oid				dbOid;			/* database this worker serves; InvalidOid = free */
 
-	pid_t			workerPid;
+	pid_t			workerPid;		/* 0 = no live worker for this entry */
 	Latch			workerLatch;	/* InitSharedLatch'd; worker owns this */
 
 	VamanaWorkerReloadRequest reloadRequests[VAMANA_MAX_RELOAD_QUEUE];
@@ -165,6 +174,13 @@ typedef struct VamanaWorkerShmem
 	/* Updated each BGW loop iteration; backends check for hung worker. */
 	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
 
+	/*
+	 * Live Vamana indexes in this database.  Maintained with plain atomics
+	 * (no array-wide lock) by the backend performing CREATE/DROP INDEX; read
+	 * by M10's DELETE guard and M11's pg_stat_vamana_worker view.
+	 */
+	pg_atomic_uint32 indexCount;
+
 	int				maxSlots;
 
 	/*
@@ -175,29 +191,47 @@ typedef struct VamanaWorkerShmem
 	 */
 	VamanaIndexLockSlot indexLocks[VAMANA_MAX_INDEXES];
 
-	VamanaWorkerSlot slots[FLEXIBLE_ARRAY_MEMBER];
-	/*
-	 * After slots[maxSlots]:
-	 *   float        queryVecs[maxSlots][VAMANA_MAX_DIM]
-	 *   ItemPointerData results[maxSlots][VAMANA_MAX_SEARCH_WINDOW]
-	 *   float        distances[maxSlots][VAMANA_MAX_SEARCH_WINDOW]
-	 *
-	 * Access via VamanaWorkerSlotQueryVec() / SlotResults() / SlotDistances().
-	 */
+	VamanaWorkerSlot *slots;		/* array of maxSlots entries; see above */
 } VamanaWorkerShmem;
 
+/*
+ * Fixed-size array of per-database control blocks.
+ *
+ * Sized once at postmaster start from max_vamana_databases and never
+ * reallocated, so an entry's address is stable for the postmaster's
+ * lifetime.  `lock` serialises entry (de)reservation: shared mode to look
+ * up an entry by dbOid, exclusive mode to claim or release one (which is
+ * what changes numActive).  Per-entry hot fields (indexCount, slot status)
+ * are plain atomics and do not take this lock.
+ */
+typedef struct VamanaWorkerShmemHeader
+{
+	LWLock		   *lock;			/* array-wide reservation lock */
+	int				numSlots;		/* capacity == max_vamana_databases */
+	int				numActive;		/* entries with a valid dbOid (under lock) */
+	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
+} VamanaWorkerShmemHeader;
+
+extern int	 max_vamana_databases;
 extern int	 vamana_worker_timeout_ms;
 extern int	 vamana_worker_startup_timeout_ms;
 extern int	 vamana_worker_restart_time;
 extern int	 vamana_max_batch_size;
 extern char *vamana_worker_database;
 
+extern VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr;
 extern VamanaWorkerShmem *VamanaWorkerShmemPtr;
 
 Size	VamanaWorkerShmemSize(void);
 void	VamanaWorkerShmemStartup(void);		/* shmem_startup_hook */
 void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_init */
 void	VamanaWorkerRegister(void);			/* called from _PG_init */
+
+/* vamanaworkershmem.c: per-database control-block lookup and reservation */
+VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
+VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
+void	VamanaWorkerReleaseSlot(Oid dbOid);
+void	VamanaWorkerIndexCountAdjust(Oid dbOid, int delta);
 
 /* vamanaworkershmem.c */
 LWLock *VamanaGetIndexLock(Oid relid);

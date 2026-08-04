@@ -42,6 +42,7 @@ int			vamana_search_window_size = VAMANA_DEFAULT_SEARCH_WINDOW;
 int			vamana_search_num_threads = 0;
 int			vamana_compact_threshold_pct = 10;
 
+int			max_vamana_databases = 8;
 int			vamana_worker_timeout_ms = 5000;
 int			vamana_worker_startup_timeout_ms = 60000;
 int			vamana_worker_restart_time = 5;
@@ -122,6 +123,16 @@ VamanaInit(void)
 	{
 		GucContext	worker_startup_ctx = process_shared_preload_libraries_in_progress
 			? PGC_POSTMASTER : PGC_SIGHUP;
+
+		DefineCustomIntVariable("svs.max_databases",
+								"Maximum number of databases that can run a vamana background worker",
+								"Sizes the per-database control-block array in shared memory. "
+								"Requires a server restart to take effect.",
+								&max_vamana_databases,
+								8, 1, 128,
+								worker_startup_ctx,
+								0,
+								NULL, NULL, NULL);
 
 		DefineCustomStringVariable("svs.worker_database",
 								   "Database the background worker connects to for catalog access",

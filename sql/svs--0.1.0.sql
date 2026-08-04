@@ -96,6 +96,7 @@ CREATE FUNCTION pg_stat_vamana_worker()
 		active_slot_count   int,
 		reload_all          bool,
 		heartbeat_ts        timestamptz,
+		index_count         int,
 		slot_index          int,
 		slot_status         text,
 		index_relid         oid,

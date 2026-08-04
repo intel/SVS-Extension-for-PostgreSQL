@@ -19,7 +19,9 @@
 
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class_d.h"
+#include "commands/defrem.h"
 #include "miscadmin.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
 /*
@@ -484,6 +486,21 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 		VamanaDeleteSaveDir(objectId);
 		VamanaReleaseIndexLock(objectId);
 		VamanaReplicationDropIfExists(MyDatabaseId, objectId);
+
+		/*
+		 * Drop of the whole relation (subId == 0), not a column.  Decrement
+		 * the per-database index counter only for vamana indexes; the hook
+		 * fires for every relation.  get_rel_relam and get_index_am_oid both
+		 * yield InvalidOid for non-index relations / a missing AM, so require
+		 * a valid, matching AM oid rather than comparing two InvalidOids.
+		 */
+		if (subId == 0)
+		{
+			Oid			vamanaAm = get_index_am_oid("vamana", true);
+
+			if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
+				VamanaWorkerIndexCountAdjust(MyDatabaseId, -1);
+		}
 	}
 }
 
