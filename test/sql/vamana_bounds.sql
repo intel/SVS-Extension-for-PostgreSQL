@@ -175,7 +175,7 @@ DROP TABLE t;
 -- compression_primary / compression_secondary valid set {+/-4, +/-8}
 -- All cases set compression_type = 1 (LEANVEC) so ValidateCompressionParam runs.
 -- Enforced by ValidateCompressionParam() in src/vamanabuild.c,
--- called inside the compression_type == LEANVEC gate in VamanaBuildIndex().
+-- called inside the compression_type == LEANVEC gate in InitBuildState().
 -- -----------------------------------------------------------------------
 
 -- Invalid: value inside [-8,8] but not in {+-4,+-8} rejected (primary = 5)
@@ -214,7 +214,7 @@ DROP TABLE t;
 -- -----------------------------------------------------------------------
 -- compression_primary precision > compression_secondary cross-check
 -- (8-bit primary with 4-bit secondary must be rejected)
--- Enforced by primary_bits > secondary_bits check in ValidateCompressionParam() in src/vamanabuild.c
+-- Enforced by primary_bits > secondary_bits check in InitBuildState() in src/vamanabuild.c
 -- -----------------------------------------------------------------------
 
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
@@ -226,6 +226,24 @@ DROP TABLE t;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 CREATE INDEX ON t USING vamana (val vector_l2_ops)
     WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- compression_primary / compression_secondary reloption-layer boundary
+-- Values outside [-8, 8] are rejected before ValidateCompressionParam runs.
+-- Enforced by add_int_reloption() in src/vamana.c
+-- -----------------------------------------------------------------------
+
+-- Invalid: outside reloption range (primary = 9)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 9, compression_secondary = 8);
+DROP TABLE t;
+
+-- Invalid: outside reloption range (secondary = -9)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = -9);
 DROP TABLE t;
 
 -- -----------------------------------------------------------------------
