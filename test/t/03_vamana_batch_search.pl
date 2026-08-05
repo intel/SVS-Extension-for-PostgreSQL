@@ -40,6 +40,9 @@ sub make_search_sql
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker($node);
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE batch_tbl (id serial PRIMARY KEY, val vector($dim));

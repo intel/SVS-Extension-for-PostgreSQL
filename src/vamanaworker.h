@@ -8,6 +8,7 @@
 
 #include "postgres.h"
 
+#include "datatype/timestamp.h"
 #include "port/atomics.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -141,6 +142,19 @@ typedef struct VamanaIndexLockSlot
 } VamanaIndexLockSlot;
 
 /*
+ * Launcher-owned crash-backoff state for one database, written only by the
+ * launcher under the shmem header LWLock.  Kept in shmem, not launcher-local
+ * memory, so the failure count survives a launcher restart; otherwise a
+ * crash-looping database would be respawned immediately on every launcher
+ * bounce.
+ */
+typedef struct VamanaLauncherBackoff
+{
+	TimestampTz	last_attempt_time;		/* when the launcher last (re)spawned */
+	uint32		consecutive_failures;	/* crashes since the last recovery */
+} VamanaLauncherBackoff;
+
+/*
  * Per-database control block.
  *
  * One entry per database served by a worker, held in the fixed-size
@@ -183,6 +197,9 @@ typedef struct VamanaWorkerShmem
 	pg_atomic_uint32 indexCount;
 
 	int				maxSlots;
+
+	/* Launcher-owned; see VamanaLauncherBackoff. */
+	VamanaLauncherBackoff backoff;
 
 	/*
 	 * Per-index r/w locks.  Up to VAMANA_MAX_INDEXES concurrent live indexes.
@@ -244,6 +261,11 @@ VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerIndexCountAdjust(Oid dbOid, int delta);
+
+/* vamanaworkershmem.c: launcher-owned crash-backoff state (header lock) */
+bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);
+void	VamanaWorkerBackoffStampAttempt(Oid dbOid, TimestampTz now);
+void	VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered);
 
 /* vamanaworkershmem.c: launcher initial-scan publication (header lock) */
 void	VamanaWorkerSetInitialScanDone(void);

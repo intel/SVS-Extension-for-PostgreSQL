@@ -38,6 +38,7 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/wait_classes.h"
 
 /* Fallback wake interval when nothing else wakes the loop; matches core. */
@@ -45,6 +46,21 @@
 
 /* NOTIFY channel published by the vamana_databases_changed trigger (M1). */
 #define VAMANA_DATABASES_CHANNEL		"vamana_databases_changed"
+
+/* Upper bound on the exponential respawn backoff. */
+#define VAMANA_RESTART_BACKOFF_CEILING_MS	60000
+
+/*
+ * Uptime after which a worker's death counts as a recovery (resetting the
+ * failure count) rather than another crash-loop iteration.
+ */
+#define VAMANA_BACKOFF_DWELL_RESET_MS		10000
+
+/* Failure-count clamp for the backoff shift, to avoid overflow. */
+#define VAMANA_BACKOFF_MAX_SHIFT			20
+
+/* Naptime floor: a near-zero backoff remainder must not wake a busy re-scan. */
+#define VAMANA_LAUNCHER_MIN_NAPTIME_MS		1000L
 
 /*
  * One tracked per-database worker: the handle returned by
@@ -58,6 +74,14 @@ typedef struct VamanaLauncherWorker
 {
 	Oid			dbOid;
 	BackgroundWorkerHandle *handle;
+
+	/*
+	 * When the handle was first observed running (BGWH_STARTED), or 0 if it has
+	 * not started yet.  Its death is a recovery only if it stayed up past the
+	 * dwell threshold; a worker that FATALs before ever starting keeps this 0
+	 * and can only escalate the backoff, never reset it.
+	 */
+	TimestampTz	started_time;
 } VamanaLauncherWorker;
 
 /*
@@ -78,12 +102,15 @@ typedef struct VamanaEnabledDatabase
  */
 static List *WorkerLedger = NIL;
 
-static void VamanaLauncherReconcileWorkers(void);
+static long VamanaLauncherReconcileWorkers(void);
 static List *ReadEnabledDatabases(void);
 static void MaterializeInitialConfig(void);
 static VamanaLauncherWorker *FindLedgerEntry(Oid dbOid);
-static void SpawnWorker(const VamanaEnabledDatabase *db);
-static void ReapStoppedWorkers(void);
+static bool IsDatabaseEnabled(List *enabled, Oid dbOid);
+static void SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now);
+static void ReconcileLedgerLiveness(List *enabled, TimestampTz now);
+static long BackoffThresholdMs(uint32 consecutiveFailures);
+static long BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now);
 
 /* -----------------------------------------------------------------------
  * Static registration
@@ -146,6 +173,7 @@ VamanaLauncherMain(Datum main_arg)
 	for (;;)
 	{
 		int			rc;
+		long		naptime;
 
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
@@ -171,29 +199,33 @@ VamanaLauncherMain(Datum main_arg)
 		 */
 		ProcessNotifyInterrupt(false);
 
-		VamanaLauncherReconcileWorkers();
+		naptime = VamanaLauncherReconcileWorkers();
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					   VAMANA_LAUNCHER_NAPTIME_MS,
+					   naptime,
 					   PG_WAIT_EXTENSION);
 		(void) rc;
 	}
 }
 
 /*
- * Reconcile the live worker set against the table on every wake.  Reaping
- * stopped handles first keeps the ledger honest before the spawn diff reads it.
+ * Reconcile the live worker set against the table on every wake, and return the
+ * naptime for the following WaitLatch.  The enabled set is read first so the
+ * liveness pass can tell a crash (accrue backoff) from a legitimate disable
+ * (drop with no accrual); the spawn diff then respawns any enabled database
+ * whose worker is gone, subject to its backoff, folding the naptime down to the
+ * soonest eligible retry so a backing-off database is not made to oversleep.
  */
-static void
+static long
 VamanaLauncherReconcileWorkers(void)
 {
 	MemoryContext cycleCtx;
 	MemoryContext oldCtx;
 	List	   *enabled;
 	ListCell   *lc;
-
-	ReapStoppedWorkers();
+	TimestampTz now = GetCurrentTimestamp();
+	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
 
 	cycleCtx = AllocSetContextCreate(TopMemoryContext,
 									 "vamana launcher reconcile",
@@ -202,16 +234,30 @@ VamanaLauncherReconcileWorkers(void)
 
 	enabled = ReadEnabledDatabases();
 
+	ReconcileLedgerLiveness(enabled, now);
+
 	foreach(lc, enabled)
 	{
 		VamanaEnabledDatabase *db = (VamanaEnabledDatabase *) lfirst(lc);
+		VamanaLauncherBackoff backoff;
+		long		remaining;
 
-		if (FindLedgerEntry(db->dbOid) == NULL)
-			SpawnWorker(db);
+		if (FindLedgerEntry(db->dbOid) != NULL)
+			continue;
+
+		VamanaWorkerBackoffSnapshot(db->dbOid, &backoff);
+		remaining = BackoffRemainingMs(&backoff, now);
+
+		if (remaining <= 0)
+			SpawnWorker(db, now);
+		else
+			naptime = Min(naptime, remaining);
 	}
 
 	MemoryContextSwitchTo(oldCtx);
 	MemoryContextDelete(cycleCtx);
+
+	return Max(naptime, VAMANA_LAUNCHER_MIN_NAPTIME_MS);
 }
 
 /* -----------------------------------------------------------------------
@@ -363,6 +409,38 @@ ReadEnabledDatabases(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Crash-backoff policy
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Milliseconds to wait between respawns: the base backoff doubled per failure,
+ * capped at the ceiling.  Exponential because a persistently broken database
+ * gains nothing from retrying every base interval.
+ */
+static long
+BackoffThresholdMs(uint32 consecutiveFailures)
+{
+	uint32		shift = Min(consecutiveFailures, VAMANA_BACKOFF_MAX_SHIFT);
+	long		threshold = (long) vamana_worker_restart_backoff << shift;
+
+	return Min(threshold, VAMANA_RESTART_BACKOFF_CEILING_MS);
+}
+
+/* Milliseconds left before the next respawn is allowed; <= 0 means spawn now. */
+static long
+BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now)
+{
+	long		elapsed;
+
+	if (backoff->last_attempt_time == 0)
+		return 0;
+
+	elapsed = TimestampDifferenceMilliseconds(backoff->last_attempt_time, now);
+
+	return BackoffThresholdMs(backoff->consecutive_failures) - elapsed;
+}
+
+/* -----------------------------------------------------------------------
  * Worker ledger and spawning
  * ----------------------------------------------------------------------- */
 
@@ -381,18 +459,47 @@ FindLedgerEntry(Oid dbOid)
 	return NULL;
 }
 
+static bool
+IsDatabaseEnabled(List *enabled, Oid dbOid)
+{
+	ListCell   *lc;
+
+	foreach(lc, enabled)
+	{
+		if (((VamanaEnabledDatabase *) lfirst(lc))->dbOid == dbOid)
+			return true;
+	}
+	return false;
+}
+
 /*
  * Register a per-database worker and record its handle in the ledger.  The
  * worker is BGW_NEVER_RESTART with bgw_notify_pid set to the launcher, so the
  * postmaster never respawns it and instead signals the launcher on its death.
+ *
+ * The slot is reserved here, before registration, for two reasons: it gives the
+ * backoff counters a durable home even for a worker that FATALs at startup
+ * before it can self-reserve (the crash-loop case), and it avoids registering a
+ * worker that could only fail the capacity check.  Reservation is idempotent,
+ * so overlap with the worker's own startup reservation is a no-op.
  */
 static void
-SpawnWorker(const VamanaEnabledDatabase *db)
+SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
 {
 	BackgroundWorker bgw;
 	BackgroundWorkerHandle *handle;
 	VamanaLauncherWorker *entry;
 	MemoryContext oldCtx;
+
+	if (VamanaWorkerReserveSlot(db->dbOid) == NULL)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
+						db->datname),
+				 errhint("Increase max_vamana_databases and restart.")));
+		return;
+	}
 
 	memset(&bgw, 0, sizeof(bgw));
 	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana worker: %s", db->datname);
@@ -427,19 +534,30 @@ SpawnWorker(const VamanaEnabledDatabase *db)
 	entry = palloc(sizeof(VamanaLauncherWorker));
 	entry->dbOid = db->dbOid;
 	entry->handle = handle;
+	entry->started_time = 0;
 	WorkerLedger = lappend(WorkerLedger, entry);
 
 	MemoryContextSwitchTo(oldCtx);
+
+	VamanaWorkerBackoffStampAttempt(db->dbOid, now);
 }
 
 /*
- * Drop ledger entries whose worker has exited.  Liveness ground truth is the
- * handle, never the slot's workerPid.  The stopped worker's slot stays
- * reserved (config persists); only the launcher's spawn bookkeeping is cleared,
- * so the next reconcile pass re-spawns an enabled database whose worker died.
+ * Update the ledger against the live worker set, and account for every death in
+ * the shmem backoff state.  Liveness ground truth is the handle, never the
+ * slot's workerPid.
+ *
+ * A running handle that has not yet been seen started gets its start time
+ * stamped, so its eventual uptime can be measured.  A stopped handle is dropped
+ * from the ledger (its slot stays reserved, so the next pass respawns it) and
+ * its death is charged to backoff: a recovery if the worker was enabled and
+ * stayed up past the dwell threshold, an escalation otherwise.  A database no
+ * longer in the enabled set is dropped with no accrual — a deliberate disable
+ * must never read as a crash-loop — which also covers a worker that FATALs at
+ * connect on a since-dropped database.
  */
 static void
-ReapStoppedWorkers(void)
+ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 {
 	ListCell   *lc;
 
@@ -447,12 +565,25 @@ ReapStoppedWorkers(void)
 	{
 		VamanaLauncherWorker *w = (VamanaLauncherWorker *) lfirst(lc);
 		pid_t		pid;
+		BgwHandleStatus status = GetBackgroundWorkerPid(w->handle, &pid);
 
-		if (GetBackgroundWorkerPid(w->handle, &pid) == BGWH_STOPPED)
+		if (status == BGWH_STARTED && w->started_time == 0)
+			w->started_time = now;
+
+		if (status != BGWH_STOPPED)
+			continue;
+
+		if (IsDatabaseEnabled(enabled, w->dbOid))
 		{
-			WorkerLedger = foreach_delete_current(WorkerLedger, lc);
-			pfree(w->handle);
-			pfree(w);
+			bool		recovered = w->started_time != 0 &&
+				TimestampDifferenceMilliseconds(w->started_time, now) >=
+				VAMANA_BACKOFF_DWELL_RESET_MS;
+
+			VamanaWorkerBackoffRecordDeath(w->dbOid, recovered);
 		}
+
+		WorkerLedger = foreach_delete_current(WorkerLedger, lc);
+		pfree(w->handle);
+		pfree(w);
 	}
 }

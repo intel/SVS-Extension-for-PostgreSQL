@@ -166,6 +166,9 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 	entry->maxSlots = MaxBackends;
 	entry->slots = (VamanaWorkerSlot *) slotRegion;
 
+	entry->backoff.last_attempt_time = 0;
+	entry->backoff.consecutive_failures = 0;
+
 	InitSharedLatch(&entry->workerLatch);
 
 	for (int i = 0; i < MaxBackends; i++)
@@ -337,6 +340,80 @@ VamanaWorkerIndexCountAdjust(Oid dbOid, int delta)
 		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));
 }
 
+/* -----------------------------------------------------------------------
+ * Launcher-owned crash-backoff state
+ *
+ * The backoff sub-struct is written only by the launcher, always under the
+ * header lock, so it stays consistent with the slot's dbOid identity.  These
+ * accessors are the storage half of the crash-backoff feature; the escalation
+ * policy (when a death counts as recovery, how the interval grows) lives in the
+ * launcher, which passes its decision in as the `recovered` flag.
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Copy dbOid's backoff counters into *out.  Returns false and zeroes *out when
+ * no slot is reserved yet, so a first-ever spawn reads as "no backoff owed".
+ */
+bool
+VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+		*out = entry->backoff;
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	if (entry == NULL)
+	{
+		out->last_attempt_time = 0;
+		out->consecutive_failures = 0;
+		return false;
+	}
+	return true;
+}
+
+/* Record the moment the launcher (re)spawned dbOid's worker. */
+void
+VamanaWorkerBackoffStampAttempt(Oid dbOid, TimestampTz now)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+		entry->backoff.last_attempt_time = now;
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
+/*
+ * Account for a worker's death: clear the failure count if the launcher judged
+ * the run a recovery, otherwise advance it one step up the escalation curve.
+ */
+void
+VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		if (recovered)
+			entry->backoff.consecutive_failures = 0;
+		else
+			entry->backoff.consecutive_failures++;
+	}
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
 /*
  * Publish that the launcher has finished its startup scan and reserved a slot
  * for every enabled database.  After this, absence of a slot for a database is
@@ -397,6 +474,8 @@ VamanaWorkerReleaseSlot(Oid dbOid)
 	{
 		entry->dbOid = InvalidOid;
 		entry->workerPid = 0;
+		entry->backoff.last_attempt_time = 0;
+		entry->backoff.consecutive_failures = 0;
 		VamanaWorkerShmemHeaderPtr->numActive--;
 	}
 

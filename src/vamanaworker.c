@@ -37,6 +37,7 @@
 #include "storage/lwlock.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/timestamp.h"
 #include "utils/memutils.h"
@@ -335,6 +336,8 @@ VamanaWorkerMain(Datum main_arg)
 				 errhint("Set wal_level = logical in postgresql.conf and restart.")));
 
 	BackgroundWorkerInitializeConnectionByOid(DatumGetObjectId(main_arg), InvalidOid, 0);
+
+	INJECTION_POINT("vamana-worker-startup-crash", NULL);
 
 	CacheRegisterRelcacheCallback(VamanaRelcacheCallback, (Datum) 0);
 
