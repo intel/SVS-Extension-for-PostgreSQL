@@ -14,6 +14,7 @@
 
 -- -----------------------------------------------------------------------
 -- graph_degree: [16, 256]
+-- Enforced by add_int_reloption() in src/vamana.c
 -- -----------------------------------------------------------------------
 
 -- Exact minimum is accepted
@@ -39,6 +40,7 @@ DROP TABLE t;
 
 -- -----------------------------------------------------------------------
 -- alpha: [-1, 200]
+-- Enforced by add_int_reloption() in src/vamana.c
 -- -----------------------------------------------------------------------
 
 -- -1 is the sentinel "use SVS default" and must be accepted
@@ -65,6 +67,7 @@ DROP TABLE t;
 -- build_window_size: [-1, 1000]
 -- (-1 is the sentinel for 2 * graph_degree; 0 is accepted by the reloption
 -- layer since min=-1, but the application treats it the same as -1)
+-- Enforced by add_int_reloption() in src/vamana.c
 -- -----------------------------------------------------------------------
 
 -- Exact minimum (-1 sentinel for 2 * graph_degree) is accepted
@@ -84,6 +87,7 @@ DROP TABLE t;
 
 -- -----------------------------------------------------------------------
 -- search_window_size (reloption): [10, 10000]
+-- Enforced by add_int_reloption() in src/vamana.c
 -- -----------------------------------------------------------------------
 
 -- Exact minimum is accepted
@@ -108,7 +112,13 @@ DROP TABLE t;
 
 -- -----------------------------------------------------------------------
 -- leanvec_dims: [-1, 2000]
+-- Enforced by add_int_reloption() in src/vamana.c
 -- -----------------------------------------------------------------------
+
+-- Exact minimum (-1 sentinel for SVS default) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (leanvec_dims = -1);
+DROP TABLE t;
 
 -- Exact maximum is accepted (requires sufficient dimension; use dim=2000)
 CREATE TABLE t (id serial PRIMARY KEY, val vector(2000));
@@ -122,9 +132,89 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops)
     WITH (compression_type = 1, leanvec_dims = 2001);
 DROP TABLE t;
 
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (leanvec_dims = -2);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- build_window_size: below-minimum symmetry (same enforcement: add_int_reloption() in src/vamana.c)
+-- -----------------------------------------------------------------------
+
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = -2);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- compression_type: [0, 2]
+-- Enforced by add_int_reloption() in src/vamana.c
+-- -----------------------------------------------------------------------
+
+-- Valid lower boundary (0 = none) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 0);
+DROP TABLE t;
+
+-- Valid upper boundary (2 = lvq) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 2);
+DROP TABLE t;
+
+-- One below minimum is rejected at reloption layer
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = -1);
+DROP TABLE t;
+
+-- One above maximum is rejected at reloption layer
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 3);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- compression_primary / compression_secondary valid set {+/-4, +/-8}
+-- All cases set compression_type = 1 (LEANVEC) so ValidateCompressionParam runs.
+-- Enforced by ValidateCompressionParam() in src/vamanabuild.c,
+-- called inside the compression_type == LEANVEC gate in InitBuildState().
+-- -----------------------------------------------------------------------
+
+-- Invalid: value inside [-8,8] but not in {+-4,+-8} rejected (primary = 5)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 5, compression_secondary = 8);
+DROP TABLE t;
+
+-- Invalid: secondary = 5, primary = 4 (valid) isolates the secondary failure
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 5);
+DROP TABLE t;
+
+-- Valid: each member of {+-4, +-8} accepted as equal-bit primary/secondary
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 4);
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = -4);
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = -8);
+DROP TABLE t;
+
 -- -----------------------------------------------------------------------
 -- compression_primary precision > compression_secondary cross-check
 -- (8-bit primary with 4-bit secondary must be rejected)
+-- Enforced by primary_bits > secondary_bits check in InitBuildState() in src/vamanabuild.c
 -- -----------------------------------------------------------------------
 
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
@@ -139,7 +229,26 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops)
 DROP TABLE t;
 
 -- -----------------------------------------------------------------------
+-- compression_primary / compression_secondary reloption-layer boundary
+-- Values outside [-8, 8] are rejected before ValidateCompressionParam runs.
+-- Enforced by add_int_reloption() in src/vamana.c
+-- -----------------------------------------------------------------------
+
+-- Invalid: outside reloption range (primary = 9)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 9, compression_secondary = 8);
+DROP TABLE t;
+
+-- Invalid: outside reloption range (secondary = -9)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = -9);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
 -- svs.search_window_size GUC: [10, 10000]
+-- Enforced by DefineCustomIntVariable() in src/vamana.c
 -- -----------------------------------------------------------------------
 
 -- Exact minimum is accepted
@@ -160,6 +269,7 @@ SET svs.search_window_size = 10001;
 
 -- -----------------------------------------------------------------------
 -- svs.search_num_threads GUC: [0, 1024]
+-- Enforced by DefineCustomIntVariable() in src/vamana.c
 -- -----------------------------------------------------------------------
 
 -- Exact minimum is accepted
@@ -183,9 +293,10 @@ SET svs.search_num_threads = -1;
 -- Session SET always returns "cannot be changed now" regardless of value,
 -- so it never exercises range validation.  Use ALTER SYSTEM which validates
 -- bounds at write time.
+-- Enforced by DefineCustomIntVariable() in src/vamana.c
 -- -----------------------------------------------------------------------
 
--- svs.checkpoint_debounce_window: [0, 86400] s
+-- svs.checkpoint_debounce_window: [0, 86400] s -- DefineCustomIntVariable() in src/vamana.c
 
 -- Out-of-range: rejected at ALTER SYSTEM time
 ALTER SYSTEM SET svs.checkpoint_debounce_window = -1;
@@ -207,7 +318,7 @@ SHOW svs.checkpoint_debounce_window;
 ALTER SYSTEM RESET svs.checkpoint_debounce_window;
 SELECT pg_reload_conf();
 
--- svs.checkpoint_max_interval: [1, 86400] s
+-- svs.checkpoint_max_interval: [1, 86400] s -- DefineCustomIntVariable() in src/vamana.c
 
 -- Out-of-range
 ALTER SYSTEM SET svs.checkpoint_max_interval = 0;
@@ -229,7 +340,7 @@ SHOW svs.checkpoint_max_interval;
 ALTER SYSTEM RESET svs.checkpoint_max_interval;
 SELECT pg_reload_conf();
 
--- svs.checkpoint_min_ops: [0, INT_MAX]
+-- svs.checkpoint_min_ops: [0, INT_MAX] -- DefineCustomIntVariable() in src/vamana.c
 
 -- Out-of-range (below min)
 ALTER SYSTEM SET svs.checkpoint_min_ops = -1;
@@ -250,7 +361,7 @@ SHOW svs.checkpoint_min_ops;
 ALTER SYSTEM RESET svs.checkpoint_min_ops;
 SELECT pg_reload_conf();
 
--- svs.max_slot_wal_size: [64, MAX_KILOBYTES] MB
+-- svs.max_slot_wal_size: [64, MAX_KILOBYTES] MB -- DefineCustomIntVariable() in src/vamana.c
 
 -- Out-of-range (below min)
 ALTER SYSTEM SET svs.max_slot_wal_size = '63MB';
@@ -263,7 +374,7 @@ SHOW svs.max_slot_wal_size;
 ALTER SYSTEM RESET svs.max_slot_wal_size;
 SELECT pg_reload_conf();
 
--- svs.checkpoint_operations: [-1, INT_MAX]
+-- svs.checkpoint_operations: [-1, INT_MAX] -- DefineCustomIntVariable() in src/vamana.c
 
 -- Out-of-range (below min)
 ALTER SYSTEM SET svs.checkpoint_operations = -2;
@@ -284,7 +395,7 @@ SHOW svs.checkpoint_operations;
 ALTER SYSTEM RESET svs.checkpoint_operations;
 SELECT pg_reload_conf();
 
--- svs.checkpoint_interval: [-1, 86400] s
+-- svs.checkpoint_interval: [-1, 86400] s -- DefineCustomIntVariable() in src/vamana.c
 
 -- Out-of-range
 ALTER SYSTEM SET svs.checkpoint_interval = -2;
