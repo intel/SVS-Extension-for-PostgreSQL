@@ -8,7 +8,7 @@
 
 #include "postgres.h"
 
-/* Static registration at _PG_init; counterpart to VamanaWorkerRegister(). */
+/* Static registration at _PG_init. */
 void	VamanaLauncherRegister(void);
 
 /* Launcher entry point (named in the BackgroundWorker struct). */

@@ -163,8 +163,13 @@ VamanaLauncherMain(Datum main_arg)
 		 * leak and is where a payload-parsing future (M9's restart:<dbname>)
 		 * will hook in.  ProcessNotifyInterrupt refuses to run inside a
 		 * transaction, so it precedes the SPI read in the reconcile pass.
+		 *
+		 * flush=false: the launcher has no client connection, so pq_flush()
+		 * would ERROR with "there is no client connection".  There is no
+		 * frontend to forward notifications to; draining the queue is all we
+		 * need.
 		 */
-		ProcessNotifyInterrupt(true);
+		ProcessNotifyInterrupt(false);
 
 		VamanaLauncherReconcileWorkers();
 
@@ -348,20 +353,6 @@ ReadEnabledDatabases(void)
 			result = AppendEnabledDatabase(result, dbOid, NameStr(*datname),
 										   callerCtx);
 		}
-	}
-
-	/*
-	 * B1.1 shim: honor a still-set svs.worker_database as an implicit enabled
-	 * database so TAP files not yet migrated to a vamana_databases row keep
-	 * spawning a worker.  Deleted in B1.2 with the GUC.
-	 */
-	if (vamana_worker_database != NULL && vamana_worker_database[0] != '\0')
-	{
-		Oid			dbOid = get_database_oid(vamana_worker_database, true);
-
-		if (OidIsValid(dbOid))
-			result = AppendEnabledDatabase(result, dbOid, vamana_worker_database,
-										   callerCtx);
 	}
 
 	SPI_finish();

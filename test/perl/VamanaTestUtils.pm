@@ -19,7 +19,7 @@ our @EXPORT_OK = qw(
     $dim $array_sql $query_sql $lv_query_sql
     $N @query_vecs $SYNC_SLEEP
     run_concurrent run_synchronized dir_size
-    wait_for_worker
+    wait_for_worker wait_for_worker_db
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 
@@ -218,6 +218,29 @@ sub wait_for_worker
         $pid = $node->safe_psql('postgres',
             "SELECT pid FROM pg_stat_activity "
           . "WHERE backend_type = 'vamana worker' LIMIT 1;");
+        chomp $pid;
+        return $pid if $pid =~ /^\d+$/;
+    }
+    return '';
+}
+
+# ---------------------------------------------------------------------------
+# wait_for_worker_db: like wait_for_worker, but for the worker serving a
+# specific database.  With the launcher spawning one worker per enabled
+# database, several workers can run at once, so a database filter is needed to
+# identify the right one.
+# ---------------------------------------------------------------------------
+sub wait_for_worker_db
+{
+    my ($node, $db, $attempts) = @_;
+    $attempts //= 30;
+    my $pid = '';
+    for my $i (1 .. $attempts)
+    {
+        usleep(500_000);
+        $pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' AND datname = '$db' LIMIT 1;");
         chomp $pid;
         return $pid if $pid =~ /^\d+$/;
     }

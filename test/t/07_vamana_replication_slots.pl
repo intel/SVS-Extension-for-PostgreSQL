@@ -32,13 +32,21 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
     $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    # The launcher spawns the worker asynchronously in response to the row
+    # above, so wait for it before CREATE INDEX: the slot is created when a live
+    # worker loads the index, and building it against no worker would leave the
+    # slot uncreated.
+    wait_for_worker($node, 30);
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE rs_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -58,19 +66,21 @@ use VamanaTestUtils qw(:all);
 
     my $slot_name = "vamana_${dboid}_${indexoid}";
 
-    wait_for_worker($node, 30);
-
-    # Give BGW time to process the LOAD slot and call VamanaReplicationCreate.
-    sleep(3);
-
     # ---------------------------------------------------------------- Test 1 --
-    # Slot exists after CREATE INDEX and BGW load.
-
-    my $slot_exists = $node->safe_psql('postgres', qq{
-        SELECT count(*) FROM pg_replication_slots
-        WHERE slot_name = '$slot_name' AND plugin = 'svs';
-    });
-    chomp $slot_exists;
+    # Slot exists after CREATE INDEX and BGW load.  Poll rather than sleep a
+    # fixed interval: the worker creates the slot when it processes the LOAD
+    # request, and its timing is not tied to CREATE INDEX returning.
+    my $slot_exists = 0;
+    for (1 .. 20)
+    {
+        usleep(500_000);
+        $slot_exists = $node->safe_psql('postgres', qq{
+            SELECT count(*) FROM pg_replication_slots
+            WHERE slot_name = '$slot_name' AND plugin = 'svs';
+        });
+        chomp $slot_exists;
+        last if $slot_exists == 1;
+    }
 
     ok($slot_exists == 1,
         "replication slot '$slot_name' exists after CREATE INDEX");
@@ -193,11 +203,13 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 20");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $dboid = $node->safe_psql('postgres',
         "SELECT oid FROM pg_database WHERE datname = 'postgres';");
@@ -373,12 +385,14 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE replay_tbl (id serial, val vector($dim));
@@ -442,13 +456,15 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
     $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE idem_tbl (id serial, val vector($dim));
@@ -559,12 +575,14 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE del_tbl (id serial, val vector($dim));
@@ -642,7 +660,7 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     # Start with checkpoints enabled so the stale tidmap.bin gets persisted;
     # suppressed later so the reuse insert stays WAL-only for replay.
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
@@ -654,6 +672,8 @@ sub wait_for_lsn_advance
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE reuse_tbl (id serial, val vector($dim));
@@ -803,12 +823,14 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE dbl_tbl (id serial, val vector($dim));
@@ -895,12 +917,19 @@ sub wait_for_lsn_advance
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    # Wait for the launcher-spawned worker before building the index so the
+    # replication slot is created and retains the post-build un-checkpointed
+    # inserts that replay must reapply after the crash.
+    wait_for_worker($node, 30);
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE drift_tbl (id serial PRIMARY KEY, val vector($dim));

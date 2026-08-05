@@ -198,6 +198,27 @@ sub dir_size
     return $total;
 }
 
+# Poll pg_stat_activity until the vamana worker serving $db appears (up to
+# $attempts x 0.5s).  With the launcher spawning one worker per enabled
+# database, several workers can run at once, so a datname filter identifies
+# the right one.  Returns the PID or '' on timeout.
+sub wait_for_worker_db
+{
+    my ($node, $db, $attempts) = @_;
+    $attempts //= 30;
+    my $pid = '';
+    for my $i (1 .. $attempts)
+    {
+        usleep(500_000);
+        $pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' AND datname = '$db' LIMIT 1;");
+        chomp $pid;
+        return $pid if $pid =~ /^\d+$/;
+    }
+    return '';
+}
+
 # ===========================================================================
 # SECTION 1: Vamana Index Persistence
 #
@@ -237,6 +258,8 @@ sub dir_size
     # ---------------------------------------------------------------- setup --
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE vp_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -464,6 +487,8 @@ sub dir_size
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE st_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -587,6 +612,8 @@ sub dir_size
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE lv_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -714,10 +741,10 @@ sub dir_size
 #   9.  pg_regress-style DROP DATABASE IF EXISTS with worker preloaded.
 #   10. svs.max_batch_size = 1 — worker serves every query correctly
 #       when forced to drain one slot per iteration.
-#   11. svs.worker_database non-default — worker connects to a named
-#       database and serves indexes created there.
-#   12. dbOid != MyDatabaseId — backend gets a hard ERROR when
-#       worker is serving a different database (no direct-mode fallback).
+#   11. Enable-then-restart — a second database enabled in vamana_databases
+#       gets its worker materialized by the launcher's startup scan on restart.
+#   12. Unconfigured database — a backend in a database with no
+#       vamana_databases row gets a config hard-fail (no direct-mode fallback).
 #   13. Worker timeout — SIGSTOP worker, set timeout to minimum;
 #       backend raises ERROR (no fallback to direct mode).
 #   14. SIGHUP GUC reload — pg_reload_conf() updates worker_timeout_ms
@@ -739,6 +766,8 @@ sub dir_size
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE bgw_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -749,10 +778,9 @@ sub dir_size
     ));
 
     # -------------------------------------------------- test 1: worker alive --
-    my $worker_pid = $node->safe_psql("postgres",
-        "SELECT pid FROM pg_stat_activity "
-      . "WHERE backend_type = 'vamana worker' LIMIT 1;");
-    chomp $worker_pid;
+    # The launcher spawns the postgres worker asynchronously after the
+    # vamana_databases row commits, so poll rather than reading the PID once.
+    my $worker_pid = wait_for_worker_db($node, 'postgres', 30);
 
     ok($worker_pid =~ /^\d+$/,
         "vamana background worker process is running (pid=$worker_pid)");
@@ -911,12 +939,13 @@ sub dir_size
             "query $i results match baseline with max_batch_size=1");
     }
 
-    # --------------------------------- test 11: worker_database non-default --
-    # Create a second database with its own extension, table, and data while the
-    # BGW is still serving "postgres".  The Vamana index is created AFTER the
-    # restart so the BGW (now serving "testdb") can adopt it immediately.
-    # Creating it before the restart would fail: the BGW would reject the build
-    # with "vamana index is not enabled for this database".
+    # ----------------------- test 11: enable-then-restart materialization --
+    # Enable a second database, then restart the server.  This exercises the
+    # launcher's startup-scan materialization: on restart the launcher reads the
+    # committed vamana_databases rows and spawns a worker for each before any
+    # backend runs, so testdb's worker comes up from the initial scan rather than
+    # a live NOTIFY.  postgres stays enabled from the top of this block, so both
+    # workers run after the restart.
     $node->safe_psql("postgres", "CREATE DATABASE testdb;");
     $node->safe_psql("testdb",   "CREATE EXTENSION vector;");
     $node->safe_psql("testdb",   "CREATE EXTENSION svs;");
@@ -926,33 +955,23 @@ sub dir_size
             SELECT ARRAY[$array_sql]::vector
             FROM generate_series(1, 200) i;
     ));
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('testdb', true);");
 
     # Snapshot before the restart so "started for database testdb" is guaranteed
     # to appear after this position.
     my $log_pos_before_testdb = length($node->log_content());
 
-    $node->stop;
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'testdb'");
-    $node->start;
+    $node->restart;
 
-    # Create the Vamana index now that the BGW is serving testdb.
+    # testdb's worker is materialized by the initial scan; the index it adopts
+    # is created after the restart, once the worker is up for testdb.
+    my $testdb_worker_pid = wait_for_worker_db($node, 'testdb', 20);
+    ok($testdb_worker_pid =~ /^\d+$/,
+        "launcher materializes a worker for testdb on restart (pid=$testdb_worker_pid)");
+
     $node->safe_psql("testdb",
         "CREATE INDEX testdb_idx ON testdb_tbl USING vamana (val vector_l2_ops);");
-
-    # Poll for the worker to appear after connecting to testdb.
-    my $testdb_worker_pid = '';
-    for my $attempt (1 .. 20)
-    {
-        usleep(500_000);    # 0.5 s
-        $testdb_worker_pid = $node->safe_psql("postgres",
-            "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
-        chomp $testdb_worker_pid;
-        last if $testdb_worker_pid =~ /^\d+$/;
-    }
-
-    ok($testdb_worker_pid =~ /^\d+$/,
-        "worker running after switching worker_database to testdb (pid=$testdb_worker_pid)");
 
     sleep(2);    # give worker time to load the index from testdb
 
@@ -962,48 +981,39 @@ sub dir_size
         SELECT id FROM testdb_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
     isnt($testdb_results, '',
-        'worker serves queries when worker_database is set to non-default testdb');
+        'testdb worker serves queries after enable-then-restart materialization');
 
     my $testdb_log = substr($node->log_content(), $log_pos_before_testdb);
     like($testdb_log, qr/vamana background worker started for database "testdb"/,
         'server log confirms worker started for testdb');
-    unlike($testdb_log, qr/vamana worker connecting to default database "postgres"/,
-        'no default-database warning when worker_database is explicitly set');
 
-    # ----------------------------- test 12: dbOid != MyDatabaseId → hard ERROR --
-    # The worker is connected to testdb.  A backend in "postgres" sees
-    # dbOid != MyDatabaseId and VamanaWorkerAssertDatabase() immediately throws
-    # an ERROR — there is no direct-mode fallback anymore.
-    my ($fallback_ret, undef, $fallback_err) = $node->psql("postgres", qq(
-        SET enable_seqscan = off;
-        SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    # ----------------------- test 12: unconfigured database → hard ERROR --
+    # A database with no vamana_databases row is unconfigured.  After the
+    # launcher's initial scan, VamanaWorkerAssertDatabase() finds no slot for it
+    # and throws immediately — this is the config half of the config/liveness
+    # split, with no direct-mode fallback.  postgres and testdb both have live
+    # workers here, so the failure is specific to the unconfigured database.
+    $node->safe_psql("postgres", "CREATE DATABASE unconfigured_db;");
+    $node->safe_psql("unconfigured_db", "CREATE EXTENSION vector;");
+    $node->safe_psql("unconfigured_db", "CREATE EXTENSION svs;");
+    # Empty table on purpose: the config gate fires before the table scan, so
+    # the hard-fail must not depend on the heap having rows.
+    my ($unconf_ret, undef, $unconf_err) = $node->psql("unconfigured_db", qq(
+        CREATE TABLE u_tbl (id serial PRIMARY KEY, val vector($dim));
+        CREATE INDEX u_idx ON u_tbl USING vamana (val vector_l2_ops);
     ));
-    like($fallback_err,
+    like($unconf_err,
         qr/vamana index is not enabled for this database/,
-        'backend gets ERROR when worker dbOid != MyDatabaseId (no direct-mode fallback)');
+        'backend in an unconfigured database gets a config hard-fail (no fallback)');
 
     # --------------- test 13: worker timeout → hard ERROR (no fallback) --
-    # Reset the worker back to postgres so VamanaWorkerIsAvailable() returns
-    # true for postgres backends.  SIGSTOP the worker to make it unresponsive,
-    # and set svs.worker_timeout_ms to its minimum (100 ms).
-    # VamanaWorkerSubmitSearch accumulates total_waited_ms >= 100 and returns
-    # -1; vamanascan raises ERROR — there is no direct-mode fallback.
-    $node->stop;
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
-    $node->start;
-
-    my $postgres_worker_pid = '';
-    for my $attempt (1 .. 20)
-    {
-        usleep(500_000);    # 0.5 s
-        $postgres_worker_pid = $node->safe_psql("postgres",
-            "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
-        chomp $postgres_worker_pid;
-        last if $postgres_worker_pid =~ /^\d+$/;
-    }
+    # SIGSTOP the postgres worker to make it unresponsive and set
+    # svs.worker_timeout_ms to its minimum (100 ms).  VamanaWorkerSubmitSearch
+    # accumulates total_waited_ms >= 100 and returns -1; vamanascan raises
+    # ERROR — there is no direct-mode fallback.
+    my $postgres_worker_pid = wait_for_worker_db($node, 'postgres', 20);
     ok($postgres_worker_pid =~ /^\d+$/,
-        "worker running and connected to postgres for timeout test (pid=$postgres_worker_pid)");
+        "postgres worker running for timeout test (pid=$postgres_worker_pid)");
 
     sleep(2);    # give worker time to load bgw_idx
 
@@ -1143,6 +1153,8 @@ sub dir_size
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE batch_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -1344,11 +1356,13 @@ sub dir_size
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
     $node->safe_psql('postgres', 'CREATE EXTENSION vector');
     $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     # Session 1: create index, insert rows, warm the BGW (triggers tidmap save).
     $node->safe_psql('postgres', qq{
@@ -1411,11 +1425,13 @@ sub dir_size
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
     $node->safe_psql('postgres', 'CREATE EXTENSION vector');
     $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     # Create two indexes so we can break one and verify the other still works.
     $node->safe_psql('postgres', qq{

@@ -45,3 +45,9 @@ SELECT count(*) FROM vamana_databases;
 DROP DATABASE vamana_databases_test_dbc;
 DROP DATABASE vamana_databases_test_dbd;
 DROP DATABASE vamana_databases_test_dbe;
+
+-- Enable this database for the remaining regression files, which share this
+-- one contrib_regression database and build vamana indexes.  The launcher
+-- reserves the slot at COMMIT and spawns the worker; the first search then
+-- waits for it via VamanaWorkerWaitUntilAvailable.
+INSERT INTO vamana_databases (datname, enabled) VALUES ('contrib_regression', true);

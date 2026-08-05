@@ -230,7 +230,6 @@ extern int	 vamana_worker_startup_timeout_ms;
 extern int	 vamana_worker_restart_time;
 extern int	 vamana_worker_restart_backoff;
 extern int	 vamana_max_batch_size;
-extern char *vamana_worker_database;
 extern char *vamana_launcher_database;
 
 extern VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr;
@@ -239,7 +238,6 @@ extern VamanaWorkerShmem *VamanaWorkerShmemPtr;
 Size	VamanaWorkerShmemSize(void);
 void	VamanaWorkerShmemStartup(void);		/* shmem_startup_hook */
 void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_init */
-void	VamanaWorkerRegister(void);			/* called from _PG_init */
 
 /* vamanaworkershmem.c: per-database control-block lookup and reservation */
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);

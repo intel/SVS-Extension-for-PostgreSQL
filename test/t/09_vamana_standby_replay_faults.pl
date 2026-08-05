@@ -54,13 +54,15 @@ sub setup_primary_standby
 	$primary->append_conf('postgresql.conf', "wal_level = logical");
 	$primary->append_conf('postgresql.conf', "max_replication_slots = 10");
 	$primary->append_conf('postgresql.conf', "max_wal_senders = 10");
-	$primary->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+	$primary->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 	$primary->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
 	$primary->start;
 
 	$primary->safe_psql('postgres', "CREATE EXTENSION vector;");
 	$primary->safe_psql('postgres', "CREATE EXTENSION svs;");
 	$primary->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+	$primary->safe_psql('postgres',
+		"INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
 	$primary->safe_psql('postgres', qq{
 		CREATE TABLE rep_tbl (id serial, val vector($dim));
@@ -81,7 +83,7 @@ sub setup_primary_standby
 	my $standby = PostgreSQL::Test::Cluster->new("standby_$name");
 	$standby->init_from_backup($primary, $backup, has_streaming => 1);
 	$standby->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-	$standby->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+	$standby->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 	$standby->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
 	$standby->append_conf('postgresql.conf', "log_min_messages = debug1");
 	$standby->append_conf('postgresql.conf', "hot_standby = on");

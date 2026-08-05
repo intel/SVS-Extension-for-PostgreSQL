@@ -49,7 +49,6 @@ int			vamana_worker_startup_timeout_ms = 60000;
 int			vamana_worker_restart_time = 5;
 int			vamana_worker_restart_backoff = 1000;
 int			vamana_max_batch_size = 0;
-char	   *vamana_worker_database = NULL;
 char	   *vamana_launcher_database = NULL;
 
 int			vamana_checkpoint_debounce_window = 300;
@@ -136,18 +135,6 @@ VamanaInit(void)
 								worker_startup_ctx,
 								0,
 								NULL, NULL, NULL);
-
-		DefineCustomStringVariable("svs.worker_database",
-								   "Database the background worker connects to for catalog access",
-								   "Must be the database where the vector extension and Vamana indexes "
-								   "are created.  Defaults to \"postgres\"; set this if your indexes "
-								   "live in a different database or the worker will not find them."
-								   " Changing this requires a server restart to take effect.",
-								   &vamana_worker_database,
-								   "postgres",
-								   worker_startup_ctx,
-								   0,
-								   NULL, NULL, NULL);
 
 		DefineCustomIntVariable("svs.worker_restart_time",
 								"Seconds to wait before restarting the background worker after a crash",

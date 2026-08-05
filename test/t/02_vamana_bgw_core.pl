@@ -28,6 +28,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE bgw_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -189,6 +191,9 @@ use VamanaTestUtils qw(:all);
         is($result, $after_insert, "query $i results match baseline with max_batch_size=1");
     }
 
+    # Dynamic enable: inserting an enabled row for testdb drives the launcher
+    # (via NOTIFY) to spawn testdb's worker with no restart.  postgres stays
+    # enabled from the top of this block, so both workers run concurrently.
     $node->safe_psql("postgres", "CREATE DATABASE testdb;");
     $node->safe_psql("testdb",   "CREATE EXTENSION vector;");
     $node->safe_psql("testdb",   "CREATE EXTENSION svs;");
@@ -200,16 +205,15 @@ use VamanaTestUtils qw(:all);
     ));
 
     my $log_pos_before_testdb = length($node->log_content());
-    $node->stop;
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'testdb'");
-    $node->start;
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('testdb', true);");
+
+    my $testdb_worker_pid = wait_for_worker_db($node, 'testdb', 20);
+    ok($testdb_worker_pid =~ /^\d+$/,
+        "launcher spawns a worker for testdb after dynamic enable (pid=$testdb_worker_pid)");
 
     $node->safe_psql("testdb",
         "CREATE INDEX testdb_idx ON testdb_tbl USING vamana (val vector_l2_ops);");
-
-    my $testdb_worker_pid = wait_for_worker($node, 20);
-    ok($testdb_worker_pid =~ /^\d+$/,
-        "worker running after switching worker_database to testdb (pid=$testdb_worker_pid)");
 
     sleep(2);
 
@@ -217,31 +221,33 @@ use VamanaTestUtils qw(:all);
         SET enable_seqscan = off;
         SELECT id FROM testdb_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
-    isnt($testdb_results, '', 'worker serves queries when worker_database is testdb');
+    isnt($testdb_results, '', 'testdb worker serves queries after dynamic enable');
 
     my $testdb_log = substr($node->log_content(), $log_pos_before_testdb);
     like($testdb_log,
         qr/vamana background worker started for database "testdb"/,
         'server log confirms worker started for testdb');
-    unlike($testdb_log,
-        qr/vamana worker connecting to default database "postgres"/,
-        'no default-database warning when worker_database is explicitly set');
 
-    my ($fallback_ret, undef, $fallback_err) = $node->psql("postgres", qq(
-        SET enable_seqscan = off;
-        SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    # A database with no vamana_databases row is unconfigured: after the
+    # launcher's initial scan, AssertDatabase hard-fails such a backend rather
+    # than spinning out the startup wait.  This is the config half of the
+    # config/liveness split, stronger than the old worker-bound-elsewhere path.
+    $node->safe_psql("postgres", "CREATE DATABASE unconfigured_db;");
+    $node->safe_psql("unconfigured_db", "CREATE EXTENSION vector;");
+    $node->safe_psql("unconfigured_db", "CREATE EXTENSION svs;");
+    # An empty table is deliberate: the config gate is checked before the table
+    # scan, so CREATE INDEX must fail regardless of the heap's contents.
+    my ($unconf_ret, undef, $unconf_err) = $node->psql("unconfigured_db", qq(
+        CREATE TABLE u_tbl (id serial PRIMARY KEY, val vector($dim));
+        CREATE INDEX u_idx ON u_tbl USING vamana (val vector_l2_ops);
     ));
-    like($fallback_err,
+    like($unconf_err,
         qr/vamana index is not enabled for this database/,
-        'backend gets ERROR when worker dbOid != MyDatabaseId');
+        'backend in an unconfigured database gets a config hard-fail');
 
-    $node->stop;
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
-    $node->start;
-
-    my $postgres_worker_pid = wait_for_worker($node, 20);
+    my $postgres_worker_pid = wait_for_worker_db($node, 'postgres', 20);
     ok($postgres_worker_pid =~ /^\d+$/,
-        "worker running and connected to postgres (pid=$postgres_worker_pid)");
+        "postgres worker still running alongside testdb worker (pid=$postgres_worker_pid)");
 
     sleep(2);
 

@@ -44,7 +44,7 @@ sub start_node
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.max_databases = $max_databases");
     $node->append_conf('postgresql.conf', "log_min_messages = '$log_min_messages'")
         if defined $log_min_messages;
@@ -52,6 +52,16 @@ sub start_node
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
     return $node;
+}
+
+# Enable the launcher_database itself so its worker reserves a slot and comes
+# up.  Kept out of start_node: the M3 precommit-reservation blocks below manage
+# vamana_databases from an empty table and would break on a pre-inserted row.
+sub enable_postgres
+{
+    my ($node) = @_;
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 }
 
 # ---------------------------------------------------------------------------
@@ -96,6 +106,7 @@ sub start_node
 # ---------------------------------------------------------------------------
 {
     my $node = start_node('vamana_shmem_norealloc', 8);
+    enable_postgres($node);
 
     my (undef, $hdr_off_before)  = shmem_alloc($node, 'VamanaWorkerShmemHeader');
     my (undef, $slot_off_before) = shmem_alloc($node, 'VamanaWorkerSlots');
@@ -130,6 +141,7 @@ sub start_node
 # ---------------------------------------------------------------------------
 {
     my $node = start_node('vamana_shmem_indexcount', 8);
+    enable_postgres($node);
 
     my $worker_pid = wait_for_worker($node, 30);
     ok($worker_pid =~ /^\d+$/, "worker running (pid=$worker_pid)");
@@ -276,9 +288,9 @@ sub start_node
 }
 
 {
-    # max_databases = 4: the worker already holds a slot for "postgres"
-    # from server startup, leaving exactly 3 free — matching the 3
-    # reservations this test queues and later aborts.
+    # max_databases = 4 against an empty vamana_databases table: all 4 slots
+    # are free.  The transaction below queues 3 reservations and aborts; if any
+    # slot leaked, the follow-up INSERT of 3 more rows would exceed capacity.
     my $node = start_node('vamana_precommit_abort_rollback', 4);
 
     $node->safe_psql('postgres', qq{

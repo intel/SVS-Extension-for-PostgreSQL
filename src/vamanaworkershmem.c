@@ -444,32 +444,6 @@ VamanaWorkerShmemRequest(void)
 }
 #endif
 
-void
-VamanaWorkerRegister(void)
-{
-	BackgroundWorker bgw;
-
-	memset(&bgw, 0, sizeof(bgw));
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana background worker");
-	snprintf(bgw.bgw_type, BGW_MAXLEN, "vamana background worker");
-	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "svs");
-	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "VamanaWorkerMain");
-	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS |
-		BGWORKER_BACKEND_DATABASE_CONNECTION;
-
-	/*
-	 * ConsistentState, not RecoveryFinished: the worker must run on a hot
-	 * standby to drain the replication slot into the in-memory index.
-	 * RecoveryFinished never fires on a node that stays in recovery.
-	 */
-	bgw.bgw_start_time = BgWorkerStart_ConsistentState;
-	bgw.bgw_restart_time = vamana_worker_restart_time;
-	bgw.bgw_main_arg = (Datum) 0;
-	bgw.bgw_notify_pid = 0;
-
-	RegisterBackgroundWorker(&bgw);
-}
-
 /* -----------------------------------------------------------------------
  * Per-index r/w lock helpers
  * ----------------------------------------------------------------------- */
