@@ -408,6 +408,12 @@ sub dir_size
     my $log_pos_before_rebuild = length($node->log_content());
     $node->start;
 
+    # Demand-driven rebuild: query so the BGW scans the table and logs progress.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM vp_progress_tbl ORDER BY val <-> '[0]' LIMIT 1;
+    ));
+
     # Give the BGW time to rebuild 100k+ 1-dim vectors (typically < 5s).
     my $rebuild_log = '';
     for (1 .. 30) {
@@ -522,6 +528,12 @@ sub dir_size
     my $log_pos_before_test4 = length($node->log_content());
     $node->restart;
 
+    # Demand-driven load: query so SVSLoadIndex runs and logs its thread count.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM st_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
     my $log_test4 = '';
     for (1 .. 20) {
         $log_test4 = substr($node->log_content(), $log_pos_before_test4);
@@ -635,6 +647,12 @@ sub dir_size
     remove_tree($index_dir);
     my $log_pos_before_second_restart = length($node->log_content());
     $node->restart;
+
+    # Demand-driven rebuild: query so the BGW scans the table and re-saves.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
 
     my $rebuild_wait_log = '';
     for (1 .. 20) {

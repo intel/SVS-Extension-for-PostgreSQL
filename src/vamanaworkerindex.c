@@ -86,15 +86,22 @@ VamanaWorkerResetStaleSlots(void)
  * not yet in the worker's in-process cache, open the relation, try to load
  * from disk, and fall back to a full rebuild.  Returns NULL on failure.
  *
+ * When loadedFromDisk is non-NULL it is set true only if the handle came from
+ * the on-disk checkpoint (not a heap rebuild): such a handle predates any
+ * post-checkpoint commit still pending in the replication slot.
+ *
  * Must be called from within an active transaction (or the caller must open
  * one).
  */
 SVSIndexHandle
-VamanaWorkerGetOrLoadIndex(Oid relid)
+VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 {
 	bool		needsRebuild;
 	SVSIndexHandle index;
 	Relation	indexRel;
+
+	if (loadedFromDisk != NULL)
+		*loadedFromDisk = false;
 
 	/* Fast path: already loaded */
 	index = VamanaGetCachedIndex(relid, &needsRebuild);
@@ -121,7 +128,12 @@ VamanaWorkerGetOrLoadIndex(Oid relid)
 		indexRel = index_open(relid, NoLock);
 		index = LoadIndexFromPages(indexRel);
 		CHECK_FOR_INTERRUPTS();
-		if (index == NULL)
+		if (index != NULL)
+		{
+			if (loadedFromDisk != NULL)
+				*loadedFromDisk = true;
+		}
+		else
 		{
 			ereport(LOG,
 					(errmsg("vamana worker: no saved copy for index %u, rebuilding", relid)));
@@ -176,18 +188,57 @@ VamanaWorkerGetOrLoadIndex(Oid relid)
 }
 
 /*
- * VamanaWorkerLoadAllIndexes
+ * Return the cached handle for relid, loaded and caught up to current WAL.
  *
- * At worker startup, enumerate all Vamana indexes in the connected database
- * via SPI and pre-load each one.  Called inside a transaction.
+ * A primary persists the graph only at checkpoint and applies later commits
+ * from its replication slot.  After a crash the reloaded on-disk copy predates
+ * those commits, so a fresh disk load is drained once to replay them.  A heap
+ * rebuild already reflects every committed row, so it is not drained: doing so
+ * would re-apply post-checkpoint commits the rebuild already contains.
+ *
+ * Owns its transaction; the caller must not open one.  Returns NULL on failure.
+ */
+SVSIndexHandle
+VamanaWorkerEnsureIndexCurrent(Oid relid)
+{
+	bool		loadedFromDisk;
+	bool		needsRebuild;
+	SVSIndexHandle index;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	if (index == NULL || !loadedFromDisk)
+		return index;
+
+	VamanaReplicationDrainSlot(relid);
+
+	/* A replay error may have rebuilt the index under a new handle. */
+	return VamanaGetCachedIndex(relid, &needsRebuild);
+}
+
+/*
+ * Load every vamana index in this database into the worker cache.  A standby
+ * has no demand path and its drain iterates only cached indexes, so an unloaded
+ * index is never replayed.  Enumerated once at startup: indexes created later
+ * are not loaded until restart (docs/bgw/issues/standby_autonomous_index_discovery.md).
  */
 void
-VamanaWorkerLoadAllIndexes(void)
+VamanaWorkerLoadStandbyIndexes(void)
 {
 	int			ret;
 	uint64		nindexes;
 	MemoryContext oldctx;
 
+	/*
+	 * Suppress eviction for the whole scan: relcache invalidations fired during
+	 * StartTransactionCommand would otherwise evict entries as they are loaded,
+	 * and a standby has no demand path to reload them.
+	 */
 	vamana_eviction_suppressed = true;
 
 	SetCurrentStatementStartTimestamp();
@@ -203,10 +254,7 @@ VamanaWorkerLoadAllIndexes(void)
 		return;
 	}
 
-	/*
-	 * Find all Vamana index OIDs in this database.  We join through pg_class
-	 * and pg_am so we don't hardcode an OID.
-	 */
+	/* Join through pg_am so the vamana access-method OID is not hardcoded. */
 	ret = SPI_execute(
 					  "SELECT c.oid "
 					  "FROM pg_catalog.pg_class c "
@@ -239,9 +287,7 @@ VamanaWorkerLoadAllIndexes(void)
 			continue;
 
 		MemoryContextSwitchTo(oldctx);
-
-		(void) VamanaWorkerGetOrLoadIndex(relid);
-
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
 		oldctx = MemoryContextSwitchTo(TopMemoryContext);
 	}
 
@@ -250,37 +296,22 @@ VamanaWorkerLoadAllIndexes(void)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	/*
-	 * A standby starts with no slots: base backup excludes pg_replslot, and the
-	 * primary write path that creates them never runs here.  Bootstrap one per
-	 * cached index now, outside any transaction as CreateOnStandby requires.
-	 * Replay any committed changes that arrived after the last checkpoint.
-	 *
-	 * Keep eviction suppressed so that relcache invalidations fired during
-	 * StartTransactionCommand do not evict entries between the OID snapshot
-	 * and the VamanaGetCache lookup.
-	 */
-	{
-		const VamanaReplayRole *role = VamanaGetReplayRole();
-		Oid		relids[VAMANA_MAX_CACHED_INDEXES];
-		int		n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
-
-		for (int i = 0; i < n; i++)
-		{
-			VamanaIndexCache *cache = VamanaGetCache(relids[i]);
-
-			if (role->creates_slot_on_load &&
-				cache != NULL && cache->replicationSlot == NULL)
-			{
-				VamanaReplicationCreateOnStandby(VamanaWorkerShmemPtr->dbOid,
-												 relids[i]);
-				cache->replicationSlot =
-					VamanaReplicationOpen(VamanaWorkerShmemPtr->dbOid, relids[i]);
-			}
-
-			VamanaReplicationDrainSlot(relids[i]);
-		}
-	}
-
 	vamana_eviction_suppressed = false;
 }
+
+/*
+ * Create and prime a replication slot for each cached index.  The snapshot
+ * build inside VamanaReplicationEnsureSlot blocks on a RUNNING_XACTS record
+ * from the primary, so this must run at startup rather than the main loop.
+ * Call after VamanaWorkerLoadStandbyIndexes and outside any transaction.
+ */
+void
+VamanaWorkerBootstrapStandbyReplicationSlots(void)
+{
+	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
+	int			n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
+
+	for (int i = 0; i < n; i++)
+		VamanaReplicationEnsureSlot(VamanaWorkerShmemPtr->dbOid, relids[i]);
+}
+

@@ -1,12 +1,13 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 06_vamana_reload_queue.pl — reload_all overflow when the per-OID reload
-# queue is full.
+# 06_vamana_reload_queue.pl — evict_all fallback when the per-OID reload
+# queue overflows.
 #
 # VAMANA_MAX_RELOAD_QUEUE is 16.  When 17 distinct index OIDs are enqueued
 # before the worker drains any, VamanaWorkerSignalReload exhausts the CAS
-# slots and sets reload_all=1 so no reload is silently dropped.
+# slots and sets evict_all=1.  The worker evicts its whole cache and each
+# index reloads on its next request, so no invalidation is silently dropped.
 
 use strict;
 use warnings FATAL => 'all';
@@ -59,9 +60,9 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
     }
 
     my $before = $node->safe_psql('postgres',
-        "SELECT reload_all FROM pg_stat_vamana_worker LIMIT 1;");
+        "SELECT evict_all FROM pg_stat_vamana_worker LIMIT 1;");
     chomp $before;
-    ok($before eq 'f', 'reload_all starts false');
+    ok($before eq 'f', 'evict_all starts false');
 
     kill('STOP', $worker_pid);
 
@@ -71,10 +72,10 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
     }
 
     my $after = $node->safe_psql('postgres',
-        "SELECT reload_all FROM pg_stat_vamana_worker LIMIT 1;");
+        "SELECT evict_all FROM pg_stat_vamana_worker LIMIT 1;");
     chomp $after;
     ok($after eq 't',
-        'reload_all set after queue overflow (17 TRUNCATEs against 16-slot queue)');
+        'evict_all set after queue overflow (17 TRUNCATEs against 16-slot queue)');
 
     kill('CONT', $worker_pid);
 
@@ -83,7 +84,7 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
     {
         usleep(500_000);
         my $flag = $node->safe_psql('postgres',
-            "SELECT reload_all FROM pg_stat_vamana_worker LIMIT 1;");
+            "SELECT evict_all FROM pg_stat_vamana_worker LIMIT 1;");
         chomp $flag;
         if ($flag eq 'f')
         {
@@ -91,7 +92,7 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
             last;
         }
     }
-    ok($cleared, 'reload_all cleared after worker resumes');
+    ok($cleared, 'evict_all cleared after worker resumes');
 
     my $nonempty = 0;
     for my $i (0 .. $N_TABLES - 1)

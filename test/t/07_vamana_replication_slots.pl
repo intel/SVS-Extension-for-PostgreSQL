@@ -789,11 +789,11 @@ sub wait_for_lsn_advance
 }
 
 # ===========================================================================
-# Replay-applied ops trigger checkpoint; data survives double crash
+# Data survives repeated crashes
 #
-# Verifies that PluginChange increments opsSinceCheckpoint so the debounce
-# system fires after crash recovery.  A second immediate stop proves the
-# checkpoint persisted the recovered data to disk.
+# An index built on an empty table takes on rows only through the write path,
+# leaving them un-checkpointed.  After each immediate stop the index recovers
+# on demand, so every row stays searchable across two successive crashes.
 # ===========================================================================
 
 {
@@ -836,64 +836,39 @@ sub wait_for_lsn_advance
     }
     wait_for_worker($node, 30);
 
+    # Returns the row count an index scan yields after the node is up.
+    my $recovered_count = sub {
+        my $count = 0;
+        for (1 .. 20)
+        {
+            usleep(500_000);
+            $count = $node->safe_psql('postgres', qq{
+                SET enable_seqscan = off;
+                SELECT count(*) FROM (
+                    SELECT id FROM dbl_tbl
+                    ORDER BY val <-> ARRAY[$array_sql]::vector
+                    LIMIT 10
+                ) sub;
+            });
+            chomp $count;
+            last if $count == 5;
+        }
+        return $count;
+    };
+
     # First crash: no checkpoint has fired (min_ops=999999), on-disk graph is empty.
     $node->stop('immediate');
-
-    # Restart with low checkpoint thresholds so replay-applied ops trigger checkpoint.
-    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
-    $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->start;
     wait_for_worker($node, 30);
+    is($recovered_count->(), 5,
+        "all rows searchable after first crash recovery");
 
-    # Wait for checkpoint to fire.  With min_ops=1 and debounce_window=1,
-    # the checkpoint fires once replay applies ops and the index goes quiet
-    # for 1 second.  We verify by checking that the on-disk save file exists.
-    my $dboid = $node->safe_psql('postgres',
-        "SELECT oid FROM pg_database WHERE datname = 'postgres';");
-    chomp $dboid;
-    my $ioid = $node->safe_psql('postgres',
-        "SELECT oid FROM pg_class WHERE relname = 'dbl_idx';");
-    chomp $ioid;
-
-    my $checkpoint_fired = 0;
-    for (1 .. 20)
-    {
-        usleep(500_000);
-        my $pgdata = $node->data_dir;
-        if (-d "$pgdata/vamana_indexes/$ioid")
-        {
-            $checkpoint_fired = 1;
-            last;
-        }
-    }
-    ok($checkpoint_fired,
-        "replay-applied ops trigger checkpoint after crash recovery");
-
-    # Second crash: data should survive because checkpoint persisted it.
+    # Second crash: the un-checkpointed rows must survive again.
     $node->stop('immediate');
-
-    # Restart with high min_ops so no new checkpoint fires.
-    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
     wait_for_worker($node, 30);
-
-    my $count = 0;
-    for (1 .. 20)
-    {
-        usleep(500_000);
-        $count = $node->safe_psql('postgres', qq{
-            SELECT count(*) FROM (
-                SELECT * FROM dbl_tbl
-                ORDER BY val <-> ARRAY[$array_sql]::vector
-                LIMIT 10
-            ) sub;
-        });
-        chomp $count;
-        last if $count == 5;
-    }
-
-    ok($count == 5,
-        "replay-applied ops survive double crash via checkpoint persistence");
+    is($recovered_count->(), 5,
+        "all rows searchable after second crash recovery");
 
     $node->stop;
 }

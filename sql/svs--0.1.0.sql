@@ -94,7 +94,7 @@ CREATE FUNCTION pg_stat_vamana_worker()
 		db_oid              oid,
 		reload_queue_depth  int,
 		active_slot_count   int,
-		reload_all          bool,
+		evict_all           bool,
 		heartbeat_ts        timestamptz,
 		index_count         int,
 		slot_index          int,

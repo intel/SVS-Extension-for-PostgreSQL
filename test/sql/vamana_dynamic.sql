@@ -3,6 +3,18 @@
 
 SET enable_seqscan = off;
 
+-- Empty-table build: CREATE INDEX on a table with no rows defers the dynamic
+-- index to the first INSERT (VamanaWorkerBuildFirstInsert).  Every row entered
+-- afterward must be searchable without a rebuild.
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+
+INSERT INTO t (val) VALUES ('[0,0,0]');
+INSERT INTO t (val) VALUES ('[1,1,1]'), ('[2,2,2]');
+SELECT * FROM t ORDER BY val <-> '[2,2,2]', id LIMIT 3;
+
+DROP TABLE t;
+
 -- Incremental INSERT: new rows are searchable without REINDEX or rebuild.
 -- After CREATE INDEX the cache is warm and dynamic, so INSERT uses SVSAddPoints
 -- and the subsequent SELECT finds the new rows without any rebuild NOTICEs.

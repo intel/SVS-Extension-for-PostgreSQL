@@ -167,9 +167,10 @@ typedef struct VamanaWorkerShmem
 
 	/*
 	 * Set to 1 by a backend when reloadRequests[] is full.  The worker
-	 * responds by reloading all cached indexes on its next cycle.
+	 * responds by evicting all cached indexes on its next cycle; each reloads
+	 * on demand.
 	 */
-	pg_atomic_uint32 reload_all;
+	pg_atomic_uint32 evict_all;
 
 	/* Updated each BGW loop iteration; backends check for hung worker. */
 	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
@@ -216,8 +217,10 @@ extern int	 max_vamana_databases;
 extern int	 vamana_worker_timeout_ms;
 extern int	 vamana_worker_startup_timeout_ms;
 extern int	 vamana_worker_restart_time;
+extern int	 vamana_worker_restart_backoff;
 extern int	 vamana_max_batch_size;
 extern char *vamana_worker_database;
+extern char *vamana_launcher_database;
 
 extern VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr;
 extern VamanaWorkerShmem *VamanaWorkerShmemPtr;
@@ -242,9 +245,11 @@ int		VamanaSlotErrcode(uint8 category);
 extern bool vamana_eviction_suppressed;
 
 /* vamanaworkerindex.c */
-SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid);
-void	VamanaWorkerLoadAllIndexes(void);
+SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk);
+SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid);
 void	VamanaWorkerResetStaleSlots(void);
+void	VamanaWorkerLoadStandbyIndexes(void);
+void	VamanaWorkerBootstrapStandbyReplicationSlots(void);
 
 /* vamanaworkersearch.c */
 void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);

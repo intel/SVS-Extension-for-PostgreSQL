@@ -167,34 +167,18 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 	 */
 	vamana_eviction_suppressed = true;
 
-	/*
-	 * Load the index if needed (requires a transaction to open the relation).
-	 */
+	/* Load and catch up the index if it is not already warm. */
 	index = VamanaGetCachedIndex(relid, &needsRebuild);
 	if (needsRebuild)
-	{
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		index = VamanaWorkerGetOrLoadIndex(relid);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-	}
+		index = VamanaWorkerEnsureIndexCurrent(relid);
 
 	/*
 	 * Retry once: handles the race where CREATE INDEX committed and sent a
 	 * LOAD slot, but that slot was processed after this write slot was already
-	 * collected as PENDING.  A second GetOrLoadIndex will find the fresh entry.
+	 * collected as PENDING.  A second attempt will find the fresh entry.
 	 */
 	if (index == NULL)
-	{
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		index = VamanaWorkerGetOrLoadIndex(relid);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-	}
+		index = VamanaWorkerEnsureIndexCurrent(relid);
 
 	if (index == NULL)
 	{

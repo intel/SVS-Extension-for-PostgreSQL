@@ -45,24 +45,15 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	SVSIndexHandle index;
 
 	/*
-	 * Get or load the index.  If not cached we need a transaction, but we
-	 * avoid opening one if the index is already in process memory.
+	 * Get or load the index.  Avoid the transaction and catch-up drain if the
+	 * index is already warm in process memory.
 	 */
 	{
 		bool		needsRebuild;
 
 		index = VamanaGetCachedIndex(relid, &needsRebuild);
 		if (needsRebuild)
-		{
-			SetCurrentStatementStartTimestamp();
-			StartTransactionCommand();
-			PushActiveSnapshot(GetTransactionSnapshot());
-
-			index = VamanaWorkerGetOrLoadIndex(relid);
-
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-		}
+			index = VamanaWorkerEnsureIndexCurrent(relid);
 	}
 
 	/*

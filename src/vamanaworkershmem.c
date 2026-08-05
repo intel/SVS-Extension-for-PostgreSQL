@@ -177,7 +177,7 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 		pg_atomic_init_u32(&entry->reloadRequests[i].relid, 0);
 
-	pg_atomic_init_u32(&entry->reload_all, 0);
+	pg_atomic_init_u32(&entry->evict_all, 0);
 	pg_atomic_init_u64(&entry->heartbeat_ts, 0);
 	pg_atomic_init_u32(&entry->indexCount, 0);
 

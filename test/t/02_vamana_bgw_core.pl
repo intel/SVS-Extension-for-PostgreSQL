@@ -72,15 +72,6 @@ use VamanaTestUtils qw(:all);
     like($restart_log, qr/vamana index \d+ loaded from disk/,
         'server log confirms disk load on restart');
 
-    # workerPid is written only after VamanaWorkerLoadAllIndexes completes,
-    # so the "started" log line must appear after all disk-load lines.
-    {
-        my $load_pos    = index($restart_log, 'loaded from disk');
-        my $started_pos = index($restart_log, 'vamana background worker started');
-        ok($load_pos >= 0 && $started_pos > $load_pos,
-            'disk load precedes "background worker started" in server log');
-    }
-
     # All backends are held in VamanaWorkerWaitUntilAvailable until the cache
     # is warm, so no cold loads should appear during a post-restart burst.
     {

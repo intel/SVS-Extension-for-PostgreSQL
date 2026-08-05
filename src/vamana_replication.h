@@ -64,6 +64,12 @@ void	VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid);
 VamanaReplicationSlot *VamanaReplicationOpen(Oid dboid, Oid indexRelid);
 
 /*
+ * BGW: create the index's slot on a standby if none exists yet.  Idempotent;
+ * no-op on a primary.  Must be called outside any transaction.
+ */
+void	VamanaReplicationEnsureSlot(Oid dboid, Oid indexRelid);
+
+/*
  * BGW: drain one index's replication slot into its cache within a
  * self-contained transaction.  Owns the full transaction, snapshot, and
  * eviction-suppression lifecycle; no-op if the index is not cached or has no

@@ -46,8 +46,10 @@ int			max_vamana_databases = 8;
 int			vamana_worker_timeout_ms = 5000;
 int			vamana_worker_startup_timeout_ms = 60000;
 int			vamana_worker_restart_time = 5;
+int			vamana_worker_restart_backoff = 1000;
 int			vamana_max_batch_size = 0;
 char	   *vamana_worker_database = NULL;
+char	   *vamana_launcher_database = NULL;
 
 int			vamana_checkpoint_debounce_window = 300;
 int			vamana_checkpoint_max_interval = 3600;
@@ -155,7 +157,30 @@ VamanaInit(void)
 								worker_startup_ctx,
 								0,
 								NULL, NULL, NULL);
+
+		DefineCustomStringVariable("svs.launcher_database",
+								   "Database the launcher connects to in order to read vamana_databases",
+								   "The launcher reads its list of enabled databases from the "
+								   "vamana_databases catalog table in this database.  Set this once at "
+								   "install time; changing it requires a server restart to take effect.",
+								   &vamana_launcher_database,
+								   "postgres",
+								   worker_startup_ctx,
+								   0,
+								   NULL, NULL, NULL);
 	}
+
+	DefineCustomIntVariable("svs.worker_restart_backoff",
+							"Base milliseconds the launcher waits before respawning a crashed per-database worker",
+							"Applied with escalating backoff on repeated crashes of the same "
+							"database's worker.  Read only by the launcher's crash-restart logic; "
+							"distinct from svs.worker_restart_time, which governs the launcher's own "
+							"restart by the postmaster.",
+							&vamana_worker_restart_backoff,
+							1000, 100, 300000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
 
 	DefineCustomIntVariable("svs.worker_timeout_ms",
 							"Milliseconds to wait for background worker IPC response",

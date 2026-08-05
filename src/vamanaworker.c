@@ -63,9 +63,8 @@ volatile sig_atomic_t worker_got_sigterm = false;
 volatile sig_atomic_t worker_got_sighup = false;
 
 /*
- * Set while VamanaWorkerLoadAllIndexes (or a per-OID reload) is in progress.
- * VamanaRelcacheCallback checks this flag to avoid evicting entries that the
- * load path itself is in the middle of populating.
+ * Set while an index load or slot drain is in progress.  VamanaRelcacheCallback
+ * checks this flag to avoid evicting entries the load path is populating.
  */
 bool		vamana_eviction_suppressed = false;
 
@@ -207,16 +206,15 @@ VamanaWorkerProcessReloads(void)
 	bool		anyReload = false;
 
 	/*
-	 * If a backend set reload_all (because the per-OID queue overflowed),
-	 * evict every cached entry and reload all Vamana indexes from disk. This
-	 * guarantees no stale handles survive an overflow event.
+	 * A backend sets evict_all when the per-OID queue overflows and the dropped
+	 * OIDs are unknown.  Evict every cached entry so the next request for each
+	 * reloads a fresh copy on demand.
 	 */
-	if (pg_atomic_exchange_u32(&VamanaWorkerShmemPtr->reload_all, 0) != 0)
+	if (pg_atomic_exchange_u32(&VamanaWorkerShmemPtr->evict_all, 0) != 0)
 	{
 		ereport(LOG,
-				(errmsg("vamana worker: reload_all set, evicting all cached indexes and reloading")));
+				(errmsg("vamana worker: evict_all set, evicting all cached indexes")));
 		VamanaEvictAllCacheEntries();
-		VamanaWorkerLoadAllIndexes();
 		return;
 	}
 
@@ -255,7 +253,7 @@ VamanaWorkerProcessReloads(void)
 		PushActiveSnapshot(GetTransactionSnapshot());
 
 		vamana_eviction_suppressed = true;
-		(void) VamanaWorkerGetOrLoadIndex(relid);
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
 		vamana_eviction_suppressed = false;
 
 		PopActiveSnapshot();
@@ -363,9 +361,19 @@ VamanaWorkerMain(Datum main_arg)
 						 "or the replication slot will be invalidated and replay will stop.")));
 
 	VamanaWorkerResetStaleSlots();
-	VamanaWorkerLoadAllIndexes();
 
-	/* Write pid last; backends treat non-zero pid as "cache is warm". */
+	/*
+	 * A standby has no demand path to populate its cache.  Do it up front, and
+	 * before workerPid is set: slot bootstrap blocks on the primary's WAL, which
+	 * would starve the heartbeat if it ran inside the main loop.
+	 */
+	if (VamanaGetReplayRole()->creates_slot_on_load)
+	{
+		VamanaWorkerLoadStandbyIndexes();
+		VamanaWorkerBootstrapStandbyReplicationSlots();
+	}
+
+	/* Non-zero pid marks the worker available to backends. */
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
 
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
@@ -817,14 +825,13 @@ VamanaWorkerSignalReload(Oid indexRelid)
 	}
 
 	/*
-	 * Queue full: set the reload_all flag so the worker performs a full
-	 * reload of all cached indexes on its next cycle, ensuring no OID is
-	 * silently dropped.
+	 * Queue full: the dropped OID is unknown, so tell the worker to evict its
+	 * whole cache.  Each index then reloads on its next request.
 	 */
-	pg_atomic_write_u32(&VamanaWorkerShmemPtr->reload_all, 1);
+	pg_atomic_write_u32(&VamanaWorkerShmemPtr->evict_all, 1);
 	ereport(WARNING,
 			(errmsg("vamana worker reload queue full for index %u; "
-					"worker will reload all cached indexes on next cycle",
+					"worker will evict all cached indexes on next cycle",
 					indexRelid)));
 	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
 }
@@ -1126,7 +1133,7 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
  * loading a large graph from disk can take 30–60 seconds.
  *
  * Returns true on success.  Returns false on failure — the caller logs a
- * WARNING; the index will be adopted by LoadAllIndexes at next BGW startup.
+ * WARNING; the index loads on demand on its next request.
  */
 bool
 VamanaWorkerSubmitLoad(Oid indexRelid,
@@ -1191,21 +1198,23 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
  * pg_stat_vamana_worker(): SQL-callable SRF exposing worker shmem state.
  *
  * Returns one row per slot (indexed 0..maxSlots-1).  Worker-level fields
- * (worker_pid, db_oid, reload_queue_depth, active_slot_count, reload_all)
- * are repeated on every row so callers can filter or aggregate freely.
+ * (worker_pid, db_oid, reload_queue_depth, active_slot_count, evict_all,
+ * heartbeat_ts, index_count) are repeated on every row so callers can filter
+ * or aggregate freely.
  *
- * Column layout (11 columns):
+ * Column layout (12 columns):
  *   0  worker_pid            int4
  *   1  db_oid                oid
  *   2  reload_queue_depth    int4
  *   3  active_slot_count     int4
- *   4  reload_all            bool
+ *   4  evict_all             bool
  *   5  heartbeat_ts          timestamptz (NULL if worker has not written first heartbeat)
- *   6  slot_index            int4
- *   7  slot_status           text   ("empty"/"pending"/"processing"/"done"/"error")
- *   8  index_relid           oid    (InvalidOid shown as NULL)
- *   9  slot_kind             text   ("search"/"insert"/"delete"/"maintenance"/NULL)
- *  10  error_message         text   (NULL unless status == error)
+ *   6  index_count           int4
+ *   7  slot_index            int4
+ *   8  slot_status           text   ("empty"/"pending"/"processing"/"done"/"error")
+ *   9  index_relid           oid    (InvalidOid shown as NULL)
+ *  10  slot_kind             text   ("search"/"insert"/"delete"/"maintenance"/NULL)
+ *  11  error_message         text   (NULL unless status == error)
  * ----------------------------------------------------------------------- */
 
 #define PG_STAT_VAMANA_WORKER_COLS 12
@@ -1218,7 +1227,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	int			maxSlots;
 	int			reloadQueueDepth;
 	int			activeSlotCount;
-	bool		reloadAll;
+	bool		evictAll;
 	pid_t		workerPid;
 	Oid			dbOid;
 	uint64		heartbeatRaw;
@@ -1238,7 +1247,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	workerPid = VamanaWorkerShmemPtr->workerPid;
 	dbOid = VamanaWorkerShmemPtr->dbOid;
 	maxSlots = VamanaWorkerShmemPtr->maxSlots;
-	reloadAll = (pg_atomic_read_u32(&VamanaWorkerShmemPtr->reload_all) != 0);
+	evictAll = (pg_atomic_read_u32(&VamanaWorkerShmemPtr->evict_all) != 0);
 	heartbeatRaw = pg_atomic_read_u64(&VamanaWorkerShmemPtr->heartbeat_ts);
 	indexCount = pg_atomic_read_u32(&VamanaWorkerShmemPtr->indexCount);
 
@@ -1302,7 +1311,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 		values[1] = ObjectIdGetDatum(dbOid);
 		values[2] = Int32GetDatum(reloadQueueDepth);
 		values[3] = Int32GetDatum(activeSlotCount);
-		values[4] = BoolGetDatum(reloadAll);
+		values[4] = BoolGetDatum(evictAll);
 
 		if (heartbeatRaw != 0)
 			values[5] = TimestampTzGetDatum((TimestampTz) heartbeatRaw);

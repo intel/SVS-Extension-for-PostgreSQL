@@ -928,6 +928,28 @@ VamanaReplicationCreateOnStandby(Oid dboid, Oid indexRelid)
 }
 
 /*
+ * Create the index's slot if this is a standby and none exists yet.  A standby
+ * must bootstrap its own slots: its base backup excludes pg_replslot and the
+ * primary write path that creates them never runs here.  Idempotent; must be
+ * called outside any transaction.
+ */
+void
+VamanaReplicationEnsureSlot(Oid dboid, Oid indexRelid)
+{
+	VamanaIndexCache *cache;
+
+	if (!VamanaGetReplayRole()->creates_slot_on_load)
+		return;
+
+	cache = VamanaGetCache(indexRelid);
+	if (cache == NULL || cache->replicationSlot != NULL)
+		return;
+
+	VamanaReplicationCreateOnStandby(dboid, indexRelid);
+	cache->replicationSlot = VamanaReplicationOpen(dboid, indexRelid);
+}
+
+/*
  * Open a lightweight handle referencing the persistent slot.
  * The slot is not acquired; it remains inactive and droppable.
  * Returns NULL if the slot does not exist.
