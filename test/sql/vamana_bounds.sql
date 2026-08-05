@@ -110,6 +110,11 @@ DROP TABLE t;
 -- leanvec_dims: [-1, 2000]
 -- -----------------------------------------------------------------------
 
+-- Exact minimum (-1 sentinel for SVS default) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (leanvec_dims = -1);
+DROP TABLE t;
+
 -- Exact maximum is accepted (requires sufficient dimension; use dim=2000)
 CREATE TABLE t (id serial PRIMARY KEY, val vector(2000));
 CREATE INDEX ON t USING vamana (val vector_l2_ops)
@@ -120,6 +125,82 @@ DROP TABLE t;
 CREATE TABLE t (id serial PRIMARY KEY, val vector(2000));
 CREATE INDEX ON t USING vamana (val vector_l2_ops)
     WITH (compression_type = 1, leanvec_dims = 2001);
+DROP TABLE t;
+
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (leanvec_dims = -2);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- build_window_size: below-minimum symmetry
+-- -----------------------------------------------------------------------
+
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = -2);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- compression_type: [0, 2]
+-- -----------------------------------------------------------------------
+
+-- Valid lower boundary (0 = none) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 0);
+DROP TABLE t;
+
+-- Valid upper boundary (2 = lvq) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 2);
+DROP TABLE t;
+
+-- One below minimum is rejected at reloption layer
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = -1);
+DROP TABLE t;
+
+-- One above maximum is rejected at reloption layer
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 3);
+DROP TABLE t;
+
+-- -----------------------------------------------------------------------
+-- compression_primary / compression_secondary valid set {+/-4, +/-8}
+-- All cases set compression_type = 1 (LEANVEC) so ValidateCompressionParam runs.
+-- -----------------------------------------------------------------------
+
+-- Invalid: value inside [-8,8] but not in {+-4,+-8} rejected (primary = 5)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 5, compression_secondary = 8);
+DROP TABLE t;
+
+-- Invalid: secondary = 5, primary = 4 (valid) isolates the secondary failure
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 5);
+DROP TABLE t;
+
+-- Valid: each member of {+-4, +-8} accepted as equal-bit primary/secondary
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 4);
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = -4);
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = -8);
 DROP TABLE t;
 
 -- -----------------------------------------------------------------------
