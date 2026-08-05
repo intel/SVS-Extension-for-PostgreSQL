@@ -483,8 +483,11 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	/* On relation drop, remove the corresponding vamana save directory. */
 	if (access == OAT_DROP && classId == RelationRelationId)
 	{
+		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
+
 		VamanaDeleteSaveDir(objectId);
-		VamanaReleaseIndexLock(objectId);
+		if (entry != NULL)
+			VamanaReleaseIndexLock(entry, objectId);
 		VamanaReplicationDropIfExists(MyDatabaseId, objectId);
 
 		/*

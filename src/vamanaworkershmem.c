@@ -57,49 +57,51 @@ static const char *const VamanaIndexLockTrancheName = "vamana_index_rwlock";
  * The slot region is a separate shared-memory allocation (see "Shared
  * memory sizing and initialisation" below), laid out as:
  *   [slots[maxSlots]] [queryVecs[maxSlots][MAX_DIM]] [results[...]] [dists[...]]
- * `VamanaWorkerShmemPtr->slots` points at its start.
+ * `entry->slots` points at its start.  The accessors take the per-database
+ * control block explicitly: a backend resolves it via VamanaWorkerLookupSlot,
+ * the worker passes its own process-local VamanaWorkerShmemPtr.
  * ----------------------------------------------------------------------- */
 
 /*
- * Byte offset from the start of the slot region to its variable-length
- * data area.
+ * Byte offset from the start of a database's slot region to its
+ * variable-length data area.
  */
 static inline size_t
-VamanaWorkerVarDataOffset(void)
+VamanaWorkerVarDataOffset(const VamanaWorkerShmem *entry)
 {
-	return (size_t) VamanaWorkerShmemPtr->maxSlots * sizeof(VamanaWorkerSlot);
+	return (size_t) entry->maxSlots * sizeof(VamanaWorkerSlot);
 }
 
 float *
-VamanaWorkerSlotQueryVec(int slotIdx)
+VamanaWorkerSlotQueryVec(VamanaWorkerShmem *entry, int slotIdx)
 {
-	size_t		offset = VamanaWorkerVarDataOffset() +
+	size_t		offset = VamanaWorkerVarDataOffset(entry) +
 		(size_t) slotIdx * VAMANA_MAX_DIM * sizeof(float);
 
-	return (float *) ((char *) VamanaWorkerShmemPtr->slots + offset);
+	return (float *) ((char *) entry->slots + offset);
 }
 
 ItemPointer
-VamanaWorkerSlotResults(int slotIdx)
+VamanaWorkerSlotResults(VamanaWorkerShmem *entry, int slotIdx)
 {
-	int			maxSlots = VamanaWorkerShmemPtr->maxSlots;
-	size_t		offset = VamanaWorkerVarDataOffset() +
+	int			maxSlots = entry->maxSlots;
+	size_t		offset = VamanaWorkerVarDataOffset(entry) +
 		(size_t) maxSlots * VAMANA_MAX_DIM * sizeof(float) +
 		(size_t) slotIdx * VAMANA_MAX_SEARCH_WINDOW * sizeof(ItemPointerData);
 
-	return (ItemPointer) ((char *) VamanaWorkerShmemPtr->slots + offset);
+	return (ItemPointer) ((char *) entry->slots + offset);
 }
 
 float *
-VamanaWorkerSlotDistances(int slotIdx)
+VamanaWorkerSlotDistances(VamanaWorkerShmem *entry, int slotIdx)
 {
-	int			maxSlots = VamanaWorkerShmemPtr->maxSlots;
-	size_t		offset = VamanaWorkerVarDataOffset() +
+	int			maxSlots = entry->maxSlots;
+	size_t		offset = VamanaWorkerVarDataOffset(entry) +
 		(size_t) maxSlots * VAMANA_MAX_DIM * sizeof(float) +
 		(size_t) maxSlots * VAMANA_MAX_SEARCH_WINDOW * sizeof(ItemPointerData) +
 		(size_t) slotIdx * VAMANA_MAX_SEARCH_WINDOW * sizeof(float);
 
-	return (float *) ((char *) VamanaWorkerShmemPtr->slots + offset);
+	return (float *) ((char *) entry->slots + offset);
 }
 
 /* -----------------------------------------------------------------------
@@ -240,9 +242,6 @@ VamanaWorkerShmemStartup(void)
 		for (int db = 0; db < VamanaWorkerShmemHeaderPtr->numSlots; db++)
 			InitSharedLatch(&VamanaWorkerShmemHeaderPtr->slots[db].workerLatch);
 	}
-
-	/* Single-worker model: bind the convenience pointer to entry 0. */
-	VamanaWorkerShmemPtr = &VamanaWorkerShmemHeaderPtr->slots[0];
 
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -434,13 +433,12 @@ VamanaWorkerRegister(void)
  * ----------------------------------------------------------------------- */
 
 /*
- * Return the LWLock for the given index OID, allocating a slot if none exists.
- * Returns NULL if the table is full (> VAMANA_MAX_INDEXES live indexes).
- *
- * Must be called from within the worker process (or shmem startup).
+ * Return the LWLock for the given index OID in the database's control block,
+ * allocating a slot if none exists.  Returns NULL if the table is full
+ * (> VAMANA_MAX_INDEXES live indexes).
  */
 LWLock *
-VamanaGetIndexLock(Oid relid)
+VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid)
 {
 	int			free_slot = -1;
 
@@ -448,7 +446,7 @@ VamanaGetIndexLock(Oid relid)
 
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 	{
-		VamanaIndexLockSlot *ls = &VamanaWorkerShmemPtr->indexLocks[i];
+		VamanaIndexLockSlot *ls = &entry->indexLocks[i];
 		uint32		cur = pg_atomic_read_u32(&ls->relid);
 
 		if (cur == (uint32) relid)
@@ -472,23 +470,23 @@ VamanaGetIndexLock(Oid relid)
 		uint32		expected = 0;
 
 		if (!pg_atomic_compare_exchange_u32(
-											&VamanaWorkerShmemPtr->indexLocks[free_slot].relid,
+											&entry->indexLocks[free_slot].relid,
 											&expected, (uint32) relid))
 		{
 			/* Lost the race; search again (recursive retry) */
-			return VamanaGetIndexLock(relid);
+			return VamanaGetIndexLock(entry, relid);
 		}
 	}
 
-	return &VamanaWorkerShmemPtr->indexLocks[free_slot].lock;
+	return &entry->indexLocks[free_slot].lock;
 }
 
 void
-VamanaReleaseIndexLock(Oid relid)
+VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid)
 {
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 	{
-		VamanaIndexLockSlot *ls = &VamanaWorkerShmemPtr->indexLocks[i];
+		VamanaIndexLockSlot *ls = &entry->indexLocks[i];
 
 		if (pg_atomic_read_u32(&ls->relid) == (uint32) relid)
 		{

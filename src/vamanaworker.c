@@ -27,6 +27,7 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "commands/dbcommands.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -333,10 +334,6 @@ VamanaWorkerMain(Datum main_arg)
 				(errmsg("vamana background worker requires wal_level = logical"),
 				 errhint("Set wal_level = logical in postgresql.conf and restart.")));
 
-	VamanaWorkerShmemPtr->dbOid = InvalidOid;
-	InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
-	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
-
 	if (strcmp(vamana_worker_database, "postgres") == 0)
 		ereport(WARNING,
 				(errmsg("vamana worker connecting to default database \"postgres\""),
@@ -345,7 +342,27 @@ VamanaWorkerMain(Datum main_arg)
 
 	CacheRegisterRelcacheCallback(VamanaRelcacheCallback, (Datum) 0);
 
-	VamanaWorkerShmemPtr->dbOid = MyDatabaseId;
+	/*
+	 * Claim this database's control block and cache the pointer for the
+	 * worker's lifetime.  Backends resolve the same block on demand via
+	 * VamanaWorkerLookupSlot(MyDatabaseId).
+	 */
+	VamanaWorkerShmemPtr = VamanaWorkerReserveSlot(MyDatabaseId);
+	if (VamanaWorkerShmemPtr == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("cannot start vamana worker: max_vamana_databases (%d) already reached",
+						max_vamana_databases)));
+
+	/*
+	 * A reused block may carry a previous instance's liveness state: a crash
+	 * exits without releasing the slot, so its pid and heartbeat survive.  The
+	 * worker owns these fields; reset them before announcing readiness.
+	 */
+	VamanaWorkerShmemPtr->workerPid = 0;
+	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
+	InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
+	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
 
 	/*
 	 * A standby's logical slot reads catalog rows the primary must not VACUUM
@@ -492,60 +509,73 @@ VamanaWorkerMain(Datum main_arg)
  * ----------------------------------------------------------------------- */
 
 /*
+ * VamanaWorkerHeartbeatStale: true if the worker has written at least one
+ * heartbeat but the most recent one is older than VAMANA_HEARTBEAT_STALE_MS,
+ * meaning the main loop has stopped — hung inside a library call, unable to
+ * drain slots or update its timestamp.
+ */
+static bool
+VamanaWorkerHeartbeatStale(VamanaWorkerShmem *entry)
+{
+	uint64		hb = pg_atomic_read_u64(&entry->heartbeat_ts);
+	TimestampTz now;
+	long		age_ms;
+
+	if (hb == 0)
+		return false;
+
+	now = GetCurrentTimestamp();
+	age_ms = (long) ((now - (TimestampTz) hb) / 1000);
+	return age_ms > VAMANA_HEARTBEAT_STALE_MS;
+}
+
+/*
+ * VamanaWorkerFindActiveSlot: the control block iff a live worker is currently
+ * serving this backend's database, else NULL.  NULL distinguishes only
+ * "no ready worker" from "ready"; callers that must tell "database not enabled"
+ * apart from "worker still starting" use VamanaWorkerLookupSlot directly.
+ */
+VamanaWorkerShmem *
+VamanaWorkerFindActiveSlot(void)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
+
+	if (entry == NULL || entry->workerPid == 0)
+		return NULL;
+	if (VamanaWorkerHeartbeatStale(entry))
+		return NULL;
+
+	return entry;
+}
+
+/*
  * VamanaWorkerIsAvailable: true if the worker is running and serving the
  * current backend's database.
  */
 bool
 VamanaWorkerIsAvailable(void)
 {
-	if (VamanaWorkerShmemPtr == NULL)
-		return false;
-	if (VamanaWorkerShmemPtr->workerPid == 0)
-		return false;
-	if (VamanaWorkerShmemPtr->dbOid != MyDatabaseId)
-		return false;
-
-	/*
-	 * A non-zero heartbeat that is older than VAMANA_HEARTBEAT_STALE_MS means the
-	 * BGW main loop has stopped running — it is hung inside a library call
-	 * and cannot drain slots or update its timestamp.
-	 */
-	{
-		uint64		hb = pg_atomic_read_u64(&VamanaWorkerShmemPtr->heartbeat_ts);
-
-		if (hb != 0)
-		{
-			TimestampTz now = GetCurrentTimestamp();
-			long		age_ms;
-
-			age_ms = (long) ((now - (TimestampTz) hb) / 1000);
-			if (age_ms > VAMANA_HEARTBEAT_STALE_MS)
-				return false;
-		}
-	}
-
-	return true;
+	return VamanaWorkerFindActiveSlot() != NULL;
 }
 
 /*
  * VamanaWorkerAssertDatabase
  *
- * If the background worker is running but serving a different database, throw
- * an immediate ERROR.  This is a permanent misconfiguration — no amount of
- * waiting will fix it — so we must not spin.
+ * Throw an immediate ERROR if this database is not the one configured for the
+ * vamana worker.  This is a permanent misconfiguration — no amount of waiting
+ * will fix it — so we must not spin.  The check is against the configured name
+ * rather than a reserved control block: the worker reserves its slot only once
+ * it has started, and index DDL may run in the configured database before then.
  */
 void
 VamanaWorkerAssertDatabase(void)
 {
-	if (VamanaWorkerShmemPtr != NULL &&
-		VamanaWorkerShmemPtr->workerPid != 0 &&
-		VamanaWorkerShmemPtr->dbOid != InvalidOid &&
-		VamanaWorkerShmemPtr->dbOid != MyDatabaseId)
+	char	   *dbname = get_database_name(MyDatabaseId);
+
+	if (dbname == NULL || strcmp(dbname, vamana_worker_database) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("vamana index is not enabled for this database"),
-				 errdetail("The background worker is running for database OID %u, not %u.",
-						   VamanaWorkerShmemPtr->dbOid, MyDatabaseId),
 				 errhint("Set svs.worker_database to the name of this database and restart the server.")));
 }
 
@@ -565,20 +595,26 @@ VamanaWorkerAssertDatabase(void)
 void
 VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 {
+	VamanaWorkerShmem *entry;
 	int			total_waited_ms = 0;
 
+	/*
+	 * A wrong database is a permanent error; no worker will ever serve it.
+	 * A configured-but-not-yet-reserved database is the normal startup window
+	 * and must be waited out, so re-resolve the live slot each iteration
+	 * rather than caching a pointer that does not exist yet.
+	 */
 	VamanaWorkerAssertDatabase();
 
-	if (VamanaWorkerIsAvailable())
+	if (VamanaWorkerFindActiveSlot() != NULL)
 		return;
 
 	/*
-	 * If the worker has written at least one heartbeat it was running
-	 * recently.  A stale heartbeat means it is now hung, not still starting
-	 * up — fail immediately rather than spinning for startup_timeout_ms.
+	 * A non-zero heartbeat with no live pid means the worker ran, then hung or
+	 * died — fail immediately rather than spinning for startup_timeout_ms.
 	 */
-	if (VamanaWorkerShmemPtr != NULL &&
-		pg_atomic_read_u64(&VamanaWorkerShmemPtr->heartbeat_ts) != 0)
+	entry = VamanaWorkerLookupSlot(MyDatabaseId);
+	if (entry != NULL && pg_atomic_read_u64(&entry->heartbeat_ts) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("vamana background worker unavailable after waiting up to %d ms; cannot %s index %u",
@@ -595,9 +631,8 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 						 PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
-		VamanaWorkerAssertDatabase();
 
-		if (VamanaWorkerIsAvailable())
+		if (VamanaWorkerFindActiveSlot() != NULL)
 			return;
 
 		total_waited_ms += (int) wait_ms;
@@ -623,18 +658,20 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 						 int dimensions, int k, int searchWindowSize,
 						 ItemPointer results, float *distances)
 {
+	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	int			slotIdx;
 	uint32		status;
 	int			total_waited_ms = 0;
 
-	if (!VamanaWorkerIsAvailable())
+	entry = VamanaWorkerFindActiveSlot();
+	if (entry == NULL)
 		return -1;
 
 	slotIdx = VAMANA_MY_SLOT_IDX;
-	Assert(slotIdx >= 0 && slotIdx < VamanaWorkerShmemPtr->maxSlots);
+	Assert(slotIdx >= 0 && slotIdx < entry->maxSlots);
 
-	slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	slot = &entry->slots[slotIdx];
 
 	status = pg_atomic_read_u32(&slot->status);
 
@@ -671,7 +708,7 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 		return -1;
 	}
 
-	memcpy(VamanaWorkerSlotQueryVec(slotIdx), queryVector,
+	memcpy(VamanaWorkerSlotQueryVec(entry, slotIdx), queryVector,
 		   dimensions * sizeof(float));
 
 	slot->indexRelid = indexRelid;
@@ -694,7 +731,7 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
 
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	SetLatch(&entry->workerLatch);
 
 	PG_TRY();
 	{
@@ -764,9 +801,9 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 
 		if (nr > 0)
 		{
-			memcpy(results, VamanaWorkerSlotResults(slotIdx),
+			memcpy(results, VamanaWorkerSlotResults(entry, slotIdx),
 				   nr * sizeof(ItemPointerData));
-			memcpy(distances, VamanaWorkerSlotDistances(slotIdx),
+			memcpy(distances, VamanaWorkerSlotDistances(entry, slotIdx),
 				   nr * sizeof(float));
 		}
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_EMPTY);
@@ -809,17 +846,22 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 void
 VamanaWorkerSignalReload(Oid indexRelid)
 {
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
+
 	Assert(OidIsValid(indexRelid));
+
+	if (entry == NULL)
+		return;
 
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 	{
 		uint32		expected = 0;
 
 		if (pg_atomic_compare_exchange_u32(
-										   &VamanaWorkerShmemPtr->reloadRequests[i].relid,
+										   &entry->reloadRequests[i].relid,
 										   &expected, (uint32) indexRelid))
 		{
-			SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+			SetLatch(&entry->workerLatch);
 			return;
 		}
 	}
@@ -828,12 +870,12 @@ VamanaWorkerSignalReload(Oid indexRelid)
 	 * Queue full: the dropped OID is unknown, so tell the worker to evict its
 	 * whole cache.  Each index then reloads on its next request.
 	 */
-	pg_atomic_write_u32(&VamanaWorkerShmemPtr->evict_all, 1);
+	pg_atomic_write_u32(&entry->evict_all, 1);
 	ereport(WARNING,
 			(errmsg("vamana worker reload queue full for index %u; "
 					"worker will evict all cached indexes on next cycle",
 					indexRelid)));
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	SetLatch(&entry->workerLatch);
 }
 
 /*
@@ -936,21 +978,25 @@ VamanaWorkerWaitForSlotIPC(VamanaWorkerSlot *slot)
  *
  * Validate that the worker is available, claim this backend's slot, and
  * initialise the latch.  Returns the slot pointer on success, NULL on
- * failure (not available, slot busy).
+ * failure (not available, slot busy).  On success *entry_out receives the
+ * serving database's control block, which the caller threads into the slot
+ * data accessors and the worker-latch wakeup.
  */
 static VamanaWorkerSlot *
-VamanaWorkerClaimSlot(Oid indexRelid)
+VamanaWorkerClaimSlot(Oid indexRelid, VamanaWorkerShmem **entry_out)
 {
+	VamanaWorkerShmem *entry;
 	int			slotIdx;
 	VamanaWorkerSlot *slot;
 	uint32		status;
 
-	if (!VamanaWorkerIsAvailable())
+	entry = VamanaWorkerFindActiveSlot();
+	if (entry == NULL)
 		return NULL;
 
 	slotIdx = VAMANA_MY_SLOT_IDX;
-	Assert(slotIdx >= 0 && slotIdx < VamanaWorkerShmemPtr->maxSlots);
-	slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Assert(slotIdx >= 0 && slotIdx < entry->maxSlots);
+	slot = &entry->slots[slotIdx];
 
 	status = pg_atomic_read_u32(&slot->status);
 
@@ -973,6 +1019,7 @@ VamanaWorkerClaimSlot(Oid indexRelid)
 	OwnLatch(&slot->latch);
 	ResetLatch(&slot->latch);
 
+	*entry_out = entry;
 	return slot;
 }
 
@@ -988,11 +1035,12 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						 int dimensions, ItemPointer heap_tid,
 						 uint64 *externalId_out)
 {
+	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	int			slotIdx = VAMANA_MY_SLOT_IDX;
 	bool		ok;
 
-	slot = VamanaWorkerClaimSlot(indexRelid);
+	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
 	if (slot == NULL)
 	{
 		ereport(ERROR,
@@ -1009,7 +1057,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						dimensions, VAMANA_MAX_DIM)));
 	}
 
-	memcpy(VamanaWorkerSlotQueryVec(slotIdx), vector,
+	memcpy(VamanaWorkerSlotQueryVec(entry, slotIdx), vector,
 		   dimensions * sizeof(float));
 	slot->dimensions = dimensions;
 	ItemPointerCopy(heap_tid, &slot->writeHeapTid);
@@ -1017,7 +1065,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	SetLatch(&entry->workerLatch);
 
 	ok = VamanaWorkerWaitForSlotIPC(slot);
 
@@ -1041,6 +1089,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 bool
 VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 {
+	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	int			slotIdx = VAMANA_MY_SLOT_IDX;
 	bool		ok;
@@ -1048,7 +1097,7 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 	if (nIds <= 0)
 		return true;
 
-	slot = VamanaWorkerClaimSlot(indexRelid);
+	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
 	if (slot == NULL)
 		return false;
 
@@ -1062,14 +1111,14 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 	 */
 	Assert(nIds <= (int) VAMANA_MAX_DELETE_IDS);
 
-	memcpy(VamanaWorkerSlotQueryVec(slotIdx), externalIds, nIds * sizeof(size_t));
+	memcpy(VamanaWorkerSlotQueryVec(entry, slotIdx), externalIds, nIds * sizeof(size_t));
 
 	slot->numResults = nIds;
 	slot->slotKind = VAMANA_SLOTKIND_DELETE;
 
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	SetLatch(&entry->workerLatch);
 
 	ok = VamanaWorkerWaitForSlotIPC(slot);
 
@@ -1092,10 +1141,11 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 bool
 VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 {
+	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	bool		ok;
 
-	slot = VamanaWorkerClaimSlot(indexRelid);
+	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
 	if (slot == NULL)
 		return false;
 
@@ -1104,7 +1154,7 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	SetLatch(&entry->workerLatch);
 
 	ok = VamanaWorkerWaitForSlotIPC(slot);
 
@@ -1146,6 +1196,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 					   uint64 nextExternalId, int numDeleted,
 					   Oid heapRelid, int vectorAttNum)
 {
+	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	int			slotIdx = VAMANA_MY_SLOT_IDX;
 	VamanaLoadParams *params;
@@ -1154,11 +1205,11 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 	StaticAssertStmt(sizeof(VamanaLoadParams) <= VAMANA_MAX_DIM * sizeof(float),
 					 "VamanaLoadParams too large for queryVec buffer");
 
-	slot = VamanaWorkerClaimSlot(indexRelid);
+	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
 	if (slot == NULL)
 		return false;
 
-	params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(slotIdx);
+	params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(entry, slotIdx);
 	params->dimensions			= dimensions;
 	params->graph_degree		= graph_degree;
 	params->alpha				= alpha;
@@ -1180,7 +1231,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	SetLatch(&entry->workerLatch);
 
 	ok = VamanaWorkerWaitForSlot(slot, vamana_worker_startup_timeout_ms);
 
@@ -1224,6 +1275,7 @@ Datum
 pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	VamanaWorkerShmem *entry;
 	int			maxSlots;
 	int			reloadQueueDepth;
 	int			activeSlotCount;
@@ -1236,7 +1288,9 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 
 	InitMaterializedSRF(fcinfo, 0);
 
-	if (VamanaWorkerShmemPtr == NULL)
+	/* Report the worker serving this database, or nothing if none is enabled. */
+	entry = VamanaWorkerLookupSlot(MyDatabaseId);
+	if (entry == NULL)
 		PG_RETURN_NULL();
 
 	/*
@@ -1244,24 +1298,24 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	 * slot statuses are read with pg_atomic_read_u32 (no lock needed — each
 	 * status word is updated atomically by the worker).
 	 */
-	workerPid = VamanaWorkerShmemPtr->workerPid;
-	dbOid = VamanaWorkerShmemPtr->dbOid;
-	maxSlots = VamanaWorkerShmemPtr->maxSlots;
-	evictAll = (pg_atomic_read_u32(&VamanaWorkerShmemPtr->evict_all) != 0);
-	heartbeatRaw = pg_atomic_read_u64(&VamanaWorkerShmemPtr->heartbeat_ts);
-	indexCount = pg_atomic_read_u32(&VamanaWorkerShmemPtr->indexCount);
+	workerPid = entry->workerPid;
+	dbOid = entry->dbOid;
+	maxSlots = entry->maxSlots;
+	evictAll = (pg_atomic_read_u32(&entry->evict_all) != 0);
+	heartbeatRaw = pg_atomic_read_u64(&entry->heartbeat_ts);
+	indexCount = pg_atomic_read_u32(&entry->indexCount);
 
 	reloadQueueDepth = 0;
 	for (i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 	{
-		if (pg_atomic_read_u32(&VamanaWorkerShmemPtr->reloadRequests[i].relid) != 0)
+		if (pg_atomic_read_u32(&entry->reloadRequests[i].relid) != 0)
 			reloadQueueDepth++;
 	}
 
 	activeSlotCount = 0;
 	for (i = 0; i < maxSlots; i++)
 	{
-		uint32		s = pg_atomic_read_u32(&VamanaWorkerShmemPtr->slots[i].status);
+		uint32		s = pg_atomic_read_u32(&entry->slots[i].status);
 
 		if (s == VAMANA_SLOT_PENDING || s == VAMANA_SLOT_PROCESSING)
 			activeSlotCount++;
@@ -1269,7 +1323,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < maxSlots; i++)
 	{
-		VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[i];
+		VamanaWorkerSlot *slot = &entry->slots[i];
 		uint32		status;
 		const char *statusStr;
 		const char *kindStr;

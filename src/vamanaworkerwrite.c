@@ -192,7 +192,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 		if (cache != NULL && slot->slotKind == VAMANA_SLOTKIND_INSERT)
 		{
 			index = VamanaWorkerBuildFirstInsert(relid, cache,
-												VamanaWorkerSlotQueryVec(slotIdx),
+												VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx),
 												&slot->writeHeapTid);
 		}
 
@@ -245,7 +245,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 	}
 
 	/* Acquire LW_EXCLUSIVE — blocks until all shared (search) holders exit. */
-	rwlock = VamanaGetIndexLock(relid);
+	rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
 	if (rwlock != NULL)
 		LWLockAcquire(rwlock, LW_EXCLUSIVE);
 
@@ -263,7 +263,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 					VamanaIndexCache *cache = VamanaGetCache(relid);
 					size_t		externalId;
 					int			added;
-					float	   *vec = VamanaWorkerSlotQueryVec(slotIdx);
+					float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 
 					if (cache == NULL)
 						ereport(ERROR,
@@ -361,7 +361,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 					 * naturally aligned for size_t).
 					 */
 					int			nIds = slot->numResults;
-					size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(slotIdx);
+					size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 					int			deleted;
 					VamanaIndexCache *cache = VamanaGetCache(relid);
 
@@ -506,7 +506,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 {
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 	Oid			relid = slot->indexRelid;
-	VamanaLoadParams *params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(slotIdx);
+	VamanaLoadParams *params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 	SVSBuildConfig	config;
 	SVSIndexHandle	svsIndex = NULL;
 	ItemPointerData *tidMapping = NULL;

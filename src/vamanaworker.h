@@ -237,7 +237,7 @@ void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerIndexCountAdjust(Oid dbOid, int delta);
 
 /* vamanaworkershmem.c */
-LWLock *VamanaGetIndexLock(Oid relid);
+LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
 int		VamanaSlotErrcode(uint8 category);
 
@@ -286,15 +286,16 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 							   int numVectors, int tidMappingCapacity,
 							   uint64 nextExternalId, int numDeleted,
 							   Oid heapRelid, int vectorAttNum);
-void	VamanaReleaseIndexLock(Oid relid);
+void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
+VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);
 bool	VamanaWorkerIsAvailable(void);
 void	VamanaWorkerAssertDatabase(void);
 void	VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation);
 
-float		  *VamanaWorkerSlotQueryVec(int slotIdx);
-ItemPointer	   VamanaWorkerSlotResults(int slotIdx);
-float		  *VamanaWorkerSlotDistances(int slotIdx);
+float		  *VamanaWorkerSlotQueryVec(VamanaWorkerShmem *entry, int slotIdx);
+ItemPointer	   VamanaWorkerSlotResults(VamanaWorkerShmem *entry, int slotIdx);
+float		  *VamanaWorkerSlotDistances(VamanaWorkerShmem *entry, int slotIdx);
 
 /*
  * Parameters for VAMANA_SLOTKIND_LOAD, packed into the queryVec buffer.
