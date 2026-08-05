@@ -37,7 +37,7 @@ sub shmem_alloc
 
 sub start_node
 {
-    my ($name, $max_databases) = @_;
+    my ($name, $max_databases, $log_min_messages) = @_;
     my $node = PostgreSQL::Test::Cluster->new($name);
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
@@ -46,6 +46,8 @@ sub start_node
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.max_databases = $max_databases");
+    $node->append_conf('postgresql.conf', "log_min_messages = '$log_min_messages'")
+        if defined $log_min_messages;
     $node->start;
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
@@ -184,6 +186,135 @@ sub start_node
     run_concurrent($node, 'postgres', $N, $drop_sql);
     is($count->(), '0',
         "index_count is 0 after $N concurrent DROP INDEX (no lost decrements)");
+
+    $node->stop;
+}
+
+{
+    my $node = start_node('vamana_precommit_registration', 8, 'debug1');
+
+    $node->safe_psql('postgres', qq{
+        CREATE DATABASE vamana_precommit_registration_dba;
+        CREATE DATABASE vamana_precommit_registration_dbb;
+    });
+
+    my $log_pos_before = length($node->log_content());
+
+    $node->safe_psql('postgres', qq{
+        INSERT INTO vamana_databases (datname)
+            VALUES ('vamana_precommit_registration_dba'), ('vamana_precommit_registration_dbb');
+        UPDATE vamana_databases SET enabled = false
+            WHERE datname = 'vamana_precommit_registration_dba';
+        UPDATE vamana_databases SET enabled = true
+            WHERE datname = 'vamana_precommit_registration_dba';
+        INSERT INTO vamana_databases (datname) VALUES ('postgres');
+    });
+
+    my $new_log = substr($node->log_content(), $log_pos_before);
+    my $registrations =
+      () = $new_log =~ /vamana_databases: registered reservation xact callback/g;
+
+    is($registrations, 1,
+        "RegisterXactCallback() fires exactly once across 4 row-trigger firings in one backend");
+
+    $node->stop;
+}
+
+{
+    my $node = start_node('vamana_precommit_capacity', 2);
+
+    $node->safe_psql('postgres', "CREATE DATABASE vamana_precommit_capacity_dba;");
+
+    $node->safe_psql('postgres', qq{
+        INSERT INTO vamana_databases (datname) VALUES ('postgres');
+        INSERT INTO vamana_databases (datname) VALUES ('vamana_precommit_capacity_dba');
+    });
+
+    my ($stdout, $stderr) = ('', '');
+    $node->psql('postgres',
+        "INSERT INTO vamana_databases (datname) VALUES ('template1');",
+        stdout => \$stdout, stderr => \$stderr);
+
+    like($stderr, qr/max_vamana_databases \(2\) already reached/,
+        "capacity-exhausted INSERT raises the documented error");
+
+    is($node->safe_psql('postgres',
+            "SELECT count(*) FROM vamana_databases WHERE datname = 'template1';"),
+        '0',
+        "the rejected row was not committed");
+
+    $node->stop;
+}
+
+{
+    my $node = start_node('vamana_precommit_savepoint', 1);
+
+    $node->safe_psql('postgres', "CREATE DATABASE vamana_precommit_savepoint_dba;");
+
+    # A row queued inside a subtransaction that is later rolled back must not
+    # be reserved at COMMIT. With max_databases = 1, if the rolled-back
+    # entry were wrongly reserved it would consume the one slot, and the
+    # second INSERT below would fail with a capacity error instead of
+    # succeeding.
+    $node->safe_psql('postgres', qq{
+        BEGIN;
+        SAVEPOINT s;
+        INSERT INTO vamana_databases (datname) VALUES ('vamana_precommit_savepoint_dba');
+        ROLLBACK TO SAVEPOINT s;
+        INSERT INTO vamana_databases (datname) VALUES ('postgres');
+        COMMIT;
+    });
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM vamana_databases;"), '1',
+        "only the post-rollback row is present");
+    is($node->safe_psql('postgres',
+            "SELECT datname FROM vamana_databases;"),
+        'postgres',
+        "the row queued before the savepoint rollback was not reserved or persisted");
+
+    $node->stop;
+}
+
+{
+    # max_databases = 4: the worker already holds a slot for "postgres"
+    # from server startup, leaving exactly 3 free — matching the 3
+    # reservations this test queues and later aborts.
+    my $node = start_node('vamana_precommit_abort_rollback', 4);
+
+    $node->safe_psql('postgres', qq{
+        CREATE DATABASE vamana_precommit_abort_rollback_dba;
+        CREATE DATABASE vamana_precommit_abort_rollback_dbb;
+        CREATE DATABASE vamana_precommit_abort_rollback_dbc;
+    });
+
+    # A transaction queuing 3 reservations that later aborts (for a reason
+    # unrelated to those INSERTs) must release all 3 slots, not just one.
+    # If any slot were left reserved after the abort, the second
+    # transaction below — reserving 3 more databases into the same 3 free
+    # slots — would fail with a capacity error instead of succeeding.
+    my ($stdout, $stderr) = ('', '');
+    $node->psql('postgres', qq{
+        BEGIN;
+        INSERT INTO vamana_databases (datname) VALUES
+            ('vamana_precommit_abort_rollback_dba'),
+            ('vamana_precommit_abort_rollback_dbb'),
+            ('vamana_precommit_abort_rollback_dbc');
+        SELECT 1/0;
+        COMMIT;
+    }, stdout => \$stdout, stderr => \$stderr);
+
+    like($stderr, qr/division by zero/,
+        "the forced error aborted the multi-row INSERT's transaction");
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM vamana_databases;"), '0',
+        "none of the 3 rows were committed");
+
+    $node->safe_psql('postgres', qq{
+        INSERT INTO vamana_databases (datname) VALUES ('template1'), ('postgres'), ('template0');
+    });
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM vamana_databases;"), '3',
+        "all 3 slots from the aborted transaction were released, leaving full capacity available");
 
     $node->stop;
 }

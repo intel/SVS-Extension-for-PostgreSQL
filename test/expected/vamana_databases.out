@@ -16,23 +16,33 @@ Triggers:
     vamana_databases_changed AFTER INSERT OR DELETE OR UPDATE ON vamana_databases FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_notify()
     vamana_databases_queue_reservation AFTER INSERT OR UPDATE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation()
 
+-- The row-level trigger resolves datname against pg_database, so every row
+-- here must name a database that actually exists.
+CREATE DATABASE vamana_databases_test_dbc;
+CREATE DATABASE vamana_databases_test_dbd;
+CREATE DATABASE vamana_databases_test_dbe;
+-- A nonexistent database is rejected outright, before any row is queued.
+INSERT INTO vamana_databases (datname) VALUES ('vamana_databases_test_missing');
+ERROR:  database "vamana_databases_test_missing" does not exist
 -- INSERT/UPDATE/DELETE succeed; the row-level trigger is declared AFTER
 -- INSERT OR UPDATE only, so DELETE below cannot invoke it.
-INSERT INTO vamana_databases (datname) VALUES ('dbA'), ('dbB'), ('dbC');
-UPDATE vamana_databases SET enabled = false WHERE datname IN ('dbA', 'dbB', 'dbC');
-DELETE FROM vamana_databases WHERE datname = 'dbA';
+INSERT INTO vamana_databases (datname)
+	VALUES ('template1'), ('postgres'), ('vamana_databases_test_dbc');
+UPDATE vamana_databases SET enabled = false
+	WHERE datname IN ('template1', 'postgres', 'vamana_databases_test_dbc');
+DELETE FROM vamana_databases WHERE datname = 'template1';
 -- Placeholder columns accept NULL and non-NULL values
-INSERT INTO vamana_databases (datname) VALUES ('dbD');
+INSERT INTO vamana_databases (datname) VALUES ('vamana_databases_test_dbd');
 INSERT INTO vamana_databases (datname, graph_memory_mb, total_memory_mb, search_num_threads)
-	VALUES ('dbE', 512, 4096, 8);
+	VALUES ('vamana_databases_test_dbe', 512, 4096, 8);
 SELECT datname, graph_memory_mb, total_memory_mb, search_num_threads
 	FROM vamana_databases ORDER BY datname;
- datname | graph_memory_mb | total_memory_mb | search_num_threads 
----------+-----------------+-----------------+--------------------
- dbB     |                 |                 |                   
- dbC     |                 |                 |                   
- dbD     |                 |                 |                   
- dbE     |             512 |            4096 |                  8
+          datname          | graph_memory_mb | total_memory_mb | search_num_threads 
+---------------------------+-----------------+-----------------+--------------------
+ postgres                  |                 |                 |                   
+ vamana_databases_test_dbc |                 |                 |                   
+ vamana_databases_test_dbd |                 |                 |                   
+ vamana_databases_test_dbe |             512 |            4096 |                  8
 (4 rows)
 
 -- TRUNCATE is revoked from PUBLIC; the table owner retains it
@@ -49,3 +59,6 @@ SELECT count(*) FROM vamana_databases;
      0
 (1 row)
 
+DROP DATABASE vamana_databases_test_dbc;
+DROP DATABASE vamana_databases_test_dbd;
+DROP DATABASE vamana_databases_test_dbe;

@@ -9,19 +9,15 @@
 #include "postgres.h"
 
 /*
- * Public API for the vamana_databases row-level trigger.
- *
- * vamana_databases_queue_reservation() appends (datname, enabled) for each
- * affected row into a backend-local, TopTransactionContext-scoped list.
- * It does not reserve any shmem slot and does not call
- * RegisterXactCallback() itself; a future PRE_COMMIT callback registered
- * elsewhere drains this list via VamanaDatabasesReservationQueue().
+ * Per-row entry queued by the vamana_databases row-level trigger, backing
+ * the PRE_COMMIT reservation callback in vamana_databases.c.
  */
-
 typedef struct VamanaDatabasesReservationEntry
 {
 	NameData	datname;
+	Oid			dbOid;
 	bool		enabled;
+	SubTransactionId subxid;
 } VamanaDatabasesReservationEntry;
 
 typedef struct VamanaDatabasesReservationList
@@ -30,12 +26,5 @@ typedef struct VamanaDatabasesReservationList
 	int			count;
 	int			capacity;
 } VamanaDatabasesReservationList;
-
-/*
- * Returns the current transaction's queued reservation entries, or NULL if
- * none have been queued yet. The list and its contents live in
- * TopTransactionContext and are reclaimed automatically at end-of-transaction.
- */
-VamanaDatabasesReservationList *VamanaDatabasesReservationQueue(void);
 
 #endif							/* VAMANA_DATABASES_H */
