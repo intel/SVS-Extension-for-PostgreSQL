@@ -210,6 +210,17 @@ typedef struct VamanaWorkerShmemHeader
 	LWLock		   *lock;			/* array-wide reservation lock */
 	int				numSlots;		/* capacity == max_vamana_databases */
 	int				numActive;		/* entries with a valid dbOid (under lock) */
+
+	/*
+	 * Set true, once, by the launcher after it has reserved a slot for every
+	 * enabled database in its startup scan.  Until then a database's absence
+	 * from slots[] is indistinguishable from "scan not yet run", so callers
+	 * must not treat "no slot" as authoritative for "not configured".  Reset
+	 * to false only by a postmaster restart (shmem re-init), never by a
+	 * launcher restart.  Guarded by lock.
+	 */
+	bool			initialScanDone;
+
 	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
 } VamanaWorkerShmemHeader;
 
@@ -235,6 +246,13 @@ VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerIndexCountAdjust(Oid dbOid, int delta);
+
+/* vamanaworkershmem.c: launcher initial-scan publication (header lock) */
+void	VamanaWorkerSetInitialScanDone(void);
+bool	VamanaWorkerInitialScanDone(void);
+
+/* vamanaworkershmem.c: true iff every slot is occupied (capacity exhausted). */
+bool	VamanaWorkerSlotsExhausted(void);
 
 /* vamanaworkershmem.c */
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);

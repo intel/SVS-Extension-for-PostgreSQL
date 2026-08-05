@@ -338,6 +338,48 @@ VamanaWorkerIndexCountAdjust(Oid dbOid, int delta)
 }
 
 /*
+ * Publish that the launcher has finished its startup scan and reserved a slot
+ * for every enabled database.  After this, absence of a slot for a database is
+ * authoritative for "not configured" (see VamanaWorkerAssertDatabase).
+ */
+void
+VamanaWorkerSetInitialScanDone(void)
+{
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+	VamanaWorkerShmemHeaderPtr->initialScanDone = true;
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
+bool
+VamanaWorkerInitialScanDone(void)
+{
+	bool		done;
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	done = VamanaWorkerShmemHeaderPtr->initialScanDone;
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return done;
+}
+
+/*
+ * True when every slot holds a valid dbOid, so no further database can be
+ * reserved without raising max_vamana_databases.  Lets callers distinguish a
+ * configured-but-unreservable database (capacity) from an unconfigured one.
+ */
+bool
+VamanaWorkerSlotsExhausted(void)
+{
+	bool		full;
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	full = VamanaWorkerShmemHeaderPtr->numActive >= VamanaWorkerShmemHeaderPtr->numSlots;
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return full;
+}
+
+/*
  * Release the control block for dbOid, returning it to the free pool.  The
  * caller is responsible for ensuring no worker is running against it.
  */

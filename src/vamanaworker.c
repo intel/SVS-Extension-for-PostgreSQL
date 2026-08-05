@@ -334,11 +334,7 @@ VamanaWorkerMain(Datum main_arg)
 				(errmsg("vamana background worker requires wal_level = logical"),
 				 errhint("Set wal_level = logical in postgresql.conf and restart.")));
 
-	if (strcmp(vamana_worker_database, "postgres") == 0)
-		ereport(WARNING,
-				(errmsg("vamana worker connecting to default database \"postgres\""),
-				 errhint("Set svs.worker_database if your Vamana indexes are in a different database.")));
-	BackgroundWorkerInitializeConnection(vamana_worker_database, NULL, 0);
+	BackgroundWorkerInitializeConnectionByOid(DatumGetObjectId(main_arg), InvalidOid, 0);
 
 	CacheRegisterRelcacheCallback(VamanaRelcacheCallback, (Datum) 0);
 
@@ -393,8 +389,11 @@ VamanaWorkerMain(Datum main_arg)
 	/* Non-zero pid marks the worker available to backends. */
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
 
+	/* get_database_name reads a catalog, so it needs a transaction. */
+	StartTransactionCommand();
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
-						 vamana_worker_database)));
+						 get_database_name(MyDatabaseId))));
+	CommitTransactionCommand();
 
 	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
 
@@ -561,22 +560,36 @@ VamanaWorkerIsAvailable(void)
 /*
  * VamanaWorkerAssertDatabase
  *
- * Throw an immediate ERROR if this database is not the one configured for the
- * vamana worker.  This is a permanent misconfiguration — no amount of waiting
- * will fix it — so we must not spin.  The check is against the configured name
- * rather than a reserved control block: the worker reserves its slot only once
- * it has started, and index DDL may run in the configured database before then.
+ * Answer only the config question: is this database enabled for vamana?  A
+ * permanent misconfiguration must fail fast (no amount of waiting fixes it);
+ * everything else returns silently and lets the liveness loop in
+ * VamanaWorkerWaitUntilAvailable bound any transient.
+ *
+ * "No slot" is authoritative for "not configured" only after the launcher has
+ * materialized the config table into shmem (initialScanDone).  Before that, an
+ * enabled database is indistinguishable from an unconfigured one, so the guard
+ * must not commit to an error.  A configured database whose slot could not be
+ * reserved because the array is full is a distinct, separately-diagnosed error.
  */
 void
 VamanaWorkerAssertDatabase(void)
 {
-	char	   *dbname = get_database_name(MyDatabaseId);
+	if (VamanaWorkerLookupSlot(MyDatabaseId) != NULL)
+		return;
 
-	if (dbname == NULL || strcmp(dbname, vamana_worker_database) != 0)
+	if (!VamanaWorkerInitialScanDone())
+		return;
+
+	if (VamanaWorkerSlotsExhausted())
 		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("vamana index is not enabled for this database"),
-				 errhint("Set svs.worker_database to the name of this database and restart the server.")));
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("vamana worker slots exhausted"),
+				 errhint("Increase max_vamana_databases and restart the server.")));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("vamana index is not enabled for this database"),
+			 errhint("Enable it by inserting a row into vamana_databases for this database.")));
 }
 
 /*
@@ -599,10 +612,13 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 	int			total_waited_ms = 0;
 
 	/*
-	 * A wrong database is a permanent error; no worker will ever serve it.
-	 * A configured-but-not-yet-reserved database is the normal startup window
-	 * and must be waited out, so re-resolve the live slot each iteration
-	 * rather than caching a pointer that does not exist yet.
+	 * An unconfigured database is a permanent error; no worker will ever serve
+	 * it.  A configured-but-not-yet-reserved database is the normal startup
+	 * window and must be waited out, so re-resolve the live slot each iteration
+	 * rather than caching a pointer that does not exist yet.  AssertDatabase is
+	 * re-called each iteration too: the instant initialScanDone flips true with
+	 * still no slot, the next call throws the crisp config error instead of
+	 * spinning to startup_timeout_ms.
 	 */
 	VamanaWorkerAssertDatabase();
 
@@ -631,6 +647,8 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 						 PG_WAIT_EXTENSION);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
+
+		VamanaWorkerAssertDatabase();
 
 		if (VamanaWorkerFindActiveSlot() != NULL)
 			return;

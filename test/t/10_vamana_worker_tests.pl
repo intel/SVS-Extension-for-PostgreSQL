@@ -751,7 +751,7 @@ sub dir_size
     # -------------------------------------------------- test 1: worker alive --
     my $worker_pid = $node->safe_psql("postgres",
         "SELECT pid FROM pg_stat_activity "
-      . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+      . "WHERE backend_type = 'vamana worker' LIMIT 1;");
     chomp $worker_pid;
 
     ok($worker_pid =~ /^\d+$/,
@@ -810,7 +810,7 @@ sub dir_size
 
     my $worker_pid_after_insert = $node->safe_psql("postgres",
         "SELECT pid FROM pg_stat_activity "
-      . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+      . "WHERE backend_type = 'vamana worker' LIMIT 1;");
     chomp $worker_pid_after_insert;
     ok($worker_pid_after_insert =~ /^\d+$/,
         'worker still running after INSERT (dynamic insert did not crash worker)');
@@ -829,7 +829,7 @@ sub dir_size
         usleep(500_000);    # 0.5 s
         $post_crash_pid = $node->safe_psql("postgres",
             "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
         chomp $post_crash_pid;
         last if $post_crash_pid =~ /^\d+$/;
     }
@@ -946,7 +946,7 @@ sub dir_size
         usleep(500_000);    # 0.5 s
         $testdb_worker_pid = $node->safe_psql("postgres",
             "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
         chomp $testdb_worker_pid;
         last if $testdb_worker_pid =~ /^\d+$/;
     }
@@ -998,7 +998,7 @@ sub dir_size
         usleep(500_000);    # 0.5 s
         $postgres_worker_pid = $node->safe_psql("postgres",
             "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
         chomp $postgres_worker_pid;
         last if $postgres_worker_pid =~ /^\d+$/;
     }

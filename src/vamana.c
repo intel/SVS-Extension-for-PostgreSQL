@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "vamana.h"
+#include "vamanalauncher.h"
 #include "vamanaworker.h"
 
 #include "access/amapi.h"
@@ -297,7 +298,7 @@ VamanaInit(void)
 	if (process_shared_preload_libraries_in_progress)
 	{
 		VamanaWorkerInstallHooks();
-		VamanaWorkerRegister();
+		VamanaLauncherRegister();
 	}
 
 	/*

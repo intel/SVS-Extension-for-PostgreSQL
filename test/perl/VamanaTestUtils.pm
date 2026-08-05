@@ -217,7 +217,7 @@ sub wait_for_worker
         usleep(500_000);
         $pid = $node->safe_psql('postgres',
             "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
         chomp $pid;
         return $pid if $pid =~ /^\d+$/;
     }
