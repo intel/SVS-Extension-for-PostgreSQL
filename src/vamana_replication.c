@@ -96,6 +96,19 @@ VamanaGetReplayRole(void)
 	return RecoveryInProgress() ? &StandbyReplayRole : &PrimaryReplayRole;
 }
 
+/*
+ * Is this node the primary (not in recovery)?
+ *
+ * A node fact, evaluated against the calling process at call time; recovery
+ * state is node-global.  Derived from the replay role rather than a second
+ * RecoveryInProgress() call so this file stays that predicate's sole reader.
+ */
+bool
+VamanaNodeIsPrimary(void)
+{
+	return VamanaGetReplayRole()->processes_write_ipc;
+}
+
 static void
 DropSlotIfInactive(const char *slotName)
 {

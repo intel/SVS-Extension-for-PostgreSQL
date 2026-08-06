@@ -222,6 +222,62 @@ VamanaWorkerEnsureIndexCurrent(Oid relid)
 }
 
 /*
+ * Enumerate every vamana index in the current database, returning a palloc'd
+ * List of index relid Oids (NIL if none).  Owns only the SPI session:
+ * connect, execute VAMANA_ENUM_INDEXES_IN_DB_SQL, collect, finish.
+ *
+ * Precondition: the caller holds an open transaction with a pushed snapshot.
+ * The two callers reach this from incompatible transaction contexts — the
+ * standby loader opens and commits its own txn; the startup seed runs inside
+ * the worker's already-open startup txn — so the transaction lifecycle stays
+ * the caller's concern, not this wrapper's.
+ */
+List *
+VamanaWorkerEnumerateIndexes(void)
+{
+	List	   *relids = NIL;
+	MemoryContext callerctx = CurrentMemoryContext;
+	uint64		nindexes;
+
+	Assert(IsTransactionState());
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		ereport(WARNING, (errmsg("vamana worker: SPI_connect failed")));
+		return NIL;
+	}
+
+	if (SPI_execute(VAMANA_ENUM_INDEXES_IN_DB_SQL, true, 0) != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		ereport(WARNING, (errmsg("vamana worker: failed to enumerate indexes")));
+		return NIL;
+	}
+
+	nindexes = SPI_processed;
+	for (uint64 i = 0; i < nindexes; i++)
+	{
+		bool		isnull;
+		Oid			relid = DatumGetObjectId(
+											 SPI_getbinval(SPI_tuptable->vals[i],
+														   SPI_tuptable->tupdesc,
+														   1, &isnull));
+		MemoryContext oldctx;
+
+		if (isnull)
+			continue;
+
+		/* Build the result in the caller's context, not SPI's short-lived one. */
+		oldctx = MemoryContextSwitchTo(callerctx);
+		relids = lappend_oid(relids, relid);
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	SPI_finish();
+	return relids;
+}
+
+/*
  * Load every vamana index in this database into the worker cache.  A standby
  * has no demand path and its drain iterates only cached indexes, so an unloaded
  * index is never replayed.  Enumerated once at startup: indexes created later
@@ -230,8 +286,7 @@ VamanaWorkerEnsureIndexCurrent(Oid relid)
 void
 VamanaWorkerLoadStandbyIndexes(void)
 {
-	int			ret;
-	uint64		nindexes;
+	List	   *relids;
 	MemoryContext oldctx;
 
 	/*
@@ -245,48 +300,17 @@ VamanaWorkerLoadStandbyIndexes(void)
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-	{
-		PopActiveSnapshot();
-		AbortCurrentTransaction();
-		vamana_eviction_suppressed = false;
-		ereport(WARNING, (errmsg("vamana worker: SPI_connect failed")));
-		return;
-	}
+	relids = VamanaWorkerEnumerateIndexes();
 
-	ret = SPI_execute(VAMANA_ENUM_INDEXES_IN_DB_SQL, true, 0);
-
-	if (ret != SPI_OK_SELECT)
-	{
-		SPI_finish();
-		PopActiveSnapshot();
-		AbortCurrentTransaction();
-		vamana_eviction_suppressed = false;
-		ereport(WARNING, (errmsg("vamana worker: failed to enumerate indexes")));
-		return;
-	}
-
-	nindexes = SPI_processed;
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
-
-	for (uint64 i = 0; i < nindexes; i++)
+	foreach_oid(relid, relids)
 	{
-		bool		isnull;
-		Oid			relid = DatumGetObjectId(
-											 SPI_getbinval(SPI_tuptable->vals[i],
-														   SPI_tuptable->tupdesc,
-														   1, &isnull));
-
-		if (isnull)
-			continue;
-
 		MemoryContextSwitchTo(oldctx);
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
 		oldctx = MemoryContextSwitchTo(TopMemoryContext);
 	}
-
 	MemoryContextSwitchTo(oldctx);
-	SPI_finish();
+
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 

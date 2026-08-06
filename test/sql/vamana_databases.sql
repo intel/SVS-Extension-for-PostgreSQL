@@ -54,8 +54,9 @@ INSERT INTO vamana_databases (datname, enabled) VALUES ('contrib_regression', tr
 
 -- Live-index counter is commit-accurate.  The BEFORE DELETE guard reads
 -- indexCount as a hard gate, so it must equal committed catalog truth and
--- must not reflect a rolled-back CREATE/DROP INDEX.  index_count is uniform
--- across a database's slots, so SELECT DISTINCT yields one row.
+-- must not reflect a rolled-back CREATE/DROP INDEX.  pg_stat_vamana_worker is
+-- cross-database, so each query filters to this database's slot; index_count is
+-- uniform across a database's slots, so SELECT DISTINCT then yields one row.
 
 CREATE TABLE vamana_counter_t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO vamana_counter_t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
@@ -63,22 +64,26 @@ SET client_min_messages = error;
 
 -- Counter tracks a committed CREATE then DROP.
 CREATE INDEX vamana_counter_i ON vamana_counter_t USING vamana (val vector_l2_ops);
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 DROP INDEX vamana_counter_i;
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 -- Aborted DROP does not under-count: the index is back, the count still reflects it.
 CREATE INDEX vamana_counter_i ON vamana_counter_t USING vamana (val vector_l2_ops);
 BEGIN;
 DROP INDEX vamana_counter_i;
 ROLLBACK;
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 -- Aborted CREATE does not over-count.
 BEGIN;
 CREATE INDEX vamana_counter_i2 ON vamana_counter_t USING vamana (val vector_l2_ops);
 ROLLBACK;
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 -- ROLLBACK TO SAVEPOINT discards only that subtransaction's delta.
 BEGIN;
@@ -86,7 +91,8 @@ SAVEPOINT sp;
 DROP INDEX vamana_counter_i;
 ROLLBACK TO SAVEPOINT sp;
 COMMIT;
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 -- A released savepoint's delta commits exactly once.
 BEGIN;
@@ -94,7 +100,22 @@ SAVEPOINT sp;
 DROP INDEX vamana_counter_i;
 RELEASE SAVEPOINT sp;
 COMMIT;
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- Counter moves only on CREATE/DROP, never on a bare rebuild.  REINDEX and
+-- TRUNCATE both re-run the build with no create or drop, and REINDEX
+-- CONCURRENTLY builds a transient index then drops the old one; none may shift
+-- the count.  It must equal committed catalog truth for the BEFORE DELETE guard.
+CREATE INDEX vamana_counter_i ON vamana_counter_t USING vamana (val vector_l2_ops);
+REINDEX INDEX vamana_counter_i;
+TRUNCATE vamana_counter_t;
+REINDEX INDEX CONCURRENTLY vamana_counter_i;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+DROP INDEX vamana_counter_i;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 RESET client_min_messages;
 DROP TABLE vamana_counter_t;
@@ -170,7 +191,8 @@ SELECT count(*) FROM vamana_databases WHERE datname = current_database();
 -- After teardown the count is zero, so the same DELETE is allowed.  Rolled
 -- back to keep this database enabled for the remaining regression files.
 SELECT dropped FROM svs_teardown_database();
-SELECT DISTINCT index_count FROM pg_stat_vamana_worker;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 BEGIN;
 DELETE FROM vamana_databases WHERE datname = current_database();
 ROLLBACK;

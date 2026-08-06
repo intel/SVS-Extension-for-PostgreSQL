@@ -10,8 +10,9 @@
 #   4. indexCount: maintained per database, correct under concurrency.
 #
 # M2 tests 2 (arbitrary-position lookup) and 5 (no torn read during a
-# reservation) are deferred to M3, which is the first module to populate
-# entries beyond slots[0]; see m03_precommit_slot_reservation.md.
+# reservation) need several databases at arbitrary array positions and the
+# cross-database stat scope to observe them; they live in
+# 10_vamana_idle_worker_visibility.pl.
 
 use strict;
 use warnings FATAL => 'all';

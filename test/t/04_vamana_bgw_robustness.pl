@@ -73,7 +73,7 @@ use VamanaTestUtils qw(:all);
     sleep(2);
 
     my $nonempty = $node->safe_psql('postgres',
-        "SELECT count(*) FROM pg_stat_vamana_worker "
+        "SELECT count(*) FROM pg_stat_vamana_worker_slot "
       . "WHERE slot_status <> 'empty';");
     chomp $nonempty;
     ok($nonempty eq '0', 'all slots empty after BGW startup (VamanaWorkerResetStaleSlots)');
@@ -522,7 +522,7 @@ use VamanaTestUtils qw(:all);
     {
         usleep(100_000);
         my $status = $node->safe_psql('postgres',
-            "SELECT slot_status FROM pg_stat_vamana_worker "
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
           . "WHERE slot_status = 'pending' LIMIT 1;");
         chomp $status;
         if ($status eq 'pending') { $slot_pending = 1; last; }
@@ -549,7 +549,7 @@ use VamanaTestUtils qw(:all);
     {
         usleep(100_000);
         my $nonempty = $node->safe_psql('postgres',
-            "SELECT count(*) FROM pg_stat_vamana_worker "
+            "SELECT count(*) FROM pg_stat_vamana_worker_slot "
           . "WHERE slot_status <> 'empty';");
         chomp $nonempty;
         if ($nonempty eq '0') { $slot_empty = 1; last; }

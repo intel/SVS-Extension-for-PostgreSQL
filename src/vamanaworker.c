@@ -27,9 +27,11 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/pg_authid.h"
 #include "commands/dbcommands.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "utils/acl.h"
 #include "postmaster/bgworker.h"
 #include "replication/walreceiver.h"
 #include "storage/ipc.h"
@@ -316,11 +318,103 @@ VamanaWorkerDrainAllSlots(void)
 	}
 }
 
+/*
+ * Counter-maintenance policy.  indexCount tracks live vamana indexes via
+ * CREATE/DROP commit-deltas plus a startup seed — a write path that exists only
+ * on the primary.  A standby has no delta path and cannot run the seed, so its
+ * counter is not maintained and readers must treat it as absent, not stale.
+ */
+bool
+VamanaIndexCountIsMaintained(void)
+{
+	return VamanaNodeIsPrimary();
+}
+
+/*
+ * Worker-lifetime state for the zero-index log-once.  A worker serves one
+ * database, so "have I already warned?" is process-local and needs no lock.
+ * dbname is captured once in the startup transaction (a catalog lookup in the
+ * txn-less heartbeat loop would segfault).
+ */
+typedef struct VamanaZeroIndexState
+{
+	char	   *dbname;			/* TopMemoryContext-owned; worker lifetime */
+	bool		warned;			/* true once warned; re-armed on return to nonzero */
+} VamanaZeroIndexState;
+
+/*
+ * Capture this database's name into TopMemoryContext for the worker's lifetime.
+ * Must run inside a transaction: get_database_name reads a catalog.
+ */
+static char *
+VamanaWorkerCaptureDatabaseName(void)
+{
+	char	   *name = get_database_name(MyDatabaseId);
+
+	return name != NULL ? MemoryContextStrdup(TopMemoryContext, name) : NULL;
+}
+
+/*
+ * Emit one LOG when this worker's index count reaches zero, once per transition
+ * into that state, re-arming when the count returns to nonzero.  Primary-only:
+ * indexCount is meaningless where it is not maintained.  Runs in the txn-less
+ * heartbeat loop, so it reads only the atomic and the pre-captured name.
+ */
+static void
+VamanaWorkerMaybeWarnZeroIndex(VamanaZeroIndexState *state)
+{
+	if (!VamanaIndexCountIsMaintained())
+		return;
+
+	if (pg_atomic_read_u32(&VamanaWorkerShmemPtr->indexCount) == 0)
+	{
+		if (!state->warned)
+		{
+			ereport(LOG,
+					(errmsg("vamana worker for database \"%s\" has no Vamana indexes",
+							state->dbname),
+					 errhint("consider removing its row from vamana_databases")));
+			state->warned = true;
+		}
+	}
+	else
+		state->warned = false;
+}
+
+/*
+ * Seed indexCount to the live count of vamana indexes in this database.
+ *
+ * indexCount otherwise only moves on CREATE/DROP commit-deltas, so after a
+ * postmaster restart a fully-populated database would read zero until the next
+ * DDL — misinforming the zero-index log-once, the SRF, and the BEFORE DELETE gate.
+ *
+ * This is the single absolute write to the counter; CREATE/DROP are relative
+ * deltas.  The ordering holds because the worker performs this in its own
+ * startup transaction, before the heartbeat loop, and a backend's CREATE/DROP
+ * cannot commit a delta until the database is already being served.
+ *
+ * Primary-only and caller-gated on VamanaIndexCountIsMaintained().  Must run
+ * inside the worker's startup transaction (VamanaWorkerEnumerateIndexes needs
+ * a live transaction and snapshot).
+ */
+void
+VamanaWorkerSeedIndexCount(void)
+{
+	List	   *relids = VamanaWorkerEnumerateIndexes();
+
+	pg_atomic_write_u32(&VamanaWorkerShmemPtr->indexCount,
+						(uint32) list_length(relids));
+	list_free(relids);
+}
+
 PGDLLEXPORT void
 VamanaWorkerMain(Datum main_arg)
 {
 	/* Tracks the role era so the main loop can detect a standby -> primary promotion. */
 	bool		wasReplayingWal;
+
+	/* Zero-index log-once state; dbname captured in the startup transaction. */
+	VamanaZeroIndexState zeroIndexState = {0};
 
 	/*
 	 * Set up signal handlers.  Do NOT override SIGUSR1: it is owned by
@@ -392,10 +486,21 @@ VamanaWorkerMain(Datum main_arg)
 	/* Non-zero pid marks the worker available to backends. */
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
 
-	/* get_database_name reads a catalog, so it needs a transaction. */
+	/*
+	 * Startup transaction: capture the database name for the txn-less loop, log
+	 * readiness, and seed indexCount from the live catalog (primary-only — a
+	 * standby neither maintains the counter nor can run the enumerating SPI).
+	 * Catalog access and SPI both require a live transaction and snapshot.
+	 */
+	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	zeroIndexState.dbname = VamanaWorkerCaptureDatabaseName();
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
-						 get_database_name(MyDatabaseId))));
+						 zeroIndexState.dbname)));
+	if (VamanaIndexCountIsMaintained())
+		VamanaWorkerSeedIndexCount();
+	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
@@ -437,6 +542,8 @@ VamanaWorkerMain(Datum main_arg)
 		 * leaving a PENDING slot unprocessed for up to 1 s otherwise.
 		 */
 		VamanaWorkerProcessRequests();
+
+		VamanaWorkerMaybeWarnZeroIndex(&zeroIndexState);
 
 		/*
 		 * A standby feeds its index by decoding streamed WAL; a primary feeds
@@ -511,24 +618,36 @@ VamanaWorkerMain(Datum main_arg)
  * ----------------------------------------------------------------------- */
 
 /*
- * VamanaWorkerHeartbeatStale: true if the worker has written at least one
- * heartbeat but the most recent one is older than VAMANA_HEARTBEAT_STALE_MS,
- * meaning the main loop has stopped — hung inside a library call, unable to
- * drain slots or update its timestamp.
+ * VamanaHeartbeatIsStale: pure staleness test over a raw heartbeat value and a
+ * reference clock.  A worker that has never beaten (rawHb == 0) is not stale;
+ * otherwise it is stale once the most recent beat is older than
+ * VAMANA_HEARTBEAT_STALE_MS, meaning the main loop has stopped — hung inside a
+ * library call, unable to drain slots or update its timestamp.
+ *
+ * One definition of "stale", shared by the live entry-path wrapper below and
+ * the snapshot-path worker-state classifier.
+ */
+bool
+VamanaHeartbeatIsStale(uint64 rawHb, TimestampTz now)
+{
+	long		age_ms;
+
+	if (rawHb == 0)
+		return false;
+
+	age_ms = (long) ((now - (TimestampTz) rawHb) / 1000);
+	return age_ms > VAMANA_HEARTBEAT_STALE_MS;
+}
+
+/*
+ * VamanaWorkerHeartbeatStale: entry-path wrapper reading the live atomic and
+ * the current clock, then delegating to the pure kernel.
  */
 static bool
 VamanaWorkerHeartbeatStale(VamanaWorkerShmem *entry)
 {
-	uint64		hb = pg_atomic_read_u64(&entry->heartbeat_ts);
-	TimestampTz now;
-	long		age_ms;
-
-	if (hb == 0)
-		return false;
-
-	now = GetCurrentTimestamp();
-	age_ms = (long) ((now - (TimestampTz) hb) / 1000);
-	return age_ms > VAMANA_HEARTBEAT_STALE_MS;
+	return VamanaHeartbeatIsStale(pg_atomic_read_u64(&entry->heartbeat_ts),
+								  GetCurrentTimestamp());
 }
 
 /*
@@ -1267,155 +1386,382 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 }
 
 /* -----------------------------------------------------------------------
- * pg_stat_vamana_worker(): SQL-callable SRF exposing worker shmem state.
+ * Observability SRFs
  *
- * Returns one row per slot (indexed 0..maxSlots-1).  Worker-level fields
- * (worker_pid, db_oid, reload_queue_depth, active_slot_count, evict_all,
- * heartbeat_ts, index_count) are repeated on every row so callers can filter
- * or aggregate freely.
+ * Two grains, mirroring core PG's pg_stat_replication/pg_replication_slots
+ * pairing: pg_stat_vamana_worker() is one row per reserved database (worker
+ * grain); pg_stat_vamana_worker_slot() is one row per work-request slot across
+ * all reserved databases (slot grain).
  *
- * Column layout (12 columns):
- *   0  worker_pid            int4
- *   1  db_oid                oid
- *   2  reload_queue_depth    int4
- *   3  active_slot_count     int4
- *   4  evict_all             bool
- *   5  heartbeat_ts          timestamptz (NULL if worker has not written first heartbeat)
- *   6  index_count           int4
- *   7  slot_index            int4
- *   8  slot_status           text   ("empty"/"pending"/"processing"/"done"/"error")
- *   9  index_relid           oid    (InvalidOid shown as NULL)
- *  10  slot_kind             text   ("search"/"insert"/"delete"/"maintenance"/NULL)
- *  11  error_message         text   (NULL unless status == error)
+ * Both walk VamanaWorkerShmemHeader in a single LW_SHARED pass via
+ * VamanaWorkerForEachReserved, copying out under the lock (the callback ctx is
+ * a stats-layer accumulator).  Cross-database rows leak tenant existence and
+ * liveness, so an unprivileged caller sees only its own MyDatabaseId row; a
+ * pg_read_all_stats member sees all.  The predicate is computed once per call
+ * and applied inside the callback — never a SQL GRANT/REVOKE, which would also
+ * hide the self-row from ordinary users.
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_COLS 12
+/*
+ * Worker liveness state.  Total: every value has a VamanaWorkerStateName()
+ * label and the switch has no default arm, so a new state is a compile error
+ * until it is named.
+ */
+typedef enum VamanaWorkerState
+{
+	VAMANA_WORKER_REPLICA,		/* node in recovery; counters not maintained */
+	VAMANA_WORKER_RUNNING,		/* live pid, fresh heartbeat */
+	VAMANA_WORKER_UNRESPONSIVE, /* live pid, stale heartbeat, not yet reaped */
+	VAMANA_WORKER_BACKOFF,		/* crashed; launcher is in respawn backoff */
+	VAMANA_WORKER_STARTING,		/* reserved, no live pid yet, no prior failures */
+} VamanaWorkerState;
+
+static const char *
+VamanaWorkerStateName(VamanaWorkerState state)
+{
+	switch (state)
+	{
+		case VAMANA_WORKER_REPLICA:		return "replica";
+		case VAMANA_WORKER_RUNNING:		return "running";
+		case VAMANA_WORKER_UNRESPONSIVE: return "unresponsive";
+		case VAMANA_WORKER_BACKOFF:		return "backoff";
+		case VAMANA_WORKER_STARTING:	return "starting";
+	}
+	pg_unreachable();
+}
+
+/*
+ * Per-reserved-database snapshot, copied out under the header lock by the
+ * worker hydration callback.  A plain-values DTO: it never carries the
+ * launcher's VamanaLauncherBackoff struct, only the derived bool, so the stats
+ * path has no compile-time dependency on that layout.
+ */
+typedef struct VamanaWorkerSnapshot
+{
+	Oid			dbOid;
+	pid_t		workerPid;
+	bool		backingOff;
+	bool		evictAll;
+	uint64		heartbeatRaw;
+	uint32		indexCount;
+} VamanaWorkerSnapshot;
+
+/*
+ * Classify worker liveness from a snapshot.  Pure over its arguments: node role
+ * and clock are node/call facts sampled once per SRF call and passed in, never
+ * re-read here, so every row is classified against one clock and one role.
+ */
+static VamanaWorkerState
+VamanaClassifyWorkerState(const VamanaWorkerSnapshot *s, TimestampTz now,
+						  bool isPrimary)
+{
+	bool		stale;
+
+	if (!isPrimary)
+		return VAMANA_WORKER_REPLICA;
+
+	stale = VamanaHeartbeatIsStale(s->heartbeatRaw, now);
+
+	if (s->workerPid != 0 && !stale)
+		return VAMANA_WORKER_RUNNING;
+
+	/*
+	 * A crashed worker does not zero its own pid (the launcher reaps it via the
+	 * bgworker handle), so a stale-but-nonzero pid means hung, not gone.  Once
+	 * the launcher has charged the death, backoff outranks that transient
+	 * unresponsive window.
+	 */
+	if (s->backingOff)
+		return VAMANA_WORKER_BACKOFF;
+
+	if (s->workerPid != 0)
+		return VAMANA_WORKER_UNRESPONSIVE;
+
+	return VAMANA_WORKER_STARTING;
+}
+
+/*
+ * Shared visibility gate for both SRFs.  The privilege bool is computed once
+ * per call and stashed here; each callback skips entries the caller may not
+ * see.  base holds the grain-specific accumulator each SRF supplies.
+ */
+typedef struct VamanaStatVisibility
+{
+	bool		seeAll;			/* has_privs_of_role(pg_read_all_stats) */
+	Oid			selfDbOid;		/* the only db an unprivileged caller may see */
+} VamanaStatVisibility;
+
+static bool
+VamanaStatEntryVisible(const VamanaStatVisibility *vis, Oid dbOid)
+{
+	return vis->seeAll || dbOid == vis->selfDbOid;
+}
+
+static VamanaStatVisibility
+VamanaStatVisibilityForCaller(void)
+{
+	VamanaStatVisibility vis;
+
+	vis.seeAll = has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS);
+	vis.selfDbOid = MyDatabaseId;
+	return vis;
+}
+
+/* -----------------------------------------------------------------------
+ * pg_stat_vamana_worker(): one row per reserved database (worker grain).
+ *
+ * Column layout (6 columns):
+ *   0  db_oid        oid
+ *   1  worker_pid    int4         (0 -> NULL)
+ *   2  worker_state  text         (see VamanaWorkerStateName)
+ *   3  index_count   int4         (NULL on a standby — counter not maintained)
+ *   4  evict_all     bool
+ *   5  heartbeat_ts  timestamptz  (0 -> NULL)
+ * ----------------------------------------------------------------------- */
+
+#define PG_STAT_VAMANA_WORKER_COLS 6
+
+typedef struct VamanaWorkerHydrateCtx
+{
+	VamanaStatVisibility vis;
+	VamanaWorkerSnapshot *snapshots;
+	int			count;
+	int			capacity;
+} VamanaWorkerHydrateCtx;
+
+static void
+VamanaWorkerHydrateCb(VamanaWorkerShmem *entry, void *ctxArg)
+{
+	VamanaWorkerHydrateCtx *ctx = (VamanaWorkerHydrateCtx *) ctxArg;
+	VamanaWorkerSnapshot *snap;
+
+	if (!VamanaStatEntryVisible(&ctx->vis, entry->dbOid))
+		return;
+
+	Assert(ctx->count < ctx->capacity);
+	snap = &ctx->snapshots[ctx->count];
+
+	snap->dbOid = entry->dbOid;
+	snap->workerPid = entry->workerPid;
+	snap->backingOff = VamanaWorkerIsBackingOff(entry);
+	snap->evictAll = (pg_atomic_read_u32(&entry->evict_all) != 0);
+	snap->heartbeatRaw = pg_atomic_read_u64(&entry->heartbeat_ts);
+	snap->indexCount = pg_atomic_read_u32(&entry->indexCount);
+	ctx->count++;
+}
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(pg_stat_vamana_worker);
 Datum
 pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	VamanaWorkerShmem *entry;
-	int			maxSlots;
-	int			reloadQueueDepth;
-	int			activeSlotCount;
-	bool		evictAll;
-	pid_t		workerPid;
-	Oid			dbOid;
-	uint64		heartbeatRaw;
-	uint32		indexCount;
-	int			i;
+	VamanaWorkerHydrateCtx ctx;
+	TimestampTz now;
+	bool		isPrimary;
 
 	InitMaterializedSRF(fcinfo, 0);
-
-	/* Report the worker serving this database, or nothing if none is enabled. */
-	entry = VamanaWorkerLookupSlot(MyDatabaseId);
-	if (entry == NULL)
-		PG_RETURN_NULL();
+	Assert(rsinfo->setDesc->natts == PG_STAT_VAMANA_WORKER_COLS);
 
 	/*
-	 * Take a consistent snapshot of the worker-level scalar fields.  Individual
-	 * slot statuses are read with pg_atomic_read_u32 (no lock needed — each
-	 * status word is updated atomically by the worker).
+	 * At most one row per reserved slot; size the accumulator to capacity so the
+	 * callback never reallocates under the lock.
 	 */
-	workerPid = entry->workerPid;
-	dbOid = entry->dbOid;
-	maxSlots = entry->maxSlots;
-	evictAll = (pg_atomic_read_u32(&entry->evict_all) != 0);
-	heartbeatRaw = pg_atomic_read_u64(&entry->heartbeat_ts);
-	indexCount = pg_atomic_read_u32(&entry->indexCount);
+	ctx.vis = VamanaStatVisibilityForCaller();
+	ctx.capacity = VamanaWorkerShmemHeaderPtr->numSlots;
+	ctx.count = 0;
+	ctx.snapshots = palloc(sizeof(VamanaWorkerSnapshot) * ctx.capacity);
 
-	reloadQueueDepth = 0;
-	for (i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
+	VamanaWorkerForEachReserved(VamanaWorkerHydrateCb, &ctx);
+
+	/* Node role and clock are call-wide facts; sample each once, classify pure. */
+	isPrimary = VamanaNodeIsPrimary();
+	now = GetCurrentTimestamp();
+
+	for (int i = 0; i < ctx.count; i++)
 	{
-		if (pg_atomic_read_u32(&entry->reloadRequests[i].relid) != 0)
-			reloadQueueDepth++;
-	}
-
-	activeSlotCount = 0;
-	for (i = 0; i < maxSlots; i++)
-	{
-		uint32		s = pg_atomic_read_u32(&entry->slots[i].status);
-
-		if (s == VAMANA_SLOT_PENDING || s == VAMANA_SLOT_PROCESSING)
-			activeSlotCount++;
-	}
-
-	for (i = 0; i < maxSlots; i++)
-	{
-		VamanaWorkerSlot *slot = &entry->slots[i];
-		uint32		status;
-		const char *statusStr;
-		const char *kindStr;
+		const VamanaWorkerSnapshot *snap = &ctx.snapshots[i];
+		VamanaWorkerState state = VamanaClassifyWorkerState(snap, now, isPrimary);
 		Datum		values[PG_STAT_VAMANA_WORKER_COLS];
 		bool		nulls[PG_STAT_VAMANA_WORKER_COLS];
 
 		memset(nulls, 0, sizeof(nulls));
 
-		status = pg_atomic_read_u32(&slot->status);
+		values[0] = ObjectIdGetDatum(snap->dbOid);
 
-		switch (status)
-		{
-			case VAMANA_SLOT_EMPTY:		 statusStr = "empty";		break;
-			case VAMANA_SLOT_PENDING:	 statusStr = "pending";		break;
-			case VAMANA_SLOT_PROCESSING: statusStr = "processing";	break;
-			case VAMANA_SLOT_DONE:		 statusStr = "done";		break;
-			case VAMANA_SLOT_ERROR:		 statusStr = "error";		break;
-			default:					 statusStr = "unknown";		break;
-		}
-
-		if (status == VAMANA_SLOT_EMPTY)
-		{
-			kindStr = NULL;
-		}
+		if (snap->workerPid != 0)
+			values[1] = Int32GetDatum((int32) snap->workerPid);
 		else
-		{
-			switch (slot->slotKind)
-			{
-				case VAMANA_SLOTKIND_SEARCH:	  kindStr = "search";	    break;
-				case VAMANA_SLOTKIND_INSERT:	  kindStr = "insert";	    break;
-				case VAMANA_SLOTKIND_DELETE:	  kindStr = "delete";	    break;
-				case VAMANA_SLOTKIND_MAINTENANCE: kindStr = "maintenance";  break;
-				default:					      kindStr = "unknown";      break;
-			}
-		}
+			nulls[1] = true;
 
-		/* worker-level columns */
-		values[0] = Int32GetDatum((int32) workerPid);
-		values[1] = ObjectIdGetDatum(dbOid);
-		values[2] = Int32GetDatum(reloadQueueDepth);
-		values[3] = Int32GetDatum(activeSlotCount);
-		values[4] = BoolGetDatum(evictAll);
+		values[2] = CStringGetTextDatum(VamanaWorkerStateName(state));
 
-		if (heartbeatRaw != 0)
-			values[5] = TimestampTzGetDatum((TimestampTz) heartbeatRaw);
+		if (VamanaIndexCountIsMaintained())
+			values[3] = Int32GetDatum((int32) snap->indexCount);
+		else
+			nulls[3] = true;
+
+		values[4] = BoolGetDatum(snap->evictAll);
+
+		if (snap->heartbeatRaw != 0)
+			values[5] = TimestampTzGetDatum((TimestampTz) snap->heartbeatRaw);
 		else
 			nulls[5] = true;
 
-		values[6] = Int32GetDatum((int32) indexCount);
-
-		/* slot-level columns */
-		values[7] = Int32GetDatum(i);
-		values[8] = CStringGetTextDatum(statusStr);
-
-		if (slot->indexRelid != InvalidOid)
-			values[9] = ObjectIdGetDatum(slot->indexRelid);
-		else
-			nulls[9] = true;
-
-		if (kindStr != NULL)
-			values[10] = CStringGetTextDatum(kindStr);
-		else
-			nulls[10] = true;
-
-		if (status == VAMANA_SLOT_ERROR && slot->errorMessage[0] != '\0')
-			values[11] = CStringGetTextDatum(slot->errorMessage);
-		else
-			nulls[11] = true;
-
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+
+	return (Datum) 0;
+}
+
+/* -----------------------------------------------------------------------
+ * pg_stat_vamana_worker_slot(): one row per work-slot across all reserved
+ * databases (slot grain).
+ *
+ * Column layout (6 columns):
+ *   0  db_oid         oid
+ *   1  slot_index     int4
+ *   2  slot_status    text   ("empty"/"pending"/"processing"/"done"/"error")
+ *   3  slot_kind      text   ("search"/"insert"/"delete"/"maintenance"/"load"/NULL)
+ *   4  index_relid    oid    (InvalidOid -> NULL)
+ *   5  error_message  text   (NULL unless status == error)
+ * ----------------------------------------------------------------------- */
+
+#define PG_STAT_VAMANA_WORKER_SLOT_COLS 6
+
+/*
+ * One work-slot's presentation snapshot, read with the acquire barrier that
+ * pairs the writers' payload -> pg_write_barrier() -> status protocol.  Status
+ * determines which payload fields are valid, encoded once here so the SRF is a
+ * pure formatter.
+ */
+typedef struct VamanaWorkerSlotSnapshot
+{
+	uint32		status;
+	uint8		slotKind;
+	Oid			indexRelid;
+	bool		hasError;
+	char		errorMessage[sizeof(((VamanaWorkerSlot *) 0)->errorMessage)];
+} VamanaWorkerSlotSnapshot;
+
+static void
+VamanaWorkerReadSlotSnapshot(VamanaWorkerSlot *slot,
+							 VamanaWorkerSlotSnapshot *out)
+{
+	out->status = pg_atomic_read_u32(&slot->status);
+	pg_read_barrier();
+
+	out->slotKind = slot->slotKind;
+	out->indexRelid = slot->indexRelid;
+	out->hasError = (out->status == VAMANA_SLOT_ERROR &&
+					 slot->errorMessage[0] != '\0');
+	if (out->hasError)
+		strlcpy(out->errorMessage, slot->errorMessage, sizeof(out->errorMessage));
+	else
+		out->errorMessage[0] = '\0';
+}
+
+static const char *
+VamanaSlotStatusName(uint32 status)
+{
+	switch (status)
+	{
+		case VAMANA_SLOT_EMPTY:		 return "empty";
+		case VAMANA_SLOT_PENDING:	 return "pending";
+		case VAMANA_SLOT_PROCESSING: return "processing";
+		case VAMANA_SLOT_DONE:		 return "done";
+		case VAMANA_SLOT_ERROR:		 return "error";
+	}
+	pg_unreachable();
+}
+
+/* NULL for an empty slot (no operation carried) or an unrecognised kind. */
+static const char *
+VamanaSlotKindName(uint32 status, uint8 slotKind)
+{
+	if (status == VAMANA_SLOT_EMPTY)
+		return NULL;
+
+	switch (slotKind)
+	{
+		case VAMANA_SLOTKIND_SEARCH:	  return "search";
+		case VAMANA_SLOTKIND_INSERT:	  return "insert";
+		case VAMANA_SLOTKIND_DELETE:	  return "delete";
+		case VAMANA_SLOTKIND_MAINTENANCE: return "maintenance";
+		case VAMANA_SLOTKIND_LOAD:		  return "load";
+	}
+	return NULL;
+}
+
+typedef struct VamanaSlotEmitCtx
+{
+	VamanaStatVisibility vis;
+	ReturnSetInfo *rsinfo;
+} VamanaSlotEmitCtx;
+
+/*
+ * Emit every work-slot of one visible entry, walking entry->slots INSIDE the
+ * iterator's header lock: holding LW_SHARED keeps slots/maxSlots and the
+ * entry's identity stable, so a released-and-re-reserved entry cannot mis-
+ * attribute slots to the wrong tenant.  Per-slot payload freshness is handled
+ * independently by the acquire barrier in VamanaWorkerReadSlotSnapshot.
+ */
+static void
+VamanaSlotEmitCb(VamanaWorkerShmem *entry, void *ctxArg)
+{
+	VamanaSlotEmitCtx *ctx = (VamanaSlotEmitCtx *) ctxArg;
+
+	if (!VamanaStatEntryVisible(&ctx->vis, entry->dbOid))
+		return;
+
+	for (int i = 0; i < entry->maxSlots; i++)
+	{
+		VamanaWorkerSlotSnapshot snap;
+		const char *kindStr;
+		Datum		values[PG_STAT_VAMANA_WORKER_SLOT_COLS];
+		bool		nulls[PG_STAT_VAMANA_WORKER_SLOT_COLS];
+
+		VamanaWorkerReadSlotSnapshot(&entry->slots[i], &snap);
+		memset(nulls, 0, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(entry->dbOid);
+		values[1] = Int32GetDatum(i);
+		values[2] = CStringGetTextDatum(VamanaSlotStatusName(snap.status));
+
+		kindStr = VamanaSlotKindName(snap.status, snap.slotKind);
+		if (kindStr != NULL)
+			values[3] = CStringGetTextDatum(kindStr);
+		else
+			nulls[3] = true;
+
+		if (OidIsValid(snap.indexRelid))
+			values[4] = ObjectIdGetDatum(snap.indexRelid);
+		else
+			nulls[4] = true;
+
+		if (snap.hasError)
+			values[5] = CStringGetTextDatum(snap.errorMessage);
+		else
+			nulls[5] = true;
+
+		tuplestore_putvalues(ctx->rsinfo->setResult, ctx->rsinfo->setDesc,
+							 values, nulls);
+	}
+}
+
+PGDLLEXPORT PG_FUNCTION_INFO_V1(pg_stat_vamana_worker_slot);
+Datum
+pg_stat_vamana_worker_slot(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	VamanaSlotEmitCtx ctx;
+
+	InitMaterializedSRF(fcinfo, 0);
+	Assert(rsinfo->setDesc->natts == PG_STAT_VAMANA_WORKER_SLOT_COLS);
+
+	ctx.vis = VamanaStatVisibilityForCaller();
+	ctx.rsinfo = rsinfo;
+
+	VamanaWorkerForEachReserved(VamanaSlotEmitCb, &ctx);
 
 	return (Datum) 0;
 }

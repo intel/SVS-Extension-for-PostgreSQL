@@ -17,12 +17,18 @@
 #include "vamanaworker.h"
 #include "svs_wrapper.h"
 
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/stratnum.h"
+#include "access/table.h"
 #include "catalog/objectaccess.h"
-#include "catalog/pg_class_d.h"
+#include "catalog/pg_class.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 
 /*
  * In-Memory Index Cache Management
@@ -467,10 +473,51 @@ VamanaForceHeapRebuild(Oid indexRelid)
 static object_access_hook_type prev_vamana_object_access_hook = NULL;
 
 /*
- * Object-access hook: fires on every DDL object event.  We only act on
- * OAT_DROP for relations: this is the correct hook for DROP INDEX / DROP
- * TABLE, unlike a relcache callback which fires on every invalidation
- * (including CREATE INDEX) and would delete the directory prematurely.
+ * Is the just-created relation a vamana index?  Called from OAT_POST_CREATE,
+ * where the new pg_class row is inserted but the command counter has not yet
+ * advanced, so syscache (get_rel_relam) cannot see it.  Scan the catalog under
+ * SnapshotSelf to read the still-invisible tuple's relkind and relam.
+ */
+static bool
+VamanaRelationIsVamanaIndex(Oid objectId, Oid vamanaAm)
+{
+	Relation	pgClass;
+	ScanKeyData skey;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		isVamana = false;
+
+	ScanKeyInit(&skey, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(objectId));
+
+	pgClass = table_open(RelationRelationId, AccessShareLock);
+	scan = systable_beginscan(pgClass, ClassOidIndexId, true,
+							  SnapshotSelf, 1, &skey);
+
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_class classForm = (Form_pg_class) GETSTRUCT(tuple);
+
+		isVamana = (classForm->relkind == RELKIND_INDEX &&
+					classForm->relam == vamanaAm);
+	}
+
+	systable_endscan(scan);
+	table_close(pgClass, AccessShareLock);
+
+	return isVamana;
+}
+
+/*
+ * Object-access hook: fires on every DDL object event.  We maintain the
+ * per-database vamana index counter symmetrically here — +1 on OAT_POST_CREATE
+ * of a vamana index, -1 on OAT_DROP — so that only genuine CREATE/DROP move it.
+ * The counter must not track raw index builds: REINDEX and TRUNCATE re-run
+ * ambuild without creating or dropping an index, and incrementing there would
+ * leak the count upward.  This is also the correct hook for save-directory
+ * cleanup on DROP INDEX / DROP TABLE, unlike a relcache callback which fires on
+ * every invalidation (including CREATE INDEX) and would delete it prematurely.
  */
 static void
 VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
@@ -479,6 +526,20 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	/* Chain to any previously-installed hook */
 	if (prev_vamana_object_access_hook)
 		(*prev_vamana_object_access_hook) (access, classId, objectId, subId, arg);
+
+	/*
+	 * Index creation: count the new relation only if it is a vamana index.
+	 * subId == 0 restricts this to the relation itself, not its columns.
+	 */
+	if (access == OAT_POST_CREATE && classId == RelationRelationId && subId == 0)
+	{
+		Oid			vamanaAm = get_index_am_oid("vamana", true);
+
+		/* Applied to shmem at COMMIT by the index-count xact callback. */
+		if (OidIsValid(vamanaAm) &&
+			VamanaRelationIsVamanaIndex(objectId, vamanaAm))
+			VamanaWorkerQueueIndexCountDelta(MyDatabaseId, 1);
+	}
 
 	/* On relation drop, remove the corresponding vamana save directory. */
 	if (access == OAT_DROP && classId == RelationRelationId)

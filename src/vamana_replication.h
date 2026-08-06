@@ -44,6 +44,9 @@ typedef struct VamanaReplayRole
 /* Resolve the current role. The sole reader of RecoveryInProgress() on this path. */
 const VamanaReplayRole *VamanaGetReplayRole(void);
 
+/* True when this node is the primary (not in recovery). */
+bool	VamanaNodeIsPrimary(void);
+
 /* BGW: create and persist a slot anchored at the current WAL position. */
 void	VamanaReplicationCreate(Oid dboid, Oid indexRelid);
 

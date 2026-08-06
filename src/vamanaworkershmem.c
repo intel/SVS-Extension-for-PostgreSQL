@@ -24,6 +24,7 @@
 #include "storage/lmgr.h"
 #include "storage/shmem.h"
 #include "utils/errcodes.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 
 /* -----------------------------------------------------------------------
@@ -293,6 +294,31 @@ VamanaWorkerLookupSlot(Oid dbOid)
 }
 
 /*
+ * Invoke cb on every reserved (dbOid != InvalidOid) control block under a
+ * single LW_SHARED pass, with the header lock held across all invocations.
+ *
+ * The callback does its own copy-out while the lock is held, so no caller has
+ * to re-lock for a second read.  Holding the lock across the whole walk keeps
+ * each entry's identity — and its slots/maxSlots — stable for the callback,
+ * closing the reserve/release window a two-pass design would reopen.  The
+ * callback must not itself take the header lock (it is non-recursive) nor do
+ * unbounded work (tuplestore, palloc storms) that would hold it too long.
+ */
+void
+VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx)
+{
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	for (int i = 0; i < VamanaWorkerShmemHeaderPtr->numSlots; i++)
+	{
+		VamanaWorkerShmem *entry = &VamanaWorkerShmemHeaderPtr->slots[i];
+
+		if (OidIsValid(entry->dbOid))
+			cb(entry, ctx);
+	}
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
+/*
  * Reserve (or return the existing) control block for dbOid.  Returns NULL
  * when the array is full (more distinct databases than max_vamana_databases).
  * The reserved entry has workerPid == 0 until a worker starts for it.
@@ -314,6 +340,14 @@ VamanaWorkerReserveSlot(Oid dbOid)
 		{
 			entry->dbOid = dbOid;
 			VamanaWorkerShmemHeaderPtr->numActive++;
+
+			/*
+			 * Between publishing dbOid and dropping the exclusive lock the entry
+			 * is half-initialised.  A concurrent reader takes the lock in shared
+			 * mode, so it can only observe the entry whole or absent — this point
+			 * lets a test pause here and prove that invariant deterministically.
+			 */
+			INJECTION_POINT("vamana-reserve-slot-midpoint", NULL);
 		}
 	}
 
@@ -565,6 +599,19 @@ VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out)
 		return false;
 	}
 	return true;
+}
+
+/*
+ * Lock-free backoff predicate for callers already holding the header lock.
+ * True iff the worker has unrecovered crashes and is therefore in the
+ * launcher's respawn-backoff regime.  Reads the count the launcher maintains
+ * (VamanaWorkerBackoffRecordDeath) rather than recomputing the interval curve,
+ * so it stays a fact about backoff, not a copy of its policy.
+ */
+bool
+VamanaWorkerIsBackingOff(const VamanaWorkerShmem *entry)
+{
+	return entry->backoff.consecutive_failures > 0;
 }
 
 /* Record the moment the launcher (re)spawned dbOid's worker. */

@@ -148,13 +148,15 @@ sub wait_for_worker_count
 }
 
 # ---------------------------------------------------------------------------
-# Tests 9 + 10: per-worker isolation and per-database availability.
+# Tests 9 + 10: cross-database enumeration, visibility gate, and per-database
+# availability.
 #
-# pg_stat_vamana_worker is per-connected-database: the SRF looks up the slot
-# for MyDatabaseId, so each backend sees only its own worker.  With workers for
-# three databases running, a backend in iso_a must see a slot whose db_oid is
-# iso_a's OID (never iso_b's), and vice versa — direct proof that the launcher
-# passed each dbOid as bgw_main_arg and each worker bound to its own database.
+# pg_stat_vamana_worker reports one row per reserved database.  A privileged
+# caller (superuser / pg_read_all_stats) sees every worker; the launcher having
+# passed each dbOid as bgw_main_arg shows up as one 'running' row per database
+# with the correct db_oid and a distinct worker_pid.  An unprivileged caller is
+# gated C-side to only its own MyDatabaseId row — proof the cross-database scope
+# does not leak other tenants' existence.
 # ---------------------------------------------------------------------------
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_launcher_isolation');
@@ -189,20 +191,35 @@ sub wait_for_worker_count
         "SELECT oid FROM pg_database WHERE datname = 'iso_b';");
     chomp $iso_b_oid;
 
-    # Test 9: each backend's view reports exactly its own worker, bound to its
-    # own database OID.  The launcher passed dbOid as bgw_main_arg; the worker
-    # recorded MyDatabaseId in its slot, which the SRF resolves per backend.
+    my $postgres_oid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'postgres';");
+    chomp $postgres_oid;
+
+    # Test 9a: a privileged caller enumerates all three workers, each 'running'
+    # with the right db_oid and a distinct pid — the launcher passed each dbOid
+    # as bgw_main_arg and each worker bound to its own database.
+    my $rows = $node->safe_psql('postgres', qq{
+        SELECT db_oid, worker_state FROM pg_stat_vamana_worker ORDER BY db_oid;
+    });
+    my %state_by_oid = map { split /\|/ } split /\n/, $rows;
+    is($state_by_oid{$postgres_oid}, 'running', 'postgres worker running (privileged view)');
+    is($state_by_oid{$iso_a_oid},    'running', 'iso_a worker running (privileged view)');
+    is($state_by_oid{$iso_b_oid},    'running', 'iso_b worker running (privileged view)');
+
+    my $distinct_pids = $node->safe_psql('postgres',
+        "SELECT count(DISTINCT worker_pid) FROM pg_stat_vamana_worker "
+      . "WHERE worker_pid IS NOT NULL;");
+    chomp $distinct_pids;
+    is($distinct_pids, '3', 'three distinct worker pids across databases');
+
+    # Test 9b: an unprivileged caller in iso_a is gated to only its own row;
+    # iso_b's existence never leaks.
+    $node->safe_psql('iso_a', "CREATE ROLE unpriv LOGIN;");
     my $seen_a = $node->safe_psql('iso_a',
-        "SELECT DISTINCT db_oid FROM pg_stat_vamana_worker;");
+        "SELECT db_oid FROM pg_stat_vamana_worker;", extra_params => [ '-U', 'unpriv' ]);
     chomp $seen_a;
     is($seen_a, $iso_a_oid,
-        'a backend in iso_a sees only iso_a\'s worker (main_arg honored)');
-
-    my $seen_b = $node->safe_psql('iso_b',
-        "SELECT DISTINCT db_oid FROM pg_stat_vamana_worker;");
-    chomp $seen_b;
-    is($seen_b, $iso_b_oid,
-        'a backend in iso_b sees only iso_b\'s worker (no cross-db leakage)');
+        'unprivileged backend in iso_a sees only its own row (no cross-db leakage)');
 
     # Test 10: a backend in iso_a, forced to search, is served by iso_a's own
     # worker.  A successful worker-mode search proves the backend resolved its

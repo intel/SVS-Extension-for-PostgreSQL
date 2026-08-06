@@ -9,6 +9,7 @@
 #include "postgres.h"
 
 #include "datatype/timestamp.h"
+#include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -262,10 +263,32 @@ VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
 
+/*
+ * Iterate every reserved control block under one LW_SHARED pass, invoking cb
+ * per entry while the header lock is held.  The callback is shmem-generic — it
+ * receives a locked reserved entry and its own ctx, and does its copy-out
+ * before the lock drops; the shmem layer never learns any consumer's DTO.
+ *
+ * entry is not const: reading its presentation atomics (heartbeat_ts,
+ * indexCount, per-slot status) goes through pg_atomic_read_*, which take a
+ * non-const volatile pointer.  The callback must still treat it as read-only.
+ */
+typedef void (*VamanaReservedEntryCb) (VamanaWorkerShmem *entry, void *ctx);
+void	VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx);
+
 /* vamanaworkershmem.c: launcher-owned crash-backoff state (header lock) */
 bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);
 void	VamanaWorkerBackoffStampAttempt(Oid dbOid, TimestampTz now);
 void	VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered);
+
+/*
+ * Lock-free backoff predicate for callers that already hold the header lock
+ * (the stats hydration pass): true iff the worker has unrecovered crashes and
+ * is in the launcher's respawn-backoff regime.  Reads entry->backoff directly;
+ * distinct from the lock-acquiring VamanaWorkerBackoffSnapshot, which would
+ * re-enter the non-recursive header LWLock if called under it.
+ */
+bool	VamanaWorkerIsBackingOff(const VamanaWorkerShmem *entry);
 
 /* vamanaworkershmem.c: launcher initial-scan publication (header lock) */
 void	VamanaWorkerSetInitialScanDone(void);
@@ -282,6 +305,23 @@ int		VamanaSlotErrcode(uint8 category);
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
 
+/*
+ * Pure staleness kernel over a raw heartbeat and a reference clock; shared by
+ * the live entry-path check and the snapshot-path worker-state classifier.
+ */
+bool	VamanaHeartbeatIsStale(uint64 rawHb, TimestampTz now);
+
+/*
+ * Counter-maintenance policy: is indexCount kept current on this node?  Derived
+ * from the node fact (VamanaNodeIsPrimary) but named separately, so a future
+ * primary-side pause of maintenance cannot silently mislabel worker_state.
+ * Gates the startup seed, the zero-index log-once, and the SRF's standby NULL.
+ */
+bool	VamanaIndexCountIsMaintained(void);
+
+/* Primary-only: seed indexCount to the live count in the worker startup txn. */
+void	VamanaWorkerSeedIndexCount(void);
+
 /* vamanaworkerindex.c */
 
 /*
@@ -295,6 +335,16 @@ extern bool vamana_eviction_suppressed;
 	"FROM pg_catalog.pg_class c " \
 	"JOIN pg_catalog.pg_am a ON a.oid = c.relam " \
 	"WHERE a.amname = 'vamana' AND c.relkind = 'i'"
+
+/*
+ * SPI kernel over VAMANA_ENUM_INDEXES_IN_DB_SQL: connect, execute, collect,
+ * finish.  Returns a palloc'd List of index relid Oids (NIL if none).
+ * Precondition: caller holds an open transaction with a pushed snapshot
+ * (asserted); the wrapper owns the SPI session, not the transaction.  Callers
+ * reduce as their grain needs: the standby loader loads each relid, the startup
+ * seed counts them.
+ */
+List   *VamanaWorkerEnumerateIndexes(void);
 
 SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk);
 SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid);

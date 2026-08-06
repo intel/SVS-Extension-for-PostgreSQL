@@ -87,27 +87,53 @@ CREATE TRIGGER vamana_databases_queue_reservation
 REVOKE TRUNCATE ON vamana_databases FROM PUBLIC;
 
 -- Observability
+--
+-- Two grains, mirroring pg_stat_replication / pg_replication_slots in core:
+-- pg_stat_vamana_worker is one row per reserved database (worker grain);
+-- pg_stat_vamana_worker_slot is one row per work-request slot (slot grain).
+--
+-- Cross-database visibility is enforced C-side, per row: an unprivileged
+-- caller sees only its own database's row, a pg_read_all_stats member sees all.
+-- The views must still be readable for that gate to run, so SELECT is granted
+-- to PUBLIC below.  Do not REVOKE it or narrow it: that would hide the self-row
+-- from ordinary users, which the C-side filter is designed to expose.
+--
+-- The function and view intentionally share a name (function returns the set,
+-- view is the queryable relation over it), mirroring the existing idiom.
 
 CREATE FUNCTION pg_stat_vamana_worker()
 	RETURNS TABLE (
-		worker_pid          int,
 		db_oid              oid,
-		reload_queue_depth  int,
-		active_slot_count   int,
-		evict_all           bool,
-		heartbeat_ts        timestamptz,
+		worker_pid          int,
+		worker_state        text,
 		index_count         int,
-		slot_index          int,
-		slot_status         text,
-		index_relid         oid,
-		slot_kind           text,
-		error_message       text
+		evict_all           bool,
+		heartbeat_ts        timestamptz
 	)
 	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker'
-	LANGUAGE C STRICT;
+	LANGUAGE C;
 
 CREATE VIEW pg_stat_vamana_worker AS
 	SELECT * FROM pg_stat_vamana_worker();
+
+CREATE FUNCTION pg_stat_vamana_worker_slot()
+	RETURNS TABLE (
+		db_oid              oid,
+		slot_index          int,
+		slot_status         text,
+		slot_kind           text,
+		index_relid         oid,
+		error_message       text
+	)
+	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker_slot'
+	LANGUAGE C;
+
+CREATE VIEW pg_stat_vamana_worker_slot AS
+	SELECT * FROM pg_stat_vamana_worker_slot();
+
+-- Readable by everyone; the C-side row filter, not SQL privileges, scopes what
+-- each caller sees (see the note above).
+GRANT SELECT ON pg_stat_vamana_worker, pg_stat_vamana_worker_slot TO PUBLIC;
 
 -- Permanent removal
 
