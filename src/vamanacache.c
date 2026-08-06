@@ -501,8 +501,9 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 		{
 			Oid			vamanaAm = get_index_am_oid("vamana", true);
 
+			/* Applied to shmem at COMMIT by the index-count xact callback. */
 			if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
-				VamanaWorkerIndexCountAdjust(MyDatabaseId, -1);
+				VamanaWorkerQueueIndexCountDelta(MyDatabaseId, -1);
 		}
 	}
 }

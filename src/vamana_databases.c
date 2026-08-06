@@ -137,6 +137,73 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	return PointerGetDatum(NULL);	/* AFTER trigger; return value is ignored */
 }
 
+/*
+ * BEFORE DELETE trigger: reject removing a database's row while vamana indexes
+ * still exist in it, so the on-disk save directories and replication slots are
+ * never orphaned by deleting the row before running svs_teardown_database().
+ *
+ * The index count lives in the target database's shmem slot, readable from any
+ * database, so no cross-database query is needed.  Two limitations follow from
+ * reading that counter rather than the target's catalog directly:
+ *
+ *   - A database with no reserved slot reads as zero regardless of its actual
+ *     indexes.  Closed at the source by hard-failing CREATE INDEX in an
+ *     unconfigured database.
+ *
+ *   - The read is best-effort at DELETE time, not serialized against the target
+ *     database: a concurrent CREATE INDEX there can commit between this check
+ *     and the DELETE.  Closing that would require cross-database locking, which
+ *     this design avoids.
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_reject_delete_with_live_indexes);
+Datum
+vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	TupleDesc	tupdesc;
+	bool		isnull;
+	Name		datname;
+	Oid			dbOid;
+	VamanaWorkerShmem *entry;
+	uint32		indexCount;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "vamana_databases_reject_delete_with_live_indexes: not called by trigger manager");
+
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event) ||
+		!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event) ||
+		!TRIGGER_FIRED_BY_DELETE(trigdata->tg_event))
+		elog(ERROR, "vamana_databases_reject_delete_with_live_indexes: must be a BEFORE DELETE FOR EACH ROW trigger");
+
+	tupdesc = trigdata->tg_relation->rd_att;
+	datname = DatumGetName(heap_getattr(trigdata->tg_trigtuple,
+										VAMANA_DATABASES_ATTNUM_DATNAME,
+										tupdesc, &isnull));
+	Assert(!isnull);			/* datname is the primary key, NOT NULL */
+
+	/*
+	 * DROP DATABASE without first removing the row is a reachable sequence: if
+	 * the database is already gone it holds no indexes, so allow the DELETE.
+	 */
+	dbOid = get_database_oid(NameStr(*datname), true);
+	if (!OidIsValid(dbOid))
+		return PointerGetDatum(trigdata->tg_trigtuple);
+
+	entry = VamanaWorkerLookupSlot(dbOid);
+	indexCount = (entry != NULL) ? pg_atomic_read_u32(&entry->indexCount) : 0;
+
+	if (indexCount > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot remove \"%s\" from vamana_databases: "
+						"%u vamana index(es) still exist in that database",
+						NameStr(*datname), indexCount),
+				 errhint("run svs_teardown_database() in \"%s\" first",
+						 NameStr(*datname))));
+
+	return PointerGetDatum(trigdata->tg_trigtuple);
+}
+
 static void
 EnsureReservationCallbacksRegistered(void)
 {

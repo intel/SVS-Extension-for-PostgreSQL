@@ -108,3 +108,25 @@ CREATE FUNCTION pg_stat_vamana_worker()
 
 CREATE VIEW pg_stat_vamana_worker AS
 	SELECT * FROM pg_stat_vamana_worker();
+
+-- Permanent removal
+
+-- Drops every vamana index in the current database, one row per index.
+-- Not SECURITY DEFINER: each drop runs with the caller's own privileges.
+CREATE FUNCTION svs_teardown_database()
+	RETURNS TABLE (index_relid oid, index_name text, dropped bool, reason text)
+	AS 'MODULE_PATHNAME', 'svs_teardown_database'
+	LANGUAGE C;
+
+-- Reject deleting a row while vamana indexes still exist in that database, so
+-- their save directories and replication slots are never orphaned.  TRUNCATE
+-- would bypass a DELETE trigger; it is already revoked from PUBLIC above.
+CREATE FUNCTION vamana_databases_reject_delete_with_live_indexes()
+	RETURNS trigger
+	AS 'MODULE_PATHNAME', 'vamana_databases_reject_delete_with_live_indexes'
+	LANGUAGE C;
+
+CREATE TRIGGER vamana_databases_reject_delete_with_live_indexes
+	BEFORE DELETE ON vamana_databases
+	FOR EACH ROW
+	EXECUTE FUNCTION vamana_databases_reject_delete_with_live_indexes();

@@ -260,7 +260,7 @@ void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_i
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
-void	VamanaWorkerIndexCountAdjust(Oid dbOid, int delta);
+void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
 
 /* vamanaworkershmem.c: launcher-owned crash-backoff state (header lock) */
 bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);
@@ -283,6 +283,19 @@ int		VamanaSlotErrcode(uint8 category);
 extern bool vamana_eviction_suppressed;
 
 /* vamanaworkerindex.c */
+
+/*
+ * Enumerates every vamana index in the current database, one c.oid per row.
+ * Shared by the standby loader and svs_teardown_database() so the definition
+ * of "a vamana index" stays in one place.  Joins pg_am so the AM oid is not
+ * hardcoded.
+ */
+#define VAMANA_ENUM_INDEXES_IN_DB_SQL \
+	"SELECT c.oid " \
+	"FROM pg_catalog.pg_class c " \
+	"JOIN pg_catalog.pg_am a ON a.oid = c.relam " \
+	"WHERE a.amname = 'vamana' AND c.relkind = 'i'"
+
 SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk);
 SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid);
 void	VamanaWorkerResetStaleSlots(void);

@@ -494,7 +494,8 @@ cleanup:
 	result->heap_tuples = buildstate.reltuples;
 	result->index_tuples = buildstate.numVectors;
 
-	VamanaWorkerIndexCountAdjust(MyDatabaseId, 1);
+	/* Applied to shmem at COMMIT by the index-count xact callback. */
+	VamanaWorkerQueueIndexCountDelta(MyDatabaseId, 1);
 
 	return result;
 }

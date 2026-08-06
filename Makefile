@@ -25,7 +25,8 @@ OBJS = src/svs.o \
        src/vamanaworkersearch.o \
        src/vamanaworkerwrite.o \
        src/svs_wrapper.o \
-       src/vamana_databases.o
+       src/vamana_databases.o \
+       src/vamana_teardown.o
 HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h
 
 TESTS = $(wildcard test/sql/*.sql)

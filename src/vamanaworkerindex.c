@@ -254,13 +254,7 @@ VamanaWorkerLoadStandbyIndexes(void)
 		return;
 	}
 
-	/* Join through pg_am so the vamana access-method OID is not hardcoded. */
-	ret = SPI_execute(
-					  "SELECT c.oid "
-					  "FROM pg_catalog.pg_class c "
-					  "JOIN pg_catalog.pg_am a ON a.oid = c.relam "
-					  "WHERE a.amname = 'vamana' AND c.relkind = 'i'",
-					  true, 0);
+	ret = SPI_execute(VAMANA_ENUM_INDEXES_IN_DB_SQL, true, 0);
 
 	if (ret != SPI_OK_SELECT)
 	{

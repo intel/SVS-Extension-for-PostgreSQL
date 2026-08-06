@@ -15,6 +15,7 @@
 #include "vamana.h"
 #include "vamanaworker.h"
 
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
@@ -23,6 +24,7 @@
 #include "storage/lmgr.h"
 #include "storage/shmem.h"
 #include "utils/errcodes.h"
+#include "utils/memutils.h"
 
 /* -----------------------------------------------------------------------
  * Module-level state
@@ -320,24 +322,213 @@ VamanaWorkerReserveSlot(Oid dbOid)
 	return entry;
 }
 
+/* -----------------------------------------------------------------------
+ * Live-index counter (commit-deferred)
+ *
+ * indexCount must equal committed catalog truth: the BEFORE DELETE guard on
+ * vamana_databases promotes it from an advisory hint into a hard gate, and an
+ * aborted DROP INDEX applying its decrement inline would under-count and let
+ * the DELETE through while a live index remains.  So a CREATE/DROP queues a
+ * delta here and the atomic is written only at COMMIT, never on abort.
+ *
+ * This mirrors the transaction-journal shape of vamana_undo.c and the
+ * reservation queue in vamana_databases.c: a TopTransactionContext-scoped,
+ * subxid-tagged pending list drained by an xact callback, pruned per
+ * subtransaction by a subxact callback.
+ * ----------------------------------------------------------------------- */
+
+typedef struct PendingIndexCountDelta
+{
+	Oid			dbOid;
+	int			delta;			/* +1 on CREATE INDEX, -1 on DROP INDEX */
+	SubTransactionId subxid;
+}			PendingIndexCountDelta;
+
+typedef struct PendingIndexCountList
+{
+	PendingIndexCountDelta *entries;
+	int			count;
+	int			capacity;
+}			PendingIndexCountList;
+
+/* Per-backend (per-transaction) list; reset to NULL at transaction end. */
+static PendingIndexCountList * CurrentIndexCountDeltas = NULL;
+
+static bool indexCountCallbacksRegistered = false;
+
+static void VamanaIndexCountXactCallback(XactEvent event, void *arg);
+static void VamanaIndexCountSubXactCallback(SubXactEvent event,
+											SubTransactionId mySubid,
+											SubTransactionId parentSubid,
+											void *arg);
+
+static PendingIndexCountList *
+GetOrCreateIndexCountDeltas(void)
+{
+	if (CurrentIndexCountDeltas == NULL)
+	{
+		MemoryContext oldCtx = MemoryContextSwitchTo(TopTransactionContext);
+
+		CurrentIndexCountDeltas = palloc0(sizeof(PendingIndexCountList));
+		CurrentIndexCountDeltas->capacity = 16;
+		CurrentIndexCountDeltas->entries =
+			palloc(CurrentIndexCountDeltas->capacity * sizeof(PendingIndexCountDelta));
+		MemoryContextSwitchTo(oldCtx);
+	}
+	return CurrentIndexCountDeltas;
+}
+
+static void
+EnsureIndexCountCallbacksRegistered(void)
+{
+	if (!indexCountCallbacksRegistered)
+	{
+		RegisterXactCallback(VamanaIndexCountXactCallback, NULL);
+		RegisterSubXactCallback(VamanaIndexCountSubXactCallback, NULL);
+		indexCountCallbacksRegistered = true;
+	}
+}
+
 /*
- * Adjust the live-index counter for dbOid.  Looking up the slot takes the
+ * Queue a live-index counter delta for dbOid, applied to shmem at COMMIT.
+ * Tagging the delta with the current subtransaction lets a ROLLBACK TO
+ * SAVEPOINT discard only its own CREATE/DROP INDEX deltas.
+ */
+void
+VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta)
+{
+	PendingIndexCountList *list;
+
+	EnsureIndexCountCallbacksRegistered();
+	list = GetOrCreateIndexCountDeltas();
+
+	if (list->count >= list->capacity)
+	{
+		MemoryContext oldCtx = MemoryContextSwitchTo(TopTransactionContext);
+
+		list->capacity *= 2;
+		list->entries = repalloc(list->entries,
+								 list->capacity * sizeof(PendingIndexCountDelta));
+		MemoryContextSwitchTo(oldCtx);
+	}
+
+	list->entries[list->count].dbOid = dbOid;
+	list->entries[list->count].delta = delta;
+	list->entries[list->count].subxid = GetCurrentSubTransactionId();
+	list->count++;
+}
+
+/*
+ * Apply a net delta to dbOid's counter.  Looking up the slot takes the
  * array-wide lock in shared mode; the increment/decrement itself is a plain
  * atomic, deliberately outside that lock (see M2 "Locking").  No-op if no
  * slot is reserved for the database.
  */
-void
-VamanaWorkerIndexCountAdjust(Oid dbOid, int delta)
+static void
+ApplyIndexCountDelta(Oid dbOid, int delta)
 {
-	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+	VamanaWorkerShmem *entry;
 
+	if (delta == 0)
+		return;
+
+	entry = VamanaWorkerLookupSlot(dbOid);
 	if (entry == NULL)
 		return;
 
-	if (delta >= 0)
+	if (delta > 0)
 		pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) delta);
 	else
 		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));
+}
+
+/*
+ * Fold the pending deltas into one net value per database and apply them,
+ * so a slot is looked up at most once per database regardless of how many
+ * indexes the transaction created or dropped.  Deltas from an aborted
+ * subtransaction carry InvalidSubTransactionId and are skipped.
+ */
+static void
+ApplyPendingIndexCountDeltas(void)
+{
+	PendingIndexCountList *list = CurrentIndexCountDeltas;
+
+	if (list == NULL)
+		return;
+
+	for (int i = 0; i < list->count; i++)
+	{
+		Oid			dbOid = list->entries[i].dbOid;
+		int			net = 0;
+
+		/* Skip entries already folded into an earlier pass or aborted. */
+		if (dbOid == InvalidOid ||
+			list->entries[i].subxid == InvalidSubTransactionId)
+			continue;
+
+		for (int j = i; j < list->count; j++)
+		{
+			if (list->entries[j].dbOid != dbOid ||
+				list->entries[j].subxid == InvalidSubTransactionId)
+				continue;
+
+			net += list->entries[j].delta;
+			list->entries[j].dbOid = InvalidOid;
+		}
+
+		ApplyIndexCountDelta(dbOid, net);
+	}
+}
+
+static void
+VamanaIndexCountXactCallback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			ApplyPendingIndexCountDeltas();
+			CurrentIndexCountDeltas = NULL;
+			break;
+
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			CurrentIndexCountDeltas = NULL;
+			break;
+
+		case XACT_EVENT_PREPARE:
+			if (CurrentIndexCountDeltas != NULL &&
+				CurrentIndexCountDeltas->count > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		default:
+			break;
+	}
+}
+
+/*
+ * A ROLLBACK TO SAVEPOINT around a CREATE/DROP INDEX must discard that
+ * subtransaction's deltas.  Entries carry their subxid rather than being
+ * removed on rollback, so this marks them discarded without compacting the
+ * array mid-transaction.
+ */
+static void
+VamanaIndexCountSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
+								SubTransactionId parentSubid, void *arg)
+{
+	PendingIndexCountList *list = CurrentIndexCountDeltas;
+
+	if (event != SUBXACT_EVENT_ABORT_SUB || list == NULL)
+		return;
+
+	for (int i = 0; i < list->count; i++)
+	{
+		if (list->entries[i].subxid == mySubid)
+			list->entries[i].subxid = InvalidSubTransactionId;
+	}
 }
 
 /* -----------------------------------------------------------------------
