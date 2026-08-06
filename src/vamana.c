@@ -57,6 +57,7 @@ int			vamana_checkpoint_min_ops = 10000;
 int			vamana_max_slot_wal_size_mb = 10240;	/* 10 GB */
 int			vamana_checkpoint_operations = -1;		/* -1 = off (simple count-based trigger) */
 int			vamana_checkpoint_interval = -1;		/* -1 = off (simple time-based trigger) */
+int			vamana_shutdown_drain_budget_ms = 30000;
 
 relopt_kind vamana_relopt_kind;
 
@@ -274,6 +275,17 @@ VamanaInit(void)
 							-1, -1, 86400,
 							PGC_SIGHUP,
 							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.shutdown_drain_budget_ms",
+							"Time budget for the worker's shutdown drain, checked between indexes",
+							"Must stay under the server's shutdown escalation window. A single "
+							"in-progress checkpoint is not preemptible, so the real bound is "
+							"this budget plus one checkpoint's worst case.",
+							&vamana_shutdown_drain_budget_ms,
+							30000, 0, 600000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
 							NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("svs");

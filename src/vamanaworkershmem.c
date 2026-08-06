@@ -166,6 +166,7 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 {
 	entry->dbOid = InvalidOid;
 	entry->workerPid = 0;
+	pg_atomic_init_u32(&entry->accepting, 0);
 	entry->maxSlots = MaxBackends;
 	entry->slots = (VamanaWorkerSlot *) slotRegion;
 

@@ -490,6 +490,19 @@ ReplayChangeGuarded(VamanaReplayContext *priv, Relation relation,
 		ErrorData  *edata;
 
 		MemoryContextSwitchTo(oldcontext);
+
+		/*
+		 * A shutdown cancel is not a corrupt change: unwind the subtransaction
+		 * but re-throw so the drain owner runs instead of dropping a good change.
+		 */
+		if (VamanaShutdownCancelPending())
+		{
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(oldcontext);
+			CurrentResourceOwner = oldowner;
+			PG_RE_THROW();
+		}
+
 		edata = CopyErrorData();
 		FlushErrorState();
 		RollbackAndReleaseCurrentSubTransaction();
@@ -799,11 +812,15 @@ VamanaReplicationDrainSlot(Oid indexRelid)
 	}
 	PG_CATCH();
 	{
-		/*
-		 * Restore before the rebuild so the flag is correct even if
-		 * VamanaForceHeapRebuild itself throws.
-		 */
 		vamana_eviction_suppressed = prevSuppressed;
+
+		/*
+		 * A shutdown cancel is not a decode failure: re-throw so the drain owner
+		 * runs, rather than dropping the slot and forcing a needless rebuild.
+		 */
+		if (VamanaShutdownCancelPending())
+			PG_RE_THROW();
+
 		VamanaRecoverFromReplayError(indexRelid);
 	}
 	PG_END_TRY();

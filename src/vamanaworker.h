@@ -178,6 +178,9 @@ typedef struct VamanaWorkerShmem
 	pid_t			workerPid;		/* 0 = no live worker for this entry */
 	Latch			workerLatch;	/* InitSharedLatch'd; worker owns this */
 
+	/* Intake gate: 1 while accepting requests, cleared with a full barrier at drain. */
+	pg_atomic_uint32 accepting;
+
 	VamanaWorkerReloadRequest reloadRequests[VAMANA_MAX_RELOAD_QUEUE];
 
 	/*
@@ -304,6 +307,16 @@ int		VamanaSlotErrcode(uint8 category);
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
+
+/*
+ * True when the error currently being handled is the query-cancel raised by the
+ * SIGTERM handler.  Recovery handlers that self-heal decode failures call this
+ * from their PG_CATCH to decline a shutdown cancel, which is not a decode
+ * failure and must reach the drain owner in VamanaWorkerMain.  Only meaningful
+ * inside an error handler; keys on the errcode, not just the flag, so a genuine
+ * decode error raised during the drain still self-heals.
+ */
+bool	VamanaShutdownCancelPending(void);
 
 /*
  * Pure staleness kernel over a raw heartbeat and a reference clock; shared by

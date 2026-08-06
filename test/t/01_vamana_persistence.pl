@@ -620,9 +620,13 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($after_insert, '', 'LeanVec query after INSERT returns results');
 
+    # Remove the on-disk index while the server is stopped: a running-server
+    # delete would be undone by the shutdown drain re-checkpointing the live
+    # index, so the restart would load from disk instead of rebuilding.
+    $node->stop;
     remove_tree($index_dir);
     my $log_pos_before_second_restart = length($node->log_content());
-    $node->restart;
+    $node->start;
 
     # Demand-driven rebuild: query so the BGW scans the table and re-saves.
     $node->safe_psql("postgres", qq(
@@ -717,10 +721,13 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($baseline, '', 'LeanVec default-dims: initial query returns results');
 
-    # Force VamanaRebuildFromTable by removing the on-disk index before restart
+    # Force VamanaRebuildFromTable by removing the on-disk index while the
+    # server is stopped; a running-server delete would be undone by the
+    # shutdown drain re-checkpointing the live index.
+    $node->stop;
     remove_tree($index_dir);
     my $log_pos = length($node->log_content());
-    $node->restart;
+    $node->start;
 
     # Demand-driven rebuild: query so the BGW scans the table and re-saves.
     $node->safe_psql("postgres", qq(

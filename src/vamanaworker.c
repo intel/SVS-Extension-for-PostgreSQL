@@ -33,6 +33,7 @@
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "postmaster/bgworker.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -81,9 +82,20 @@ VamanaWorkerSigterm(SIGNAL_ARGS)
 {
 	int			save_errno = errno;
 
-	worker_got_sigterm = true;
-	ProcDiePending = true;
-	InterruptPending = true;
+	/*
+	 * Record durable shutdown intent and raise a catchable cancel so any core
+	 * primitive blocked in a CHECK_FOR_INTERRUPTS wait (e.g. the decoding
+	 * startpoint scan during slot creation) unwinds via ERROR back to the main
+	 * loop, which then drains and exits.  A catchable cancel, not ProcDiePending:
+	 * FATAL here would abandon the drain.  Guarded like core's
+	 * StatementCancelHandler so we do not joggle proc_exit.
+	 */
+	if (!proc_exit_inprogress)
+	{
+		worker_got_sigterm = true;
+		InterruptPending = true;
+		QueryCancelPending = true;
+	}
 	SetLatch(MyLatch);
 	errno = save_errno;
 }
@@ -96,6 +108,12 @@ VamanaWorkerSighup(SIGNAL_ARGS)
 	worker_got_sighup = true;
 	SetLatch(MyLatch);
 	errno = save_errno;
+}
+
+bool
+VamanaShutdownCancelPending(void)
+{
+	return worker_got_sigterm && geterrcode() == ERRCODE_QUERY_CANCELED;
 }
 
 /* -----------------------------------------------------------------------
@@ -407,12 +425,274 @@ VamanaWorkerSeedIndexCount(void)
 	list_free(relids);
 }
 
-PGDLLEXPORT void
-VamanaWorkerMain(Datum main_arg)
+/*
+ * VamanaWorkerStopAccepting: close the request intake with a full barrier so
+ * the drain's final sweep is ordered after every enqueue that observed the
+ * worker as accepting.  The full barrier is required: the enqueue side pairs
+ * its accepting load with a write barrier over the slot metadata, and a plain
+ * store would not establish the store/load ordering.
+ */
+static void
+VamanaWorkerStopAccepting(void)
+{
+	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 0);
+}
+
+/*
+ * VamanaWorkerDrainFinalCheckpoint: flush every cached index to disk one last
+ * time before exit.  Unlike the steady-state sweep this ignores ShouldCheckpoint
+ * debounce.  Best-effort: one index's failure must not abandon the rest, so each
+ * checkpoint runs under its own PG_TRY and a failure is logged and skipped.
+ *
+ * Bounded by svs.shutdown_drain_budget_ms, tested before each index so a slow
+ * SVS-library checkpoint cannot hold the postmaster past its shutdown escalation
+ * window.  The bound is granular, not hard: a single in-progress checkpoint is
+ * not preemptible, so the real limit is the budget plus one checkpoint's worst
+ * case.  Indexes not reached are left at their last debounced LSN and logged.
+ *
+ * Primary only.  A standby never persists (PerformCheckpoint asserts
+ * !RecoveryInProgress), so the caller must not reach here in recovery.
+ */
+static void
+VamanaWorkerDrainFinalCheckpoint(void)
+{
+	Oid			cached_relids[VAMANA_MAX_CACHED_INDEXES];
+	int			ncached;
+	TimestampTz	drainStart = GetCurrentTimestamp();
+
+	ncached = VamanaGetAllCachedRelids(cached_relids, VAMANA_MAX_CACHED_INDEXES);
+	for (int ci = 0; ci < ncached; ci++)
+	{
+		VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
+
+		if (cache == NULL || !cache->isValid || cache->svsIndex == NULL)
+			continue;
+
+		if (TimestampDifferenceExceeds(drainStart, GetCurrentTimestamp(),
+									   vamana_shutdown_drain_budget_ms))
+		{
+			ereport(LOG,
+					(errmsg("vamana shutdown: drain budget of %d ms exhausted; "
+							"%d of %d indexes not checkpointed",
+							vamana_shutdown_drain_budget_ms, ncached - ci, ncached)));
+			return;
+		}
+
+		PG_TRY();
+		{
+			VamanaCheckpointCachedIndex(cache);
+		}
+		PG_CATCH();
+		{
+			EmitErrorReport();
+			FlushErrorState();
+			AbortCurrentTransaction();
+			ereport(LOG,
+					(errmsg("vamana shutdown: index %u not checkpointed",
+							cached_relids[ci])));
+		}
+		PG_END_TRY();
+
+		INJECTION_POINT("vamana-drain-checkpoint-slow", NULL);
+
+		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts,
+							(uint64) GetCurrentTimestamp());
+	}
+}
+
+/*
+ * VamanaWorkerDrainAndStop: shutdown sequence run after the main loop breaks on
+ * SIGTERM.  Owns the clean exit.  Defuses the cancel the handler raised so it
+ * cannot re-fire inside shutdown's own transactions, drains, then exits.
+ *
+ * A standby feeds its index by decoding WAL and never persists, so it takes a
+ * final slot drain instead of a checkpoint; a primary flushes every cached
+ * index to disk.
+ */
+static pg_noreturn void
+VamanaWorkerDrainAndStop(void)
+{
+	QueryCancelPending = false;
+
+	ereport(LOG, (errmsg("vamana background worker shutting down")));
+
+	/*
+	 * Close intake, then clear workerPid, then sweep once.  Backends re-check
+	 * accepting after publishing their metadata, so anything published before
+	 * the barrier is serviced by this final sweep; a late publisher sees intake
+	 * closed and falls back to its own bounded wait.
+	 */
+	VamanaWorkerStopAccepting();
+	VamanaWorkerShmemPtr->workerPid = 0;
+	VamanaWorkerProcessRequests();
+
+	if (VamanaGetReplayRole()->persists_index)
+		VamanaWorkerDrainFinalCheckpoint();
+	else
+		VamanaWorkerDrainAllSlots();
+
+	DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
+	proc_exit(0);
+}
+
+/*
+ * Bootstrap the standby cache, announce readiness, then service requests until
+ * a shutdown is requested.  A shutdown cancel raised anywhere in this span —
+ * including the standby slot bootstrap that blocks on the primary's WAL —
+ * propagates out to the drain owner in VamanaWorkerMain rather than being
+ * handled here.
+ */
+static void
+VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 {
 	/* Tracks the role era so the main loop can detect a standby -> primary promotion. */
 	bool		wasReplayingWal;
 
+	/*
+	 * A standby has no demand path to populate its cache.  Do it up front, and
+	 * before workerPid is set: slot bootstrap blocks on the primary's WAL, which
+	 * would starve the heartbeat if it ran inside the main loop.
+	 */
+	if (VamanaGetReplayRole()->creates_slot_on_load)
+	{
+		VamanaWorkerLoadStandbyIndexes();
+		VamanaWorkerBootstrapStandbyReplicationSlots();
+	}
+
+	/* Non-zero pid marks the worker available to backends. */
+	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 1);
+	VamanaWorkerShmemPtr->workerPid = MyProcPid;
+
+	/*
+	 * Startup transaction: capture the database name for the txn-less loop, log
+	 * readiness, and seed indexCount from the live catalog (primary-only — a
+	 * standby neither maintains the counter nor can run the enumerating SPI).
+	 * Catalog access and SPI both require a live transaction and snapshot.
+	 */
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	zeroIndexState->dbname = VamanaWorkerCaptureDatabaseName();
+	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
+						 zeroIndexState->dbname)));
+	if (VamanaIndexCountIsMaintained())
+		VamanaWorkerSeedIndexCount();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
+
+	while (!worker_got_sigterm)
+	{
+		int			rc;
+		const VamanaReplayRole *role = VamanaGetReplayRole();
+
+		rc = WaitLatch(&VamanaWorkerShmemPtr->workerLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   1000L,	/* 1-second heartbeat */
+					   PG_WAIT_EXTENSION);
+
+		ResetLatch(&VamanaWorkerShmemPtr->workerLatch);
+
+		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts,
+							(uint64) GetCurrentTimestamp());
+
+		if (rc & WL_POSTMASTER_DEATH)
+		{
+			DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
+			proc_exit(1);
+		}
+
+		if (worker_got_sigterm)
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (worker_got_sighup)
+		{
+			ProcessConfigFile(PGC_SIGHUP);
+			worker_got_sighup = false;
+		}
+
+		VamanaWorkerProcessReloads();
+
+		/*
+		 * Process pending search requests on every iteration, not only when
+		 * the latch was set.  A latch set can race WL_TIMEOUT attribution,
+		 * leaving a PENDING slot unprocessed for up to 1 s otherwise.
+		 */
+		VamanaWorkerProcessRequests();
+
+		VamanaWorkerMaybeWarnZeroIndex(zeroIndexState);
+
+		/*
+		 * A standby feeds its index by decoding streamed WAL; a primary feeds
+		 * it from write IPC.  These are the two ways index changes arrive, so
+		 * the drain is exactly the branch the write dispatch is not.
+		 */
+		if (!role->processes_write_ipc)
+			VamanaWorkerDrainAllSlots();
+
+		/*
+		 * Promotion: recovery just ended.  PG hands the promoted primary the
+		 * standby-era logical slot intact, positioned at the last replay LSN,
+		 * so there is nothing to drop or recreate.  Run one final drain to
+		 * absorb WAL that streamed in before the flip, then let steady-state
+		 * writes arrive via IPC.
+		 */
+		if (wasReplayingWal && !role->creates_slot_on_load)
+		{
+			ereport(LOG,
+					(errmsg("vamana replay: standby promoted to primary; "
+							"continuing replay on inherited slots")));
+			VamanaWorkerDrainAllSlots();
+		}
+		wasReplayingWal = role->creates_slot_on_load;
+
+		/*
+		 * Check each cached index and flush to disk if the debounce policy
+		 * says it is time.  The snapshot of OIDs is taken before the loop so
+		 * a mid-loop eviction does not invalidate the iterator; VamanaGetCache
+		 * returns NULL for any OID that was evicted by then.
+		 */
+		{
+			Oid		cached_relids[VAMANA_MAX_CACHED_INDEXES];
+			int		ncached;
+
+			ncached = VamanaGetAllCachedRelids(cached_relids,
+											   VAMANA_MAX_CACHED_INDEXES);
+			for (int ci = 0; ci < ncached; ci++)
+			{
+				VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
+
+				if (cache == NULL || !ShouldCheckpoint(cache))
+					continue;
+
+				VamanaCheckpointCachedIndex(cache);
+			}
+		}
+	}
+}
+
+/*
+ * Reset to a clean state after absorbing a shutdown cancel: release any slot
+ * the interrupted replay held, abort its open transaction, and clear the error
+ * so the drain runs on a well-defined footing.
+ */
+static void
+VamanaWorkerResetAfterShutdownCancel(void)
+{
+	HOLD_INTERRUPTS();
+	if (MyReplicationSlot != NULL)
+		ReplicationSlotRelease();
+	AbortOutOfAnyTransaction();
+	FlushErrorState();
+	RESUME_INTERRUPTS();
+}
+
+PGDLLEXPORT void
+VamanaWorkerMain(Datum main_arg)
+{
 	/* Zero-index log-once state; dbname captured in the startup transaction. */
 	VamanaZeroIndexState zeroIndexState = {0};
 
@@ -473,144 +753,24 @@ VamanaWorkerMain(Datum main_arg)
 	VamanaWorkerResetStaleSlots();
 
 	/*
-	 * A standby has no demand path to populate its cache.  Do it up front, and
-	 * before workerPid is set: slot bootstrap blocks on the primary's WAL, which
-	 * would starve the heartbeat if it ran inside the main loop.
+	 * Own the drain: a SIGTERM raises a catchable cancel so a blocked primitive
+	 * (e.g. the standby slot bootstrap's startpoint scan) unwinds here rather
+	 * than at proc_exit.  Absorb only that cancel and fall through to the single
+	 * drain; any other error re-throws and restarts the worker.
 	 */
-	if (VamanaGetReplayRole()->creates_slot_on_load)
+	PG_TRY();
 	{
-		VamanaWorkerLoadStandbyIndexes();
-		VamanaWorkerBootstrapStandbyReplicationSlots();
+		VamanaWorkerServe(&zeroIndexState);
 	}
-
-	/* Non-zero pid marks the worker available to backends. */
-	VamanaWorkerShmemPtr->workerPid = MyProcPid;
-
-	/*
-	 * Startup transaction: capture the database name for the txn-less loop, log
-	 * readiness, and seed indexCount from the live catalog (primary-only — a
-	 * standby neither maintains the counter nor can run the enumerating SPI).
-	 * Catalog access and SPI both require a live transaction and snapshot.
-	 */
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	zeroIndexState.dbname = VamanaWorkerCaptureDatabaseName();
-	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
-						 zeroIndexState.dbname)));
-	if (VamanaIndexCountIsMaintained())
-		VamanaWorkerSeedIndexCount();
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-
-	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
-
-	while (!worker_got_sigterm)
+	PG_CATCH();
 	{
-		int			rc;
-		const VamanaReplayRole *role = VamanaGetReplayRole();
-
-		rc = WaitLatch(&VamanaWorkerShmemPtr->workerLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   1000L,	/* 1-second heartbeat */
-					   PG_WAIT_EXTENSION);
-
-		ResetLatch(&VamanaWorkerShmemPtr->workerLatch);
-
-		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts,
-							(uint64) GetCurrentTimestamp());
-
-		if (rc & WL_POSTMASTER_DEATH)
-		{
-			DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
-			proc_exit(1);
-		}
-
-		CHECK_FOR_INTERRUPTS();
-
-		if (worker_got_sighup)
-		{
-			ProcessConfigFile(PGC_SIGHUP);
-			worker_got_sighup = false;
-		}
-
-		VamanaWorkerProcessReloads();
-
-		/*
-		 * Process pending search requests on every iteration, not only when
-		 * the latch was set.  A latch set can race WL_TIMEOUT attribution,
-		 * leaving a PENDING slot unprocessed for up to 1 s otherwise.
-		 */
-		VamanaWorkerProcessRequests();
-
-		VamanaWorkerMaybeWarnZeroIndex(&zeroIndexState);
-
-		/*
-		 * A standby feeds its index by decoding streamed WAL; a primary feeds
-		 * it from write IPC.  These are the two ways index changes arrive, so
-		 * the drain is exactly the branch the write dispatch is not.
-		 */
-		if (!role->processes_write_ipc)
-			VamanaWorkerDrainAllSlots();
-
-		/*
-		 * Promotion: recovery just ended.  PG hands the promoted primary the
-		 * standby-era logical slot intact, positioned at the last replay LSN,
-		 * so there is nothing to drop or recreate.  Run one final drain to
-		 * absorb WAL that streamed in before the flip, then let steady-state
-		 * writes arrive via IPC.
-		 */
-		if (wasReplayingWal && !role->creates_slot_on_load)
-		{
-			ereport(LOG,
-					(errmsg("vamana replay: standby promoted to primary; "
-							"continuing replay on inherited slots")));
-			VamanaWorkerDrainAllSlots();
-		}
-		wasReplayingWal = role->creates_slot_on_load;
-
-		/*
-		 * Check each cached index and flush to disk if the debounce policy
-		 * says it is time.  The snapshot of OIDs is taken before the loop so
-		 * a mid-loop eviction does not invalidate the iterator; VamanaGetCache
-		 * returns NULL for any OID that was evicted by then.
-		 */
-		{
-			Oid		cached_relids[VAMANA_MAX_CACHED_INDEXES];
-			int		ncached;
-
-			ncached = VamanaGetAllCachedRelids(cached_relids,
-											   VAMANA_MAX_CACHED_INDEXES);
-			for (int ci = 0; ci < ncached; ci++)
-			{
-				VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
-
-				if (cache == NULL || !ShouldCheckpoint(cache))
-					continue;
-
-				/*
-				 * StartTransactionCommand and index_open inside PerformCheckpoint
-				 * call AcceptInvalidationMessages, which can fire
-				 * VamanaRelcacheCallback and evict this entry mid-save — freeing
-				 * the SVSIndexHandle the checkpoint is about to serialize.
-				 * Suppress eviction for the duration, as the write and reload
-				 * paths do; a genuine invalidation is re-serviced next iteration.
-				 */
-				vamana_eviction_suppressed = true;
-				SetCurrentStatementStartTimestamp();
-				StartTransactionCommand();
-				PushActiveSnapshot(GetTransactionSnapshot());
-				PerformCheckpoint(cache);
-				PopActiveSnapshot();
-				CommitTransactionCommand();
-				vamana_eviction_suppressed = false;
-			}
-		}
+		if (!VamanaShutdownCancelPending())
+			PG_RE_THROW();
+		VamanaWorkerResetAfterShutdownCancel();
 	}
+	PG_END_TRY();
 
-	ereport(LOG, (errmsg("vamana background worker shutting down")));
-	DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
-	proc_exit(0);
+	VamanaWorkerDrainAndStop();
 }
 
 /* -----------------------------------------------------------------------
@@ -786,6 +946,37 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 }
 
 /*
+ * VamanaWorkerPublishPending
+ *
+ * Publish a fully-populated slot as PENDING and wake the worker, unless the
+ * worker has stopped accepting.  The write barrier orders the slot metadata
+ * before the accepting load; paired with the full-barrier clear in
+ * VamanaWorkerStopAccepting, an enqueue that observes accepting still set is
+ * ordered ahead of the drain's final sweep.  Returns false without publishing
+ * if intake has closed, leaving the slot EMPTY for the caller to release.
+ */
+static bool
+VamanaWorkerPublishPending(VamanaWorkerShmem *entry, VamanaWorkerSlot *slot)
+{
+	pg_write_barrier();
+
+	if (pg_atomic_read_u32(&entry->accepting) == 0)
+		return false;
+
+	/*
+	 * Between observing accepting set and storing PENDING, a concurrent drain
+	 * can clear accepting, run its final sweep, and exit — leaving this store to
+	 * a departed worker.  The backend's own bounded wait self-cancels the
+	 * orphaned slot, so no request is lost.
+	 */
+	INJECTION_POINT("vamana-enqueue-before-publish", NULL);
+
+	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
+	SetLatch(&entry->workerLatch);
+	return true;
+}
+
+/*
  * VamanaWorkerSubmitSearch
  *
  * Backend-side: write the query into this backend's shared-memory slot,
@@ -864,14 +1055,11 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 	OwnLatch(&slot->latch);
 	ResetLatch(&slot->latch);
 
-	/*
-	 * Store-release: ensure metadata writes above are visible to the worker
-	 * before it reads PENDING status.
-	 */
-	pg_write_barrier();
-	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-
-	SetLatch(&entry->workerLatch);
+	if (!VamanaWorkerPublishPending(entry, slot))
+	{
+		DisownLatch(&slot->latch);
+		return -1;
+	}
 
 	PG_TRY();
 	{
@@ -1203,9 +1391,14 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 	ItemPointerCopy(heap_tid, &slot->writeHeapTid);
 	slot->slotKind = VAMANA_SLOTKIND_INSERT;
 
-	pg_write_barrier();
-	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&entry->workerLatch);
+	if (!VamanaWorkerPublishPending(entry, slot))
+	{
+		DisownLatch(&slot->latch);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("vamana background worker is shutting down; cannot insert into index %u",
+						indexRelid)));
+	}
 
 	ok = VamanaWorkerWaitForSlotIPC(slot);
 
@@ -1256,9 +1449,11 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 	slot->numResults = nIds;
 	slot->slotKind = VAMANA_SLOTKIND_DELETE;
 
-	pg_write_barrier();
-	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&entry->workerLatch);
+	if (!VamanaWorkerPublishPending(entry, slot))
+	{
+		DisownLatch(&slot->latch);
+		return false;
+	}
 
 	ok = VamanaWorkerWaitForSlotIPC(slot);
 
@@ -1292,9 +1487,11 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 	slot->slotKind = VAMANA_SLOTKIND_MAINTENANCE;
 	slot->maintenanceOp = op;
 
-	pg_write_barrier();
-	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&entry->workerLatch);
+	if (!VamanaWorkerPublishPending(entry, slot))
+	{
+		DisownLatch(&slot->latch);
+		return false;
+	}
 
 	ok = VamanaWorkerWaitForSlotIPC(slot);
 
@@ -1369,9 +1566,11 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 
 	slot->slotKind = VAMANA_SLOTKIND_LOAD;
 
-	pg_write_barrier();
-	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PENDING);
-	SetLatch(&entry->workerLatch);
+	if (!VamanaWorkerPublishPending(entry, slot))
+	{
+		DisownLatch(&slot->latch);
+		return false;
+	}
 
 	ok = VamanaWorkerWaitForSlot(slot, vamana_worker_startup_timeout_ms);
 
