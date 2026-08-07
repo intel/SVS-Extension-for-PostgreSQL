@@ -585,6 +585,7 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 |-----|---------|-------------|
 | `svs.launcher_database` | `'postgres'` | Database the launcher connects to in order to read `vamana_databases`. Set once at install time. This is the only remaining GUC that names a specific database. |
 | `svs.max_databases` | `8` | Maximum number of databases that can run a worker concurrently. Sizes the per-database shared-memory array. Range 1 – 128. |
+| `svs.worker_restart_time` | `5` (s) | Seconds the postmaster waits before restarting the **launcher** if it crashes. `-1` disables auto-restart. Governs only the launcher, not per-database workers. Range -1 – 300. |
 
 **Runtime-tunable GUCs** (`postgresql.conf` or `pg_reload_conf()` — `PGC_SIGHUP`, no restart needed):
 
@@ -592,9 +593,10 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 |-----|---------|-------|-------------|
 | `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. |
 | `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. |
-| `svs.worker_restart_time` | `5` (s) | -1 – 300 | Seconds the postmaster waits before restarting the **launcher** if it crashes. `-1` disables auto-restart. Governs only the launcher, not per-database workers. |
 | `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. |
 | `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends`. |
+| `svs.shutdown_drain_budget_ms` | `30000` | 0 – 600000 | Time budget for the worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
+| `svs.worker_stop_timeout_ms` | `30000` | 0 – 600000 | Milliseconds the launcher waits for a restarting worker to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
 
 > `svs.worker_restart_time` and `svs.worker_restart_backoff` govern two different restart policies deliberately: a fixed interval for the launcher itself (via the postmaster's native mechanism), and escalating backoff for per-database workers (a worker crash-looping on a corrupted index or an out-of-memory condition should not be respawned every second forever). They are not interchangeable.
 
@@ -681,16 +683,12 @@ This guarantees on-disk save directories and replication slots are never orphane
 
 ### TRUNCATE
 
-> **Known limitation:** `TRUNCATE` resets the index metapage but does **not** invalidate the in-memory Vamana index cache. The BGW will continue to serve queries from the stale pre-TRUNCATE SVS index, which can return incorrect results.
-
-After `TRUNCATE`, run `REINDEX` to flush the cache and restore correct behavior:
+`TRUNCATE` rebuilds every index on the table, including any Vamana index, via the same path `ambuild` uses — no manual `REINDEX` is needed:
 
 ```sql
 TRUNCATE documents;
-REINDEX INDEX documents_vamana_idx;
+-- documents_vamana_idx is already empty and searchable; no REINDEX required
 ```
-
-Until the bug is fixed, do not rely on post-TRUNCATE queries returning empty results without a preceding `REINDEX`.
 
 ### Typical Deployment Flow
 
@@ -1059,6 +1057,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 |-----|---------|-------|
 | `svs.launcher_database` | `'postgres'` | Database the launcher reads `vamana_databases` from; set once at install time |
 | `svs.max_databases` | `8` | Max databases that can run a worker concurrently (range 1–128); sizes the shared-memory slot array |
+| `svs.worker_restart_time` | `5` (s) | Postmaster wait before restarting the **launcher** after a crash; `-1` disables. Range -1–300 |
 
 ### Runtime-tunable Server GUC Parameters (`PGC_SIGHUP` — reload with `SELECT pg_reload_conf()`)
 
@@ -1066,9 +1065,11 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 |-----|---------|-----|-----|-------|
 | `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker (ms); exceeded → error |
 | `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms); exceeded → error |
-| `svs.worker_restart_time` | `5` (s) | `-1` | `300` | Postmaster wait before restarting the **launcher** after a crash; `-1` disables |
 | `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; escalates on repeated crashes |
 | `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
+| `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |
+| `svs.worker_stop_timeout_ms` | `30000` | `0` | `600000` | Wait for a restarting worker to report stopped before giving up; does not force-kill |
+| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
 | `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
 | `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |

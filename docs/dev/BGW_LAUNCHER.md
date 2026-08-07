@@ -70,12 +70,12 @@ Wholesale truncation of the table is blocked by revoking the truncate privilege 
 
 ## 4. Shared Memory Layout
 
-Backends and workers coordinate through a fixed-size array of per-database control structures in shared memory, sized at postmaster startup by a postmaster-level parameter (`max_vamana_databases`). The array cannot grow at runtime; PostgreSQL has no native mechanism for growing a shared-memory region after allocation. Exhausting it is handled explicitly (see [Section 5](#5-enabling-a-database-the-reservation-handshake)).
+Backends and workers coordinate through a fixed-size array of per-database control structures in shared memory, sized at postmaster startup by a postmaster-level parameter (`svs.max_databases`). The array cannot grow at runtime; PostgreSQL has no native mechanism for growing a shared-memory region after allocation. Exhausting it is handled explicitly (see [Section 5](#5-enabling-a-database-the-reservation-handshake)).
 
 The layout separates two concerns that used to share one variable-length structure:
 
 - A small, fixed-stride control structure per database. This holds the database OID that identifies the slot, the worker's process ID (its readiness claim), an atomic index counter, the worker's latch and heartbeat, and the launcher's own crash-backoff state. Because each entry is fixed size, these entries form the array that backends scan.
-- Separate flat buffers holding the large backend-IPC region (the per-backend request slots and their query-vector, result-TID, and distance areas). These are sized by `max_vamana_databases` multiplied by the per-database backend-scaled size. Each control entry points into its database's region of these buffers, stitched together once at shared-memory startup.
+- Separate flat buffers holding the large backend-IPC region (the per-backend request slots and their query-vector, result-TID, and distance areas). These are sized by `svs.max_databases` multiplied by the per-database backend-scaled size. Each control entry points into its database's region of these buffers, stitched together once at shared-memory startup.
 
 This follows PostgreSQL's own idiom for "N entities, each needing a large per-backend-scaled attachment" rather than trying to make an array of variable-length structures, which C does not allow.
 
@@ -303,7 +303,7 @@ This is made visible rather than silent: a worker whose index enumeration return
 
 The check reads the per-database shared-memory slot and distinguishes the three states from [Section 5](#5-enabling-a-database-the-reservation-handshake):
 
-1. **No slot** (once the launcher has published its initial scan): the database is not enabled. Hard error, no build attempted. If the slot is missing specifically because the array is full, the error says so distinctly ("worker slots exhausted; raise `max_vamana_databases`") rather than misdiagnosing it as "not enabled," because the database *was* configured; the operator's corrective action is different.
+1. **No slot** (once the launcher has published its initial scan): the database is not enabled. Hard error, no build attempted. If the slot is missing specifically because the array is full, the error says so distinctly ("vamana worker slots exhausted"; hint: increase `svs.max_databases`) rather than misdiagnosing it as "not enabled," because the database *was* configured; the operator's corrective action is different.
 2. **Slot present, worker process ID still zero:** the database is enabled and the worker is starting. Proceed with the existing bounded wait.
 3. **Slot present, worker process ID set:** available, proceed normally.
 
@@ -340,15 +340,17 @@ Because the view is cross-database, a query that cares about the current databas
 | Parameter | Class | Role |
 |---|---|---|
 | `svs.launcher_database` | postmaster | The database the launcher connects to in order to read the configuration catalog. The only remaining parameter that names a specific database; a one-time install choice. |
-| `max_vamana_databases` | postmaster | Sizes the per-database shared-memory array. Cannot change without a restart. Default sized for a typical number of Vamana-enabled databases plus headroom. |
-| `svs.worker_restart_time` | reloadable | Governs the launcher's *own* crash-restart interval (via its static registration). No longer read by any per-database worker. |
+| `svs.max_databases` | postmaster | Sizes the per-database shared-memory array. Cannot change without a restart. Default sized for a typical number of Vamana-enabled databases plus headroom. |
+| `svs.worker_restart_time` | postmaster | Governs the launcher's *own* crash-restart interval (via its static registration). No longer read by any per-database worker. |
 | `svs.worker_restart_backoff` | reloadable | The base interval the launcher uses for per-database worker crash-restart backoff. Read only by the launcher's own restart logic. Deliberately separate from `svs.worker_restart_time`, because the two govern different restart policies (a fixed interval for the launcher itself, versus escalating backoff for per-database workers) that merely share a plausible default. |
 | `svs.worker_startup_timeout_ms` | reloadable | Cluster-wide bound on the wait for a worker that is enabled but not yet available. No per-database override. |
 | `svs.worker_timeout_ms` | reloadable | Cluster-wide bound on an individual IPC request. No per-database override. |
+| `svs.shutdown_drain_budget_ms` | reloadable | Time budget for a worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
+| `svs.worker_stop_timeout_ms` | reloadable | How long the launcher waits for a restarting worker's handle to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
 
 The pre-existing checkpoint and replication parameters (`svs.checkpoint_debounce_window`, `svs.checkpoint_min_ops`, `svs.max_slot_wal_size`) are unchanged by this design; drain-and-stop builds on the same checkpoint path they govern.
 
-The following genuinely require a restart, and only these: the launcher itself (statically registered), `svs.launcher_database`, and `max_vamana_databases`. Everything else about enablement is a runtime catalog change.
+The following genuinely require a restart, and only these: the launcher itself (statically registered), `svs.launcher_database`, `svs.max_databases`, and `svs.worker_restart_time`. Everything else about enablement is a runtime catalog change.
 
 The per-database worker crash-backoff ceiling is a named internal constant rather than a parameter, on the principle that the base interval is already the operator knob and promoting the constant to a parameter later is a trivial, non-breaking change if a need appears.
 
