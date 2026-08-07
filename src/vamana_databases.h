@@ -17,6 +17,7 @@ typedef struct VamanaDatabasesReservationEntry
 	NameData	datname;
 	Oid			dbOid;
 	bool		enabled;
+	int64		restart_generation;
 	SubTransactionId subxid;
 } VamanaDatabasesReservationEntry;
 

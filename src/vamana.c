@@ -58,6 +58,7 @@ int			vamana_max_slot_wal_size_mb = 10240;	/* 10 GB */
 int			vamana_checkpoint_operations = -1;		/* -1 = off (simple count-based trigger) */
 int			vamana_checkpoint_interval = -1;		/* -1 = off (simple time-based trigger) */
 int			vamana_shutdown_drain_budget_ms = 30000;
+int			vamana_worker_stop_timeout_ms = 30000;
 
 relopt_kind vamana_relopt_kind;
 
@@ -283,6 +284,17 @@ VamanaInit(void)
 							"in-progress checkpoint is not preemptible, so the real bound is "
 							"this budget plus one checkpoint's worst case.",
 							&vamana_shutdown_drain_budget_ms,
+							30000, 0, 600000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.worker_stop_timeout_ms",
+							"Timeout for waiting for a restarting worker to exit",
+							"The launcher waits this long for a terminated worker handle to report "
+							"BGWH_STOPPED before giving up. Does not force-kill; if a worker does not "
+							"stop within this window, the restart stays pending until it exits naturally.",
+							&vamana_worker_stop_timeout_ms,
 							30000, 0, 600000,
 							PGC_SIGHUP,
 							GUC_UNIT_MS,

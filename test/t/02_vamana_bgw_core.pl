@@ -245,6 +245,24 @@ use VamanaTestUtils qw(:all);
         qr/vamana index is not enabled for this database/,
         'backend in an unconfigured database gets a config hard-fail');
 
+    # A vamana_databases row whose enabled = false never has a shmem slot
+    # reserved (M3 reserves only on enabled = true commit), so
+    # VamanaWorkerLookupSlot returns NULL exactly as for an absent row.  The
+    # config gate must therefore raise the identical "not enabled" hard error,
+    # proving present-but-disabled and absent are the same state-1 case.
+    $node->safe_psql("postgres", "CREATE DATABASE disabled_db;");
+    $node->safe_psql("disabled_db", "CREATE EXTENSION vector;");
+    $node->safe_psql("disabled_db", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('disabled_db', false);");
+    my ($disabled_ret, undef, $disabled_err) = $node->psql("disabled_db", qq(
+        CREATE TABLE d_tbl (id serial PRIMARY KEY, val vector($dim));
+        CREATE INDEX d_idx ON d_tbl USING vamana (val vector_l2_ops);
+    ));
+    like($disabled_err,
+        qr/vamana index is not enabled for this database/,
+        'present-but-disabled database gets the same config hard-fail as absent');
+
     my $postgres_worker_pid = wait_for_worker_db($node, 'postgres', 20);
     ok($postgres_worker_pid =~ /^\d+$/,
         "postgres worker still running alongside testdb worker (pid=$postgres_worker_pid)");

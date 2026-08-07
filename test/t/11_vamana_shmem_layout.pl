@@ -248,7 +248,7 @@ sub enable_postgres
         "INSERT INTO vamana_databases (datname) VALUES ('template1');",
         stdout => \$stdout, stderr => \$stderr);
 
-    like($stderr, qr/max_vamana_databases \(2\) already reached/,
+    like($stderr, qr/svs\.max_databases \(2\) already reached/,
         "capacity-exhausted INSERT raises the documented error");
 
     is($node->safe_psql('postgres',

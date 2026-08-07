@@ -32,8 +32,9 @@
 #include "utils/rel.h"
 
 /* Column positions in vamana_databases, matching the CREATE TABLE order. */
-#define VAMANA_DATABASES_ATTNUM_DATNAME		1
-#define VAMANA_DATABASES_ATTNUM_ENABLED		2
+#define VAMANA_DATABASES_ATTNUM_DATNAME			1
+#define VAMANA_DATABASES_ATTNUM_ENABLED			2
+#define VAMANA_DATABASES_ATTNUM_RESTART_GENERATION	3
 
 #define VAMANA_DATABASES_QUEUE_INITIAL_CAPACITY	16
 
@@ -71,7 +72,7 @@ GetOrCreateReservationQueue(void)
 }
 
 static void
-QueueReservationEntry(Name datname, Oid dbOid, bool enabled)
+QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_generation)
 {
 	VamanaDatabasesReservationList *queue = GetOrCreateReservationQueue();
 	VamanaDatabasesReservationEntry *entry;
@@ -90,6 +91,7 @@ QueueReservationEntry(Name datname, Oid dbOid, bool enabled)
 	namestrcpy(&entry->datname, NameStr(*datname));
 	entry->dbOid = dbOid;
 	entry->enabled = enabled;
+	entry->restart_generation = restart_generation;
 	entry->subxid = GetCurrentSubTransactionId();
 }
 
@@ -103,8 +105,10 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	bool		isnull;
 	Datum		datnameDatum;
 	Datum		enabledDatum;
+	Datum		restartGenDatum;
 	Name		datname;
 	Oid			dbOid;
+	int64		restart_generation;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "vamana_databases_queue_reservation: not called by trigger manager");
@@ -130,9 +134,13 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	enabledDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_ENABLED, tupdesc, &isnull);
 	Assert(!isnull);			/* enabled is NOT NULL */
 
+	restartGenDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_RESTART_GENERATION, tupdesc, &isnull);
+	Assert(!isnull);			/* restart_generation is NOT NULL */
+	restart_generation = DatumGetInt64(restartGenDatum);
+
 	dbOid = get_database_oid(NameStr(*datname), false);
 
-	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum));
+	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation);
 
 	return PointerGetDatum(NULL);	/* AFTER trigger; return value is ignored */
 }

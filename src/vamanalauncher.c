@@ -22,6 +22,7 @@
 
 #include "postgres.h"
 
+#include "vamana.h"
 #include "vamanalauncher.h"
 #include "vamanaworker.h"
 
@@ -70,6 +71,22 @@
  * launcher-local and correctly rebuilt from a fresh scan after a launcher
  * restart.
  */
+typedef enum VamanaRestartAction
+{
+	RESTART_NOOP,				/* no restart needed */
+	RESTART_TERMINATE,			/* mismatch: terminate and wait */
+	RESTART_WAIT,				/* waiting for handle to stop */
+	RESTART_WAIT_TIMEOUT,		/* wait timeout exceeded */
+	RESTART_RESPAWN				/* handle stopped: caller respawns */
+} VamanaRestartAction;
+
+typedef struct VamanaRestartState
+{
+	bool		restarting;			/* is a restart in flight? */
+	int64		target_generation;	/* generation we're converging to */
+	TimestampTz	wait_started;		/* when did we start waiting for stop? */
+} VamanaRestartState;
+
 typedef struct VamanaLauncherWorker
 {
 	Oid			dbOid;
@@ -82,6 +99,9 @@ typedef struct VamanaLauncherWorker
 	 * and can only escalate the backoff, never reset it.
 	 */
 	TimestampTz	started_time;
+
+	int64		serviced_generation;
+	VamanaRestartState restart_state;
 } VamanaLauncherWorker;
 
 /*
@@ -94,6 +114,7 @@ typedef struct VamanaEnabledDatabase
 {
 	Oid			dbOid;
 	char	   *datname;
+	int64		restart_generation;
 } VamanaEnabledDatabase;
 
 /*
@@ -108,9 +129,15 @@ static void MaterializeInitialConfig(void);
 static VamanaLauncherWorker *FindLedgerEntry(Oid dbOid);
 static bool IsDatabaseEnabled(List *enabled, Oid dbOid);
 static bool IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w);
+static VamanaRestartAction VamanaRestartStateAdvance(VamanaRestartState *state,
+													 int64 serviced_generation,
+													 int64 current_generation,
+													 BgwHandleStatus handle_status,
+													 TimestampTz now);
 static void SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now);
 static void ReconcileLedgerLiveness(List *enabled, TimestampTz now);
 static void TerminateDisabledWorkers(List *enabled);
+static void ReconcileRestartConvergence(List *enabled, TimestampTz now);
 static long BackoffThresholdMs(uint32 consecutiveFailures);
 static long BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now);
 
@@ -238,6 +265,8 @@ VamanaLauncherReconcileWorkers(void)
 
 	ReconcileLedgerLiveness(enabled, now);
 	TerminateDisabledWorkers(enabled);
+	if (WorkerLedger != NIL)
+		ReconcileRestartConvergence(enabled, now);
 
 	foreach(lc, enabled)
 	{
@@ -322,7 +351,7 @@ MaterializeInitialConfig(void)
  */
 static List *
 AppendEnabledDatabase(List *list, Oid dbOid, const char *datname,
-					  MemoryContext callerCtx)
+					  int64 restart_generation, MemoryContext callerCtx)
 {
 	VamanaEnabledDatabase *db;
 	MemoryContext oldCtx;
@@ -336,6 +365,7 @@ AppendEnabledDatabase(List *list, Oid dbOid, const char *datname,
 	db = palloc(sizeof(VamanaEnabledDatabase));
 	db->dbOid = dbOid;
 	db->datname = pstrdup(datname);
+	db->restart_generation = restart_generation;
 	list = lappend(list, db);
 	MemoryContextSwitchTo(oldCtx);
 
@@ -373,7 +403,7 @@ ReadEnabledDatabases(void)
 	 */
 	if (OidIsValid(RelnameGetRelid("vamana_databases")))
 	{
-		int			ret = SPI_execute("SELECT datname FROM vamana_databases WHERE enabled",
+		int			ret = SPI_execute("SELECT datname, restart_generation FROM vamana_databases WHERE enabled",
 									  true, 0);
 
 		if (ret != SPI_OK_SELECT)
@@ -385,6 +415,9 @@ ReadEnabledDatabases(void)
 			Name		datname = DatumGetName(SPI_getbinval(SPI_tuptable->vals[i],
 															 SPI_tuptable->tupdesc,
 															 1, &isnull));
+			int64		restart_generation = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i],
+																		   SPI_tuptable->tupdesc,
+																		   2, &isnull));
 			Oid			dbOid;
 
 			if (isnull)
@@ -400,7 +433,7 @@ ReadEnabledDatabases(void)
 			}
 
 			result = AppendEnabledDatabase(result, dbOid, NameStr(*datname),
-										   callerCtx);
+										   restart_generation, callerCtx);
 		}
 	}
 
@@ -475,15 +508,93 @@ IsDatabaseEnabled(List *enabled, Oid dbOid)
 	return false;
 }
 
+static VamanaEnabledDatabase *
+FindEnabledDatabase(List *enabled, Oid dbOid)
+{
+	ListCell   *lc;
+
+	foreach(lc, enabled)
+	{
+		VamanaEnabledDatabase *db = (VamanaEnabledDatabase *) lfirst(lc);
+
+		if (db->dbOid == dbOid)
+			return db;
+	}
+	return NULL;
+}
+
 /*
  * True when a worker's death is an operator-intended stop rather than a crash,
- * so its exit must not accrue respawn backoff.  A disabled database is the one
- * deliberate stop today; explicit restart adds another and shares this gate.
+ * so its exit must not accrue respawn backoff.  A disabled database and an
+ * in-flight restart are both deliberate stops.
  */
 static bool
 IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w)
 {
-	return !IsDatabaseEnabled(enabled, w->dbOid);
+	return !IsDatabaseEnabled(enabled, w->dbOid) || w->restart_state.restarting;
+}
+
+/*
+ * Advance the restart state machine toward convergence with the current
+ * restart_generation read from the database.  The state is launcher-local
+ * (survives launcher restarts automatically by being rebuilt from ground truth)
+ * and tracks: (1) whether a restart is in flight, (2) what generation we're
+ * converging to. Coalescing falls out: if multiple restart calls land before
+ * the first drain finishes, the generation increments each time but the state
+ * records the latest target; after the drain, convergence sees the gap and
+ * does exactly one more restart.
+ *
+ * Returns the action the caller should take: NOOP (no restart needed),
+ * TERMINATE (start draining), WAIT (still draining), WAIT_TIMEOUT (timeout
+ * exceeded, still waiting), or RESPAWN (start new).
+ */
+static VamanaRestartAction
+VamanaRestartStateAdvance(VamanaRestartState *state,
+						  int64 serviced_generation,
+						  int64 current_generation,
+						  BgwHandleStatus handle_status,
+						  TimestampTz now)
+{
+	if (!state->restarting && serviced_generation == current_generation)
+	{
+		/* No restart needed; idle. */
+		return RESTART_NOOP;
+	}
+
+	if (!state->restarting && serviced_generation != current_generation)
+	{
+		/* Mismatch detected: start a restart. */
+		state->restarting = true;
+		state->target_generation = current_generation;
+		state->wait_started = 0;
+		return RESTART_TERMINATE;
+	}
+
+	if (state->restarting && handle_status != BGWH_STOPPED)
+	{
+		/* First time waiting: record when we started. */
+		if (state->wait_started == 0)
+			state->wait_started = now;
+
+		/* Check if timeout exceeded. */
+		if (TimestampDifferenceExceeds(state->wait_started, now,
+									   vamana_worker_stop_timeout_ms))
+			return RESTART_WAIT_TIMEOUT;
+
+		/* Still waiting within timeout. */
+		return RESTART_WAIT;
+	}
+
+	if (state->restarting && handle_status == BGWH_STOPPED)
+	{
+		/* Handle stopped: caller will respawn and update serviced_generation. */
+		state->restarting = false;
+		state->wait_started = 0;
+		return RESTART_RESPAWN;
+	}
+
+	/* Should not reach. */
+	return RESTART_NOOP;
 }
 
 /*
@@ -549,6 +660,10 @@ SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
 	entry->dbOid = db->dbOid;
 	entry->handle = handle;
 	entry->started_time = 0;
+	entry->serviced_generation = 0;
+	entry->restart_state.restarting = false;
+	entry->restart_state.target_generation = 0;
+	entry->restart_state.wait_started = 0;
 	WorkerLedger = lappend(WorkerLedger, entry);
 
 	MemoryContextSwitchTo(oldCtx);
@@ -628,5 +743,61 @@ TerminateDisabledWorkers(List *enabled)
 
 		if (GetBackgroundWorkerPid(w->handle, &pid) == BGWH_STARTED)
 			TerminateBackgroundWorker(w->handle);
+	}
+}
+
+static void
+ExecuteRestartAction(VamanaRestartAction action, VamanaLauncherWorker *ledger,
+					  const VamanaEnabledDatabase *db, TimestampTz now)
+{
+	switch (action)
+	{
+		case RESTART_NOOP:
+		case RESTART_WAIT:
+			break;
+
+		case RESTART_TERMINATE:
+			TerminateBackgroundWorker(ledger->handle);
+			break;
+
+		case RESTART_WAIT_TIMEOUT:
+			ereport(WARNING,
+					(errmsg("vamana launcher: worker for database \"%s\" did not stop within %d ms",
+							db->datname, vamana_worker_stop_timeout_ms),
+					 errhint("Restart remains pending until worker exits.")));
+			break;
+
+		case RESTART_RESPAWN:
+			SpawnWorker(db, now);
+			ledger->serviced_generation = ledger->restart_state.target_generation;
+			break;
+	}
+}
+
+static void
+ReconcileRestartConvergence(List *enabled, TimestampTz now)
+{
+	ListCell   *lc;
+
+	foreach(lc, WorkerLedger)
+	{
+		VamanaLauncherWorker *ledger_entry = (VamanaLauncherWorker *) lfirst(lc);
+		VamanaEnabledDatabase *db;
+		BgwHandleStatus handle_status;
+		VamanaRestartAction action;
+		pid_t		pid;
+
+		db = FindEnabledDatabase(enabled, ledger_entry->dbOid);
+		if (db == NULL)
+			continue;
+
+		handle_status = GetBackgroundWorkerPid(ledger_entry->handle, &pid);
+		action = VamanaRestartStateAdvance(&ledger_entry->restart_state,
+										   ledger_entry->serviced_generation,
+										   db->restart_generation,
+										   handle_status,
+										   now);
+
+		ExecuteRestartAction(action, ledger_entry, db, now);
 	}
 }
