@@ -278,58 +278,115 @@ VamanaWorkerEnumerateIndexes(void)
 }
 
 /*
- * Load every vamana index in this database into the worker cache.  A standby
- * has no demand path and its drain iterates only cached indexes, so an unloaded
- * index is never replayed.  Enumerated once at startup: indexes created later
- * are not loaded until restart.
+ * VamanaWorkerEnumerateIndexes in a self-contained transaction, returning the
+ * relids in TopMemoryContext.
  */
-void
-VamanaWorkerLoadStandbyIndexes(void)
+List *
+VamanaWorkerEnumerateAllIndexes(void)
 {
 	List	   *relids;
 	MemoryContext oldctx;
 
-	/*
-	 * Suppress eviction for the whole scan: relcache invalidations fired during
-	 * StartTransactionCommand would otherwise evict entries as they are loaded,
-	 * and a standby has no demand path to reload them.
-	 */
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	oldctx = MemoryContextSwitchTo(TopMemoryContext);
+	relids = VamanaWorkerEnumerateIndexes();
+	MemoryContextSwitchTo(oldctx);
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	return relids;
+}
+
+/*
+ * Load a not-yet-cached standby index, suppressing eviction for the load so a
+ * relcache invalidation fired while opening the relation does not evict the
+ * entry being populated.  Owns its own transaction.
+ */
+static void
+VamanaStandbyLoadIndex(Oid relid)
+{
+	bool		prevSuppressed = vamana_eviction_suppressed;
+
 	vamana_eviction_suppressed = true;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	relids = VamanaWorkerEnumerateIndexes();
-
-	oldctx = MemoryContextSwitchTo(TopMemoryContext);
-	foreach_oid(relid, relids)
-	{
-		MemoryContextSwitchTo(oldctx);
-		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
-		oldctx = MemoryContextSwitchTo(TopMemoryContext);
-	}
-	MemoryContextSwitchTo(oldctx);
+	(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
 
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	vamana_eviction_suppressed = false;
+	vamana_eviction_suppressed = prevSuppressed;
 }
 
 /*
- * Create and prime a replication slot for each cached index.  The snapshot
- * build inside VamanaReplicationEnsureSlot blocks on a RUNNING_XACTS record
- * from the primary, so this must run at startup rather than the main loop.
- * Call after VamanaWorkerLoadStandbyIndexes and outside any transaction.
+ * Release everything a standby holds for an index no longer in the live
+ * enumeration: the persistent slot (the orphaned-slot leak DROP INDEX redo
+ * would otherwise leave behind, since OAT_DROP never fires on standby redo),
+ * the index-lock reservation, and the in-memory cache entry.
  */
-void
-VamanaWorkerBootstrapStandbyReplicationSlots(void)
+static void
+VamanaStandbyReleaseIndex(Oid relid)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
+	VamanaWorkerShmem *entry = VamanaWorkerShmemPtr;
 
-	for (int i = 0; i < n; i++)
-		VamanaReplicationEnsureSlot(VamanaWorkerShmemPtr->dbOid, relids[i]);
+	VamanaReplicationDropIfExists(entry->dbOid, relid);
+	VamanaReleaseIndexLock(entry, relid);
+	VamanaEvictCacheEntry(relid);
+}
+
+/*
+ * Slot activation reaches CONSISTENT asynchronously: a freshly created handle
+ * is not proof of it, so this checks the underlying slot rather than
+ * cache->replicationSlot != NULL.
+ */
+static bool
+VamanaStandbySlotIsLive(Oid relid)
+{
+	return VamanaReplicationSlotIsConsistent(VamanaWorkerShmemPtr->dbOid, relid);
+}
+
+/*
+ * Bring a standby's cache to match targetRelids: load what is missing,
+ * activate the slot (via the caller's activateSlot policy: blocking at
+ * startup, bounded from the main loop) for anything not yet live, and release
+ * anything cached that is no longer targeted.  Diffs against the live cache
+ * each call rather than tracking prior state, so a call left with an
+ * unconverged slot is safe to repeat.
+ */
+bool
+VamanaReconcileStandbyCache(List *targetRelids,
+							 void (*activateSlot) (Oid relid))
+{
+	Oid			cachedRelids[VAMANA_MAX_CACHED_INDEXES];
+	int			nCached = VamanaGetAllCachedRelids(cachedRelids,
+													VAMANA_MAX_CACHED_INDEXES);
+	bool		allConverged = true;
+
+	for (int i = 0; i < nCached; i++)
+	{
+		if (!list_member_oid(targetRelids, cachedRelids[i]))
+			VamanaStandbyReleaseIndex(cachedRelids[i]);
+	}
+
+	foreach_oid(relid, targetRelids)
+	{
+		if (VamanaGetCache(relid) == NULL)
+			VamanaStandbyLoadIndex(relid);
+
+		if (!VamanaStandbySlotIsLive(relid))
+			activateSlot(relid);
+
+		if (!VamanaStandbySlotIsLive(relid))
+			allConverged = false;
+	}
+
+	return allConverged;
 }
 

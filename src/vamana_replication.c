@@ -738,6 +738,32 @@ VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb)
 }
 
 /*
+ * True once the index's slot has reached snapshot consistency (confirmed_flush
+ * is set).  A freshly created slot has confirmed_flush unset until snapshot
+ * build reaches CONSISTENT, so a slot handle existing is not by itself proof
+ * of consistency.  False if the slot does not exist.
+ */
+bool
+VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid)
+{
+	char				slotName[NAMEDATALEN];
+	ReplicationSlot	   *slot;
+	XLogRecPtr			confirmedFlush;
+
+	SlotName(dboid, indexRelid, slotName);
+
+	slot = SearchNamedReplicationSlot(slotName, true);
+	if (slot == NULL)
+		return false;
+
+	SpinLockAcquire(&slot->mutex);
+	confirmedFlush = slot->data.confirmed_flush;
+	SpinLockRelease(&slot->mutex);
+
+	return confirmedFlush != InvalidXLogRecPtr;
+}
+
+/*
  * VamanaRecoverFromReplayError
  *
  * Recover from an unrecoverable decoding error and self-heal by rebuilding the
@@ -926,6 +952,84 @@ VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid)
 						(int) SnapBuildCurrentState(ctx->snapshot_builder),
 						DecodingContextReady(ctx) ? "yes" : "no",
 						LSN_FORMAT_ARGS(MyReplicationSlot->data.confirmed_flush))));
+
+		FreeDecodingContext(ctx);
+		ReplicationSlotRelease();
+	}
+	PG_CATCH();
+	{
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+/*
+ * Scan WAL from restart_lsn up to role->current_wal_end and stop, whether or
+ * not the SnapBuild reaches CONSISTENT.  Unlike VamanaReplicationBuildSnapshot
+ * this never waits for a not-yet-replayed xl_running_xacts record, so it is
+ * safe to call from the main loop.  A pass that stops short of CONSISTENT
+ * discards its progress (the builder is freed with the decoding context; a
+ * snapshot is serialized only once CONSISTENT is reached), so the next pass
+ * starts over from restart_lsn; convergence needs only that the primary keep
+ * emitting xl_running_xacts.
+ */
+void
+VamanaReplicationActivateSlotBounded(Oid dboid, Oid indexRelid)
+{
+	char					slotName[NAMEDATALEN];
+	LogicalDecodingContext *ctx;
+	XLogRecPtr				endOfWal;
+
+	SlotName(dboid, indexRelid, slotName);
+
+	if (SearchNamedReplicationSlot(slotName, true) == NULL)
+		return;
+
+	ReplicationSlotAcquire(slotName, /*nowait=*/ true,
+						   /*error_if_invalid=*/ false);
+	if (MyReplicationSlot == NULL)
+		return;
+
+	PG_TRY();
+	{
+		ctx = CreateDecodingContext(InvalidXLogRecPtr,
+									NIL,
+									/*fast_forward=*/ false,
+									XL_ROUTINE(.page_read = read_local_xlog_page,
+											   .segment_open = wal_segment_open,
+											   .segment_close = wal_segment_close),
+									NULL, NULL, NULL);
+
+		XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
+		endOfWal = VamanaGetReplayRole()->current_wal_end(NULL);
+
+		while (ctx->reader->EndRecPtr < endOfWal)
+		{
+			XLogRecord *record;
+			char	   *errm = NULL;
+
+			record = XLogReadRecord(ctx->reader, &errm);
+			if (errm != NULL)
+				elog(ERROR, "vamana slot activation: WAL read error: %s", errm);
+			if (record == NULL)
+				break;
+
+			LogicalDecodingProcessRecord(ctx, ctx->reader);
+
+			if (DecodingContextReady(ctx))
+				break;
+
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		if (DecodingContextReady(ctx))
+		{
+			SpinLockAcquire(&MyReplicationSlot->mutex);
+			MyReplicationSlot->data.confirmed_flush = ctx->reader->EndRecPtr;
+			SpinLockRelease(&MyReplicationSlot->mutex);
+		}
 
 		FreeDecodingContext(ctx);
 		ReplicationSlotRelease();

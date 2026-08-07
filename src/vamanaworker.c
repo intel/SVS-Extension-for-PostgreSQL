@@ -73,6 +73,13 @@ volatile sig_atomic_t worker_got_sighup = false;
  */
 bool		vamana_eviction_suppressed = false;
 
+/*
+ * Set by VamanaRelcacheCallback when a relid outside the cache is invalidated;
+ * cleared by the main loop after it reconciles.  A standby has no other signal
+ * that a vamana index was created or dropped on the primary.
+ */
+bool		standbyRediscoverPending = false;
+
 /* -----------------------------------------------------------------------
  * Signal handlers (worker process only)
  * ----------------------------------------------------------------------- */
@@ -301,6 +308,9 @@ VamanaWorkerProcessReloads(void)
 static void
 VamanaRelcacheCallback(Datum arg, Oid relid)
 {
+	if (relid == InvalidOid || VamanaGetCache(relid) == NULL)
+		standbyRediscoverPending = true;
+
 	if (vamana_eviction_suppressed)
 		return;
 
@@ -538,9 +548,45 @@ VamanaWorkerDrainAndStop(void)
 }
 
 /*
+ * Blocking slot-activation policy for VamanaReconcileStandbyCache: waits for
+ * the primary's next xl_running_xacts if needed.  Only safe before workerPid
+ * is published, since it can block the caller for as long as that record
+ * takes to arrive.
+ */
+static void
+VamanaStandbyActivateSlotBlocking(Oid relid)
+{
+	VamanaReplicationEnsureSlot(VamanaWorkerShmemPtr->dbOid, relid);
+}
+
+/*
+ * Bounded slot-activation policy for VamanaReconcileStandbyCache: creates the
+ * slot if missing (pins restart_lsn, does not block), then scans WAL only up
+ * to the locally-replayed end.  Safe to call every main-loop pass; a pass
+ * that does not reach consistency leaves the slot for the next pass to retry.
+ */
+static void
+VamanaStandbyActivateSlotBounded(Oid relid)
+{
+	Oid					dbOid = VamanaWorkerShmemPtr->dbOid;
+	VamanaIndexCache   *cache = VamanaGetCache(relid);
+
+	if (cache == NULL)
+		return;
+
+	if (cache->replicationSlot == NULL)
+	{
+		VamanaReplicationCreate(dbOid, relid);
+		cache->replicationSlot = VamanaReplicationOpen(dbOid, relid);
+	}
+
+	VamanaReplicationActivateSlotBounded(dbOid, relid);
+}
+
+/*
  * Bootstrap the standby cache, announce readiness, then service requests until
  * a shutdown is requested.  A shutdown cancel raised anywhere in this span —
- * including the standby slot bootstrap that blocks on the primary's WAL —
+ * including the blocking slot activation that waits on the primary's WAL —
  * propagates out to the drain owner in VamanaWorkerMain rather than being
  * handled here.
  */
@@ -552,13 +598,14 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 
 	/*
 	 * A standby has no demand path to populate its cache.  Do it up front, and
-	 * before workerPid is set: slot bootstrap blocks on the primary's WAL, which
-	 * would starve the heartbeat if it ran inside the main loop.
+	 * before workerPid is set: blocking slot activation waits on the primary's
+	 * WAL, which would starve the heartbeat if it ran inside the main loop.
 	 */
 	if (VamanaGetReplayRole()->creates_slot_on_load)
 	{
-		VamanaWorkerLoadStandbyIndexes();
-		VamanaWorkerBootstrapStandbyReplicationSlots();
+		List *relids = VamanaWorkerEnumerateAllIndexes();
+
+		(void) VamanaReconcileStandbyCache(relids, VamanaStandbyActivateSlotBlocking);
 	}
 
 	/* Non-zero pid marks the worker available to backends. */
@@ -626,6 +673,17 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 		VamanaWorkerProcessRequests();
 
 		VamanaWorkerMaybeWarnZeroIndex(zeroIndexState);
+
+		if (!role->processes_write_ipc && standbyRediscoverPending)
+		{
+			List *relids;
+
+			standbyRediscoverPending = false;
+			relids = VamanaWorkerEnumerateAllIndexes();
+			if (!VamanaReconcileStandbyCache(relids, VamanaStandbyActivateSlotBounded))
+				standbyRediscoverPending = true;
+			list_free(relids);
+		}
 
 		/*
 		 * A standby feeds its index by decoding streamed WAL; a primary feeds

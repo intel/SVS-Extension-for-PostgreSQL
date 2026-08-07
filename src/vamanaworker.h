@@ -361,11 +361,16 @@ void	VamanaWorkerSeedIndexCount(void);
  */
 List   *VamanaWorkerEnumerateIndexes(void);
 
+/* VamanaWorkerEnumerateIndexes wrapped in its own transaction. */
+List   *VamanaWorkerEnumerateAllIndexes(void);
+
 SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk);
 SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid);
 void	VamanaWorkerResetStaleSlots(void);
-void	VamanaWorkerLoadStandbyIndexes(void);
-void	VamanaWorkerBootstrapStandbyReplicationSlots(void);
+
+/* Converges a standby's cache onto targetRelids; returns true once every relid has a live slot. */
+bool	VamanaReconcileStandbyCache(List *targetRelids,
+									void (*activateSlot) (Oid relid));
 
 /* vamanaworkersearch.c */
 void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);

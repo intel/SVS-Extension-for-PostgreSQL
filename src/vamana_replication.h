@@ -63,6 +63,12 @@ void	VamanaReplicationCreateOnStandby(Oid dboid, Oid indexRelid);
  */
 void	VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid);
 
+/*
+ * BGW: scan WAL to CONSISTENT or role->current_wal_end, whichever comes
+ * first; never blocks waiting on the primary.  Safe to call repeatedly.
+ */
+void	VamanaReplicationActivateSlotBounded(Oid dboid, Oid indexRelid);
+
 /* BGW: open a handle to the slot. Returns NULL if the slot does not exist. */
 VamanaReplicationSlot *VamanaReplicationOpen(Oid dboid, Oid indexRelid);
 
@@ -85,6 +91,9 @@ void	VamanaReplicationDrainSlot(Oid indexRelid);
  * Safe when the slot does not exist or has no restart_lsn yet.
  */
 bool	VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb);
+
+/* BGW: true once the index's slot has reached snapshot consistency. */
+bool	VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid);
 
 /* BGW: advance confirmed_flush_lsn. Safe to call with slot == NULL. */
 void	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
