@@ -643,3 +643,60 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 	ereport(DEBUG1,
 			(errmsg("vamana: exited BuildSnapshot for index %u", relid)));
 }
+
+/*
+ * VamanaWorkerProcessWarmupSlot
+ *
+ * Force an index resident in the worker cache on demand.  Routes through
+ * VamanaWorkerGetOrLoadIndex, so a hot index is a no-op via its fast path.
+ *
+ * Unlike ProcessLoadSlot, GetOrLoadIndex opens the index relation and reads
+ * the catalog, so it must run inside a transaction.  Eviction is suppressed
+ * across the load for the same reason the reload path does it: a relcache
+ * invalidation fired during StartTransactionCommand must not evict the entry
+ * mid-load.  Must not throw: all errors become VAMANA_SLOT_ERROR.
+ */
+void
+VamanaWorkerProcessWarmupSlot(int slotIdx)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Oid			relid = slot->indexRelid;
+
+	PG_TRY();
+	{
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		vamana_eviction_suppressed = true;
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
+		vamana_eviction_suppressed = false;
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		pg_write_barrier();
+		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		vamana_eviction_suppressed = false;
+
+		if (IsTransactionState())
+			AbortCurrentTransaction();
+
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+				 "%s", edata->message ? edata->message : "unknown error");
+		slot->errorCategory = VamanaCategorizeSQLState(edata->sqlerrcode);
+		FreeErrorData(edata);
+
+		pg_write_barrier();
+		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+	}
+	PG_END_TRY();
+}

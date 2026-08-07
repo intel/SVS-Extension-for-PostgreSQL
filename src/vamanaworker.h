@@ -49,6 +49,7 @@ typedef void *SVSIndexHandle;
 #define VAMANA_SLOTKIND_DELETE      2
 #define VAMANA_SLOTKIND_MAINTENANCE 3	/* consolidate / compact */
 #define VAMANA_SLOTKIND_LOAD        4	/* load index from save dir into BGW cache */
+#define VAMANA_SLOTKIND_WARMUP      5	/* force an index resident in the BGW cache on demand */
 
 /* Maintenance sub-operations (valid when slotKind == VAMANA_SLOTKIND_MAINTENANCE) */
 #define VAMANA_MAINTENANCE_CONSOLIDATE 0
@@ -372,6 +373,7 @@ void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);
 /* vamanaworkerwrite.c */
 void	VamanaWorkerProcessWriteSlot(int slotIdx);
 void	VamanaWorkerProcessLoadSlot(int slotIdx);
+void	VamanaWorkerProcessWarmupSlot(int slotIdx);
 
 /* Worker entry point.
  * PG 18 replaced pg_attribute_noreturn() with pg_noreturn (placed before
@@ -401,6 +403,7 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 							   int numVectors, int tidMappingCapacity,
 							   uint64 nextExternalId, int numDeleted,
 							   Oid heapRelid, int vectorAttNum);
+bool	VamanaWorkerSubmitWarmup(Oid indexRelid);
 void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
 VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);

@@ -172,6 +172,18 @@ CREATE FUNCTION svs_teardown_database()
 	AS 'MODULE_PATHNAME', 'svs_teardown_database'
 	LANGUAGE C;
 
+-- Force a vamana index resident in the worker cache; fails if the argument is
+-- not a vamana index or no worker is available.
+CREATE FUNCTION svs_warmup_index(index regclass) RETURNS void
+	AS 'MODULE_PATHNAME', 'svs_warmup_index'
+	LANGUAGE C;
+
+-- Warm every vamana index in the current database, best-effort, returning the
+-- number warmed.  Per-index failures warn and are skipped.
+CREATE FUNCTION svs_warmup_database() RETURNS integer
+	AS 'MODULE_PATHNAME', 'svs_warmup_database'
+	LANGUAGE C;
+
 -- Reject deleting a row while vamana indexes still exist in that database, so
 -- their save directories and replication slots are never orphaned.  TRUNCATE
 -- would bypass a DELETE trigger; it is already revoked from PUBLIC above.

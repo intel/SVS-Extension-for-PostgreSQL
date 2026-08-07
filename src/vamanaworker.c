@@ -194,6 +194,8 @@ VamanaWorkerProcessRequests(void)
 
 			if (ws->slotKind == VAMANA_SLOTKIND_LOAD)
 				VamanaWorkerProcessLoadSlot(writePending[i]);
+			else if (ws->slotKind == VAMANA_SLOTKIND_WARMUP)
+				VamanaWorkerProcessWarmupSlot(writePending[i]);
 			else
 				VamanaWorkerProcessWriteSlot(writePending[i]);
 		}
@@ -862,6 +864,14 @@ VamanaWorkerAssertDatabase(void)
 	if (!VamanaWorkerInitialScanDone())
 		return;
 
+	/*
+	 * An enabled database reaches this point only if its slot could not be
+	 * reserved.  Reservation happens at PRE_COMMIT when enabled = true commits,
+	 * and a full array fails that commit, so an enabled row is never visible
+	 * without a slot.  This branch is therefore a defensive guard, unreachable
+	 * through the catalog path; it diagnoses exhaustion distinctly from the
+	 * not-enabled case below should the invariant ever be violated.
+	 */
 	if (VamanaWorkerSlotsExhausted())
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
@@ -1295,10 +1305,22 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
 	return false;
 }
 
-static inline bool
-VamanaWorkerWaitForSlotIPC(VamanaWorkerSlot *slot)
+/*
+ * elevel diverges by path: insert passes ERROR so a failure aborts the
+ * statement and never returns; delete/maintenance/load pass WARNING and
+ * degrade on the returned false.
+ */
+static bool
+VamanaWorkerFinishSubmit(VamanaWorkerSlot *slot, int timeout_ms,
+						 int elevel, const char *verb)
 {
-	return VamanaWorkerWaitForSlot(slot, vamana_worker_timeout_ms);
+	if (VamanaWorkerWaitForSlot(slot, timeout_ms))
+		return true;
+
+	ereport(elevel,
+			(errcode(VamanaSlotErrcode(slot->errorCategory)),
+			 errmsg("vamana worker %s failed: %s", verb, slot->errorMessage)));
+	return false;
 }
 
 /*
@@ -1366,7 +1388,6 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	int			slotIdx = VAMANA_MY_SLOT_IDX;
-	bool		ok;
 
 	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
 	if (slot == NULL)
@@ -1400,12 +1421,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						indexRelid)));
 	}
 
-	ok = VamanaWorkerWaitForSlotIPC(slot);
-
-	if (!ok)
-		ereport(ERROR,
-				(errcode(VamanaSlotErrcode(slot->errorCategory)),
-				 errmsg("vamana worker insert failed: %s", slot->errorMessage)));
+	VamanaWorkerFinishSubmit(slot, vamana_worker_timeout_ms, ERROR, "insert");
 
 	pg_read_barrier();
 	*externalId_out = slot->writeExternalId;
@@ -1425,7 +1441,6 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
 	int			slotIdx = VAMANA_MY_SLOT_IDX;
-	bool		ok;
 
 	if (nIds <= 0)
 		return true;
@@ -1455,16 +1470,8 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 		return false;
 	}
 
-	ok = VamanaWorkerWaitForSlotIPC(slot);
-
-	if (!ok)
-	{
-		ereport(WARNING,
-				(errcode(VamanaSlotErrcode(slot->errorCategory)),
-				 errmsg("vamana worker delete failed: %s", slot->errorMessage)));
-		return false;
-	}
-	return true;
+	return VamanaWorkerFinishSubmit(slot, vamana_worker_timeout_ms, WARNING,
+									"delete");
 }
 
 /*
@@ -1478,7 +1485,6 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 {
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
-	bool		ok;
 
 	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
 	if (slot == NULL)
@@ -1493,16 +1499,8 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 		return false;
 	}
 
-	ok = VamanaWorkerWaitForSlotIPC(slot);
-
-	if (!ok)
-	{
-		ereport(WARNING,
-				(errcode(VamanaSlotErrcode(slot->errorCategory)),
-				 errmsg("vamana worker maintenance failed: %s", slot->errorMessage)));
-		return false;
-	}
-	return true;
+	return VamanaWorkerFinishSubmit(slot, vamana_worker_timeout_ms, WARNING,
+									"maintenance");
 }
 
 /*
@@ -1537,7 +1535,6 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 	VamanaWorkerSlot *slot;
 	int			slotIdx = VAMANA_MY_SLOT_IDX;
 	VamanaLoadParams *params;
-	bool		ok;
 
 	StaticAssertStmt(sizeof(VamanaLoadParams) <= VAMANA_MAX_DIM * sizeof(float),
 					 "VamanaLoadParams too large for queryVec buffer");
@@ -1572,16 +1569,38 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 		return false;
 	}
 
-	ok = VamanaWorkerWaitForSlot(slot, vamana_worker_startup_timeout_ms);
+	return VamanaWorkerFinishSubmit(slot, vamana_worker_startup_timeout_ms,
+									WARNING, "load");
+}
 
-	if (!ok)
+/*
+ * VamanaWorkerSubmitWarmup
+ *
+ * Ask the worker to make one index resident in its cache.  Carries only the
+ * relid: the worker reconstructs everything else through GetOrLoadIndex, whose
+ * fast path makes an already-hot index a no-op.  Uses the startup timeout
+ * because a cold load off disk can take tens of seconds.
+ */
+bool
+VamanaWorkerSubmitWarmup(Oid indexRelid)
+{
+	VamanaWorkerShmem *entry;
+	VamanaWorkerSlot *slot;
+
+	slot = VamanaWorkerClaimSlot(indexRelid, &entry);
+	if (slot == NULL)
+		return false;
+
+	slot->slotKind = VAMANA_SLOTKIND_WARMUP;
+
+	if (!VamanaWorkerPublishPending(entry, slot))
 	{
-		ereport(WARNING,
-				(errcode(VamanaSlotErrcode(slot->errorCategory)),
-				 errmsg("vamana worker load failed: %s", slot->errorMessage)));
+		DisownLatch(&slot->latch);
 		return false;
 	}
-	return true;
+
+	return VamanaWorkerFinishSubmit(slot, vamana_worker_startup_timeout_ms,
+									WARNING, "warmup");
 }
 
 /* -----------------------------------------------------------------------
@@ -1887,6 +1906,7 @@ VamanaSlotKindName(uint32 status, uint8 slotKind)
 		case VAMANA_SLOTKIND_DELETE:	  return "delete";
 		case VAMANA_SLOTKIND_MAINTENANCE: return "maintenance";
 		case VAMANA_SLOTKIND_LOAD:		  return "load";
+		case VAMANA_SLOTKIND_WARMUP:	  return "warmup";
 	}
 	return NULL;
 }

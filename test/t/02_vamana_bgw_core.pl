@@ -10,7 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use Time::HiRes qw(usleep);
+use Time::HiRes qw(usleep gettimeofday tv_interval);
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -245,11 +245,8 @@ use VamanaTestUtils qw(:all);
         qr/vamana index is not enabled for this database/,
         'backend in an unconfigured database gets a config hard-fail');
 
-    # A vamana_databases row whose enabled = false never has a shmem slot
-    # reserved (M3 reserves only on enabled = true commit), so
-    # VamanaWorkerLookupSlot returns NULL exactly as for an absent row.  The
-    # config gate must therefore raise the identical "not enabled" hard error,
-    # proving present-but-disabled and absent are the same state-1 case.
+    # A disabled row never gets a shmem slot reserved, so the config gate sees
+    # the same missing slot as an absent row and must raise the same error.
     $node->safe_psql("postgres", "CREATE DATABASE disabled_db;");
     $node->safe_psql("disabled_db", "CREATE EXTENSION vector;");
     $node->safe_psql("disabled_db", "CREATE EXTENSION svs;");
@@ -263,9 +260,57 @@ use VamanaTestUtils qw(:all);
         qr/vamana index is not enabled for this database/,
         'present-but-disabled database gets the same config hard-fail as absent');
 
+    # The gate fires before the relation, its catalog row, or its on-disk save
+    # directory ($PGDATA/vamana_indexes/<relid>) exist, so a failure leaves none.
+    $node->safe_psql("disabled_db",
+        "CREATE TABLE na_tbl (id serial PRIMARY KEY, val vector($dim));");
+
+    my $vamana_dir = $node->data_dir . "/vamana_indexes";
+    my $count_index_dirs = sub {
+        return 0 unless -d $vamana_dir;
+        opendir(my $dh, $vamana_dir) or die "opendir $vamana_dir: $!";
+        my @e = grep { !/^\.\.?$/ } readdir($dh);
+        closedir($dh);
+        return scalar @e;
+    };
+    my $dirs_before = $count_index_dirs->();
+
+    my ($na_ret, undef, $na_err) = $node->psql("disabled_db",
+        "CREATE INDEX na_idx ON na_tbl USING vamana (val vector_l2_ops);");
+    like($na_err,
+        qr/vamana index is not enabled for this database/,
+        'unconfigured-database CREATE INDEX hard-fails');
+    is($node->safe_psql("disabled_db", "SELECT to_regclass('na_idx') IS NULL;"),
+        't', 'no relation survives the failed CREATE INDEX');
+    is($node->safe_psql("disabled_db",
+            "SELECT count(*) FROM pg_class WHERE relname = 'na_idx';"),
+        '0', 'pg_class has no row for the attempted index');
+    is($count_index_dirs->(), $dirs_before,
+        'no on-disk save directory created by the failed build');
+
     my $postgres_worker_pid = wait_for_worker_db($node, 'postgres', 20);
     ok($postgres_worker_pid =~ /^\d+$/,
         "postgres worker still running alongside testdb worker (pid=$postgres_worker_pid)");
+
+    # With a live worker, CREATE INDEX takes the available fast path and builds
+    # immediately, with no startup wait.
+    $node->safe_psql("postgres", qq(
+        CREATE TABLE running_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO running_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200) i;
+    ));
+    my $t0 = [gettimeofday];
+    $node->safe_psql("postgres",
+        "CREATE INDEX running_idx ON running_tbl USING vamana (val vector_l2_ops);");
+    my $running_elapsed = tv_interval($t0);
+    ok($running_elapsed < 5,
+        "CREATE INDEX with a running worker proceeds without a startup wait (${running_elapsed}s)");
+    is($node->safe_psql("postgres", qq(
+            SET enable_seqscan = off;
+            SELECT count(*) FROM (
+                SELECT id FROM running_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5
+            ) q;
+        )), '5', 'running-worker index serves queries after the no-wait build');
 
     sleep(2);
 
