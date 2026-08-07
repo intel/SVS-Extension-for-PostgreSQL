@@ -197,7 +197,7 @@ typedef struct VamanaWorkerShmem
 	/*
 	 * Live Vamana indexes in this database.  Maintained with plain atomics
 	 * (no array-wide lock) by the backend performing CREATE/DROP INDEX; read
-	 * by M10's DELETE guard and M11's pg_stat_vamana_worker view.
+	 * by the DELETE guard and the pg_stat_vamana_worker view.
 	 */
 	pg_atomic_uint32 indexCount;
 

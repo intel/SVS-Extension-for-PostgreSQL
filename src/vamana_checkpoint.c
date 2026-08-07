@@ -133,7 +133,7 @@ PerformCheckpoint(VamanaIndexCache *cache)
 		index_close(indexRel, AccessShareLock);
 		indexRel = NULL;
 
-		/* Phase 5: advance slot only after on-disk state is durable. */
+		/* Advance slot only after on-disk state is durable. */
 		VamanaSlotAdvance(cache->replicationSlot, checkpoint_lsn);
 	}
 	PG_CATCH();

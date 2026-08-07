@@ -135,8 +135,7 @@ sub wait_for_worker_count
 }
 
 # ---------------------------------------------------------------------------
-# Tests 9 + 10: cross-database enumeration, visibility gate, and per-database
-# availability.
+# Cross-database enumeration, visibility gate, and per-database availability.
 #
 # pg_stat_vamana_worker reports one row per reserved database.  A privileged
 # caller (superuser / pg_read_all_stats) sees every worker; the launcher having
@@ -351,11 +350,10 @@ sub wait_for_worker_count
 }
 
 # ---------------------------------------------------------------------------
-# Tests 17 + 18 + 19: GUC inventory and entry-point cutover.
+# GUC inventory and entry-point cutover.
 #
-# The old single-worker GUC is gone; the launcher GUCs exist with the
-# documented contexts.  The registered static worker is the launcher, and no
-# running code path still reads svs.worker_database.
+# The launcher GUCs exist with the documented contexts.  The registered static
+# worker is the launcher, and no running code path reads svs.worker_database.
 # ---------------------------------------------------------------------------
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_launcher_cutover');

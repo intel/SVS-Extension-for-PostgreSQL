@@ -281,7 +281,7 @@ VamanaWorkerEnumerateIndexes(void)
  * Load every vamana index in this database into the worker cache.  A standby
  * has no demand path and its drain iterates only cached indexes, so an unloaded
  * index is never replayed.  Enumerated once at startup: indexes created later
- * are not loaded until restart (docs/bgw/issues/standby_autonomous_index_discovery.md).
+ * are not loaded until restart.
  */
 void
 VamanaWorkerLoadStandbyIndexes(void)

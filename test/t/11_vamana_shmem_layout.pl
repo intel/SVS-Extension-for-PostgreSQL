@@ -1,18 +1,17 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 11_vamana_shmem_layout.pl — M2 shmem control-block array.
+# 11_vamana_shmem_layout.pl — shmem control-block array.
 #
-# Covers the M2 structural and concurrency tests that have an observable
+# Covers the structural and concurrency guarantees that have an observable
 # surface in the single-worker interim:
-#   1. Sizing: the shmem segments scale with svs.max_databases.
-#   3. No reallocation: segment offsets are stable for the postmaster's life.
-#   4. indexCount: maintained per database, correct under concurrency.
+#   Sizing: the shmem segments scale with svs.max_databases.
+#   No reallocation: segment offsets are stable for the postmaster's life.
+#   indexCount: maintained per database, correct under concurrency.
 #
-# M2 tests 2 (arbitrary-position lookup) and 5 (no torn read during a
-# reservation) need several databases at arbitrary array positions and the
-# cross-database stat scope to observe them; they live in
-# 10_vamana_idle_worker_visibility.pl.
+# Arbitrary-position lookup and no-torn-read during a reservation need several
+# databases at arbitrary array positions and the cross-database stat scope to
+# observe them; they live in 10_vamana_idle_worker_visibility.pl.
 
 use strict;
 use warnings FATAL => 'all';
@@ -56,7 +55,7 @@ sub start_node
 }
 
 # Enable the launcher_database itself so its worker reserves a slot and comes
-# up.  Kept out of start_node: the M3 precommit-reservation blocks below manage
+# up.  Kept out of start_node: the precommit-reservation blocks below manage
 # vamana_databases from an empty table and would break on a pre-inserted row.
 sub enable_postgres
 {

@@ -218,11 +218,11 @@ sub wait_for_lsn_advance
     # Helper: create a fresh table+index, wait for BGW to load it, and
     # return (table_name, slot_name, baseline_lsn).
     #
-    # The 5 seed rows set opsSinceCheckpoint=5 inside the BGW.  Because
-    # VamanaCacheIndex now initialises lastCheckpointTime=GetCurrentTimestamp(),
-    # the max_interval clock starts at load time and the BGW will not fire a
-    # spurious immediate checkpoint — so baseline_lsn is a stable starting
-    # point for each case's guard assertions.
+    # The 5 seed rows set opsSinceCheckpoint=5 inside the BGW.  VamanaCacheIndex
+    # initialises lastCheckpointTime=GetCurrentTimestamp(), so the max_interval
+    # clock starts at load time and the BGW will not fire a spurious immediate
+    # checkpoint — baseline_lsn is a stable starting point for each case's guard
+    # assertions.
     my $case_num = 0;
     my $make_index = sub {
         $case_num++;

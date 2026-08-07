@@ -45,7 +45,7 @@
 /* Fallback wake interval when nothing else wakes the loop; matches core. */
 #define VAMANA_LAUNCHER_NAPTIME_MS		180000L
 
-/* NOTIFY channel published by the vamana_databases_changed trigger (M1). */
+/* NOTIFY channel published by the vamana_databases_changed trigger. */
 #define VAMANA_DATABASES_CHANNEL		"vamana_databases_changed"
 
 /* Upper bound on the exponential respawn backoff. */
@@ -67,9 +67,8 @@
  * One tracked per-database worker: the handle returned by
  * RegisterDynamicBackgroundWorker is the authoritative liveness signal (via
  * GetBackgroundWorkerPid), never the slot's workerPid, which is set only once
- * the worker reaches readiness (see B1 Decision 4).  The ledger is
- * launcher-local and correctly rebuilt from a fresh scan after a launcher
- * restart.
+ * the worker reaches readiness.  The ledger is launcher-local and correctly
+ * rebuilt from a fresh scan after a launcher restart.
  */
 typedef enum VamanaRestartAction
 {
@@ -217,8 +216,7 @@ VamanaLauncherMain(Datum main_arg)
 		 * Drain the async queue outside any transaction.  A latch set leaves
 		 * the queue un-consumed (notifyInterruptPending stays set, the SLRU
 		 * tail never advances for this backend); consuming it both avoids that
-		 * leak and is where a payload-parsing future (M9's restart:<dbname>)
-		 * will hook in.  ProcessNotifyInterrupt refuses to run inside a
+		 * leak.  ProcessNotifyInterrupt refuses to run inside a
 		 * transaction, so it precedes the SPI read in the reconcile pass.
 		 *
 		 * flush=false: the launcher has no client connection, so pq_flush()
@@ -302,9 +300,9 @@ VamanaLauncherReconcileWorkers(void)
  * config table into shmem: at postmaster start slots[] is empty, and without
  * this a CREATE INDEX / INSERT in a long-enabled database would read "no slot"
  * and hard-fail "not enabled" in the window before that database's worker
- * self-reserves (see B1 Decision 2).
+ * self-reserves.
  *
- * Reservation is idempotent (VamanaWorkerReserveSlot), so overlap with M3's
+ * Reservation is idempotent (VamanaWorkerReserveSlot), so overlap with the
  * PRE_COMMIT trigger or a worker's own startup reservation is a no-op.
  */
 static void
@@ -376,7 +374,7 @@ AppendEnabledDatabase(List *list, Oid dbOid, const char *datname,
  * Return the currently-enabled databases, allocated in the caller's memory
  * context (which must outlive the SPI transaction opened here).  Name-to-OID
  * resolution is tolerant: a row whose database no longer exists is skipped and
- * logged rather than aborting the scan (see B1 Decision 1 and 5).
+ * logged rather than aborting the scan.
  */
 static List *
 ReadEnabledDatabases(void)

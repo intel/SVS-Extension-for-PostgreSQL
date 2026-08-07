@@ -36,7 +36,7 @@ VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr = NULL;
 
 /*
  * Convenience pointer to this worker's control block.  Until the launcher
- * (M4) assigns entries per database, the single worker uses entry 0.
+ * assigns entries per database, the single worker uses entry 0.
  */
 VamanaWorkerShmem *VamanaWorkerShmemPtr = NULL;
 
@@ -277,7 +277,7 @@ VamanaWorkerFindSlot(Oid dbOid)
 
 /*
  * Return the control block serving dbOid, or NULL if none is reserved.
- * The "not found" result is the state M12's CREATE INDEX check treats as
+ * The "not found" result is the state the CREATE INDEX check treats as
  * "this database is not enabled for vamana."
  */
 VamanaWorkerShmem *
@@ -456,7 +456,7 @@ VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta)
 /*
  * Apply a net delta to dbOid's counter.  Looking up the slot takes the
  * array-wide lock in shared mode; the increment/decrement itself is a plain
- * atomic, deliberately outside that lock (see M2 "Locking").  No-op if no
+ * atomic, deliberately outside that lock.  No-op if no
  * slot is reserved for the database.
  */
 static void

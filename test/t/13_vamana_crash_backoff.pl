@@ -10,18 +10,6 @@
 # stays up past the dwell threshold has its failure count forgiven.  The failure
 # count lives in shared memory, so it survives a restart of the launcher itself.
 #
-# Coverage (spec numbers follow m04_launcher_core.md):
-#   5. Near-instant respawn: a clean worker death is respawned far faster than
-#      the fallback naptime, proving the respawn is latch-driven, not polled.
-#   7. Escalating capped backoff: repeated startup crashes are respawned on a
-#      growing delay, not a fixed interval.
-#   8. The launcher's own restart is postmaster-owned (svs.worker_restart_time),
-#      independent of the per-worker svs.worker_restart_backoff.
-#   Dwell reset: a worker that survives past VAMANA_BACKOFF_DWELL_RESET_MS clears
-#      its failure count, so a later crash restarts the backoff from the base.
-#   Durability: the failure count is shared-memory state and survives a launcher
-#      restart, so backoff does not reset to the base when the launcher respawns.
-#
 # The crash loop is driven by the in-tree injection-point framework, the same
 # mechanism 09 uses; without it there is no deterministic startup-crash trigger.
 
@@ -129,7 +117,7 @@ sub start_node
 }
 
 # ---------------------------------------------------------------------------
-# Spec 5: a clean worker death is respawned near-instantly.
+# A clean worker death is respawned near-instantly.
 #
 # SIGTERM (not SIGKILL) is deliberate: a BGWORKER_SHMEM_ACCESS worker killed
 # uncleanly exits with a status the postmaster treats as a crash, triggering
@@ -166,7 +154,7 @@ sub start_node
 }
 
 # ---------------------------------------------------------------------------
-# Spec 7 + dwell reset: escalating capped backoff, then forgiveness.
+# Escalating capped backoff, then forgiveness.
 #
 # Attaching the startup-crash injection makes every spawn FATAL, so the worker
 # crash-loops.  The gaps between successive crashes must grow (base is doubled
@@ -233,7 +221,7 @@ sub start_node
 }
 
 # ---------------------------------------------------------------------------
-# Spec 8 + durability: the launcher's own restart is postmaster-owned, and the
+# The launcher's own restart is postmaster-owned, and the
 # per-database failure count survives it.
 #
 # Killing the launcher cleanly (its SIGTERM handler exits normally) lets the

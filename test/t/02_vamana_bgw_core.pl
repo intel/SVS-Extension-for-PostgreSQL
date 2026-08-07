@@ -231,7 +231,7 @@ use VamanaTestUtils qw(:all);
     # A database with no vamana_databases row is unconfigured: after the
     # launcher's initial scan, AssertDatabase hard-fails such a backend rather
     # than spinning out the startup wait.  This is the config half of the
-    # config/liveness split, stronger than the old worker-bound-elsewhere path.
+    # config/liveness split.
     $node->safe_psql("postgres", "CREATE DATABASE unconfigured_db;");
     $node->safe_psql("unconfigured_db", "CREATE EXTENSION vector;");
     $node->safe_psql("unconfigured_db", "CREATE EXTENSION svs;");
