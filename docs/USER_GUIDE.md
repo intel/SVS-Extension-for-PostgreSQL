@@ -20,12 +20,14 @@
    - 5.4 [Choosing a Compression Configuration](#54-choosing-a-compression-configuration)
    - 5.5 [Creating a Compressed Index](#55-creating-a-compressed-index)
 6. [Performance Tuning](#6-performance-tuning)
-   - 6.1 [Background Worker (Advanced)](#background-worker-advanced)
+   - 6.1 [Background Workers and Per-Database Enablement (Advanced)](#61-background-workers-and-per-database-enablement-advanced)
 7. [Operational Considerations](#7-operational-considerations)
-   - 7.1 [TRUNCATE](#truncate)
-   - 7.2 [Security and Deployment Notes](#security-and-deployment-notes)
+   - 7.1 [Pausing vs. Removing a Database](#pausing-vs-removing-a-database)
+   - 7.2 [TRUNCATE](#truncate)
+   - 7.3 [Security and Deployment Notes](#security-and-deployment-notes)
 8. [Monitoring](#8-monitoring)
-   - 8.1 [Server Log Messages](#server-log-messages)
+   - 8.1 [Worker Status](#worker-status)
+   - 8.2 [Server Log Messages](#server-log-messages)
 9. [Troubleshooting](#9-troubleshooting)
 10. [Appendix: Vamana vs. HNSW Comparison](#10-appendix-vamana-vs-hnsw-comparison)
 11. [Reference: Parameter Summary](#11-reference-parameter-summary)
@@ -73,13 +75,22 @@ SELECT extversion FROM pg_extension WHERE extname = 'svs';
 
 - An Intel Xeon processor instance is strongly recommended to benefit from AVX-512 optimizations. On AWS, the `r7i`, `c7i`, and `m7i` instance families qualify.
 
-- **Required — Background Worker:** The background worker must be running for all write operations (INSERT, DELETE+VACUUM). Add `svs` to `shared_preload_libraries` in `postgresql.conf` and restart the server:
+- **Required — Background Workers:** Background workers must be running for all Vamana operations (search, INSERT, DELETE+VACUUM). Add `svs` to `shared_preload_libraries` in `postgresql.conf` and restart the server:
 
   ```
   shared_preload_libraries = 'svs'
   ```
 
-  This is required because the worker registers shared memory segments at server start — actions that cannot be performed after the server is already running. Without this, the worker will not start and all index reads and writes will return an error.
+  This is required because the extension registers shared memory segments and a supervisor process (the *launcher*) at server start — actions that cannot be performed after the server is already running. Without this, no workers start and all index reads and writes will return an error.
+
+- **Required — Enable your database:** Each database that hosts Vamana indexes must be enrolled in the `vamana_databases` table so the launcher spawns a worker for it. Enrollment takes effect immediately, with no restart:
+
+  ```sql
+  -- Run this in the launcher's database (default: postgres)
+  INSERT INTO vamana_databases (datname) VALUES ('mydb');
+  ```
+
+  See [Section 6.1](#61-background-workers-and-per-database-enablement-advanced) for the full model. A `CREATE INDEX ... USING vamana` in a database that is not enabled fails immediately with an actionable error.
 
 ---
 
@@ -124,8 +135,8 @@ LIMIT 5;
 
 **Edge cases to know about:**
 
-- The first `INSERT` after a server restart blocks until the BGW has loaded all indexes. Run a warmup `SELECT` at startup to pre-warm before writes begin.
-- Writes are serialized per index inside the BGW. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
+- Indexes are loaded on demand, not eagerly at worker startup. The first `SELECT`, `INSERT`, or `VACUUM` touching a given index after a server restart pays that index's load cost; subsequent operations serve from the warm cache. To pre-warm deliberately, call `svs_warmup_index()` or `svs_warmup_database()` (see [Section 6.1](#61-background-workers-and-per-database-enablement-advanced)).
+- Writes are serialized per index inside the worker. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
 - Deletes are soft: `VACUUM` marks entries deleted, patches graph edges, and compacts when deletion pressure exceeds `svs.compact_threshold_pct` (default 10%).
 - External IDs are never reused for the life of the index. `REINDEX` resets the counter.
 
@@ -476,37 +487,118 @@ CREATE INDEX … USING vamana (…);
 
 > **Note:** Unlike HNSW, there is no separate PostgreSQL leader thread — the value is used directly as the SVS thread pool size. Search threads are always capped at `nproc - 1` regardless of this setting.
 
-### Background Worker (Advanced)
+### 6.1 Background Workers and Per-Database Enablement (Advanced)
 
-The extension includes a background worker that owns all Vamana index state in a single process. All write operations (INSERT, DELETE+VACUUM via `SVSAddPoints`, `SVSDeletePoints`, consolidate, and compact) are submitted to the BGW by backends via IPC and executed exclusively by the BGW. Search requests are also served through the BGW, avoiding per-backend index loads and enabling high read concurrency.
+The extension serves every Vamana operation through background workers. A worker owns the in-memory SVS graph for all Vamana indexes in one database: all write operations (INSERT, DELETE+VACUUM, consolidate, and compact) and all search requests are submitted to it by backends via shared-memory IPC and executed exclusively by the worker. This avoids per-backend index loads and enables high read concurrency.
 
-**Prerequisite:** The background worker only starts when the extension is loaded via `shared_preload_libraries`. Add the following to `postgresql.conf` and restart:
+#### The launcher and per-database workers
+
+There is **one worker per database**, and a single supervisor process — the *launcher* — that starts, stops, restarts, and tracks them. The launcher is the only process registered at server start; every per-database worker is spawned dynamically. This means you can enable Vamana for a new database, pause it, or remove it entirely by changing a table, with no server restart and no `postgresql.conf` edit.
+
+```
+postmaster
+  └── vamana launcher            (reads vamana_databases)
+        └── vamana worker: mydb
+        └── vamana worker: appdb
+        └── ...
+```
+
+**Prerequisite:** The launcher only starts when the extension is loaded via `shared_preload_libraries`. Add the following to `postgresql.conf` and restart:
 
 ```
 shared_preload_libraries = 'svs'
-svs.worker_database = 'mydb'   # database where your Vamana indexes live
 ```
 
-`shared_preload_libraries` is required because the worker registers shared memory segments and a background process at server start. Loading the extension later via `CREATE EXTENSION` does not start the worker. The worker starts automatically when the extension is loaded — no additional flag is needed.
+`shared_preload_libraries` is required because the extension registers shared memory segments and the launcher process at server start. Loading the extension later via `CREATE EXTENSION` does not start the launcher.
+
+#### Enabling and disabling a database
+
+Enablement lives in the `vamana_databases` table in the launcher's home database (`svs.launcher_database`, default `postgres`). The launcher reacts to changes within a fraction of a second.
+
+```sql
+-- Enable Vamana for a database (no restart). A worker is spawned within moments.
+INSERT INTO vamana_databases (datname) VALUES ('mydb');
+
+-- Pause it (reversible — see Section 7). The worker checkpoints and stops;
+-- on-disk state and the replication slot are kept, idle.
+UPDATE vamana_databases SET enabled = false WHERE datname = 'mydb';
+
+-- Resume it. The worker restarts and picks up where it left off.
+UPDATE vamana_databases SET enabled = true WHERE datname = 'mydb';
+```
+
+Enrollment reserves the database's worker slot **synchronously** at commit, so a `CREATE INDEX ... USING vamana` issued immediately afterward will not spuriously fail with a "not enabled" error. The worker itself spawns asynchronously a moment later; the first operation against an index waits (bounded by `svs.worker_startup_timeout_ms`) if the worker is still starting.
+
+> **Do not use `enabled = false` then `true` to bounce a worker.** Use `svs_restart_worker()` instead (below). Two updates in one transaction never produce an intermediate state the launcher can observe, and disabling is the "take this database offline" signal, not a restart primitive.
+
+#### Restarting a single worker on demand
+
+To bounce one database's worker without taking the database offline — for example, to force a clean checkpoint and replication-slot advance right now rather than waiting for the debounced checkpoint policy:
+
+```sql
+SELECT svs_restart_worker('mydb');
+```
+
+This drains and cleanly stops the worker (checkpointing every cached index first) and respawns it. It raises an error if the named database is paused or not configured. Only enabled databases can be restarted.
+
+#### Removing a database permanently
+
+Pausing (`enabled = false`) and removal are **different** operations. Pausing is reversible and keeps on-disk state; removal is permanent. Removal is a deliberate two-step action — see [Section 7](#7-operational-considerations) for full details:
+
+```sql
+-- Step 1, connected to the target database: drop every Vamana index in it.
+SELECT * FROM svs_teardown_database();
+
+-- Step 2, connected to the launcher's database: remove the row.
+DELETE FROM vamana_databases WHERE datname = 'mydb';
+```
+
+Running step 2 first is rejected: `DELETE` fails with an actionable hint if Vamana indexes still exist in that database, so on-disk save directories and replication slots are never orphaned.
+
+#### Warming the cache
+
+Because indexes load on demand, there is otherwise no way to get a hot cache without waiting on real query traffic. Force a warm cache deliberately, at a time you control (e.g. after a planned restart, or in a benchmark's load phase):
+
+```sql
+SELECT svs_warmup_index('documents_vamana_idx');  -- one index
+SELECT svs_warmup_database();                      -- every Vamana index in this database
+```
+
+`svs_warmup_index()` errors if the argument is not a Vamana index or no worker is available. `svs_warmup_database()` is best-effort: per-index failures warn and are skipped, and it returns the number of indexes warmed.
+
+#### Capacity
+
+`svs.max_databases` (default 8) sizes the fixed shared-memory array of worker slots at server start. Enabling more databases than this limit fails the `INSERT`/`UPDATE` with:
+
+```
+ERROR: cannot enable database "mydb": svs.max_databases (8) already reached
+HINT:  increase svs.max_databases and restart, or disable another database first
+```
+
+Plan for your expected number of Vamana-enabled databases plus headroom, since changing this limit requires a server restart.
+
+#### Configuration parameters
 
 **Startup GUCs** (`postgresql.conf`, require restart — `PGC_POSTMASTER`):
 
 | GUC | Default | Description |
 |-----|---------|-------------|
-| `svs.worker_database` | `'postgres'` | Database the worker connects to. Set this to the database where your Vamana indexes are created; the default `'postgres'` is only correct if that is where your indexes live. |
+| `svs.launcher_database` | `'postgres'` | Database the launcher connects to in order to read `vamana_databases`. Set once at install time. This is the only remaining GUC that names a specific database. |
+| `svs.max_databases` | `8` | Maximum number of databases that can run a worker concurrently. Sizes the per-database shared-memory array. Range 1 – 128. |
 
 **Runtime-tunable GUCs** (`postgresql.conf` or `pg_reload_conf()` — `PGC_SIGHUP`, no restart needed):
 
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
-| `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for the worker to finish startup before returning an error. Startup can be slow when many large indexes are deserialized from disk. |
-| `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for the worker before returning an error. |
-| `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends` (PostgreSQL's configured backend limit). |
+| `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. |
+| `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. |
+| `svs.worker_restart_time` | `5` (s) | -1 – 300 | Seconds the postmaster waits before restarting the **launcher** if it crashes. `-1` disables auto-restart. Governs only the launcher, not per-database workers. |
+| `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. |
+| `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends`. |
 
-**Timeout behavior:** If the worker does not respond within `svs.worker_timeout_ms`, the backend returns an error.
+> `svs.worker_restart_time` and `svs.worker_restart_backoff` govern two different restart policies deliberately: a fixed interval for the launcher itself (via the postmaster's native mechanism), and escalating backoff for per-database workers (a worker crash-looping on a corrupted index or an out-of-memory condition should not be respawned every second forever). They are not interchangeable.
 
-**Multi-database note:** The worker connects to a single database (`svs.worker_database`). Vamana indexes in other databases cannot be searched.
-
+**Crash handling:** If a per-database worker crashes, the launcher detects it near-instantly and respawns it, backing off exponentially on repeated crashes. If the launcher itself crashes, the postmaster restarts it, and it re-derives the full worker set from `vamana_databases`.
 
 ---
 
@@ -542,7 +634,50 @@ VACUUM performs three operations on the index:
 REINDEX INDEX CONCURRENTLY documents_vamana_idx;
 ```
 
-**Cold-cache fallback:** On BGW startup, the worker loads all indexes from disk and replays committed operations from the replication slot before accepting any requests. An INSERT that arrives while the BGW is still starting up blocks on `VamanaWorkerWaitUntilAvailable` until the BGW signals it is ready. If no saved index exists on disk, the BGW rebuilds from the heap before marking itself available.
+**Cold-cache behavior:** Indexes are loaded on demand, not eagerly at worker startup. The worker becomes available as soon as it connects to its database; the first operation touching a given index loads that index from its on-disk save (replaying any committed operations from the replication slot since the last checkpoint) before that operation proceeds. Subsequent operations serve from the warm cache. An operation that arrives while the worker is still starting waits until the worker signals it is ready, bounded by `svs.worker_startup_timeout_ms`. If no saved copy exists on disk, the worker rebuilds that index from the heap on first access. To warm a cold cache deliberately rather than on first query, use `svs_warmup_index()`/`svs_warmup_database()` (see [Section 6.1](#61-background-workers-and-per-database-enablement-advanced)).
+
+### Pausing vs. Removing a Database
+
+Disabling a database and removing it are different operations with different, well-defined effects. A DBA reasoning about "is it safe to leave this database like this" needs to know exactly what survives each:
+
+| | Pause (`enabled = false`) | Permanent removal (teardown + `DELETE`) |
+|---|---|---|
+| Worker process | Stopped | Stopped |
+| On-disk save directory | Kept | Deleted |
+| Replication slot | Kept, idle, caught up | Dropped |
+| Catalog row | Kept | Removed |
+| Resumable? | Yes — re-enable and the worker resumes | No — indexes must be rebuilt |
+
+**Pause** means "stop serving this database for now, but I may come back": a maintenance window, a cost-driven scale-down, a database quiet on weekends. When you set `enabled = false`, the worker checkpoints every cached index (flushing to disk and advancing the replication slot), then stops. At rest, no worker runs; the on-disk saves are current; the replication slot is present, inactive, and not accumulating WAL. Re-enabling later replays little or nothing. Nothing ever escalates a pause into removal — a long-paused database stays exactly paused until you act.
+
+While paused, any query or write against a Vamana index in that database fails (after the startup timeout), rather than queuing quietly.
+
+**Permanent removal** means "I am done with Vamana in this database." It is a deliberate two-step action, run in the two databases it affects (PostgreSQL has no cross-database DDL):
+
+```sql
+-- Step 1, connected to the target database: drops every Vamana index in it,
+-- deleting each index's on-disk save directory and dropping its replication slot.
+SELECT * FROM svs_teardown_database();
+
+-- Step 2, connected to the launcher's database: stops the launcher running a
+-- worker for it.
+DELETE FROM vamana_databases WHERE datname = 'mydb';
+```
+
+`svs_teardown_database()` runs with **your own privileges** (not elevated), so it can only drop indexes you own; it returns one row per index reporting whether each was dropped and, if skipped, why. It does not abort on the first index you cannot drop — it continues and reports the mixed result.
+
+**Order matters, and the wrong order is rejected.** Running step 2 first — `DELETE` while Vamana indexes still exist — fails immediately:
+
+```
+ERROR: cannot remove "mydb" from vamana_databases: 3 Vamana index(es) still exist in that database
+HINT:  run svs_teardown_database() in "mydb" first
+```
+
+This guarantees on-disk save directories and replication slots are never orphaned with no catalog row pointing at them.
+
+**Forgetting step 2 is safe, not harmful.** If you run teardown but never remove the row, the real cleanup already happened; what remains is only an idle worker serving zero indexes. It is wasteful (it holds one worker slot) but harmless, and it is surfaced via `pg_stat_vamana_worker` (`index_count = 0`) and a one-time server-log hint. The launcher deliberately does not auto-remove the row, since a database with zero indexes right now may simply be between `CREATE INDEX` calls.
+
+> `TRUNCATE vamana_databases` is blocked (revoked from `PUBLIC`) because it would bypass the removal-safety check on every row at once. Use the two-step removal per database instead.
 
 ### TRUNCATE
 
@@ -560,13 +695,18 @@ Until the bug is fixed, do not rely on post-TRUNCATE queries returning empty res
 ### Typical Deployment Flow
 
 ```sql
--- 1. Build the index
+-- 1. Enable this database for Vamana (run in the launcher's database).
+--    Skip if already enabled. A worker is spawned within moments.
+INSERT INTO vamana_databases (datname) VALUES ('mydb')
+    ON CONFLICT (datname) DO NOTHING;
+
+-- 2. Build the index
 CREATE INDEX CONCURRENTLY docs_vamana ON docs USING vamana (embedding vector_cosine_ops);
 
--- 2. Warm the BGW cache before first INSERT
-SELECT id FROM docs ORDER BY embedding <=> '[0,0,...]' LIMIT 1;
+-- 3. Warm the worker cache before first INSERT (optional)
+SELECT svs_warmup_index('docs_vamana');
 
--- 3. Begin serving writes
+-- 4. Begin serving writes
 INSERT INTO docs (embedding) VALUES ('[...]');
 ```
 
@@ -609,7 +749,7 @@ With LeanVec compression, the stored element size is much smaller than `D × 4 b
 
 ### PostgreSQL Restart / Crash Recovery
 
-On BGW startup after a restart or crash, the worker loads the last checkpoint from disk and replays any committed operations recorded in the replication slot since that checkpoint. This happens before the BGW accepts any backend requests, so the index is fully consistent by the time the first query or insert arrives. There is no data loss for committed transactions.
+After a restart or crash, the launcher re-reads `vamana_databases` and respawns a worker for each enabled database. Each worker loads an index on first access: it reads the last checkpoint from disk and replays any committed operations recorded in the replication slot since that checkpoint before serving the first operation against that index. Because replay happens before that operation proceeds, the index is fully consistent by the time the first query or insert against it completes. There is no data loss for committed transactions. (Loading is per-index and on demand, so startup no longer scales with the number or size of indexes; see [Section 6.1](#61-background-workers-and-per-database-enablement-advanced).)
 
 ### Security and Deployment Notes
 
@@ -625,7 +765,7 @@ Operators who require encryption-at-rest for embedding data should use full-disk
 
 #### WAL Configuration Requirement
 
-The background worker requires `wal_level = logical` in `postgresql.conf`. If `wal_level` is set to a lower value (`replica` or `minimal`), the BGW emits `FATAL` at startup and enters a crash-restart loop (`svs.worker_restart_time` interval). The postmaster is not affected, but all Vamana index operations (search, insert, delete) will fail with "background worker unavailable" errors until the configuration is corrected and the server is restarted.
+Background workers require `wal_level = logical` in `postgresql.conf`. If `wal_level` is set to a lower value (`replica` or `minimal`), each per-database worker emits `FATAL` at startup; the launcher respawns it with escalating backoff (`svs.worker_restart_backoff`), so it enters a backoff-limited crash loop rather than restarting every few seconds. The postmaster and launcher are not affected, but all Vamana index operations (search, insert, delete) will fail with "background worker unavailable" errors until the configuration is corrected and the server is restarted.
 
 ```
 # Required in postgresql.conf
@@ -660,6 +800,27 @@ WHERE relid = 'documents'::regclass;
 Phases:
 - `initializing` — setting up build state
 - `loading tuples` — buffering vectors from heap
+
+### Worker Status
+
+`pg_stat_vamana_worker` reports one row per enabled database — including databases whose worker is starting, backing off after a crash, or serving zero indexes — mirroring how `pg_stat_replication` shows slots regardless of transient state:
+
+```sql
+SELECT db_oid::regnamespace, worker_pid, worker_state, index_count, heartbeat_ts
+FROM pg_stat_vamana_worker;
+```
+
+| Column | Meaning |
+|---|---|
+| `db_oid` | OID of the enabled database |
+| `worker_pid` | The worker's PID, or `0`/NULL if no worker is currently running (starting, or crashed and awaiting respawn) |
+| `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive`, or `replica` (serving a hot standby) |
+| `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)) |
+| `heartbeat_ts` | Last time the worker updated its heartbeat |
+
+`pg_stat_vamana_worker_slot` reports one row per in-flight IPC work-request slot (`slot_status`, `slot_kind`, `index_relid`, `error_message`) for finer-grained diagnosis of what a worker is currently processing.
+
+> **Cross-database visibility:** both views are cluster-wide. An ordinary user sees only their own database's rows; a `pg_read_all_stats` member sees all databases. When you care about the current database only, filter by `db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`.
 
 ### Server Log Messages
 
@@ -710,8 +871,9 @@ WHERE relname = 'documents_vamana_idx';
 | What | How |
 |---|---|
 | Live vs. deleted vector count | No SQL-level view currently; monitor via server log messages below. |
+| Worker state per database | Query `pg_stat_vamana_worker` (see [Worker Status](#worker-status) above). |
 | Write serialization pressure | Query `pg_stat_activity` for `wait_event_type = 'LWLock'` and `wait_event = 'vamana_index_rwlock'`; backends waiting on this are queued behind an in-progress write. |
-| Rebuild frequency | Look for `rebuilding vamana index from table data` in server logs. A healthy dynamic index sees this only on BGW cold start after a restart or REINDEX. |
+| Rebuild frequency | Look for `rebuilding vamana index from table data` in server logs. A healthy dynamic index sees this only on worker cold start after a restart or REINDEX. |
 | Checkpoint activity | Look for slot advance log messages; infrequent checkpoints indicate low write volume. |
 
 ---
@@ -768,8 +930,8 @@ RESET enable_seqscan;
 
 ### New rows not appearing in search results after INSERT
 
-**Cause:** The BGW must be running and have finished loading all indexes before it can accept inserts. If the BGW is unavailable, the backend returns an ERROR rather than silently dropping the insert.
-**Fix:** Ensure the BGW is running (`shared_preload_libraries = 'vector,svs'`). If the server just restarted, the first INSERT blocks until the BGW finishes startup (controlled by `svs.worker_startup_timeout_ms`). If the timeout is exceeded, increase it or investigate slow index loading.
+**Cause:** The database's worker must be running before it can accept inserts. If no worker is available, the backend returns an ERROR rather than silently dropping the insert. The two common reasons are: the database is not enabled in `vamana_databases`, or the worker is still starting after a restart.
+**Fix:** Confirm the database is enabled (`SELECT * FROM vamana_databases WHERE datname = current_database()`) and its worker is running (`SELECT worker_state FROM pg_stat_vamana_worker WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`). Ensure `shared_preload_libraries = 'svs'`. If the server just restarted, the first operation waits until the worker finishes startup (controlled by `svs.worker_startup_timeout_ms`); if the timeout is exceeded, increase it or investigate slow startup.
 
 ### Low recall after compression
 
@@ -778,26 +940,26 @@ RESET enable_seqscan;
 
 ### Slow first query after restart
 
-**Cause:** The BGW loads all indexes from disk and replays the replication slot at startup. Until startup completes, backends queue on their IPC latches.
-**Fix:** Warm up by running a representative query after the server is ready:
+**Cause:** Indexes load on demand, so the first query against a given index after a restart pays that index's load-and-replay cost. This is per index, not a single upfront load of the whole database.
+**Fix:** Warm the cache deliberately after the server is ready, rather than paying the cost on the first real query:
 
 ```sql
--- Warm-up query (results can be discarded)
-SELECT id FROM documents
-ORDER BY embedding <=> '[0,0,0,…]'
-LIMIT 1;
+SELECT svs_warmup_database();   -- warm every Vamana index in this database
+-- or a single index:
+SELECT svs_warmup_index('documents_vamana_idx');
 ```
 
 ### INSERT does not appear in a SELECT from another session
 
-**Cause:** All inserts go through the BGW synchronously — the inserting session blocks until the BGW ACKs. If a SELECT in another session does not return the inserted row, the most likely cause is the BGW is not running.
+**Cause:** All inserts go through the worker synchronously — the inserting session blocks until the worker ACKs. If a SELECT in another session does not return the inserted row, the most likely cause is that this database's worker is not running.
 
-**Check:** is the background worker running?
+**Check:** is this database's worker running?
 ```sql
-SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'vamana background worker';
+SELECT worker_state, worker_pid FROM pg_stat_vamana_worker
+WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 ```
 
-**Fix:** ensure the worker is running (load the extension via `shared_preload_libraries` and restart). If the worker is running and rows are still missing, force a rebuild with `REINDEX INDEX CONCURRENTLY <idx>`.
+**Fix:** ensure the database is enabled in `vamana_databases` and its `worker_state` is `running`. If the worker is running and rows are still missing, force a rebuild with `REINDEX INDEX CONCURRENTLY <idx>`.
 
 ### SELECT returns fewer than `LIMIT` rows after many DELETEs
 
@@ -818,7 +980,7 @@ When `SVSAddPoints` fails, the insert invalidates the cache and returns success 
 
 ### "Index will be rebuilt from table on next query" NOTICE after VACUUM
 
-This notice fires when VACUUM runs but the BGW has not yet loaded the index (e.g., immediately after a server restart before the BGW finishes startup). The BGW loads all indexes from disk and replays the replication slot at startup; once startup completes, subsequent VACUUM operations use the normal incremental path. If you see this notice persistently, verify the BGW is running and check server logs for startup errors.
+This notice fires when VACUUM runs but the worker has not yet loaded that index into its cache (e.g., immediately after a server restart, before the index has been touched). The worker loads the index from disk and replays the replication slot on first access; once loaded, subsequent VACUUM operations use the normal incremental path. If you see this notice persistently, verify the database is enabled and its worker is running (`pg_stat_vamana_worker`), and check server logs for startup errors.
 
 ---
 
@@ -895,14 +1057,17 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 
 | GUC | Default | Notes |
 |-----|---------|-------|
-| `svs.worker_database` | `'postgres'` | Database the worker connects to; must match where indexes are created |
+| `svs.launcher_database` | `'postgres'` | Database the launcher reads `vamana_databases` from; set once at install time |
+| `svs.max_databases` | `8` | Max databases that can run a worker concurrently (range 1–128); sizes the shared-memory slot array |
 
 ### Runtime-tunable Server GUC Parameters (`PGC_SIGHUP` — reload with `SELECT pg_reload_conf()`)
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
-| `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Worker startup timeout (ms); exceeded → error |
-| `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker response timeout (ms); exceeded → error |
+| `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker (ms); exceeded → error |
+| `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms); exceeded → error |
+| `svs.worker_restart_time` | `5` (s) | `-1` | `300` | Postmaster wait before restarting the **launcher** after a crash; `-1` disables |
+| `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; escalates on repeated crashes |
 | `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
 | `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
 | `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
@@ -910,6 +1075,23 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.checkpoint_min_ops` | `10000` | — | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
 | `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set |
 | `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set |
+
+### SQL Functions
+
+| Function | Runs in | Purpose |
+|----------|---------|---------|
+| `svs_restart_worker(dbname name)` | launcher's database | Drain, stop, and respawn one enabled database's worker on demand |
+| `svs_teardown_database()` | target database | Drop every Vamana index in the current database (step 1 of permanent removal); returns one row per index |
+| `svs_warmup_index(regclass)` | target database | Load one Vamana index into the worker cache |
+| `svs_warmup_database()` | target database | Load every Vamana index in the current database; returns the count warmed |
+
+### Catalog and Views
+
+| Object | Purpose |
+|--------|---------|
+| `vamana_databases` | Per-database enablement (`INSERT` to enable, `UPDATE ... SET enabled` to pause/resume, two-step teardown + `DELETE` to remove) |
+| `pg_stat_vamana_worker` | One row per enabled database: worker PID, state, index count, heartbeat |
+| `pg_stat_vamana_worker_slot` | One row per in-flight IPC work-request slot |
 
 ### Operator Classes
 
