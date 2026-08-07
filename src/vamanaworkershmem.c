@@ -654,6 +654,29 @@ VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered)
 }
 
 /*
+ * Reset a database's backoff to its base state after a deliberate stop.  Crash
+ * throttle governs automatic respawns; an operator re-enable is a fresh intent
+ * that must spawn without waiting out a window it never earned.  Clearing
+ * last_attempt_time makes BackoffRemainingMs return 0 on the next reconcile.
+ */
+void
+VamanaWorkerBackoffClear(Oid dbOid)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		entry->backoff.last_attempt_time = 0;
+		entry->backoff.consecutive_failures = 0;
+	}
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
+/*
  * Publish that the launcher has finished its startup scan and reserved a slot
  * for every enabled database.  After this, absence of a slot for a database is
  * authoritative for "not configured" (see VamanaWorkerAssertDatabase).

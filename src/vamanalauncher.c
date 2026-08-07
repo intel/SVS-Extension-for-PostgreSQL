@@ -107,8 +107,10 @@ static List *ReadEnabledDatabases(void);
 static void MaterializeInitialConfig(void);
 static VamanaLauncherWorker *FindLedgerEntry(Oid dbOid);
 static bool IsDatabaseEnabled(List *enabled, Oid dbOid);
+static bool IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w);
 static void SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now);
 static void ReconcileLedgerLiveness(List *enabled, TimestampTz now);
+static void TerminateDisabledWorkers(List *enabled);
 static long BackoffThresholdMs(uint32 consecutiveFailures);
 static long BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now);
 
@@ -235,6 +237,7 @@ VamanaLauncherReconcileWorkers(void)
 	enabled = ReadEnabledDatabases();
 
 	ReconcileLedgerLiveness(enabled, now);
+	TerminateDisabledWorkers(enabled);
 
 	foreach(lc, enabled)
 	{
@@ -299,7 +302,7 @@ MaterializeInitialConfig(void)
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
 							db->datname),
-					 errhint("Increase max_vamana_databases and restart.")));
+					 errhint("Increase svs.max_databases and restart.")));
 	}
 
 	VamanaWorkerSetInitialScanDone();
@@ -473,6 +476,17 @@ IsDatabaseEnabled(List *enabled, Oid dbOid)
 }
 
 /*
+ * True when a worker's death is an operator-intended stop rather than a crash,
+ * so its exit must not accrue respawn backoff.  A disabled database is the one
+ * deliberate stop today; explicit restart adds another and shares this gate.
+ */
+static bool
+IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w)
+{
+	return !IsDatabaseEnabled(enabled, w->dbOid);
+}
+
+/*
  * Register a per-database worker and record its handle in the ledger.  The
  * worker is BGW_NEVER_RESTART with bgw_notify_pid set to the launcher, so the
  * postmaster never respawns it and instead signals the launcher on its death.
@@ -497,7 +511,7 @@ SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
 						db->datname),
-				 errhint("Increase max_vamana_databases and restart.")));
+				 errhint("Increase svs.max_databases and restart.")));
 		return;
 	}
 
@@ -573,7 +587,9 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 		if (status != BGWH_STOPPED)
 			continue;
 
-		if (IsDatabaseEnabled(enabled, w->dbOid))
+		if (IsDeliberateStop(enabled, w))
+			VamanaWorkerBackoffClear(w->dbOid);
+		else
 		{
 			bool		recovered = w->started_time != 0 &&
 				TimestampDifferenceMilliseconds(w->started_time, now) >=
@@ -585,5 +601,32 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 		WorkerLedger = foreach_delete_current(WorkerLedger, lc);
 		pfree(w->handle);
 		pfree(w);
+	}
+}
+
+/*
+ * Stop every live worker whose database has left the enabled set.
+ * TerminateBackgroundWorker delivers SIGTERM, which the flag-only handler turns
+ * into the graceful drain-and-stop; the next reconcile pass observes the
+ * stopped handle, drops the ledger entry with no backoff accrual
+ * (IsDeliberateStop), and leaves the slot reserved so the paused database stays
+ * configured.  Idempotent: a worker still draining reports BGWH_STARTED, so a
+ * repeat wakeup re-signals it harmlessly.
+ */
+static void
+TerminateDisabledWorkers(List *enabled)
+{
+	ListCell   *lc;
+
+	foreach(lc, WorkerLedger)
+	{
+		VamanaLauncherWorker *w = (VamanaLauncherWorker *) lfirst(lc);
+		pid_t		pid;
+
+		if (IsDatabaseEnabled(enabled, w->dbOid))
+			continue;
+
+		if (GetBackgroundWorkerPid(w->handle, &pid) == BGWH_STARTED)
+			TerminateBackgroundWorker(w->handle);
 	}
 }

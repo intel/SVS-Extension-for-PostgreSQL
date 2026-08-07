@@ -724,7 +724,7 @@ VamanaWorkerMain(Datum main_arg)
 	if (VamanaWorkerShmemPtr == NULL)
 		ereport(FATAL,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("cannot start vamana worker: max_vamana_databases (%d) already reached",
+				 errmsg("cannot start vamana worker: svs.max_databases (%d) already reached",
 						max_vamana_databases)));
 
 	/*
@@ -866,7 +866,7 @@ VamanaWorkerAssertDatabase(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("vamana worker slots exhausted"),
-				 errhint("Increase max_vamana_databases and restart the server.")));
+				 errhint("Increase svs.max_databases and restart the server.")));
 
 	ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

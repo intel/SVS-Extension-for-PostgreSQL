@@ -283,6 +283,7 @@ void	VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx);
 bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);
 void	VamanaWorkerBackoffStampAttempt(Oid dbOid, TimestampTz now);
 void	VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered);
+void	VamanaWorkerBackoffClear(Oid dbOid);
 
 /*
  * Lock-free backoff predicate for callers that already hold the header lock

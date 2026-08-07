@@ -290,9 +290,9 @@ ReserveSlotsForEnabledEntries(void)
 		if (VamanaWorkerReserveSlot(entry->dbOid) == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-					 errmsg("cannot enable database \"%s\": max_vamana_databases (%d) already reached",
+					 errmsg("cannot enable database \"%s\": svs.max_databases (%d) already reached",
 							NameStr(entry->datname), max_vamana_databases),
-					 errhint("increase max_vamana_databases and restart, or disable another database first")));
+					 errhint("Increase svs.max_databases and restart, or disable another database first.")));
 
 		ReservedThisXactDbOids = lappend_oid(ReservedThisXactDbOids, entry->dbOid);
 	}
