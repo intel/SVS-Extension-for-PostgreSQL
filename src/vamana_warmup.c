@@ -20,10 +20,10 @@
 
 #include "postgres.h"
 
+#include "vamana_subxact_guard.h"
 #include "vamanaworker.h"
 
 #include "access/relation.h"
-#include "access/xact.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
 #include "fmgr.h"
@@ -79,6 +79,21 @@ svs_warmup_index(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/* Arguments/result for WarmupOneBody, bundled for VamanaRunInSubXact. */
+typedef struct WarmupOneArgs
+{
+	Oid		relid;
+	bool	warmed;
+} WarmupOneArgs;
+
+static void
+WarmupOneBody(void *arg)
+{
+	WarmupOneArgs *args = (WarmupOneArgs *) arg;
+
+	args->warmed = warmup_one(args->relid);
+}
+
 /*
  * Warm one index under an internal subtransaction so a failure is confined to
  * that index and the batch continues.  Returns true if the index was warmed.
@@ -86,39 +101,21 @@ svs_warmup_index(PG_FUNCTION_ARGS)
 static bool
 warmup_one_guarded(Oid relid)
 {
-	MemoryContext oldCtx = CurrentMemoryContext;
-	ResourceOwner oldOwner = CurrentResourceOwner;
-	bool		warmed;
+	WarmupOneArgs		args = {relid, false};
+	VamanaSubXactResult	result;
 
-	BeginInternalSubTransaction(NULL);
-	MemoryContextSwitchTo(oldCtx);
+	result = VamanaRunInSubXact(WarmupOneBody, &args, NULL);
 
-	PG_TRY();
+	if (!result.succeeded)
 	{
-		warmed = warmup_one(relid);
-		ReleaseCurrentSubTransaction();
-	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
-
-		MemoryContextSwitchTo(oldCtx);
-		edata = CopyErrorData();
-		FlushErrorState();
-
 		ereport(WARNING,
 				(errmsg("could not warm up vamana index %u: %s",
-						relid, edata->message)));
-		FreeErrorData(edata);
-
-		RollbackAndReleaseCurrentSubTransaction();
-		warmed = false;
+						relid, result.edata->message)));
+		FreeErrorData(result.edata);
+		return false;
 	}
-	PG_END_TRY();
 
-	MemoryContextSwitchTo(oldCtx);
-	CurrentResourceOwner = oldOwner;
-	return warmed;
+	return args.warmed;
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_warmup_database);

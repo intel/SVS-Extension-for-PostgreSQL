@@ -19,12 +19,10 @@ struct VamanaIndexCache;
 /*
  * BGW-side handle for one logical replication slot.
  * Allocated in TopMemoryContext by VamanaReplicationOpen.
- * decodingCtx is NULL until WAL replay is initialized.
  */
 typedef struct VamanaReplicationSlot
 {
-	char					slotName[NAMEDATALEN];
-	LogicalDecodingContext *decodingCtx;
+	char	slotName[NAMEDATALEN];
 } VamanaReplicationSlot;
 
 /*

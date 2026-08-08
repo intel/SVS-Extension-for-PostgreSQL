@@ -79,9 +79,24 @@ typedef enum VamanaRestartAction
 	RESTART_RESPAWN				/* handle stopped: caller respawns */
 } VamanaRestartAction;
 
+/*
+ * Why a stopped handle stopped.  A stopped handle has exactly one owner keyed
+ * on this reason: a restart drain is completed by the restart machinery
+ * (respawn in place, preserving backoff), while a crash or a disable is settled
+ * by the liveness pass (accrue or clear backoff, drop the entry).  Conflating
+ * the two owners is what let a restart delete the entry it needed to respawn.
+ */
+typedef enum VamanaStopReason
+{
+	STOP_CRASH,					/* unexpected exit: accrue backoff, drop */
+	STOP_DISABLED,				/* database left the enabled set: drop */
+	STOP_RESTART_DRAIN			/* deliberate restart in flight: respawn */
+} VamanaStopReason;
+
 typedef struct VamanaRestartState
 {
 	bool		restarting;			/* is a restart in flight? */
+	int64		serviced_generation;	/* generation the running worker serves */
 	int64		target_generation;	/* generation we're converging to */
 	TimestampTz	wait_started;		/* when did we start waiting for stop? */
 } VamanaRestartState;
@@ -99,7 +114,6 @@ typedef struct VamanaLauncherWorker
 	 */
 	TimestampTz	started_time;
 
-	int64		serviced_generation;
 	VamanaRestartState restart_state;
 } VamanaLauncherWorker;
 
@@ -125,15 +139,20 @@ static List *WorkerLedger = NIL;
 static long VamanaLauncherReconcileWorkers(void);
 static List *ReadEnabledDatabases(void);
 static void MaterializeInitialConfig(void);
+static bool VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname);
 static VamanaLauncherWorker *FindLedgerEntry(Oid dbOid);
 static bool IsDatabaseEnabled(List *enabled, Oid dbOid);
-static bool IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w);
+static VamanaStopReason ClassifyWorkerStop(List *enabled,
+										   const VamanaLauncherWorker *w);
 static VamanaRestartAction VamanaRestartStateAdvance(VamanaRestartState *state,
-													 int64 serviced_generation,
 													 int64 current_generation,
 													 BgwHandleStatus handle_status,
 													 TimestampTz now);
+static BackgroundWorkerHandle *RegisterDatabaseWorker(const VamanaEnabledDatabase *db,
+													  TimestampTz now);
 static void SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now);
+static bool RespawnWorker(VamanaLauncherWorker *w, const VamanaEnabledDatabase *db,
+						  TimestampTz now);
 static void ReconcileLedgerLiveness(List *enabled, TimestampTz now);
 static void TerminateDisabledWorkers(List *enabled);
 static void ReconcileRestartConvergence(List *enabled, TimestampTz now);
@@ -295,6 +314,24 @@ VamanaLauncherReconcileWorkers(void)
  * ----------------------------------------------------------------------- */
 
 /*
+ * Reserve dbOid's slot, logging the launcher's standard capacity-exceeded
+ * message on failure.  Returns whether the reservation succeeded.
+ */
+static bool
+VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname)
+{
+	if (VamanaWorkerReserveSlot(dbOid) != NULL)
+		return true;
+
+	ereport(LOG,
+			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+			 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
+					datname),
+			 errhint("Increase svs.max_databases and restart.")));
+	return false;
+}
+
+/*
  * Reserve a slot for every enabled database before any worker is registered,
  * then publish initialScanDone.  This is the restart-durable projection of the
  * config table into shmem: at postmaster start slots[] is empty, and without
@@ -324,12 +361,7 @@ MaterializeInitialConfig(void)
 	{
 		VamanaEnabledDatabase *db = (VamanaEnabledDatabase *) lfirst(lc);
 
-		if (VamanaWorkerReserveSlot(db->dbOid) == NULL)
-			ereport(LOG,
-					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-					 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
-							db->datname),
-					 errhint("Increase svs.max_databases and restart.")));
+		(void) VamanaWorkerReserveSlotOrLog(db->dbOid, db->datname);
 	}
 
 	VamanaWorkerSetInitialScanDone();
@@ -522,14 +554,20 @@ FindEnabledDatabase(List *enabled, Oid dbOid)
 }
 
 /*
- * True when a worker's death is an operator-intended stop rather than a crash,
- * so its exit must not accrue respawn backoff.  A disabled database and an
- * in-flight restart are both deliberate stops.
+ * Classify why a worker's handle stopped, so exactly one machine owns the
+ * transition.  A disable outranks an in-flight restart: a database leaving the
+ * enabled set is torn down here (drop, no accrual) even mid-restart, since the
+ * restart convergence pass only visits enabled databases and would otherwise
+ * leave the entry orphaned between the two owners.
  */
-static bool
-IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w)
+static VamanaStopReason
+ClassifyWorkerStop(List *enabled, const VamanaLauncherWorker *w)
 {
-	return !IsDatabaseEnabled(enabled, w->dbOid) || w->restart_state.restarting;
+	if (!IsDatabaseEnabled(enabled, w->dbOid))
+		return STOP_DISABLED;
+	if (w->restart_state.restarting)
+		return STOP_RESTART_DRAIN;
+	return STOP_CRASH;
 }
 
 /*
@@ -542,24 +580,29 @@ IsDeliberateStop(List *enabled, const VamanaLauncherWorker *w)
  * records the latest target; after the drain, convergence sees the gap and
  * does exactly one more restart.
  *
+ * The terminal RESPAWN transition (clearing restarting, advancing
+ * serviced_generation) is left to the caller and applied only once the respawn
+ * actually succeeds: a failed registration keeps the state RESPAWN-pending, so
+ * the next cycle sees the still-stopped handle and retries rather than dropping
+ * the restart on the floor.
+ *
  * Returns the action the caller should take: NOOP (no restart needed),
  * TERMINATE (start draining), WAIT (still draining), WAIT_TIMEOUT (timeout
- * exceeded, still waiting), or RESPAWN (start new).
+ * exceeded, still waiting), or RESPAWN (stopped: respawn in place).
  */
 static VamanaRestartAction
 VamanaRestartStateAdvance(VamanaRestartState *state,
-						  int64 serviced_generation,
 						  int64 current_generation,
 						  BgwHandleStatus handle_status,
 						  TimestampTz now)
 {
-	if (!state->restarting && serviced_generation == current_generation)
+	if (!state->restarting && state->serviced_generation == current_generation)
 	{
 		/* No restart needed; idle. */
 		return RESTART_NOOP;
 	}
 
-	if (!state->restarting && serviced_generation != current_generation)
+	if (!state->restarting && state->serviced_generation != current_generation)
 	{
 		/* Mismatch detected: start a restart. */
 		state->restarting = true;
@@ -585,9 +628,7 @@ VamanaRestartStateAdvance(VamanaRestartState *state,
 
 	if (state->restarting && handle_status == BGWH_STOPPED)
 	{
-		/* Handle stopped: caller will respawn and update serviced_generation. */
-		state->restarting = false;
-		state->wait_started = 0;
+		/* Handle stopped: caller respawns and completes the transition. */
 		return RESTART_RESPAWN;
 	}
 
@@ -596,33 +637,30 @@ VamanaRestartStateAdvance(VamanaRestartState *state,
 }
 
 /*
- * Register a per-database worker and record its handle in the ledger.  The
- * worker is BGW_NEVER_RESTART with bgw_notify_pid set to the launcher, so the
- * postmaster never respawns it and instead signals the launcher on its death.
+ * Reserve a slot and register a per-database worker, returning its handle (in
+ * TopMemoryContext) or NULL on failure.  The worker is BGW_NEVER_RESTART with
+ * bgw_notify_pid set to the launcher, so the postmaster never respawns it and
+ * instead signals the launcher on its death.
  *
  * The slot is reserved here, before registration, for two reasons: it gives the
  * backoff counters a durable home even for a worker that FATALs at startup
  * before it can self-reserve (the crash-loop case), and it avoids registering a
  * worker that could only fail the capacity check.  Reservation is idempotent,
  * so overlap with the worker's own startup reservation is a no-op.
+ *
+ * The handle is palloc'd in TopMemoryContext because the ledger outlives the
+ * per-cycle reconcile context; a cycle-context handle would dangle once that
+ * context is freed.
  */
-static void
-SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
+static BackgroundWorkerHandle *
+RegisterDatabaseWorker(const VamanaEnabledDatabase *db, TimestampTz now)
 {
 	BackgroundWorker bgw;
 	BackgroundWorkerHandle *handle;
-	VamanaLauncherWorker *entry;
 	MemoryContext oldCtx;
 
-	if (VamanaWorkerReserveSlot(db->dbOid) == NULL)
-	{
-		ereport(LOG,
-				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
-						db->datname),
-				 errhint("Increase svs.max_databases and restart.")));
-		return;
-	}
+	if (!VamanaWorkerReserveSlotOrLog(db->dbOid, db->datname))
+		return NULL;
 
 	memset(&bgw, 0, sizeof(bgw));
 	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana worker: %s", db->datname);
@@ -636,12 +674,6 @@ SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
 	bgw.bgw_main_arg = ObjectIdGetDatum(db->dbOid);
 	bgw.bgw_notify_pid = MyProcPid;
 
-	/*
-	 * RegisterDynamicBackgroundWorker palloc's the returned handle in the
-	 * current context.  The ledger outlives the per-cycle reconcile context,
-	 * so both the handle and its entry must be allocated in TopMemoryContext;
-	 * otherwise the handle dangles once the cycle context is freed.
-	 */
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 
 	if (!RegisterDynamicBackgroundWorker(&bgw, &handle))
@@ -651,22 +683,76 @@ SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
 				(errmsg("vamana launcher could not register worker for database \"%s\"",
 						db->datname),
 				 errhint("Consider increasing max_worker_processes.")));
-		return;
+		return NULL;
 	}
-
-	entry = palloc(sizeof(VamanaLauncherWorker));
-	entry->dbOid = db->dbOid;
-	entry->handle = handle;
-	entry->started_time = 0;
-	entry->serviced_generation = 0;
-	entry->restart_state.restarting = false;
-	entry->restart_state.target_generation = 0;
-	entry->restart_state.wait_started = 0;
-	WorkerLedger = lappend(WorkerLedger, entry);
 
 	MemoryContextSwitchTo(oldCtx);
 
 	VamanaWorkerBackoffStampAttempt(db->dbOid, now);
+	return handle;
+}
+
+/*
+ * Spawn a fresh worker and append its ledger entry.  serviced_generation is
+ * seeded from the database's current restart_generation so a newly spawned
+ * worker is never mistaken for one lagging a past restart: only a subsequent
+ * svs_restart_worker() bump makes convergence see a gap.
+ */
+static void
+SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
+{
+	BackgroundWorkerHandle *handle;
+	VamanaLauncherWorker *entry;
+	MemoryContext oldCtx;
+
+	handle = RegisterDatabaseWorker(db, now);
+	if (handle == NULL)
+		return;
+
+	/*
+	 * The ledger List's cells, not just entry itself, must live in
+	 * TopMemoryContext: lappend() outside this switch would link the new cell
+	 * into the per-cycle reconcile context, leaving WorkerLedger dangling once
+	 * that context is deleted at the end of the cycle.
+	 */
+	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+	entry = palloc(sizeof(VamanaLauncherWorker));
+
+	entry->dbOid = db->dbOid;
+	entry->handle = handle;
+	entry->started_time = 0;
+	entry->restart_state.restarting = false;
+	entry->restart_state.serviced_generation = db->restart_generation;
+	entry->restart_state.target_generation = db->restart_generation;
+	entry->restart_state.wait_started = 0;
+	WorkerLedger = lappend(WorkerLedger, entry);
+	MemoryContextSwitchTo(oldCtx);
+}
+
+/*
+ * Respawn a stopped worker in place, completing the restart transition.  The
+ * existing ledger entry is reused so it is never orphaned between the liveness
+ * and convergence owners, and its backoff is preserved (a deliberate restart is
+ * not a crash).  On success the entry adopts the target generation and clears
+ * the in-flight flag; on registration failure the entry is left RESPAWN-pending
+ * so the next cycle retries.  Returns true on success.
+ */
+static bool
+RespawnWorker(VamanaLauncherWorker *w, const VamanaEnabledDatabase *db,
+			  TimestampTz now)
+{
+	BackgroundWorkerHandle *handle = RegisterDatabaseWorker(db, now);
+
+	if (handle == NULL)
+		return false;
+
+	pfree(w->handle);
+	w->handle = handle;
+	w->started_time = 0;
+	w->restart_state.restarting = false;
+	w->restart_state.serviced_generation = w->restart_state.target_generation;
+	w->restart_state.wait_started = 0;
+	return true;
 }
 
 /*
@@ -675,13 +761,13 @@ SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
  * slot's workerPid.
  *
  * A running handle that has not yet been seen started gets its start time
- * stamped, so its eventual uptime can be measured.  A stopped handle is dropped
- * from the ledger (its slot stays reserved, so the next pass respawns it) and
- * its death is charged to backoff: a recovery if the worker was enabled and
- * stayed up past the dwell threshold, an escalation otherwise.  A database no
- * longer in the enabled set is dropped with no accrual — a deliberate disable
- * must never read as a crash-loop — which also covers a worker that FATALs at
- * connect on a since-dropped database.
+ * stamped, so its eventual uptime can be measured.  A stopped handle is settled
+ * by its stop reason: a crash is charged to backoff (a recovery if it stayed up
+ * past the dwell threshold, an escalation otherwise) and dropped; a disable is
+ * dropped with no accrual, since a deliberate disable must never read as a
+ * crash-loop.  Either way the slot stays reserved so the next pass respawns.  A
+ * stop that is part of an in-flight restart is left untouched here: the restart
+ * convergence pass owns that handle and respawns it in place.
  */
 static void
 ReconcileLedgerLiveness(List *enabled, TimestampTz now)
@@ -700,15 +786,25 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 		if (status != BGWH_STOPPED)
 			continue;
 
-		if (IsDeliberateStop(enabled, w))
-			VamanaWorkerBackoffClear(w->dbOid);
-		else
+		switch (ClassifyWorkerStop(enabled, w))
 		{
-			bool		recovered = w->started_time != 0 &&
-				TimestampDifferenceMilliseconds(w->started_time, now) >=
-				VAMANA_BACKOFF_DWELL_RESET_MS;
+			case STOP_RESTART_DRAIN:
+				/* Convergence owns this handle; do not touch it. */
+				continue;
 
-			VamanaWorkerBackoffRecordDeath(w->dbOid, recovered);
+			case STOP_DISABLED:
+				VamanaWorkerBackoffClear(w->dbOid);
+				break;
+
+			case STOP_CRASH:
+				{
+					bool		recovered = w->started_time != 0 &&
+						TimestampDifferenceMilliseconds(w->started_time, now) >=
+						VAMANA_BACKOFF_DWELL_RESET_MS;
+
+					VamanaWorkerBackoffRecordDeath(w->dbOid, recovered);
+					break;
+				}
 		}
 
 		WorkerLedger = foreach_delete_current(WorkerLedger, lc);
@@ -722,7 +818,7 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
  * TerminateBackgroundWorker delivers SIGTERM, which the flag-only handler turns
  * into the graceful drain-and-stop; the next reconcile pass observes the
  * stopped handle, drops the ledger entry with no backoff accrual
- * (IsDeliberateStop), and leaves the slot reserved so the paused database stays
+ * (STOP_DISABLED), and leaves the slot reserved so the paused database stays
  * configured.  Idempotent: a worker still draining reports BGWH_STARTED, so a
  * repeat wakeup re-signals it harmlessly.
  */
@@ -766,8 +862,7 @@ ExecuteRestartAction(VamanaRestartAction action, VamanaLauncherWorker *ledger,
 			break;
 
 		case RESTART_RESPAWN:
-			SpawnWorker(db, now);
-			ledger->serviced_generation = ledger->restart_state.target_generation;
+			RespawnWorker(ledger, db, now);
 			break;
 	}
 }
@@ -791,7 +886,6 @@ ReconcileRestartConvergence(List *enabled, TimestampTz now)
 
 		handle_status = GetBackgroundWorkerPid(ledger_entry->handle, &pid);
 		action = VamanaRestartStateAdvance(&ledger_entry->restart_state,
-										   ledger_entry->serviced_generation,
 										   db->restart_generation,
 										   handle_status,
 										   now);

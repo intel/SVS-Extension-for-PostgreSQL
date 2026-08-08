@@ -14,6 +14,7 @@
 
 #include "vamana.h"
 #include "vamanaworker.h"
+#include "vamana_subxid_pending_array.h"
 
 #include "access/xact.h"
 #include "miscadmin.h"
@@ -365,11 +366,6 @@ VamanaWorkerReserveSlot(Oid dbOid)
  * aborted DROP INDEX applying its decrement inline would under-count and let
  * the DELETE through while a live index remains.  So a CREATE/DROP queues a
  * delta here and the atomic is written only at COMMIT, never on abort.
- *
- * This mirrors the transaction-journal shape of vamana_undo.c and the
- * reservation queue in vamana_databases.c: a TopTransactionContext-scoped,
- * subxid-tagged pending list drained by an xact callback, pruned per
- * subtransaction by a subxact callback.
  * ----------------------------------------------------------------------- */
 
 typedef struct PendingIndexCountDelta
@@ -379,15 +375,8 @@ typedef struct PendingIndexCountDelta
 	SubTransactionId subxid;
 }			PendingIndexCountDelta;
 
-typedef struct PendingIndexCountList
-{
-	PendingIndexCountDelta *entries;
-	int			count;
-	int			capacity;
-}			PendingIndexCountList;
-
 /* Per-backend (per-transaction) list; reset to NULL at transaction end. */
-static PendingIndexCountList * CurrentIndexCountDeltas = NULL;
+static VamanaSubxidPendingArray * CurrentIndexCountDeltas = NULL;
 
 static bool indexCountCallbacksRegistered = false;
 
@@ -397,19 +386,15 @@ static void VamanaIndexCountSubXactCallback(SubXactEvent event,
 											SubTransactionId parentSubid,
 											void *arg);
 
-static PendingIndexCountList *
+static VamanaSubxidPendingArray *
 GetOrCreateIndexCountDeltas(void)
 {
 	if (CurrentIndexCountDeltas == NULL)
-	{
-		MemoryContext oldCtx = MemoryContextSwitchTo(TopTransactionContext);
-
-		CurrentIndexCountDeltas = palloc0(sizeof(PendingIndexCountList));
-		CurrentIndexCountDeltas->capacity = 16;
-		CurrentIndexCountDeltas->entries =
-			palloc(CurrentIndexCountDeltas->capacity * sizeof(PendingIndexCountDelta));
-		MemoryContextSwitchTo(oldCtx);
-	}
+		CurrentIndexCountDeltas =
+			VamanaSubxidPendingArrayCreate(TopTransactionContext,
+									 sizeof(PendingIndexCountDelta),
+									 offsetof(PendingIndexCountDelta, subxid),
+									 16);
 	return CurrentIndexCountDeltas;
 }
 
@@ -432,25 +417,12 @@ EnsureIndexCountCallbacksRegistered(void)
 void
 VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta)
 {
-	PendingIndexCountList *list;
+	PendingIndexCountDelta *entry;
 
 	EnsureIndexCountCallbacksRegistered();
-	list = GetOrCreateIndexCountDeltas();
-
-	if (list->count >= list->capacity)
-	{
-		MemoryContext oldCtx = MemoryContextSwitchTo(TopTransactionContext);
-
-		list->capacity *= 2;
-		list->entries = repalloc(list->entries,
-								 list->capacity * sizeof(PendingIndexCountDelta));
-		MemoryContextSwitchTo(oldCtx);
-	}
-
-	list->entries[list->count].dbOid = dbOid;
-	list->entries[list->count].delta = delta;
-	list->entries[list->count].subxid = GetCurrentSubTransactionId();
-	list->count++;
+	entry = VamanaSubxidPendingArrayAppend(GetOrCreateIndexCountDeltas());
+	entry->dbOid = dbOid;
+	entry->delta = delta;
 }
 
 /*
@@ -486,29 +458,31 @@ ApplyIndexCountDelta(Oid dbOid, int delta)
 static void
 ApplyPendingIndexCountDeltas(void)
 {
-	PendingIndexCountList *list = CurrentIndexCountDeltas;
+	VamanaSubxidPendingArray *list = CurrentIndexCountDeltas;
 
 	if (list == NULL)
 		return;
 
 	for (int i = 0; i < list->count; i++)
 	{
-		Oid			dbOid = list->entries[i].dbOid;
+		PendingIndexCountDelta *entryI = VamanaSubxidPendingArrayEntryAt(list, i);
+		Oid			dbOid = entryI->dbOid;
 		int			net = 0;
 
 		/* Skip entries already folded into an earlier pass or aborted. */
-		if (dbOid == InvalidOid ||
-			list->entries[i].subxid == InvalidSubTransactionId)
+		if (dbOid == InvalidOid || entryI->subxid == InvalidSubTransactionId)
 			continue;
 
 		for (int j = i; j < list->count; j++)
 		{
-			if (list->entries[j].dbOid != dbOid ||
-				list->entries[j].subxid == InvalidSubTransactionId)
+			PendingIndexCountDelta *entryJ = VamanaSubxidPendingArrayEntryAt(list, j);
+
+			if (entryJ->dbOid != dbOid ||
+				entryJ->subxid == InvalidSubTransactionId)
 				continue;
 
-			net += list->entries[j].delta;
-			list->entries[j].dbOid = InvalidOid;
+			net += entryJ->delta;
+			entryJ->dbOid = InvalidOid;
 		}
 
 		ApplyIndexCountDelta(dbOid, net);
@@ -554,16 +528,10 @@ static void
 VamanaIndexCountSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 								SubTransactionId parentSubid, void *arg)
 {
-	PendingIndexCountList *list = CurrentIndexCountDeltas;
-
-	if (event != SUBXACT_EVENT_ABORT_SUB || list == NULL)
+	if (event != SUBXACT_EVENT_ABORT_SUB || CurrentIndexCountDeltas == NULL)
 		return;
 
-	for (int i = 0; i < list->count; i++)
-	{
-		if (list->entries[i].subxid == mySubid)
-			list->entries[i].subxid = InvalidSubTransactionId;
-	}
+	VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentIndexCountDeltas, mySubid);
 }
 
 /* -----------------------------------------------------------------------
@@ -797,45 +765,40 @@ VamanaWorkerShmemRequest(void)
 LWLock *
 VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid)
 {
-	int			free_slot = -1;
-
 	Assert(OidIsValid(relid));
 
-	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
+	for (;;)
 	{
-		VamanaIndexLockSlot *ls = &entry->indexLocks[i];
-		uint32		cur = pg_atomic_read_u32(&ls->relid);
+		int			free_slot = -1;
+		uint32		expected;
 
-		if (cur == (uint32) relid)
-			return &ls->lock;
-
-		if (cur == 0 && free_slot < 0)
-			free_slot = i;
-	}
-
-	if (free_slot < 0)
-	{
-		ereport(WARNING,
-				(errmsg("vamana worker: index lock table full (VAMANA_MAX_INDEXES=%d); "
-						"cannot allocate lock for index %u",
-						VAMANA_MAX_INDEXES, relid)));
-		return NULL;
-	}
-
-	/* CAS 0 → relid to claim the slot */
-	{
-		uint32		expected = 0;
-
-		if (!pg_atomic_compare_exchange_u32(
-											&entry->indexLocks[free_slot].relid,
-											&expected, (uint32) relid))
+		for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 		{
-			/* Lost the race; search again (recursive retry) */
-			return VamanaGetIndexLock(entry, relid);
-		}
-	}
+			VamanaIndexLockSlot *ls = &entry->indexLocks[i];
+			uint32		cur = pg_atomic_read_u32(&ls->relid);
 
-	return &entry->indexLocks[free_slot].lock;
+			if (cur == (uint32) relid)
+				return &ls->lock;
+
+			if (cur == 0 && free_slot < 0)
+				free_slot = i;
+		}
+
+		if (free_slot < 0)
+		{
+			ereport(WARNING,
+					(errmsg("vamana worker: index lock table full (VAMANA_MAX_INDEXES=%d); "
+							"cannot allocate lock for index %u",
+							VAMANA_MAX_INDEXES, relid)));
+			return NULL;
+		}
+
+		/* CAS 0 → relid to claim the slot; on a lost race, rescan from the top. */
+		expected = 0;
+		if (pg_atomic_compare_exchange_u32(&entry->indexLocks[free_slot].relid,
+											&expected, (uint32) relid))
+			return &entry->indexLocks[free_slot].lock;
+	}
 }
 
 void

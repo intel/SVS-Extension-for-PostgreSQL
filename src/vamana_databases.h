@@ -21,11 +21,4 @@ typedef struct VamanaDatabasesReservationEntry
 	SubTransactionId subxid;
 } VamanaDatabasesReservationEntry;
 
-typedef struct VamanaDatabasesReservationList
-{
-	VamanaDatabasesReservationEntry *entries;
-	int			count;
-	int			capacity;
-} VamanaDatabasesReservationList;
-
 #endif							/* VAMANA_DATABASES_H */

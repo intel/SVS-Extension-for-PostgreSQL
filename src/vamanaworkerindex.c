@@ -80,6 +80,72 @@ VamanaWorkerResetStaleSlots(void)
 }
 
 /*
+ * Table has 0 vectors: cache an entry with svsIndex=NULL.  The dynamic index
+ * is built lazily on first INSERT (SVS requires at least 1 vector for build).
+ */
+static void
+CacheEmptyTableIndex(Relation indexRel, Oid relid)
+{
+	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+	int			dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
+
+	VamanaCacheIndex(relid, NULL, dims,
+					  opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
+					  opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
+					  NULL, 0, 0, 0, 0);
+}
+
+/*
+ * Load relid's graph from its on-disk checkpoint, or rebuild it from the heap
+ * if there is no saved copy or the table has no rows yet.  *loadedFromDisk is
+ * set true only when the on-disk checkpoint was used.
+ */
+static SVSIndexHandle
+LoadIndexFromDiskOrRebuild(Relation indexRel, Oid relid, bool *loadedFromDisk)
+{
+	SVSIndexHandle index;
+
+	index = LoadIndexFromPages(indexRel);
+	CHECK_FOR_INTERRUPTS();
+	if (index != NULL)
+	{
+		if (loadedFromDisk != NULL)
+			*loadedFromDisk = true;
+		return index;
+	}
+
+	ereport(LOG,
+			(errmsg("vamana worker: no saved copy for index %u, rebuilding", relid)));
+	index = VamanaRebuildFromTable(indexRel);
+	CHECK_FOR_INTERRUPTS();
+	if (index != NULL)
+		TrySaveAfterRebuild(indexRel, index, relid);
+	else
+		CacheEmptyTableIndex(indexRel, relid);
+
+	return index;
+}
+
+/*
+ * Backfill the cache entry's heap linkage and lazily open its replication
+ * slot.  A no-op past the first call for relid (replicationSlot stays set).
+ */
+static void
+FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
+{
+	VamanaIndexCache *cache = VamanaGetCache(relid);
+
+	if (cache == NULL)
+		return;
+
+	cache->heapRelid = indexRel->rd_index->indrelid;
+	cache->vectorAttNum = indexRel->rd_index->indkey.values[0] - 1;
+
+	if (cache->replicationSlot == NULL)
+		cache->replicationSlot = VamanaReplicationOpen(VamanaWorkerShmemPtr->dbOid, relid);
+}
+
+/*
  * VamanaWorkerGetOrLoadIndex
  *
  * Return the cached SVSIndexHandle for the given index OID.  If the index is
@@ -126,52 +192,8 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 	PG_TRY();
 	{
 		indexRel = index_open(relid, NoLock);
-		index = LoadIndexFromPages(indexRel);
-		CHECK_FOR_INTERRUPTS();
-		if (index != NULL)
-		{
-			if (loadedFromDisk != NULL)
-				*loadedFromDisk = true;
-		}
-		else
-		{
-			ereport(LOG,
-					(errmsg("vamana worker: no saved copy for index %u, rebuilding", relid)));
-			index = VamanaRebuildFromTable(indexRel);
-			CHECK_FOR_INTERRUPTS();
-			if (index != NULL)
-				TrySaveAfterRebuild(indexRel, index, relid);
-			else
-			{
-				/*
-				 * Table has 0 vectors.  Cache an entry with svsIndex=NULL.
-				 * The dynamic index will be built lazily on first INSERT
-				 * (SVS requires at least 1 vector for build).
-				 */
-				VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
-				int		dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
-
-				VamanaCacheIndex(relid, NULL, dims,
-								opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
-								opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
-								NULL, 0, 0, 0, 0);
-			}
-		}
-
-		{
-			VamanaIndexCache *cache = VamanaGetCache(relid);
-
-			if (cache != NULL)
-			{
-				cache->heapRelid    = indexRel->rd_index->indrelid;
-				cache->vectorAttNum = indexRel->rd_index->indkey.values[0] - 1;
-
-				if (cache->replicationSlot == NULL)
-					cache->replicationSlot = VamanaReplicationOpen(
-						VamanaWorkerShmemPtr->dbOid, relid);
-			}
-		}
-
+		index = LoadIndexFromDiskOrRebuild(indexRel, relid, loadedFromDisk);
+		FinalizeIndexCacheEntry(indexRel, relid);
 		index_close(indexRel, AccessShareLock);
 	}
 	PG_CATCH();

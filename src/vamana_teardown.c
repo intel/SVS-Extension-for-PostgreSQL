@@ -20,9 +20,9 @@
 
 #include "postgres.h"
 
+#include "vamana_subxact_guard.h"
 #include "vamanaworker.h"
 
-#include "access/xact.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "utils/builtins.h"
@@ -92,64 +92,50 @@ EnumerateVamanaIndexes(MemoryContext resultCtx, int *nout)
 	return targets;
 }
 
+static void
+DropIndexBody(void *arg)
+{
+	const char *qualifiedName = (const char *) arg;
+	StringInfoData cmd;
+
+	initStringInfo(&cmd);
+	appendStringInfo(&cmd, "DROP INDEX %s", qualifiedName);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "svs_teardown_database: SPI_connect failed");
+	if (SPI_execute(cmd.data, false, 0) != SPI_OK_UTILITY)
+		elog(ERROR, "svs_teardown_database: DROP INDEX %s failed", qualifiedName);
+	SPI_finish();
+
+	pfree(cmd.data);
+}
+
 /*
  * Drop one index inside its own subtransaction.  Returns true on success
  * (*reason = NULL); on a caught error returns false with *reason copied into
  * resultCtx (ownership failure, concurrent drop, etc.), leaving the outer
  * transaction alive so the caller can continue with the next index.
- *
- * The subtransaction scaffolding mirrors ReplayChangeGuarded() in
- * vamana_replication.c; the difference is disposition: this captures the error
- * text for the result set rather than logging and discarding it.
  */
 static bool
 TryDropIndex(const TeardownTarget *target, MemoryContext resultCtx, char **reason)
 {
-	MemoryContext oldCtx = CurrentMemoryContext;
-	ResourceOwner oldOwner = CurrentResourceOwner;
-	StringInfoData cmd;
+	VamanaSubXactResult result;
 
-	initStringInfo(&cmd);
-	appendStringInfo(&cmd, "DROP INDEX %s", target->qualifiedName);
+	result = VamanaRunInSubXact(DropIndexBody, target->qualifiedName, NULL);
 
-	BeginInternalSubTransaction(NULL);
-	MemoryContextSwitchTo(oldCtx);
-
-	PG_TRY();
+	if (result.succeeded)
 	{
-		if (SPI_connect() != SPI_OK_CONNECT)
-			elog(ERROR, "svs_teardown_database: SPI_connect failed");
-		if (SPI_execute(cmd.data, false, 0) != SPI_OK_UTILITY)
-			elog(ERROR, "svs_teardown_database: DROP INDEX %s failed",
-				 target->qualifiedName);
-		SPI_finish();
-
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldCtx);
-		CurrentResourceOwner = oldOwner;
-
 		*reason = NULL;
 	}
-	PG_CATCH();
+	else
 	{
-		ErrorData  *edata;
+		MemoryContext oldCtx = MemoryContextSwitchTo(resultCtx);
 
+		*reason = pstrdup(result.edata->message);
 		MemoryContextSwitchTo(oldCtx);
-		edata = CopyErrorData();
-
-		MemoryContextSwitchTo(resultCtx);
-		*reason = pstrdup(edata->message);
-
-		FreeErrorData(edata);
-		FlushErrorState();
-
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldCtx);
-		CurrentResourceOwner = oldOwner;
+		FreeErrorData(result.edata);
 	}
-	PG_END_TRY();
 
-	pfree(cmd.data);
 	return (*reason == NULL);
 }
 

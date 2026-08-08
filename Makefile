@@ -12,6 +12,8 @@ OBJS = src/svs.o \
        src/vamana_replication.o \
        src/vamana_checkpoint.o \
        src/vamana_undo.o \
+       src/vamana_subxid_pending_array.o \
+       src/vamana_subxact_guard.o \
        src/vamanabuild.o \
        src/vamanacache.o \
        src/vamanaio.o \
@@ -20,6 +22,7 @@ OBJS = src/svs.o \
        src/vamanautils.o \
        src/vamanavacuum.o \
        src/vamanaworker.o \
+       src/vamanaworkerstats.o \
        src/vamanaworkershmem.o \
        src/vamanaworkerindex.o \
        src/vamanaworkersearch.o \

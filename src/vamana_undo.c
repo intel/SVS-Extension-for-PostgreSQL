@@ -22,6 +22,7 @@
 
 #include "vamana_undo.h"
 #include "vamanaworker.h"
+#include "vamana_subxid_pending_array.h"
 
 #include "access/xact.h"
 #include "utils/memutils.h"
@@ -37,19 +38,8 @@ typedef struct VamanaUndoEntry
 	SubTransactionId subxid;
 }			VamanaUndoEntry;
 
-/*
- * Per-transaction log.  Allocated in TopTransactionContext on first insert.
- * The array grows by doubling; entries are appended, never removed.
- */
-typedef struct VamanaUndoLog
-{
-	VamanaUndoEntry *entries;
-	int			nEntries;
-	int			capacity;
-}			VamanaUndoLog;
-
 /* Per-backend (per-transaction) log; reset to NULL at transaction end. */
-static VamanaUndoLog * CurrentUndoLog = NULL;
+static VamanaSubxidPendingArray * CurrentUndoLog = NULL;
 
 /* Whether we have registered the xact / subxact callbacks (once per backend). */
 static bool undoCallbacksRegistered = false;
@@ -65,18 +55,14 @@ static void VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
  * Internal helpers
  * ----------------------------------------------------------------------- */
 
-static VamanaUndoLog *
+static VamanaSubxidPendingArray *
 GetOrCreateUndoLog(void)
 {
 	if (CurrentUndoLog == NULL)
-	{
-		MemoryContext oldCtx = MemoryContextSwitchTo(TopTransactionContext);
-
-		CurrentUndoLog = palloc0(sizeof(VamanaUndoLog));
-		CurrentUndoLog->capacity = 16;
-		CurrentUndoLog->entries = palloc(16 * sizeof(VamanaUndoEntry));
-		MemoryContextSwitchTo(oldCtx);
-	}
+		CurrentUndoLog = VamanaSubxidPendingArrayCreate(TopTransactionContext,
+												  sizeof(VamanaUndoEntry),
+												  offsetof(VamanaUndoEntry, subxid),
+												  16);
 	return CurrentUndoLog;
 }
 
@@ -104,27 +90,12 @@ EnsureCallbacksRegistered(void)
 void
 VamanaUndoAppend(Oid indexRelid, uint64 externalId)
 {
-	VamanaUndoLog *log;
-	MemoryContext oldCtx;
+	VamanaUndoEntry *entry;
 
 	EnsureCallbacksRegistered();
-	log = GetOrCreateUndoLog();
-
-	if (log->nEntries >= log->capacity)
-	{
-		int			newCap = log->capacity * 2;
-
-		oldCtx = MemoryContextSwitchTo(TopTransactionContext);
-		log->entries = repalloc(log->entries,
-								newCap * sizeof(VamanaUndoEntry));
-		MemoryContextSwitchTo(oldCtx);
-		log->capacity = newCap;
-	}
-
-	log->entries[log->nEntries].indexRelid = indexRelid;
-	log->entries[log->nEntries].externalId = externalId;
-	log->entries[log->nEntries].subxid = GetCurrentSubTransactionId();
-	log->nEntries++;
+	entry = VamanaSubxidPendingArrayAppend(GetOrCreateUndoLog());
+	entry->indexRelid = indexRelid;
+	entry->externalId = externalId;
 }
 
 /* -----------------------------------------------------------------------
@@ -174,9 +145,9 @@ VamanaXactCallback(XactEvent event, void *arg)
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			{
-				VamanaUndoLog *log = CurrentUndoLog;
+				VamanaSubxidPendingArray *log = CurrentUndoLog;
 
-				if (log != NULL && log->nEntries > 0 && VamanaWorkerIsAvailable())
+				if (log != NULL && log->count > 0 && VamanaWorkerIsAvailable())
 				{
 					size_t		batchIds[VAMANA_MAX_DELETE_IDS];
 					int			batchCount = 0;
@@ -184,12 +155,14 @@ VamanaXactCallback(XactEvent event, void *arg)
 					Oid			consolidateRelids[VAMANA_MAX_INDEXES];
 					int			nConsolidate = 0;
 
-					qsort(log->entries, log->nEntries,
+					qsort(log->entries, log->count,
 						  sizeof(VamanaUndoEntry), undo_entry_cmp_by_relid);
 
-					for (int i = 0; i < log->nEntries; i++)
+					for (int i = 0; i < log->count; i++)
 					{
-						if (log->entries[i].indexRelid != currentRelid ||
+						VamanaUndoEntry *entry = VamanaSubxidPendingArrayEntryAt(log, i);
+
+						if (entry->indexRelid != currentRelid ||
 							batchCount >= (int) VAMANA_MAX_DELETE_IDS)
 						{
 							if (batchCount > 0)
@@ -203,10 +176,10 @@ VamanaXactCallback(XactEvent event, void *arg)
 									consolidateRelids[nConsolidate++] = currentRelid;
 							}
 
-							currentRelid = log->entries[i].indexRelid;
+							currentRelid = entry->indexRelid;
 							batchCount = 0;
 						}
-						batchIds[batchCount++] = (size_t) log->entries[i].externalId;
+						batchIds[batchCount++] = (size_t) entry->externalId;
 					}
 					if (batchCount > 0)
 					{
@@ -236,7 +209,7 @@ VamanaXactCallback(XactEvent event, void *arg)
 			}
 
 		case XACT_EVENT_PREPARE:
-			if (CurrentUndoLog != NULL && CurrentUndoLog->nEntries > 0)
+			if (CurrentUndoLog != NULL && CurrentUndoLog->count > 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("vamana index does not support two-phase commit")));
@@ -251,7 +224,7 @@ static void
 VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 					  SubTransactionId parentSubid, void *arg)
 {
-	VamanaUndoLog *log = CurrentUndoLog;
+	VamanaSubxidPendingArray *log = CurrentUndoLog;
 	size_t		batchIds[VAMANA_MAX_DELETE_IDS];
 	int			batchCount = 0;
 	Oid			currentRelid = InvalidOid;
@@ -259,7 +232,7 @@ VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 	if (event != SUBXACT_EVENT_ABORT_SUB)
 		return;
 
-	if (log == NULL || log->nEntries == 0 || !VamanaWorkerIsAvailable())
+	if (log == NULL || log->count == 0 || !VamanaWorkerIsAvailable())
 		return;
 
 	/*
@@ -267,23 +240,25 @@ VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 	 * relid.  We iterate in insertion order; entries for the same index are
 	 * typically adjacent, so batching works without a full qsort.
 	 */
-	for (int i = 0; i < log->nEntries; i++)
+	for (int i = 0; i < log->count; i++)
 	{
-		if (log->entries[i].subxid != mySubid)
+		VamanaUndoEntry *entry = VamanaSubxidPendingArrayEntryAt(log, i);
+
+		if (entry->subxid != mySubid)
 			continue;
 
-		if (log->entries[i].indexRelid != currentRelid ||
+		if (entry->indexRelid != currentRelid ||
 			batchCount >= (int) VAMANA_MAX_DELETE_IDS)
 		{
 			if (batchCount > 0)
 				undo_flush_batch(currentRelid, batchIds, batchCount);
 
-			currentRelid = log->entries[i].indexRelid;
+			currentRelid = entry->indexRelid;
 			batchCount = 0;
 		}
-		batchIds[batchCount++] = (size_t) log->entries[i].externalId;
+		batchIds[batchCount++] = (size_t) entry->externalId;
 
-		log->entries[i].subxid = InvalidSubTransactionId;
+		entry->subxid = InvalidSubTransactionId;
 	}
 	if (batchCount > 0)
 		undo_flush_batch(currentRelid, batchIds, batchCount);

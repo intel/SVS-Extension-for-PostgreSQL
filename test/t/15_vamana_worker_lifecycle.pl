@@ -17,6 +17,44 @@ use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
 
+# Poll until the vamana worker pid differs from $old (and is numeric), or
+# timeout.  Returns the new pid, or '' on timeout.  wait_for_worker reports only
+# the current pid, so a restart's new pid needs its own wait.
+sub wait_for_new_worker_pid
+{
+    my ($node, $old, $attempts) = @_;
+    $attempts //= 60;
+    for my $i (1 .. $attempts)
+    {
+        usleep(500_000);
+        my $pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
+        chomp $pid;
+        return $pid if $pid =~ /^\d+$/ && $pid ne $old;
+    }
+    return '';
+}
+
+# Sample the worker pid every 0.5s for $secs seconds and return the number of
+# distinct pids seen.  A settled worker yields exactly one; a terminate/respawn
+# loop yields many.
+sub count_distinct_worker_pids
+{
+    my ($node, $secs) = @_;
+    my %seen;
+    for my $i (1 .. ($secs * 2))
+    {
+        my $pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
+        chomp $pid;
+        $seen{$pid} = 1 if $pid =~ /^\d+$/;
+        usleep(500_000);
+    }
+    return scalar keys %seen;
+}
+
 # A SIGTERM must run the graceful drain, not raise FATAL mid-loop.  The drain's
 # entry log line proves the flag-only handler is in effect: had the handler set
 # ProcDiePending, the next CHECK_FOR_INTERRUPTS would FATAL before the drain
@@ -836,6 +874,87 @@ SKIP: {
         "immediate shutdown request reaches the postmaster");
     unlike($log, qr/vamana background worker shutting down/,
         "immediate shutdown skips the worker drain");
+}
+
+# svs_restart_worker bounces a database's worker exactly once and then settles.
+# The regression it guards against is a perpetual terminate/respawn loop: the
+# liveness pass reaping the stopped handle before restart convergence can
+# respawn it, so the worker never converges and its pid churns forever.
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_restart');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+    $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    $node->safe_psql("postgres", qq(
+        CREATE TABLE restart_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO restart_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 200) i;
+        CREATE INDEX restart_idx ON restart_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    my $pid1 = wait_for_worker($node, 30);
+    ok($pid1 =~ /^\d+$/, "worker running before restart (pid=$pid1)");
+
+    $node->safe_psql("postgres", "SELECT svs_restart_worker('postgres');");
+
+    my $pid2 = wait_for_new_worker_pid($node, $pid1);
+    ok($pid2 =~ /^\d+$/, "worker respawned with a new pid (pid=$pid2)");
+    isnt($pid2, $pid1, "restart replaced the worker (pid $pid1 -> $pid2)");
+
+    # Once respawned, the worker must hold steady: exactly one pid over the
+    # window, not a churn of terminate/respawn cycles.
+    my $distinct = count_distinct_worker_pids($node, 6);
+    is($distinct, 1,
+        "worker pid holds steady after restart (no terminate/respawn loop)");
+
+    # A second call bounces the worker again, proving repeatability.
+    $node->safe_psql("postgres", "SELECT svs_restart_worker('postgres');");
+    my $pid3 = wait_for_new_worker_pid($node, $pid2);
+    ok($pid3 =~ /^\d+$/ && $pid3 ne $pid2,
+        "second restart bounces the worker again (pid=$pid3)");
+
+    $node->stop;
+}
+
+# svs_restart_worker rejects databases it cannot restart with actionable errors,
+# leaving restart_generation untouched.
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_restart_errors');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->start;
+
+    $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+    $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', false);");
+
+    my ($rc, $out, $err) = $node->psql('postgres',
+        "SELECT svs_restart_worker('postgres');");
+    isnt($rc, 0, "restart on a paused database errors");
+    like($err, qr/is paused/, "paused database error is actionable");
+
+    ($rc, $out, $err) = $node->psql('postgres',
+        "SELECT svs_restart_worker('no_such_db');");
+    isnt($rc, 0, "restart on an unconfigured database errors");
+    like($err, qr/is not configured for vamana/,
+        "unconfigured database error is actionable");
+
+    $node->stop;
 }
 
 done_testing();

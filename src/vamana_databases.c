@@ -22,6 +22,7 @@
 
 #include "vamana_databases.h"
 #include "vamanaworker.h"
+#include "vamana_subxid_pending_array.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -39,7 +40,7 @@
 #define VAMANA_DATABASES_QUEUE_INITIAL_CAPACITY	16
 
 /* Reset to NULL at transaction end, alongside TopTransactionContext. */
-static VamanaDatabasesReservationList *CurrentReservationQueue = NULL;
+static VamanaSubxidPendingArray *CurrentReservationQueue = NULL;
 
 /* dbOids reserved by this transaction; released on ABORT. TopTransactionContext-scoped. */
 static List *ReservedThisXactDbOids = NIL;
@@ -55,44 +56,28 @@ static void VamanaDatabasesSubXactCallback(SubXactEvent event,
 static void ReserveSlotsForEnabledEntries(void);
 static void ReleaseSlotsReservedThisXact(void);
 
-static VamanaDatabasesReservationList *
+static VamanaSubxidPendingArray *
 GetOrCreateReservationQueue(void)
 {
 	if (CurrentReservationQueue == NULL)
-	{
-		MemoryContext oldContext = MemoryContextSwitchTo(TopTransactionContext);
-
-		CurrentReservationQueue = palloc0(sizeof(VamanaDatabasesReservationList));
-		CurrentReservationQueue->capacity = VAMANA_DATABASES_QUEUE_INITIAL_CAPACITY;
-		CurrentReservationQueue->entries =
-			palloc(CurrentReservationQueue->capacity * sizeof(VamanaDatabasesReservationEntry));
-		MemoryContextSwitchTo(oldContext);
-	}
+		CurrentReservationQueue =
+			VamanaSubxidPendingArrayCreate(TopTransactionContext,
+									 sizeof(VamanaDatabasesReservationEntry),
+									 offsetof(VamanaDatabasesReservationEntry, subxid),
+									 VAMANA_DATABASES_QUEUE_INITIAL_CAPACITY);
 	return CurrentReservationQueue;
 }
 
 static void
 QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_generation)
 {
-	VamanaDatabasesReservationList *queue = GetOrCreateReservationQueue();
-	VamanaDatabasesReservationEntry *entry;
+	VamanaDatabasesReservationEntry *entry =
+		VamanaSubxidPendingArrayAppend(GetOrCreateReservationQueue());
 
-	if (queue->count >= queue->capacity)
-	{
-		MemoryContext oldContext = MemoryContextSwitchTo(TopTransactionContext);
-
-		queue->capacity *= 2;
-		queue->entries = repalloc(queue->entries,
-								   queue->capacity * sizeof(VamanaDatabasesReservationEntry));
-		MemoryContextSwitchTo(oldContext);
-	}
-
-	entry = &queue->entries[queue->count++];
 	namestrcpy(&entry->datname, NameStr(*datname));
 	entry->dbOid = dbOid;
 	entry->enabled = enabled;
 	entry->restart_generation = restart_generation;
-	entry->subxid = GetCurrentSubTransactionId();
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_queue_reservation);
@@ -261,16 +246,10 @@ static void
 VamanaDatabasesSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 								SubTransactionId parentSubid, void *arg)
 {
-	VamanaDatabasesReservationList *queue = CurrentReservationQueue;
-
-	if (event != SUBXACT_EVENT_ABORT_SUB || queue == NULL)
+	if (event != SUBXACT_EVENT_ABORT_SUB || CurrentReservationQueue == NULL)
 		return;
 
-	for (int i = 0; i < queue->count; i++)
-	{
-		if (queue->entries[i].subxid == mySubid)
-			queue->entries[i].subxid = InvalidSubTransactionId;
-	}
+	VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentReservationQueue, mySubid);
 }
 
 /*
@@ -280,7 +259,7 @@ VamanaDatabasesSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 static void
 ReserveSlotsForEnabledEntries(void)
 {
-	VamanaDatabasesReservationList *queue = CurrentReservationQueue;
+	VamanaSubxidPendingArray *queue = CurrentReservationQueue;
 	MemoryContext oldContext;
 
 	if (queue == NULL)
@@ -290,7 +269,7 @@ ReserveSlotsForEnabledEntries(void)
 
 	for (int i = 0; i < queue->count; i++)
 	{
-		VamanaDatabasesReservationEntry *entry = &queue->entries[i];
+		VamanaDatabasesReservationEntry *entry = VamanaSubxidPendingArrayEntryAt(queue, i);
 
 		if (!entry->enabled || entry->subxid == InvalidSubTransactionId)
 			continue;
