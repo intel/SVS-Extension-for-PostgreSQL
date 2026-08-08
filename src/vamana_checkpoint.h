@@ -10,5 +10,6 @@
 
 bool	ShouldCheckpoint(VamanaIndexCache *cache);
 void	PerformCheckpoint(VamanaIndexCache *cache);
+void	VamanaCheckpointCachedIndex(VamanaIndexCache *cache);
 
 #endif							/* VAMANA_CHECKPOINT_H */

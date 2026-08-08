@@ -297,6 +297,14 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	Size		dataSize;
 	int			error_code;
 
+	/*
+	 * Reject the build up front if this database is not enabled for vamana: the
+	 * index could never be served here, and the check is a property of the
+	 * database, not of the heap's contents.  Doing it before the scan also
+	 * avoids wasting a full table scan on a permanent misconfiguration.
+	 */
+	VamanaWorkerAssertDatabase();
+
 	InitBuildState(&buildstate, heap, index, indexInfo, MAIN_FORKNUM);
 
 	CreateMetaPage(&buildstate);
@@ -407,13 +415,6 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	/* Serialize index to disk so the BGW can adopt it. */
 	SerializeIndexToPages(&buildstate, svsIndex);
-
-	/*
-	 * Fail immediately if the worker is running for a different database —
-	 * this is a permanent misconfiguration and the index will never be
-	 * usable here.
-	 */
-	VamanaWorkerAssertDatabase();
 
 	/*
 	 * Synchronous warm-up: send a LOAD slot to the BGW so the index is in

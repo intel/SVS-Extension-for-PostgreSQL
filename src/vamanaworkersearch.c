@@ -45,24 +45,15 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	SVSIndexHandle index;
 
 	/*
-	 * Get or load the index.  If not cached we need a transaction, but we
-	 * avoid opening one if the index is already in process memory.
+	 * Get or load the index.  Avoid the transaction and catch-up drain if the
+	 * index is already warm in process memory.
 	 */
 	{
 		bool		needsRebuild;
 
 		index = VamanaGetCachedIndex(relid, &needsRebuild);
 		if (needsRebuild)
-		{
-			SetCurrentStatementStartTimestamp();
-			StartTransactionCommand();
-			PushActiveSnapshot(GetTransactionSnapshot());
-
-			index = VamanaWorkerGetOrLoadIndex(relid);
-
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-		}
+			index = VamanaWorkerEnsureIndexCurrent(relid);
 	}
 
 	/*
@@ -104,7 +95,7 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	 * and kills the worker.
 	 */
 	{
-		LWLock	   *rwlock = VamanaGetIndexLock(relid);
+		LWLock	   *rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
 		bool		batch_done = false;
 
 		if (rwlock != NULL)
@@ -160,7 +151,7 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 
 					for (int i = 0; i < n; i++)
 						memcpy(queryBuf + (size_t) i * dims,
-							   VamanaWorkerSlotQueryVec(slotIdxs[i]),
+							   VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdxs[i]),
 							   dims * sizeof(float));
 
 					total = SVSBatchSearch(relid, index,
@@ -178,8 +169,8 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 						if (total >= 0)
 						{
 							int			nr = nrBuf[i];
-							ItemPointer resptr = VamanaWorkerSlotResults(slotIdx);
-							float	   *distptr = VamanaWorkerSlotDistances(slotIdx);
+							ItemPointer resptr = VamanaWorkerSlotResults(VamanaWorkerShmemPtr, slotIdx);
+							float	   *distptr = VamanaWorkerSlotDistances(VamanaWorkerShmemPtr, slotIdx);
 
 							if (nr > 0)
 							{
@@ -228,9 +219,9 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 				{
 					int			slotIdx = slotIdxs[i];
 					VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
-					float	   *qvec = VamanaWorkerSlotQueryVec(slotIdx);
-					ItemPointer resptr = VamanaWorkerSlotResults(slotIdx);
-					float	   *distptr = VamanaWorkerSlotDistances(slotIdx);
+					float	   *qvec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
+					ItemPointer resptr = VamanaWorkerSlotResults(VamanaWorkerShmemPtr, slotIdx);
+					float	   *distptr = VamanaWorkerSlotDistances(VamanaWorkerShmemPtr, slotIdx);
 					int			nr;
 
 					nr = SVSSearch(relid, index,

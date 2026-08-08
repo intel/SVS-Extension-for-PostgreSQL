@@ -80,21 +80,94 @@ VamanaWorkerResetStaleSlots(void)
 }
 
 /*
+ * Table has 0 vectors: cache an entry with svsIndex=NULL.  The dynamic index
+ * is built lazily on first INSERT (SVS requires at least 1 vector for build).
+ */
+static void
+CacheEmptyTableIndex(Relation indexRel, Oid relid)
+{
+	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+	int			dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
+
+	VamanaCacheIndex(relid, NULL, dims,
+					  opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
+					  opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
+					  NULL, 0, 0, 0, 0);
+}
+
+/*
+ * Load relid's graph from its on-disk checkpoint, or rebuild it from the heap
+ * if there is no saved copy or the table has no rows yet.  *loadedFromDisk is
+ * set true only when the on-disk checkpoint was used.
+ */
+static SVSIndexHandle
+LoadIndexFromDiskOrRebuild(Relation indexRel, Oid relid, bool *loadedFromDisk)
+{
+	SVSIndexHandle index;
+
+	index = LoadIndexFromPages(indexRel);
+	CHECK_FOR_INTERRUPTS();
+	if (index != NULL)
+	{
+		if (loadedFromDisk != NULL)
+			*loadedFromDisk = true;
+		return index;
+	}
+
+	ereport(LOG,
+			(errmsg("vamana worker: no saved copy for index %u, rebuilding", relid)));
+	index = VamanaRebuildFromTable(indexRel);
+	CHECK_FOR_INTERRUPTS();
+	if (index != NULL)
+		TrySaveAfterRebuild(indexRel, index, relid);
+	else
+		CacheEmptyTableIndex(indexRel, relid);
+
+	return index;
+}
+
+/*
+ * Backfill the cache entry's heap linkage and lazily open its replication
+ * slot.  A no-op past the first call for relid (replicationSlot stays set).
+ */
+static void
+FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
+{
+	VamanaIndexCache *cache = VamanaGetCache(relid);
+
+	if (cache == NULL)
+		return;
+
+	cache->heapRelid = indexRel->rd_index->indrelid;
+	cache->vectorAttNum = indexRel->rd_index->indkey.values[0] - 1;
+
+	if (cache->replicationSlot == NULL)
+		cache->replicationSlot = VamanaReplicationOpen(VamanaWorkerShmemPtr->dbOid, relid);
+}
+
+/*
  * VamanaWorkerGetOrLoadIndex
  *
  * Return the cached SVSIndexHandle for the given index OID.  If the index is
  * not yet in the worker's in-process cache, open the relation, try to load
  * from disk, and fall back to a full rebuild.  Returns NULL on failure.
  *
+ * When loadedFromDisk is non-NULL it is set true only if the handle came from
+ * the on-disk checkpoint (not a heap rebuild): such a handle predates any
+ * post-checkpoint commit still pending in the replication slot.
+ *
  * Must be called from within an active transaction (or the caller must open
  * one).
  */
 SVSIndexHandle
-VamanaWorkerGetOrLoadIndex(Oid relid)
+VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 {
 	bool		needsRebuild;
 	SVSIndexHandle index;
 	Relation	indexRel;
+
+	if (loadedFromDisk != NULL)
+		*loadedFromDisk = false;
 
 	/* Fast path: already loaded */
 	index = VamanaGetCachedIndex(relid, &needsRebuild);
@@ -119,47 +192,8 @@ VamanaWorkerGetOrLoadIndex(Oid relid)
 	PG_TRY();
 	{
 		indexRel = index_open(relid, NoLock);
-		index = LoadIndexFromPages(indexRel);
-		CHECK_FOR_INTERRUPTS();
-		if (index == NULL)
-		{
-			ereport(LOG,
-					(errmsg("vamana worker: no saved copy for index %u, rebuilding", relid)));
-			index = VamanaRebuildFromTable(indexRel);
-			CHECK_FOR_INTERRUPTS();
-			if (index != NULL)
-				TrySaveAfterRebuild(indexRel, index, relid);
-			else
-			{
-				/*
-				 * Table has 0 vectors.  Cache an entry with svsIndex=NULL.
-				 * The dynamic index will be built lazily on first INSERT
-				 * (SVS requires at least 1 vector for build).
-				 */
-				VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
-				int		dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
-
-				VamanaCacheIndex(relid, NULL, dims,
-								opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
-								opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
-								NULL, 0, 0, 0, 0);
-			}
-		}
-
-		{
-			VamanaIndexCache *cache = VamanaGetCache(relid);
-
-			if (cache != NULL)
-			{
-				cache->heapRelid    = indexRel->rd_index->indrelid;
-				cache->vectorAttNum = indexRel->rd_index->indkey.values[0] - 1;
-
-				if (cache->replicationSlot == NULL)
-					cache->replicationSlot = VamanaReplicationOpen(
-						VamanaWorkerShmemPtr->dbOid, relid);
-			}
-		}
-
+		index = LoadIndexFromDiskOrRebuild(indexRel, relid, loadedFromDisk);
+		FinalizeIndexCacheEntry(indexRel, relid);
 		index_close(indexRel, AccessShareLock);
 	}
 	PG_CATCH();
@@ -176,57 +210,73 @@ VamanaWorkerGetOrLoadIndex(Oid relid)
 }
 
 /*
- * VamanaWorkerLoadAllIndexes
+ * Return the cached handle for relid, loaded and caught up to current WAL.
  *
- * At worker startup, enumerate all Vamana indexes in the connected database
- * via SPI and pre-load each one.  Called inside a transaction.
+ * A primary persists the graph only at checkpoint and applies later commits
+ * from its replication slot.  After a crash the reloaded on-disk copy predates
+ * those commits, so a fresh disk load is drained once to replay them.  A heap
+ * rebuild already reflects every committed row, so it is not drained: doing so
+ * would re-apply post-checkpoint commits the rebuild already contains.
+ *
+ * Owns its transaction; the caller must not open one.  Returns NULL on failure.
  */
-void
-VamanaWorkerLoadAllIndexes(void)
+SVSIndexHandle
+VamanaWorkerEnsureIndexCurrent(Oid relid)
 {
-	int			ret;
-	uint64		nindexes;
-	MemoryContext oldctx;
-
-	vamana_eviction_suppressed = true;
+	bool		loadedFromDisk;
+	bool		needsRebuild;
+	SVSIndexHandle index;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
+	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	if (index == NULL || !loadedFromDisk)
+		return index;
+
+	VamanaReplicationDrainSlot(relid);
+
+	/* A replay error may have rebuilt the index under a new handle. */
+	return VamanaGetCachedIndex(relid, &needsRebuild);
+}
+
+/*
+ * Enumerate every vamana index in the current database, returning a palloc'd
+ * List of index relid Oids (NIL if none).  Owns only the SPI session:
+ * connect, execute VAMANA_ENUM_INDEXES_IN_DB_SQL, collect, finish.
+ *
+ * Precondition: the caller holds an open transaction with a pushed snapshot.
+ * The two callers reach this from incompatible transaction contexts — the
+ * standby loader opens and commits its own txn; the startup seed runs inside
+ * the worker's already-open startup txn — so the transaction lifecycle stays
+ * the caller's concern, not this wrapper's.
+ */
+List *
+VamanaWorkerEnumerateIndexes(void)
+{
+	List	   *relids = NIL;
+	MemoryContext callerctx = CurrentMemoryContext;
+	uint64		nindexes;
+
+	Assert(IsTransactionState());
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 	{
-		PopActiveSnapshot();
-		AbortCurrentTransaction();
-		vamana_eviction_suppressed = false;
 		ereport(WARNING, (errmsg("vamana worker: SPI_connect failed")));
-		return;
+		return NIL;
 	}
 
-	/*
-	 * Find all Vamana index OIDs in this database.  We join through pg_class
-	 * and pg_am so we don't hardcode an OID.
-	 */
-	ret = SPI_execute(
-					  "SELECT c.oid "
-					  "FROM pg_catalog.pg_class c "
-					  "JOIN pg_catalog.pg_am a ON a.oid = c.relam "
-					  "WHERE a.amname = 'vamana' AND c.relkind = 'i'",
-					  true, 0);
-
-	if (ret != SPI_OK_SELECT)
+	if (SPI_execute(VAMANA_ENUM_INDEXES_IN_DB_SQL, true, 0) != SPI_OK_SELECT)
 	{
 		SPI_finish();
-		PopActiveSnapshot();
-		AbortCurrentTransaction();
-		vamana_eviction_suppressed = false;
 		ereport(WARNING, (errmsg("vamana worker: failed to enumerate indexes")));
-		return;
+		return NIL;
 	}
 
 	nindexes = SPI_processed;
-	oldctx = MemoryContextSwitchTo(TopMemoryContext);
-
 	for (uint64 i = 0; i < nindexes; i++)
 	{
 		bool		isnull;
@@ -234,53 +284,131 @@ VamanaWorkerLoadAllIndexes(void)
 											 SPI_getbinval(SPI_tuptable->vals[i],
 														   SPI_tuptable->tupdesc,
 														   1, &isnull));
+		MemoryContext oldctx;
 
 		if (isnull)
 			continue;
 
+		/* Build the result in the caller's context, not SPI's short-lived one. */
+		oldctx = MemoryContextSwitchTo(callerctx);
+		relids = lappend_oid(relids, relid);
 		MemoryContextSwitchTo(oldctx);
-
-		(void) VamanaWorkerGetOrLoadIndex(relid);
-
-		oldctx = MemoryContextSwitchTo(TopMemoryContext);
 	}
 
-	MemoryContextSwitchTo(oldctx);
 	SPI_finish();
+	return relids;
+}
+
+/*
+ * VamanaWorkerEnumerateIndexes in a self-contained transaction, returning the
+ * relids in TopMemoryContext.
+ */
+List *
+VamanaWorkerEnumerateAllIndexes(void)
+{
+	List	   *relids;
+	MemoryContext oldctx;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	oldctx = MemoryContextSwitchTo(TopMemoryContext);
+	relids = VamanaWorkerEnumerateIndexes();
+	MemoryContextSwitchTo(oldctx);
+
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	/*
-	 * A standby starts with no slots: base backup excludes pg_replslot, and the
-	 * primary write path that creates them never runs here.  Bootstrap one per
-	 * cached index now, outside any transaction as CreateOnStandby requires.
-	 * Replay any committed changes that arrived after the last checkpoint.
-	 *
-	 * Keep eviction suppressed so that relcache invalidations fired during
-	 * StartTransactionCommand do not evict entries between the OID snapshot
-	 * and the VamanaGetCache lookup.
-	 */
+	return relids;
+}
+
+/*
+ * Load a not-yet-cached standby index, suppressing eviction for the load so a
+ * relcache invalidation fired while opening the relation does not evict the
+ * entry being populated.  Owns its own transaction.
+ */
+static void
+VamanaStandbyLoadIndex(Oid relid)
+{
+	bool		prevSuppressed = vamana_eviction_suppressed;
+
+	vamana_eviction_suppressed = true;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	vamana_eviction_suppressed = prevSuppressed;
+}
+
+/*
+ * Release everything a standby holds for an index no longer in the live
+ * enumeration: the persistent slot (the orphaned-slot leak DROP INDEX redo
+ * would otherwise leave behind, since OAT_DROP never fires on standby redo),
+ * the index-lock reservation, and the in-memory cache entry.
+ */
+static void
+VamanaStandbyReleaseIndex(Oid relid)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerShmemPtr;
+
+	VamanaReplicationDropIfExists(entry->dbOid, relid);
+	VamanaReleaseIndexLock(entry, relid);
+	VamanaEvictCacheEntry(relid);
+}
+
+/*
+ * Slot activation reaches CONSISTENT asynchronously: a freshly created handle
+ * is not proof of it, so this checks the underlying slot rather than
+ * cache->replicationSlot != NULL.
+ */
+static bool
+VamanaStandbySlotIsLive(Oid relid)
+{
+	return VamanaReplicationSlotIsConsistent(VamanaWorkerShmemPtr->dbOid, relid);
+}
+
+/*
+ * Bring a standby's cache to match targetRelids: load what is missing,
+ * activate the slot (via the caller's activateSlot policy: blocking at
+ * startup, bounded from the main loop) for anything not yet live, and release
+ * anything cached that is no longer targeted.  Diffs against the live cache
+ * each call rather than tracking prior state, so a call left with an
+ * unconverged slot is safe to repeat.
+ */
+bool
+VamanaReconcileStandbyCache(List *targetRelids,
+							 void (*activateSlot) (Oid relid))
+{
+	Oid			cachedRelids[VAMANA_MAX_CACHED_INDEXES];
+	int			nCached = VamanaGetAllCachedRelids(cachedRelids,
+													VAMANA_MAX_CACHED_INDEXES);
+	bool		allConverged = true;
+
+	for (int i = 0; i < nCached; i++)
 	{
-		const VamanaReplayRole *role = VamanaGetReplayRole();
-		Oid		relids[VAMANA_MAX_CACHED_INDEXES];
-		int		n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
-
-		for (int i = 0; i < n; i++)
-		{
-			VamanaIndexCache *cache = VamanaGetCache(relids[i]);
-
-			if (role->creates_slot_on_load &&
-				cache != NULL && cache->replicationSlot == NULL)
-			{
-				VamanaReplicationCreateOnStandby(VamanaWorkerShmemPtr->dbOid,
-												 relids[i]);
-				cache->replicationSlot =
-					VamanaReplicationOpen(VamanaWorkerShmemPtr->dbOid, relids[i]);
-			}
-
-			VamanaReplicationDrainSlot(relids[i]);
-		}
+		if (!list_member_oid(targetRelids, cachedRelids[i]))
+			VamanaStandbyReleaseIndex(cachedRelids[i]);
 	}
 
-	vamana_eviction_suppressed = false;
+	foreach_oid(relid, targetRelids)
+	{
+		if (VamanaGetCache(relid) == NULL)
+			VamanaStandbyLoadIndex(relid);
+
+		if (!VamanaStandbySlotIsLive(relid))
+			activateSlot(relid);
+
+		if (!VamanaStandbySlotIsLive(relid))
+			allConverged = false;
+	}
+
+	return allConverged;
 }
+

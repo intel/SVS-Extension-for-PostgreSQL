@@ -31,6 +31,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE vp_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -149,6 +151,13 @@ use VamanaTestUtils qw(:all);
     my $log_pos_before_rebuild = length($node->log_content());
     $node->start;
 
+    # Demand-driven load: the rebuild fires only when a backend queries the
+    # index.  Issue the query, then read the progress LOG it produced.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM vp_progress_tbl ORDER BY val <-> '[0]' LIMIT 1;
+    ));
+
     my $rebuild_log = '';
     for (1 .. 30) {
         $rebuild_log = substr($node->log_content(), $log_pos_before_rebuild);
@@ -207,6 +216,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     # Deferred save after INSERT
     {
@@ -313,6 +324,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE bi_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -379,6 +392,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE rb_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -402,12 +417,28 @@ use VamanaTestUtils qw(:all);
 
     my $log_pos = length($node->log_content());
 
-    # Restart to trigger the rebuild path in VamanaWorkerGetOrLoadIndex.
+    # Restart to evict the cache; the rebuild fires on the first query.
     $node->restart;
-
-    # Wait for the BGW to come up and attempt the load/rebuild.
     wait_for_worker($node);
-    sleep(2);
+
+    # Query while the save dir is still locked so the post-rebuild save fails.
+    # An ORDER BY ... LIMIT is required: a distance predicate is not an
+    # indexable qual, so it would seqscan and never reach the worker.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM rb_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    my $save_failed = 0;
+    for (1 .. 20) {
+        if (substr($node->log_content(), $log_pos) =~
+            /save after rebuild failed, will retry; index durability degraded/)
+        {
+            $save_failed = 1;
+            last;
+        }
+        usleep(500_000);
+    }
 
     chmod(0755, $save_parent) or die "chmod 0755 $save_parent: $!";
 
@@ -456,6 +487,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE st_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -502,6 +535,12 @@ use VamanaTestUtils qw(:all);
     my $log_pos_before_test4 = length($node->log_content());
     $node->restart;
 
+    # Demand-driven load: query so SVSLoadIndex runs and logs its thread count.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM st_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
     my $log_test4 = '';
     for (1 .. 20) {
         $log_test4 = substr($node->log_content(), $log_pos_before_test4);
@@ -535,6 +574,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE lv_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -594,9 +635,19 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($after_insert, '', 'LeanVec query after INSERT returns results');
 
+    # Remove the on-disk index while the server is stopped: a running-server
+    # delete would be undone by the shutdown drain re-checkpointing the live
+    # index, so the restart would load from disk instead of rebuilding.
+    $node->stop;
     remove_tree($index_dir);
     my $log_pos_before_second_restart = length($node->log_content());
-    $node->restart;
+    $node->start;
+
+    # Demand-driven rebuild: query so the BGW scans the table and re-saves.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
 
     my $rebuild_wait_log = '';
     for (1 .. 20) {
@@ -661,6 +712,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     # Create LeanVec index without specifying leanvec_dims — defaults to -1
     $node->safe_psql("postgres", qq(
@@ -683,10 +736,19 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($baseline, '', 'LeanVec default-dims: initial query returns results');
 
-    # Force VamanaRebuildFromTable by removing the on-disk index before restart
+    # Force VamanaRebuildFromTable by removing the on-disk index while the
+    # server is stopped; a running-server delete would be undone by the
+    # shutdown drain re-checkpointing the live index.
+    $node->stop;
     remove_tree($index_dir);
     my $log_pos = length($node->log_content());
-    $node->restart;
+    $node->start;
+
+    # Demand-driven rebuild: query so the BGW scans the table and re-saves.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_default_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
 
     # Wait for BGW to complete rebuild
     my $rebuild_log = '';
@@ -727,7 +789,7 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
     $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
@@ -735,6 +797,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE hdr_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -769,12 +833,8 @@ use VamanaTestUtils qw(:all);
     $node->start;
     wait_for_worker($node, 30);
 
-    my $log = substr($node->log_content(), $log_pos);
-    like($log, qr/TID map .* is malformed or larger than expected/,
-        'corrupt tidmap.bin header rejected on load');
-    like($log, qr/rebuilding vamana index from table data/,
-        'index rebuilt from heap after rejection');
-
+    # Demand-driven load: the corrupt-TID-map rejection and heap rebuild fire
+    # only when a backend queries the index.
     my $count = $node->safe_psql('postgres', qq{
         SET enable_seqscan = off;
         SELECT count(*) FROM (
@@ -782,6 +842,13 @@ use VamanaTestUtils qw(:all);
         ) s;
     });
     chomp $count;
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/TID map .* is malformed or larger than expected/,
+        'corrupt tidmap.bin header rejected on load');
+    like($log, qr/rebuilding vamana index from table data/,
+        'index rebuilt from heap after rejection');
+
     is($count, 51, 'all 51 rows searchable after rebuild');
 
     $node->stop;

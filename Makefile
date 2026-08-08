@@ -8,9 +8,12 @@ MODULE_big = svs
 DATA = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/svs.o \
        src/vamana.o \
+       src/vamanalauncher.o \
        src/vamana_replication.o \
        src/vamana_checkpoint.o \
        src/vamana_undo.o \
+       src/vamana_subxid_pending_array.o \
+       src/vamana_subxact_guard.o \
        src/vamanabuild.o \
        src/vamanacache.o \
        src/vamanaio.o \
@@ -19,12 +22,16 @@ OBJS = src/svs.o \
        src/vamanautils.o \
        src/vamanavacuum.o \
        src/vamanaworker.o \
+       src/vamanaworkerstats.o \
        src/vamanaworkershmem.o \
        src/vamanaworkerindex.o \
        src/vamanaworkersearch.o \
        src/vamanaworkerwrite.o \
-       src/svs_wrapper.o
-HEADERS = src/vamana.h src/svs_wrapper.h
+       src/svs_wrapper.o \
+       src/vamana_databases.o \
+       src/vamana_teardown.o \
+       src/vamana_warmup.o
+HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))

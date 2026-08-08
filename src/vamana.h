@@ -103,6 +103,8 @@ extern int	vamana_checkpoint_min_ops;
 extern int	vamana_max_slot_wal_size_mb;
 extern int	vamana_checkpoint_operations;
 extern int	vamana_checkpoint_interval;
+extern int	vamana_shutdown_drain_budget_ms;
+extern int	vamana_worker_stop_timeout_ms;
 
 /* Vamana index options */
 typedef struct VamanaOptions 

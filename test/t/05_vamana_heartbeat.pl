@@ -26,11 +26,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $hb_dim  = 4;
     my $hb_seed = join(",", ('random()') x $hb_dim);
@@ -82,7 +84,7 @@ use VamanaTestUtils qw(:all);
 
     $hb_worker_pid = $node->safe_psql('postgres',
         "SELECT pid FROM pg_stat_activity "
-      . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+      . "WHERE backend_type = 'vamana worker' LIMIT 1;");
     chomp $hb_worker_pid;
 
     kill('STOP', $hb_worker_pid);

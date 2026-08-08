@@ -8,6 +8,8 @@
 
 #include "postgres.h"
 
+#include "datatype/timestamp.h"
+#include "nodes/pg_list.h"
 #include "port/atomics.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -47,6 +49,7 @@ typedef void *SVSIndexHandle;
 #define VAMANA_SLOTKIND_DELETE      2
 #define VAMANA_SLOTKIND_MAINTENANCE 3	/* consolidate / compact */
 #define VAMANA_SLOTKIND_LOAD        4	/* load index from save dir into BGW cache */
+#define VAMANA_SLOTKIND_WARMUP      5	/* force an index resident in the BGW cache on demand */
 
 /* Maintenance sub-operations (valid when slotKind == VAMANA_SLOTKIND_MAINTENANCE) */
 #define VAMANA_MAINTENANCE_CONSOLIDATE 0
@@ -130,13 +133,6 @@ typedef struct VamanaWorkerReloadRequest
 } VamanaWorkerReloadRequest;
 
 /*
- * Fixed header of the shared-memory region.
- *
- * The variable-length slot array is a FLEXIBLE_ARRAY_MEMBER; query vectors,
- * result TIDs, and distances are in three separate arrays immediately after
- * the slot array.  Use VamanaWorkerSlotQueryVec() etc. to locate them.
- */
-/*
  * Per-index reader/writer lock entry.  LW_SHARED for searches; LW_EXCLUSIVE
  * for writes (INSERT, DELETE, CONSOLIDATE, COMPACT, ADOPT).  Keyed by a
  * stable slot index assigned when the BGW first loads each index.
@@ -147,25 +143,68 @@ typedef struct VamanaIndexLockSlot
 	LWLock			lock;			/* the actual r/w lock */
 } VamanaIndexLockSlot;
 
+/*
+ * Launcher-owned crash-backoff state for one database, written only by the
+ * launcher under the shmem header LWLock.  Kept in shmem, not launcher-local
+ * memory, so the failure count survives a launcher restart; otherwise a
+ * crash-looping database would be respawned immediately on every launcher
+ * bounce.
+ */
+typedef struct VamanaLauncherBackoff
+{
+	TimestampTz	last_attempt_time;		/* when the launcher last (re)spawned */
+	uint32		consecutive_failures;	/* crashes since the last recovery */
+} VamanaLauncherBackoff;
+
+/*
+ * Per-database control block.
+ *
+ * One entry per database served by a worker, held in the fixed-size
+ * VamanaWorkerShmemHeader array below.  `dbOid == InvalidOid` marks a free
+ * entry; `workerPid == 0` marks an entry that is reserved (or whose worker
+ * crashed) but has no live worker process.  These two states are distinct:
+ * "no entry for this database" versus "entry exists, worker not up".
+ *
+ * The per-backend request slots, and their query-vector/result-TID/distance
+ * buffers, are not embedded here: each is variable-length (scaled by
+ * MaxBackends), and a struct containing one cannot itself be made fixed-size.
+ * They live in a separate shared-memory allocation reached through `slots`;
+ * use VamanaWorkerSlotQueryVec() etc. to locate the buffers that follow
+ * slots[maxSlots] in that allocation.
+ */
 typedef struct VamanaWorkerShmem
 {
-	Oid				dbOid;			/* database this worker serves */
+	Oid				dbOid;			/* database this worker serves; InvalidOid = free */
 
-	pid_t			workerPid;
+	pid_t			workerPid;		/* 0 = no live worker for this entry */
 	Latch			workerLatch;	/* InitSharedLatch'd; worker owns this */
+
+	/* Intake gate: 1 while accepting requests, cleared with a full barrier at drain. */
+	pg_atomic_uint32 accepting;
 
 	VamanaWorkerReloadRequest reloadRequests[VAMANA_MAX_RELOAD_QUEUE];
 
 	/*
 	 * Set to 1 by a backend when reloadRequests[] is full.  The worker
-	 * responds by reloading all cached indexes on its next cycle.
+	 * responds by evicting all cached indexes on its next cycle; each reloads
+	 * on demand.
 	 */
-	pg_atomic_uint32 reload_all;
+	pg_atomic_uint32 evict_all;
 
 	/* Updated each BGW loop iteration; backends check for hung worker. */
 	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
 
+	/*
+	 * Live Vamana indexes in this database.  Maintained with plain atomics
+	 * (no array-wide lock) by the backend performing CREATE/DROP INDEX; read
+	 * by the DELETE guard and the pg_stat_vamana_worker view.
+	 */
+	pg_atomic_uint32 indexCount;
+
 	int				maxSlots;
+
+	/* Launcher-owned; see VamanaLauncherBackoff. */
+	VamanaLauncherBackoff backoff;
 
 	/*
 	 * Per-index r/w locks.  Up to VAMANA_MAX_INDEXES concurrent live indexes.
@@ -175,42 +214,163 @@ typedef struct VamanaWorkerShmem
 	 */
 	VamanaIndexLockSlot indexLocks[VAMANA_MAX_INDEXES];
 
-	VamanaWorkerSlot slots[FLEXIBLE_ARRAY_MEMBER];
-	/*
-	 * After slots[maxSlots]:
-	 *   float        queryVecs[maxSlots][VAMANA_MAX_DIM]
-	 *   ItemPointerData results[maxSlots][VAMANA_MAX_SEARCH_WINDOW]
-	 *   float        distances[maxSlots][VAMANA_MAX_SEARCH_WINDOW]
-	 *
-	 * Access via VamanaWorkerSlotQueryVec() / SlotResults() / SlotDistances().
-	 */
+	VamanaWorkerSlot *slots;		/* array of maxSlots entries; see above */
 } VamanaWorkerShmem;
 
+/*
+ * Fixed-size array of per-database control blocks.
+ *
+ * Sized once at postmaster start from max_vamana_databases and never
+ * reallocated, so an entry's address is stable for the postmaster's
+ * lifetime.  `lock` serialises entry (de)reservation: shared mode to look
+ * up an entry by dbOid, exclusive mode to claim or release one (which is
+ * what changes numActive).  Per-entry hot fields (indexCount, slot status)
+ * are plain atomics and do not take this lock.
+ */
+typedef struct VamanaWorkerShmemHeader
+{
+	LWLock		   *lock;			/* array-wide reservation lock */
+	int				numSlots;		/* capacity == max_vamana_databases */
+	int				numActive;		/* entries with a valid dbOid (under lock) */
+
+	/*
+	 * Set true, once, by the launcher after it has reserved a slot for every
+	 * enabled database in its startup scan.  Until then a database's absence
+	 * from slots[] is indistinguishable from "scan not yet run", so callers
+	 * must not treat "no slot" as authoritative for "not configured".  Reset
+	 * to false only by a postmaster restart (shmem re-init), never by a
+	 * launcher restart.  Guarded by lock.
+	 */
+	bool			initialScanDone;
+
+	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
+} VamanaWorkerShmemHeader;
+
+extern int	 max_vamana_databases;
 extern int	 vamana_worker_timeout_ms;
 extern int	 vamana_worker_startup_timeout_ms;
 extern int	 vamana_worker_restart_time;
+extern int	 vamana_worker_restart_backoff;
 extern int	 vamana_max_batch_size;
-extern char *vamana_worker_database;
+extern char *vamana_launcher_database;
 
+extern VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr;
 extern VamanaWorkerShmem *VamanaWorkerShmemPtr;
 
 Size	VamanaWorkerShmemSize(void);
 void	VamanaWorkerShmemStartup(void);		/* shmem_startup_hook */
 void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_init */
-void	VamanaWorkerRegister(void);			/* called from _PG_init */
+
+/* vamanaworkershmem.c: per-database control-block lookup and reservation */
+VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
+VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
+void	VamanaWorkerReleaseSlot(Oid dbOid);
+void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
+
+/*
+ * Iterate every reserved control block under one LW_SHARED pass, invoking cb
+ * per entry while the header lock is held.  The callback is shmem-generic — it
+ * receives a locked reserved entry and its own ctx, and does its copy-out
+ * before the lock drops; the shmem layer never learns any consumer's DTO.
+ *
+ * entry is not const: reading its presentation atomics (heartbeat_ts,
+ * indexCount, per-slot status) goes through pg_atomic_read_*, which take a
+ * non-const volatile pointer.  The callback must still treat it as read-only.
+ */
+typedef void (*VamanaReservedEntryCb) (VamanaWorkerShmem *entry, void *ctx);
+void	VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx);
+
+/* vamanaworkershmem.c: launcher-owned crash-backoff state (header lock) */
+bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);
+void	VamanaWorkerBackoffStampAttempt(Oid dbOid, TimestampTz now);
+void	VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered);
+void	VamanaWorkerBackoffClear(Oid dbOid);
+
+/*
+ * Lock-free backoff predicate for callers that already hold the header lock
+ * (the stats hydration pass): true iff the worker has unrecovered crashes and
+ * is in the launcher's respawn-backoff regime.  Reads entry->backoff directly;
+ * distinct from the lock-acquiring VamanaWorkerBackoffSnapshot, which would
+ * re-enter the non-recursive header LWLock if called under it.
+ */
+bool	VamanaWorkerIsBackingOff(const VamanaWorkerShmem *entry);
+
+/* vamanaworkershmem.c: launcher initial-scan publication (header lock) */
+void	VamanaWorkerSetInitialScanDone(void);
+bool	VamanaWorkerInitialScanDone(void);
+
+/* vamanaworkershmem.c: true iff every slot is occupied (capacity exhausted). */
+bool	VamanaWorkerSlotsExhausted(void);
 
 /* vamanaworkershmem.c */
-LWLock *VamanaGetIndexLock(Oid relid);
+LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
 int		VamanaSlotErrcode(uint8 category);
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
 
+/*
+ * True when the error currently being handled is the query-cancel raised by the
+ * SIGTERM handler.  Recovery handlers that self-heal decode failures call this
+ * from their PG_CATCH to decline a shutdown cancel, which is not a decode
+ * failure and must reach the drain owner in VamanaWorkerMain.  Only meaningful
+ * inside an error handler; keys on the errcode, not just the flag, so a genuine
+ * decode error raised during the drain still self-heals.
+ */
+bool	VamanaShutdownCancelPending(void);
+
+/*
+ * Pure staleness kernel over a raw heartbeat and a reference clock; shared by
+ * the live entry-path check and the snapshot-path worker-state classifier.
+ */
+bool	VamanaHeartbeatIsStale(uint64 rawHb, TimestampTz now);
+
+/*
+ * Counter-maintenance policy: is indexCount kept current on this node?  Derived
+ * from the node fact (VamanaNodeIsPrimary) but named separately, so a future
+ * primary-side pause of maintenance cannot silently mislabel worker_state.
+ * Gates the startup seed, the zero-index log-once, and the SRF's standby NULL.
+ */
+bool	VamanaIndexCountIsMaintained(void);
+
+/* Primary-only: seed indexCount to the live count in the worker startup txn. */
+void	VamanaWorkerSeedIndexCount(void);
+
 /* vamanaworkerindex.c */
-SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid);
-void	VamanaWorkerLoadAllIndexes(void);
+
+/*
+ * Enumerates every vamana index in the current database, one c.oid per row.
+ * Shared by the standby loader and svs_teardown_database() so the definition
+ * of "a vamana index" stays in one place.  Joins pg_am so the AM oid is not
+ * hardcoded.
+ */
+#define VAMANA_ENUM_INDEXES_IN_DB_SQL \
+	"SELECT c.oid " \
+	"FROM pg_catalog.pg_class c " \
+	"JOIN pg_catalog.pg_am a ON a.oid = c.relam " \
+	"WHERE a.amname = 'vamana' AND c.relkind = 'i'"
+
+/*
+ * SPI kernel over VAMANA_ENUM_INDEXES_IN_DB_SQL: connect, execute, collect,
+ * finish.  Returns a palloc'd List of index relid Oids (NIL if none).
+ * Precondition: caller holds an open transaction with a pushed snapshot
+ * (asserted); the wrapper owns the SPI session, not the transaction.  Callers
+ * reduce as their grain needs: the standby loader loads each relid, the startup
+ * seed counts them.
+ */
+List   *VamanaWorkerEnumerateIndexes(void);
+
+/* VamanaWorkerEnumerateIndexes wrapped in its own transaction. */
+List   *VamanaWorkerEnumerateAllIndexes(void);
+
+SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk);
+SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid);
 void	VamanaWorkerResetStaleSlots(void);
+
+/* Converges a standby's cache onto targetRelids; returns true once every relid has a live slot. */
+bool	VamanaReconcileStandbyCache(List *targetRelids,
+									void (*activateSlot) (Oid relid));
 
 /* vamanaworkersearch.c */
 void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);
@@ -218,6 +378,7 @@ void	VamanaWorkerDispatchBatch(int *slotIdxs, int n);
 /* vamanaworkerwrite.c */
 void	VamanaWorkerProcessWriteSlot(int slotIdx);
 void	VamanaWorkerProcessLoadSlot(int slotIdx);
+void	VamanaWorkerProcessWarmupSlot(int slotIdx);
 
 /* Worker entry point.
  * PG 18 replaced pg_attribute_noreturn() with pg_noreturn (placed before
@@ -247,15 +408,17 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 							   int numVectors, int tidMappingCapacity,
 							   uint64 nextExternalId, int numDeleted,
 							   Oid heapRelid, int vectorAttNum);
-void	VamanaReleaseIndexLock(Oid relid);
+bool	VamanaWorkerSubmitWarmup(Oid indexRelid);
+void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
+VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);
 bool	VamanaWorkerIsAvailable(void);
 void	VamanaWorkerAssertDatabase(void);
 void	VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation);
 
-float		  *VamanaWorkerSlotQueryVec(int slotIdx);
-ItemPointer	   VamanaWorkerSlotResults(int slotIdx);
-float		  *VamanaWorkerSlotDistances(int slotIdx);
+float		  *VamanaWorkerSlotQueryVec(VamanaWorkerShmem *entry, int slotIdx);
+ItemPointer	   VamanaWorkerSlotResults(VamanaWorkerShmem *entry, int slotIdx);
+float		  *VamanaWorkerSlotDistances(VamanaWorkerShmem *entry, int slotIdx);
 
 /*
  * Parameters for VAMANA_SLOTKIND_LOAD, packed into the queryVec buffer.

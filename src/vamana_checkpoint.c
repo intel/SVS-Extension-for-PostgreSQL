@@ -27,6 +27,7 @@
 #include "vamana.h"
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
+#include "vamanaworker.h"
 
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -132,7 +133,7 @@ PerformCheckpoint(VamanaIndexCache *cache)
 		index_close(indexRel, AccessShareLock);
 		indexRel = NULL;
 
-		/* Phase 5: advance slot only after on-disk state is durable. */
+		/* Advance slot only after on-disk state is durable. */
 		VamanaSlotAdvance(cache->replicationSlot, checkpoint_lsn);
 	}
 	PG_CATCH();
@@ -155,4 +156,36 @@ PerformCheckpoint(VamanaIndexCache *cache)
 	ereport(DEBUG1,
 			(errmsg("vamana index %u: checkpoint complete, slot advanced to %X/%X",
 					cache->indexRelid, LSN_FORMAT_ARGS(checkpoint_lsn))));
+}
+
+/*
+ * Checkpoint one cached index: the transaction/snapshot ritual around
+ * PerformCheckpoint.  Suppresses eviction for the duration, because
+ * AcceptInvalidationMessages inside StartTransactionCommand/index_open can fire
+ * VamanaRelcacheCallback and free the SVSIndexHandle mid-save.  The PG_CATCH
+ * only restores the suppression global and re-throws; it never absorbs the
+ * error.
+ */
+void
+VamanaCheckpointCachedIndex(VamanaIndexCache *cache)
+{
+	bool		prevSuppressed = vamana_eviction_suppressed;
+
+	PG_TRY();
+	{
+		vamana_eviction_suppressed = true;
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		PerformCheckpoint(cache);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		vamana_eviction_suppressed = prevSuppressed;
+	}
+	PG_CATCH();
+	{
+		vamana_eviction_suppressed = prevSuppressed;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }

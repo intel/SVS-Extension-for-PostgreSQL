@@ -37,11 +37,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $ss_dim  = 4;
     my $ss_seed = join(",", ('random()') x $ss_dim);
@@ -71,7 +73,7 @@ use VamanaTestUtils qw(:all);
     sleep(2);
 
     my $nonempty = $node->safe_psql('postgres',
-        "SELECT count(*) FROM pg_stat_vamana_worker "
+        "SELECT count(*) FROM pg_stat_vamana_worker_slot "
       . "WHERE slot_status <> 'empty';");
     chomp $nonempty;
     ok($nonempty eq '0', 'all slots empty after BGW startup (VamanaWorkerResetStaleSlots)');
@@ -98,11 +100,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
     $node->safe_psql('postgres', 'CREATE EXTENSION vector');
     $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE t_cold (id serial PRIMARY KEY, val vector($dim));
@@ -147,11 +151,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
     $node->safe_psql('postgres', 'CREATE EXTENSION vector');
     $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE t1 (id serial PRIMARY KEY, val vector($dim));
@@ -194,6 +200,106 @@ use VamanaTestUtils qw(:all);
 }
 
 # ===========================================================================
+# Empty-table first INSERT that throws — worker must survive
+#
+# An empty-table CREATE INDEX caches an entry with svsIndex=NULL; the dynamic
+# index is built lazily on the first INSERT, which also creates the index's
+# replication slot.  That build path runs inside VamanaWorkerProcessWriteSlot,
+# whose contract is "must not throw: all errors become VAMANA_SLOT_ERROR".
+# Here we exhaust the replication-slot budget so slot creation throws.  The
+# error must be converted to a per-request slot error, NOT escape and kill the
+# worker.  The observable guarantee is a stable worker PID and continued
+# service.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('empty_insert_fault');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 4");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 4");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.worker_timeout_ms = 3000");
+    $node->start;
+
+    $node->safe_psql('postgres', 'CREATE EXTENSION vector');
+    $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $ef_dim = 4;
+    my $ef_vec = join(",", map { sprintf("%.4f", rand()) } 1 .. $ef_dim);
+
+    # Empty-table CREATE INDEX: caches an svsIndex=NULL entry, creates no slot.
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE t_empty (id serial PRIMARY KEY, val vector($ef_dim));
+        CREATE INDEX ON t_empty USING vamana (val vector_l2_ops);
+    });
+
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid =~ /^\d+$/, "worker running before fault (pid=$worker_pid)");
+
+    # Warm the empty index so the first INSERT takes the empty-table build path.
+    $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT id FROM t_empty ORDER BY val <-> '[$ef_vec]' LIMIT 1;
+    });
+
+    # Exhaust the replication-slot budget so VamanaReplicationCreate throws.
+    my $filled = 0;
+    for my $i (1 .. 8)
+    {
+        last unless eval {
+            $node->safe_psql('postgres',
+                "SELECT pg_create_physical_replication_slot('fill_$i');");
+            1;
+        };
+        $filled++;
+    }
+    ok($filled > 0, "replication slot budget exhausted ($filled slots)");
+
+    # First INSERT into the empty index throws in the build path.  The backend
+    # gets an error either way; what this pins down is that the worker survives.
+    eval {
+        $node->safe_psql('postgres',
+            "INSERT INTO t_empty (val) VALUES ('[$ef_vec]');");
+    };
+
+    my $worker_survived = 1;
+    for (1 .. 20)
+    {
+        usleep(250_000);
+        my $pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker' LIMIT 1;");
+        chomp $pid;
+        if ($pid ne $worker_pid) { $worker_survived = 0; last; }
+    }
+    ok($worker_survived,
+        "worker survives a throwing empty-table first INSERT (pid stable at $worker_pid)");
+
+    # Free a slot and confirm the worker still serves end to end.
+    $node->safe_psql('postgres', "SELECT pg_drop_replication_slot('fill_1');");
+    my $live_seed = join(",", ('random()') x $ef_dim);
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE t_live (id serial PRIMARY KEY, val vector($ef_dim));
+        INSERT INTO t_live (val)
+            SELECT ARRAY[$live_seed]::vector FROM generate_series(1, 20);
+        CREATE INDEX ON t_live USING vamana (val vector_l2_ops);
+    });
+
+    my $served = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT count(*) FROM (
+            SELECT id FROM t_live ORDER BY val <-> '[$ef_vec]' LIMIT 5
+        ) sub;
+    });
+    chomp $served;
+    ok($served == 5, "worker still serving after the fault (got $served results)");
+
+    $node->stop;
+}
+
+# ===========================================================================
 # BGW evicts cache after VACUUM FULL / CLUSTER
 #
 # VACUUM FULL and CLUSTER replace the heap relfilenode without calling any
@@ -207,11 +313,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $ri_dim  = 4;
     my $ri_seed = join(",", ('random()') x $ri_dim);
@@ -229,7 +337,7 @@ use VamanaTestUtils qw(:all);
         usleep(500_000);
         my $pid = $node->safe_psql('postgres',
             "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
         chomp $pid;
         if ($pid =~ /^\d+$/) { $worker_up = 1; last; }
     }
@@ -286,12 +394,14 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $rw_dim = 8;
     my $rw_seed = join(",", ('random()') x $rw_dim);
@@ -373,12 +483,14 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'warning'");
     $node->start;
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE lock_leak_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -451,11 +563,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $cw_dim  = 4;
     my $cw_seed = join(",", ('random()') x $cw_dim);
@@ -508,7 +622,7 @@ use VamanaTestUtils qw(:all);
     {
         usleep(100_000);
         my $status = $node->safe_psql('postgres',
-            "SELECT slot_status FROM pg_stat_vamana_worker "
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
           . "WHERE slot_status = 'pending' LIMIT 1;");
         chomp $status;
         if ($status eq 'pending') { $slot_pending = 1; last; }
@@ -535,7 +649,7 @@ use VamanaTestUtils qw(:all);
     {
         usleep(100_000);
         my $nonempty = $node->safe_psql('postgres',
-            "SELECT count(*) FROM pg_stat_vamana_worker "
+            "SELECT count(*) FROM pg_stat_vamana_worker_slot "
           . "WHERE slot_status <> 'empty';");
         chomp $nonempty;
         if ($nonempty eq '0') { $slot_empty = 1; last; }

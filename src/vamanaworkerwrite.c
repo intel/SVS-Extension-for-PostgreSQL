@@ -25,6 +25,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
+#include "replication/slot.h"
 #include "storage/lwlock.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -33,6 +34,30 @@
 /* -----------------------------------------------------------------------
  * Write slot execution
  * ----------------------------------------------------------------------- */
+
+/*
+ * Persist the cached counters to the index metapage in a short-lived
+ * transaction.  Shared by every write path that mutates the cache.
+ */
+static void
+VamanaWorkerPersistMetaCounters(Oid relid, VamanaIndexCache *cache)
+{
+	Relation	indexRel;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	indexRel = index_open(relid, AccessShareLock);
+	VamanaWriteMetaPageDynamic(indexRel,
+							   cache->nextExternalId,
+							   (uint32) cache->numVectors,
+							   (uint32) cache->numDeleted,
+							   (uint32) cache->tidMappingCapacity,
+							   MAIN_FORKNUM);
+	index_close(indexRel, AccessShareLock);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+}
 
 /*
  * Build the dynamic SVS index using the first INSERT vector as seed data.
@@ -135,24 +160,273 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 }
 
 /*
- * VamanaWorkerProcessWriteSlot
- *
- * Execute a single non-SEARCH slot (INSERT / DELETE / MAINTENANCE)
- * under the per-index LW_EXCLUSIVE lock.  Writes DONE or ERROR into the slot
- * status.  SetLatch on the waiting backend is the caller's responsibility.
- *
- * Called from VamanaWorkerProcessRequests after the slot has been transitioned
- * to PROCESSING.  The function must not throw: all errors are caught and
- * converted into VAMANA_SLOT_ERROR.
+ * Empty-table CREATE INDEX leaves a cache entry with svsIndex=NULL because SVS
+ * requires at least one vector to build.  The first INSERT builds the dynamic
+ * index from the incoming vector as seed and lazily creates the index's
+ * replication slot.  Marks the slot DONE on success; throws on failure so the
+ * caller's guard converts it into VAMANA_SLOT_ERROR.
  */
-void
-VamanaWorkerProcessWriteSlot(int slotIdx)
+static void
+VamanaWorkerBuildEmptyTableIndex(int slotIdx)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Oid			relid = slot->indexRelid;
+	VamanaIndexCache *cache = VamanaGetCache(relid);
+	SVSIndexHandle index = NULL;
+
+	if (cache != NULL && slot->slotKind == VAMANA_SLOTKIND_INSERT)
+		index = VamanaWorkerBuildFirstInsert(relid, cache,
+											 VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx),
+											 &slot->writeHeapTid);
+
+	if (index == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("vamana worker: index %u not loaded for write", relid)));
+
+	/* Seed vector is already indexed by the build; no external ID to return. */
+	slot->writeExternalId = 0;
+
+	if (cache->replicationSlot == NULL)
+	{
+		VamanaReplicationCreate(VamanaWorkerShmemPtr->dbOid, relid);
+		cache->replicationSlot = VamanaReplicationOpen(
+			VamanaWorkerShmemPtr->dbOid, relid);
+		cache->lastReplayLsn = GetFlushRecPtr(NULL);
+	}
+
+	VamanaWorkerPersistMetaCounters(relid, cache);
+
+	cache->opsSinceCheckpoint++;
+	cache->lastWriteTime = GetCurrentTimestamp();
+	pg_write_barrier();
+	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+}
+
+/*
+ * Resolve the index and run the requested write, holding the per-index
+ * LW_EXCLUSIVE lock across the INSERT/DELETE/MAINTENANCE paths.  Every failure
+ * throws; the caller's guard releases all locks and converts it to a slot
+ * error.
+ */
+static void
+VamanaWorkerExecuteWriteSlot(int slotIdx)
 {
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 	Oid			relid = slot->indexRelid;
 	LWLock	   *rwlock;
 	SVSIndexHandle index;
 	bool		needsRebuild;
+
+	/* Load and catch up the index if it is not already warm. */
+	index = VamanaGetCachedIndex(relid, &needsRebuild);
+	if (needsRebuild)
+		index = VamanaWorkerEnsureIndexCurrent(relid);
+
+	/*
+	 * Retry once: handles the race where CREATE INDEX committed and sent a
+	 * LOAD slot, but that slot was processed after this write slot was already
+	 * collected as PENDING.  A second attempt will find the fresh entry.
+	 */
+	if (index == NULL)
+		index = VamanaWorkerEnsureIndexCurrent(relid);
+
+	if (index == NULL)
+	{
+		VamanaWorkerBuildEmptyTableIndex(slotIdx);
+		return;
+	}
+
+	/* Acquire LW_EXCLUSIVE — blocks until all shared (search) holders exit. */
+	rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
+	if (rwlock != NULL)
+		LWLockAcquire(rwlock, LW_EXCLUSIVE);
+
+	switch (slot->slotKind)
+	{
+		case VAMANA_SLOTKIND_INSERT:
+			{
+				/*
+				 * The query vector and heap_tid are already in the slot.
+				 * Allocate the next external ID from the cached nextExternalId,
+				 * then call SVSAddPoints.
+				 */
+				VamanaIndexCache *cache = VamanaGetCache(relid);
+				size_t		externalId;
+				int			added;
+				float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
+
+				if (cache == NULL)
+					ereport(ERROR,
+							(errmsg("vamana worker: no cache entry for insert on index %u",
+									relid)));
+
+				externalId = (size_t) cache->nextExternalId;
+				added = SVSAddPoints(index, vec, &externalId, 1);
+
+				if (added <= 0)
+					ereport(ERROR,
+							(errmsg("vamana worker: SVSAddPoints failed for index %u",
+									relid)));
+
+				/* Grow tidMapping if needed. */
+				if ((int) externalId >= cache->tidMappingCapacity)
+				{
+					int			newCap = cache->tidMappingCapacity > 0 ?
+						cache->tidMappingCapacity * 2 : 1024;
+					MemoryContext oldCtx;
+
+					if (newCap <= (int) externalId)
+						newCap = (int) externalId + 1;
+
+					oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+					cache->tidMapping = repalloc(cache->tidMapping,
+												 (Size) newCap * sizeof(ItemPointerData));
+					MemSet(cache->tidMapping + cache->tidMappingCapacity, 0,
+						   (Size) (newCap - cache->tidMappingCapacity) *
+						   sizeof(ItemPointerData));
+					MemoryContextSwitchTo(oldCtx);
+					cache->tidMappingCapacity = newCap;
+				}
+
+				ItemPointerCopy(&slot->writeHeapTid,
+								&cache->tidMapping[externalId]);
+
+				/* Keep reverse hash in sync. */
+				if (cache->tidToExternalId != NULL)
+				{
+					bool	found;
+					uint64	eid = (uint64) externalId;
+					char   *hentry = (char *) hash_search(
+						cache->tidToExternalId,
+						&slot->writeHeapTid,
+						HASH_ENTER,
+						&found);
+
+					if (!found)
+						memcpy(hentry + sizeof(ItemPointerData),
+							   &eid, sizeof(uint64));
+				}
+
+				cache->nextExternalId = externalId + 1;
+				cache->numVectors++;
+				/* Return the allocated external ID to the backend. */
+				slot->writeExternalId = (uint64) externalId;
+
+				VamanaWorkerPersistMetaCounters(relid, cache);
+
+				slot->numResults = 1;
+				cache->opsSinceCheckpoint++;
+				cache->lastWriteTime = GetCurrentTimestamp();
+				pg_write_barrier();
+				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+				break;
+			}
+
+		case VAMANA_SLOTKIND_DELETE:
+			{
+				/*
+				 * The backend wrote the count of IDs into slot->numResults and
+				 * packed the size_t IDs into the query-vector buffer (reused for
+				 * input; float[] is naturally aligned for size_t).
+				 */
+				int			nIds = slot->numResults;
+				size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
+				int			deleted;
+				VamanaIndexCache *cache = VamanaGetCache(relid);
+
+				deleted = SVSDeletePoints(index, ids, nIds);
+
+				if (deleted < 0)
+					ereport(ERROR,
+							(errmsg("vamana worker: SVSDeletePoints failed for index %u",
+									relid)));
+
+				if (cache != NULL)
+				{
+					for (int i = 0; i < nIds; i++)
+						VamanaCacheForgetExternalId(cache, ids[i]);
+
+					cache->numDeleted += deleted;
+					cache->numVectors = (cache->numVectors > deleted) ?
+						cache->numVectors - deleted : 0;
+
+					VamanaWorkerPersistMetaCounters(relid, cache);
+				}
+
+				slot->numResults = deleted;
+				if (cache != NULL)
+				{
+					cache->opsSinceCheckpoint++;
+					cache->lastWriteTime = GetCurrentTimestamp();
+				}
+				pg_write_barrier();
+				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+				break;
+			}
+
+		case VAMANA_SLOTKIND_MAINTENANCE:
+			{
+				VamanaIndexCache *cache = VamanaGetCache(relid);
+
+				if (slot->maintenanceOp == VAMANA_MAINTENANCE_CONSOLIDATE)
+				{
+					if (!SVSConsolidate(index))
+						ereport(ERROR,
+								(errmsg("vamana worker: SVSConsolidate failed for index %u",
+										relid)));
+				}
+				else if (slot->maintenanceOp == VAMANA_MAINTENANCE_COMPACT)
+				{
+					if (!SVSCompact(index, 0))
+						ereport(ERROR,
+								(errmsg("vamana worker: SVSCompact failed for index %u",
+										relid)));
+					if (cache != NULL)
+						cache->numDeleted = 0;
+				}
+
+				if (cache != NULL)
+				{
+					cache->opsSinceCheckpoint++;
+					cache->lastWriteTime = GetCurrentTimestamp();
+				}
+
+				slot->numResults = 0;
+				pg_write_barrier();
+				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+				break;
+			}
+
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("vamana worker: unknown slotKind %u",
+							slot->slotKind)));
+			break;
+	}
+
+	if (rwlock != NULL)
+		LWLockRelease(rwlock);
+}
+
+/*
+ * VamanaWorkerProcessWriteSlot
+ *
+ * Execute a single non-SEARCH slot (INSERT / DELETE / MAINTENANCE), building
+ * the dynamic index on the empty-table first-insert path when needed.  Writes
+ * DONE or ERROR into the slot status; SetLatch on the waiting backend is the
+ * caller's responsibility.
+ *
+ * Called from VamanaWorkerProcessRequests after the slot has been transitioned
+ * to PROCESSING.  Must not throw: this guard is the sole owner of the
+ * eviction-suppression flag and the terminal error status, so every failure
+ * below becomes VAMANA_SLOT_ERROR uniformly.
+ */
+void
+VamanaWorkerProcessWriteSlot(int slotIdx)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 
 	/*
 	 * Suppress VamanaRelcacheCallback for the entire duration of this write
@@ -167,322 +441,31 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 	 */
 	vamana_eviction_suppressed = true;
 
-	/*
-	 * Load the index if needed (requires a transaction to open the relation).
-	 */
-	index = VamanaGetCachedIndex(relid, &needsRebuild);
-	if (needsRebuild)
-	{
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		index = VamanaWorkerGetOrLoadIndex(relid);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-	}
-
-	/*
-	 * Retry once: handles the race where CREATE INDEX committed and sent a
-	 * LOAD slot, but that slot was processed after this write slot was already
-	 * collected as PENDING.  A second GetOrLoadIndex will find the fresh entry.
-	 */
-	if (index == NULL)
-	{
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		index = VamanaWorkerGetOrLoadIndex(relid);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-	}
-
-	if (index == NULL)
-	{
-		/*
-		 * Empty-table CREATE INDEX: cache exists with svsIndex=NULL because
-		 * SVS requires at least 1 vector for build.  If this is an INSERT,
-		 * build the dynamic index now using the incoming vector as seed.
-		 */
-		VamanaIndexCache *cache = VamanaGetCache(relid);
-
-		if (cache != NULL && slot->slotKind == VAMANA_SLOTKIND_INSERT)
-		{
-			index = VamanaWorkerBuildFirstInsert(relid, cache,
-												VamanaWorkerSlotQueryVec(slotIdx),
-												&slot->writeHeapTid);
-		}
-
-		if (index == NULL)
-		{
-			vamana_eviction_suppressed = false;
-			snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-					 "vamana worker: index %u not loaded for write", relid);
-			slot->errorCategory = VAMANA_ERR_INTERNAL;
-			pg_write_barrier();
-			pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
-			return;
-		}
-
-		/* First insert was handled by the build; skip the normal INSERT path. */
-		slot->writeExternalId = 0;
-
-		if (cache->replicationSlot == NULL)
-		{
-			VamanaReplicationCreate(VamanaWorkerShmemPtr->dbOid, relid);
-			cache->replicationSlot = VamanaReplicationOpen(
-				VamanaWorkerShmemPtr->dbOid, relid);
-			cache->lastReplayLsn = GetFlushRecPtr(NULL);
-		}
-
-		{
-			Relation	indexRel;
-
-			SetCurrentStatementStartTimestamp();
-			StartTransactionCommand();
-			PushActiveSnapshot(GetTransactionSnapshot());
-			indexRel = index_open(relid, AccessShareLock);
-			VamanaWriteMetaPageDynamic(indexRel,
-									   cache->nextExternalId,
-									   (uint32) cache->numVectors,
-									   (uint32) cache->numDeleted,
-									   (uint32) cache->tidMappingCapacity,
-									   MAIN_FORKNUM);
-			index_close(indexRel, AccessShareLock);
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-		}
-
-		cache->opsSinceCheckpoint++;
-		cache->lastWriteTime = GetCurrentTimestamp();
-		pg_write_barrier();
-		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-		vamana_eviction_suppressed = false;
-		return;
-	}
-
-	/* Acquire LW_EXCLUSIVE — blocks until all shared (search) holders exit. */
-	rwlock = VamanaGetIndexLock(relid);
-	if (rwlock != NULL)
-		LWLockAcquire(rwlock, LW_EXCLUSIVE);
-
 	PG_TRY();
 	{
-		switch (slot->slotKind)
-		{
-			case VAMANA_SLOTKIND_INSERT:
-				{
-					/*
-					 * The query vector and heap_tid are already in the slot.
-					 * Allocate the next external ID from the cached
-					 * nextExternalId, then call SVSAddPoints.
-					 */
-					VamanaIndexCache *cache = VamanaGetCache(relid);
-					size_t		externalId;
-					int			added;
-					float	   *vec = VamanaWorkerSlotQueryVec(slotIdx);
-
-					if (cache == NULL)
-						ereport(ERROR,
-								(errmsg("vamana worker: no cache entry for insert on index %u",
-										relid)));
-
-					externalId = (size_t) cache->nextExternalId;
-					added = SVSAddPoints(index, vec, &externalId, 1);
-
-					if (added <= 0)
-						ereport(ERROR,
-								(errmsg("vamana worker: SVSAddPoints failed for index %u",
-										relid)));
-
-					/* Grow tidMapping if needed. */
-					if ((int) externalId >= cache->tidMappingCapacity)
-					{
-						int			newCap = cache->tidMappingCapacity > 0 ?
-							cache->tidMappingCapacity * 2 : 1024;
-						MemoryContext oldCtx;
-
-						if (newCap <= (int) externalId)
-							newCap = (int) externalId + 1;
-
-						oldCtx = MemoryContextSwitchTo(TopMemoryContext);
-						cache->tidMapping = repalloc(cache->tidMapping,
-													 (Size) newCap * sizeof(ItemPointerData));
-						MemSet(cache->tidMapping + cache->tidMappingCapacity, 0,
-							   (Size) (newCap - cache->tidMappingCapacity) *
-							   sizeof(ItemPointerData));
-						MemoryContextSwitchTo(oldCtx);
-						cache->tidMappingCapacity = newCap;
-					}
-
-					ItemPointerCopy(&slot->writeHeapTid,
-									&cache->tidMapping[externalId]);
-
-					/* Keep reverse hash in sync. */
-					if (cache->tidToExternalId != NULL)
-					{
-						bool	found;
-						uint64	eid = (uint64) externalId;
-						char   *hentry = (char *) hash_search(
-							cache->tidToExternalId,
-							&slot->writeHeapTid,
-							HASH_ENTER,
-							&found);
-
-						if (!found)
-							memcpy(hentry + sizeof(ItemPointerData),
-								   &eid, sizeof(uint64));
-					}
-
-					cache->nextExternalId = externalId + 1;
-					cache->numVectors++;
-					/* Return the allocated external ID to the backend. */
-					slot->writeExternalId = (uint64) externalId;
-
-					/*
-					 * Persist counters to the metapage.  We need an open
-					 * relation for this; open and close inside a transaction.
-					 */
-					{
-						Relation	indexRel;
-
-						SetCurrentStatementStartTimestamp();
-						StartTransactionCommand();
-						PushActiveSnapshot(GetTransactionSnapshot());
-						indexRel = index_open(relid, AccessShareLock);
-						VamanaWriteMetaPageDynamic(indexRel,
-												   cache->nextExternalId,
-												   (uint32) cache->numVectors,
-												   (uint32) cache->numDeleted,
-												   (uint32) cache->tidMappingCapacity,
-												   MAIN_FORKNUM);
-						index_close(indexRel, AccessShareLock);
-						PopActiveSnapshot();
-						CommitTransactionCommand();
-					}
-
-					slot->numResults = 1;
-					cache->opsSinceCheckpoint++;
-					cache->lastWriteTime = GetCurrentTimestamp();
-					pg_write_barrier();
-					pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-					break;
-				}
-
-			case VAMANA_SLOTKIND_DELETE:
-				{
-					/*
-					 * The backend wrote the count of IDs into
-					 * slot->numResults and packed the size_t IDs into the
-					 * query-vector buffer (reused for input; float[] is
-					 * naturally aligned for size_t).
-					 */
-					int			nIds = slot->numResults;
-					size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(slotIdx);
-					int			deleted;
-					VamanaIndexCache *cache = VamanaGetCache(relid);
-
-					deleted = SVSDeletePoints(index, ids, nIds);
-
-					if (deleted < 0)
-						ereport(ERROR,
-								(errmsg("vamana worker: SVSDeletePoints failed for index %u",
-										relid)));
-
-					if (cache != NULL)
-					{
-						for (int i = 0; i < nIds; i++)
-							VamanaCacheForgetExternalId(cache, ids[i]);
-
-						cache->numDeleted += deleted;
-						cache->numVectors = (cache->numVectors > deleted) ?
-							cache->numVectors - deleted : 0;
-
-						{
-							Relation	indexRel;
-
-							SetCurrentStatementStartTimestamp();
-							StartTransactionCommand();
-							PushActiveSnapshot(GetTransactionSnapshot());
-							indexRel = index_open(relid, AccessShareLock);
-							VamanaWriteMetaPageDynamic(indexRel,
-													   cache->nextExternalId,
-													   (uint32) cache->numVectors,
-													   (uint32) cache->numDeleted,
-													   (uint32) cache->tidMappingCapacity,
-													   MAIN_FORKNUM);
-							index_close(indexRel, AccessShareLock);
-							PopActiveSnapshot();
-							CommitTransactionCommand();
-						}
-					}
-
-					slot->numResults = deleted;
-					if (cache != NULL)
-					{
-						cache->opsSinceCheckpoint++;
-						cache->lastWriteTime = GetCurrentTimestamp();
-					}
-					pg_write_barrier();
-					pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-					break;
-				}
-
-			case VAMANA_SLOTKIND_MAINTENANCE:
-				{
-					VamanaIndexCache *cache = VamanaGetCache(relid);
-
-					if (slot->maintenanceOp == VAMANA_MAINTENANCE_CONSOLIDATE)
-					{
-						if (!SVSConsolidate(index))
-							ereport(ERROR,
-									(errmsg("vamana worker: SVSConsolidate failed for index %u",
-											relid)));
-					}
-					else if (slot->maintenanceOp == VAMANA_MAINTENANCE_COMPACT)
-					{
-						if (!SVSCompact(index, 0))
-							ereport(ERROR,
-									(errmsg("vamana worker: SVSCompact failed for index %u",
-											relid)));
-						if (cache != NULL)
-							cache->numDeleted = 0;
-					}
-
-					if (cache != NULL)
-					{
-						cache->opsSinceCheckpoint++;
-						cache->lastWriteTime = GetCurrentTimestamp();
-					}
-
-					slot->numResults = 0;
-					pg_write_barrier();
-					pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-					break;
-				}
-
-			default:
-				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-						 "vamana worker: unknown slotKind %u", slot->slotKind);
-				slot->errorCategory = VAMANA_ERR_INTERNAL;
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
-				break;
-		}
+		VamanaWorkerExecuteWriteSlot(slotIdx);
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata;
 
-		vamana_eviction_suppressed = false;
-
-		if (rwlock != NULL)
-			LWLockRelease(rwlock);
-
-		if (IsTransactionState())
-			AbortCurrentTransaction();
+		/*
+		 * Unwind process-level resources the way the top-level backend loop
+		 * does.  The empty-table build path throws from outside a transaction
+		 * (VamanaReplicationCreate holds ReplicationSlotAllocationLock and can
+		 * ereport "all replication slots are in use"), so AbortCurrentTransaction
+		 * alone would leak that lock and any per-index lock still held.  Keep
+		 * the worker alive rather than letting the error reach proc_exit.
+		 */
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		AbortOutOfAnyTransaction();
 
 		edata = CopyErrorData();
 		FlushErrorState();
+		RESUME_INTERRUPTS();
 
 		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
 				 "%s", edata->message ? edata->message : "unknown error");
@@ -491,12 +474,11 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+
+		vamana_eviction_suppressed = false;
 		return;
 	}
 	PG_END_TRY();
-
-	if (rwlock != NULL)
-		LWLockRelease(rwlock);
 
 	vamana_eviction_suppressed = false;
 }
@@ -522,7 +504,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 {
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 	Oid			relid = slot->indexRelid;
-	VamanaLoadParams *params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(slotIdx);
+	VamanaLoadParams *params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 	SVSBuildConfig	config;
 	SVSIndexHandle	svsIndex = NULL;
 	ItemPointerData *tidMapping = NULL;
@@ -658,4 +640,61 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 	PG_END_TRY();
 	ereport(DEBUG1,
 			(errmsg("vamana: exited BuildSnapshot for index %u", relid)));
+}
+
+/*
+ * VamanaWorkerProcessWarmupSlot
+ *
+ * Force an index resident in the worker cache on demand.  Routes through
+ * VamanaWorkerGetOrLoadIndex, so a hot index is a no-op via its fast path.
+ *
+ * Unlike ProcessLoadSlot, GetOrLoadIndex opens the index relation and reads
+ * the catalog, so it must run inside a transaction.  Eviction is suppressed
+ * across the load for the same reason the reload path does it: a relcache
+ * invalidation fired during StartTransactionCommand must not evict the entry
+ * mid-load.  Must not throw: all errors become VAMANA_SLOT_ERROR.
+ */
+void
+VamanaWorkerProcessWarmupSlot(int slotIdx)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Oid			relid = slot->indexRelid;
+
+	PG_TRY();
+	{
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		vamana_eviction_suppressed = true;
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
+		vamana_eviction_suppressed = false;
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		pg_write_barrier();
+		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		vamana_eviction_suppressed = false;
+
+		if (IsTransactionState())
+			AbortCurrentTransaction();
+
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+				 "%s", edata->message ? edata->message : "unknown error");
+		slot->errorCategory = VamanaCategorizeSQLState(edata->sqlerrcode);
+		FreeErrorData(edata);
+
+		pg_write_barrier();
+		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+	}
+	PG_END_TRY();
 }

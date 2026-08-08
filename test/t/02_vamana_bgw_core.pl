@@ -10,7 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use Time::HiRes qw(usleep);
+use Time::HiRes qw(usleep gettimeofday tv_interval);
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -28,6 +28,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE bgw_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -71,15 +73,6 @@ use VamanaTestUtils qw(:all);
         'worker loaded from disk after restart — no table rebuild');
     like($restart_log, qr/vamana index \d+ loaded from disk/,
         'server log confirms disk load on restart');
-
-    # workerPid is written only after VamanaWorkerLoadAllIndexes completes,
-    # so the "started" log line must appear after all disk-load lines.
-    {
-        my $load_pos    = index($restart_log, 'loaded from disk');
-        my $started_pos = index($restart_log, 'vamana background worker started');
-        ok($load_pos >= 0 && $started_pos > $load_pos,
-            'disk load precedes "background worker started" in server log');
-    }
 
     # All backends are held in VamanaWorkerWaitUntilAvailable until the cache
     # is warm, so no cold loads should appear during a post-restart burst.
@@ -198,6 +191,9 @@ use VamanaTestUtils qw(:all);
         is($result, $after_insert, "query $i results match baseline with max_batch_size=1");
     }
 
+    # Dynamic enable: inserting an enabled row for testdb drives the launcher
+    # (via NOTIFY) to spawn testdb's worker with no restart.  postgres stays
+    # enabled from the top of this block, so both workers run concurrently.
     $node->safe_psql("postgres", "CREATE DATABASE testdb;");
     $node->safe_psql("testdb",   "CREATE EXTENSION vector;");
     $node->safe_psql("testdb",   "CREATE EXTENSION svs;");
@@ -209,16 +205,15 @@ use VamanaTestUtils qw(:all);
     ));
 
     my $log_pos_before_testdb = length($node->log_content());
-    $node->stop;
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'testdb'");
-    $node->start;
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('testdb', true);");
+
+    my $testdb_worker_pid = wait_for_worker_db($node, 'testdb', 20);
+    ok($testdb_worker_pid =~ /^\d+$/,
+        "launcher spawns a worker for testdb after dynamic enable (pid=$testdb_worker_pid)");
 
     $node->safe_psql("testdb",
         "CREATE INDEX testdb_idx ON testdb_tbl USING vamana (val vector_l2_ops);");
-
-    my $testdb_worker_pid = wait_for_worker($node, 20);
-    ok($testdb_worker_pid =~ /^\d+$/,
-        "worker running after switching worker_database to testdb (pid=$testdb_worker_pid)");
 
     sleep(2);
 
@@ -226,31 +221,96 @@ use VamanaTestUtils qw(:all);
         SET enable_seqscan = off;
         SELECT id FROM testdb_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
-    isnt($testdb_results, '', 'worker serves queries when worker_database is testdb');
+    isnt($testdb_results, '', 'testdb worker serves queries after dynamic enable');
 
     my $testdb_log = substr($node->log_content(), $log_pos_before_testdb);
     like($testdb_log,
         qr/vamana background worker started for database "testdb"/,
         'server log confirms worker started for testdb');
-    unlike($testdb_log,
-        qr/vamana worker connecting to default database "postgres"/,
-        'no default-database warning when worker_database is explicitly set');
 
-    my ($fallback_ret, undef, $fallback_err) = $node->psql("postgres", qq(
-        SET enable_seqscan = off;
-        SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    # A database with no vamana_databases row is unconfigured: after the
+    # launcher's initial scan, AssertDatabase hard-fails such a backend rather
+    # than spinning out the startup wait.  This is the config half of the
+    # config/liveness split.
+    $node->safe_psql("postgres", "CREATE DATABASE unconfigured_db;");
+    $node->safe_psql("unconfigured_db", "CREATE EXTENSION vector;");
+    $node->safe_psql("unconfigured_db", "CREATE EXTENSION svs;");
+    # An empty table is deliberate: the config gate is checked before the table
+    # scan, so CREATE INDEX must fail regardless of the heap's contents.
+    my ($unconf_ret, undef, $unconf_err) = $node->psql("unconfigured_db", qq(
+        CREATE TABLE u_tbl (id serial PRIMARY KEY, val vector($dim));
+        CREATE INDEX u_idx ON u_tbl USING vamana (val vector_l2_ops);
     ));
-    like($fallback_err,
+    like($unconf_err,
         qr/vamana index is not enabled for this database/,
-        'backend gets ERROR when worker dbOid != MyDatabaseId');
+        'backend in an unconfigured database gets a config hard-fail');
 
-    $node->stop;
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
-    $node->start;
+    # A disabled row never gets a shmem slot reserved, so the config gate sees
+    # the same missing slot as an absent row and must raise the same error.
+    $node->safe_psql("postgres", "CREATE DATABASE disabled_db;");
+    $node->safe_psql("disabled_db", "CREATE EXTENSION vector;");
+    $node->safe_psql("disabled_db", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres",
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('disabled_db', false);");
+    my ($disabled_ret, undef, $disabled_err) = $node->psql("disabled_db", qq(
+        CREATE TABLE d_tbl (id serial PRIMARY KEY, val vector($dim));
+        CREATE INDEX d_idx ON d_tbl USING vamana (val vector_l2_ops);
+    ));
+    like($disabled_err,
+        qr/vamana index is not enabled for this database/,
+        'present-but-disabled database gets the same config hard-fail as absent');
 
-    my $postgres_worker_pid = wait_for_worker($node, 20);
+    # The gate fires before the relation, its catalog row, or its on-disk save
+    # directory ($PGDATA/vamana_indexes/<relid>) exist, so a failure leaves none.
+    $node->safe_psql("disabled_db",
+        "CREATE TABLE na_tbl (id serial PRIMARY KEY, val vector($dim));");
+
+    my $vamana_dir = $node->data_dir . "/vamana_indexes";
+    my $count_index_dirs = sub {
+        return 0 unless -d $vamana_dir;
+        opendir(my $dh, $vamana_dir) or die "opendir $vamana_dir: $!";
+        my @e = grep { !/^\.\.?$/ } readdir($dh);
+        closedir($dh);
+        return scalar @e;
+    };
+    my $dirs_before = $count_index_dirs->();
+
+    my ($na_ret, undef, $na_err) = $node->psql("disabled_db",
+        "CREATE INDEX na_idx ON na_tbl USING vamana (val vector_l2_ops);");
+    like($na_err,
+        qr/vamana index is not enabled for this database/,
+        'unconfigured-database CREATE INDEX hard-fails');
+    is($node->safe_psql("disabled_db", "SELECT to_regclass('na_idx') IS NULL;"),
+        't', 'no relation survives the failed CREATE INDEX');
+    is($node->safe_psql("disabled_db",
+            "SELECT count(*) FROM pg_class WHERE relname = 'na_idx';"),
+        '0', 'pg_class has no row for the attempted index');
+    is($count_index_dirs->(), $dirs_before,
+        'no on-disk save directory created by the failed build');
+
+    my $postgres_worker_pid = wait_for_worker_db($node, 'postgres', 20);
     ok($postgres_worker_pid =~ /^\d+$/,
-        "worker running and connected to postgres (pid=$postgres_worker_pid)");
+        "postgres worker still running alongside testdb worker (pid=$postgres_worker_pid)");
+
+    # With a live worker, CREATE INDEX takes the available fast path and builds
+    # immediately, with no startup wait.
+    $node->safe_psql("postgres", qq(
+        CREATE TABLE running_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO running_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200) i;
+    ));
+    my $t0 = [gettimeofday];
+    $node->safe_psql("postgres",
+        "CREATE INDEX running_idx ON running_tbl USING vamana (val vector_l2_ops);");
+    my $running_elapsed = tv_interval($t0);
+    ok($running_elapsed < 5,
+        "CREATE INDEX with a running worker proceeds without a startup wait (${running_elapsed}s)");
+    is($node->safe_psql("postgres", qq(
+            SET enable_seqscan = off;
+            SELECT count(*) FROM (
+                SELECT id FROM running_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5
+            ) q;
+        )), '5', 'running-worker index serves queries after the no-wait build');
 
     sleep(2);
 

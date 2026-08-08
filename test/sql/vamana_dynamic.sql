@@ -1,7 +1,37 @@
 -- Copyright (C) 2026 Intel Corporation
 -- SPDX-License-Identifier: PostgreSQL
 
+-- Enable this database and wait for its worker before any index work, so this
+-- file runs standalone.  Enrollment reserves the slot synchronously (the gate
+-- then passes), but the worker spawns asynchronously; the first INSERT would
+-- otherwise race its cold start and time out.  Idempotent and a no-op in the
+-- full suite, where vamana_databases.sql (ordered first) has already warmed it.
+INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true)
+	ON CONFLICT (datname) DO NOTHING;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
 SET enable_seqscan = off;
+
+-- Empty-table build: CREATE INDEX on a table with no rows defers the dynamic
+-- index to the first INSERT (VamanaWorkerBuildFirstInsert).  Every row entered
+-- afterward must be searchable without a rebuild.
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+
+INSERT INTO t (val) VALUES ('[0,0,0]');
+INSERT INTO t (val) VALUES ('[1,1,1]'), ('[2,2,2]');
+SELECT * FROM t ORDER BY val <-> '[2,2,2]', id LIMIT 3;
+
+DROP TABLE t;
 
 -- Incremental INSERT: new rows are searchable without REINDEX or rebuild.
 -- After CREATE INDEX the cache is warm and dynamic, so INSERT uses SVSAddPoints
