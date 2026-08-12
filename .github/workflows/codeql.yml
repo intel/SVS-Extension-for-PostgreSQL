@@ -105,6 +105,8 @@ jobs:
       with:
         template: report
         token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: GitHub Upload Release Artifacts
       uses: actions/upload-artifact@v4
       with:
         name: report
