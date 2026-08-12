@@ -51,7 +51,18 @@ ifeq ($(shell uname -m), riscv64)
 	OPTFLAGS =
 endif
 
-PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+# GCC 11+ is the minimum supported compiler (see docs/build_guide/README.md).
+# -D_FORTIFY_SOURCE=3 and -fstack-clash-protection are both available on GCC 11+.
+# -D_FORTIFY_SOURCE requires at least -O1 to take effect (provided by PGXS defaults).
+HARDENING_CFLAGS = -Wall -Wextra -Werror -Wconversion -Wimplicit-fallthrough \
+                   -Wformat -Wformat-security -Werror=format-security \
+                   -fstack-protector-strong -fstack-clash-protection \
+                   -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS -fPIC
+
+# Linker hardening flags
+HARDENING_LDFLAGS = -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now -Wl,-z,nodlopen
+
+PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math $(HARDENING_CFLAGS)
 
 # Coverage instrumentation, opt-in via 'make COVERAGE=1'. Kept out of default
 # builds because --coverage slows the binary and writes .gcda files at runtime.
@@ -69,7 +80,7 @@ $(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run build_s
 endif
 
 PG_CPPFLAGS += -DUSE_SVS -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
-SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib
+SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib $(HARDENING_LDFLAGS)
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
