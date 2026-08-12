@@ -100,7 +100,7 @@ jobs:
         category: "/language:${{matrix.language}}"
         
     - name: Generate Security Report
-      uses: rsdmike/github-security-report-action@v4
+      uses: rsdmike/github-security-report-action@v3.0.4
       with:
         template: report
         token: ${{ secrets.SECURITY_TOKEN }}
