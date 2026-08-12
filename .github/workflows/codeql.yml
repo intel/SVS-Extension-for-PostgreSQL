@@ -100,11 +100,11 @@ jobs:
         category: "/language:${{matrix.language}}"
         
     - name: Generate Security Report
+      if: github.event_name != 'pull_request'
       uses: rsdmike/github-security-report-action@v3.0.4
       with:
         template: report
-        token: ${{ secrets.SECURITY_TOKEN }}
-    - name: GitHub Upload Release Artifacts
+        token: ${{ secrets.GITHUB_TOKEN }}
       uses: actions/upload-artifact@v4
       with:
         name: report
