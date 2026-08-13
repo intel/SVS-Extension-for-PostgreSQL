@@ -60,12 +60,13 @@ PG_CFLAGS  += --coverage
 SHLIB_LINK += --coverage
 endif
 
-# SVS library paths
-SVS_INSTALL ?= svs_install_public
+# SVS library paths. Matches SVS_INSTALL_DIR in docs/build_guide/config; relative,
+# so a bare 'make' works from the repository root after running the build guide.
+SVS_INSTALL ?= docs/build_guide/svs_install
 
 # Validate SVS library exists
 ifeq (,$(wildcard $(SVS_INSTALL)/lib/libsvs_c_api.so))
-$(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run build_svs_public.sh first or set SVS_INSTALL correctly)
+$(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run docs/build_guide/build_svs.sh first, or pass SVS_INSTALL=/path/to/svs_install)
 endif
 
 PG_CPPFLAGS += -DUSE_SVS -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
