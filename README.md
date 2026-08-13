@@ -75,3 +75,4 @@ make prove_installcheck
 ```
 
 Test files are in `test/sql/` and `test/t/`.
+
