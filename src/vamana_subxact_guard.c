@@ -21,6 +21,13 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
+/* A query cancel must always propagate, regardless of shouldPropagate. */
+static bool
+VamanaErrorIsQueryCancel(void)
+{
+	return geterrcode() == ERRCODE_QUERY_CANCELED;
+}
+
 VamanaSubXactResult
 VamanaRunInSubXact(VamanaSubXactBody body, void *arg,
 					VamanaSubXactShouldPropagate shouldPropagate)
@@ -44,7 +51,8 @@ VamanaRunInSubXact(VamanaSubXactBody body, void *arg,
 	}
 	PG_CATCH();
 	{
-		bool	propagate = shouldPropagate != NULL && shouldPropagate();
+		bool	callerWantsPropagate = shouldPropagate != NULL && shouldPropagate();
+		bool	propagate = callerWantsPropagate || VamanaErrorIsQueryCancel();
 
 		MemoryContextSwitchTo(oldCtx);
 

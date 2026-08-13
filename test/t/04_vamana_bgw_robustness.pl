@@ -10,7 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use File::Temp;
+use File::Temp qw(tempdir);
 use POSIX qw(_exit);
 use Time::HiRes qw(usleep);
 
@@ -680,6 +680,160 @@ use VamanaTestUtils qw(:all);
     });
     chomp $after;
     ok($after == 5, "subsequent query returns correct results after cancel (got $after)");
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Query cancel during svs_warmup_database() — PG_CATCH in VamanaRunInSubXact
+#
+# svs_warmup_database() and svs_teardown_database() run each item's work in
+# its own subtransaction via VamanaRunInSubXact, so one bad item doesn't abort
+# the whole batch.  That guard must never swallow a query cancel: the caller
+# issued it and expects the whole batch to stop, not just the item in flight.
+#
+# Determinism: SIGSTOP the worker before calling svs_warmup_database() so the
+# backend is guaranteed to be blocked in VamanaWorkerWaitForSlot's WaitLatch
+# loop (which calls CHECK_FOR_INTERRUPTS() every iteration) when the cancel
+# arrives.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_warmup_cancel');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE warmup_cancel_t (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO warmup_cancel_t (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+        CREATE INDEX ON warmup_cancel_t USING vamana (val vector_l2_ops);
+    });
+
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid =~ /^\d+$/, "worker running (pid=$worker_pid)");
+
+    kill('STOP', $worker_pid);
+    usleep(100_000);
+
+    my $tmpdir = tempdir(CLEANUP => 1);
+    my $child_pid = fork();
+    die "fork: $!" unless defined $child_pid;
+    if ($child_pid == 0)
+    {
+        my $result = eval { $node->safe_psql('postgres', "SELECT svs_warmup_database();") };
+        my $outcome = defined $result ? "OK:$result" : "ERR:$@";
+        if (open(my $fh, '>', "$tmpdir/result.txt"))
+        {
+            print $fh $outcome;
+            close $fh;
+        }
+        _exit(0);
+    }
+
+    my $slot_pending = 0;
+    for (1 .. 50)
+    {
+        usleep(100_000);
+        my $status = $node->safe_psql('postgres',
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_status = 'pending' AND slot_kind = 'warmup' LIMIT 1;");
+        chomp $status;
+        if ($status eq 'pending') { $slot_pending = 1; last; }
+    }
+    ok($slot_pending, 'warmup slot is PENDING while backend waits in WaitLatch');
+
+    my $backend_pid = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity "
+      . "WHERE query LIKE '%svs_warmup_database%' AND state = 'active' "
+      . "AND pid <> pg_backend_pid() LIMIT 1;");
+    chomp $backend_pid;
+    ok($backend_pid =~ /^\d+$/, "found blocked backend (pid=$backend_pid)");
+
+    $node->safe_psql('postgres', "SELECT pg_cancel_backend($backend_pid);");
+
+    kill('CONT', $worker_pid);
+
+    waitpid($child_pid, 0);
+
+    my $outcome = '';
+    if (open(my $fh, '<', "$tmpdir/result.txt"))
+    {
+        local $/;
+        $outcome = <$fh>;
+        close $fh;
+    }
+
+    like($outcome, qr/^ERR:.*canceling statement due to user request/s,
+        'cancel during svs_warmup_database() propagates to the caller, not swallowed by the subxact guard');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# SAVEPOINT then outer ROLLBACK — undo must not resubmit a subxact's DELETE
+#
+# A row inserted inside a savepoint is undone once by ROLLBACK TO.  On the
+# outer ROLLBACK the abort-time undo must skip that row: its externalId is
+# already gone from the graph, so a second DELETE fails in the worker and
+# surfaces as "SVSDeletePoints failed".  The search result is correct either
+# way (the double-delete is idempotent), so the WARNING in the server log is
+# the only observable signal — hence a TAP log assertion rather than a
+# regression diff.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_undo_subxact');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid =~ /^\d+$/, "worker running (pid=$worker_pid)");
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE undo_subxact_t (id serial PRIMARY KEY, val vector(3));
+        INSERT INTO undo_subxact_t (val) VALUES ('[0,0,0]'), ('[1,1,1]'), ('[2,2,2]');
+        CREATE INDEX ON undo_subxact_t USING vamana (val vector_l2_ops);
+    });
+
+    my $log_pos = length($node->log_content());
+
+    $node->safe_psql('postgres', qq{
+        BEGIN;
+        INSERT INTO undo_subxact_t (val) VALUES ('[5,5,5]');
+        SAVEPOINT sp1;
+        INSERT INTO undo_subxact_t (val) VALUES ('[9,9,9]');
+        ROLLBACK TO sp1;
+        ROLLBACK;
+    });
+
+    my $undo_log = substr($node->log_content(), $log_pos);
+    unlike($undo_log, qr/SVSDeletePoints failed/,
+        'outer ROLLBACK does not resubmit the savepoint-undone DELETE');
+
+    my $survivors = $node->safe_psql('postgres',
+        "SELECT string_agg(val::text, ',' ORDER BY id) FROM undo_subxact_t;");
+    chomp $survivors;
+    is($survivors, '[0,0,0],[1,1,1],[2,2,2]',
+        'only the original rows survive the aborted transaction');
 
     $node->stop;
 }

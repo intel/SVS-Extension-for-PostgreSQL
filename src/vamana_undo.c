@@ -162,6 +162,9 @@ VamanaXactCallback(XactEvent event, void *arg)
 					{
 						VamanaUndoEntry *entry = VamanaSubxidPendingArrayEntryAt(log, i);
 
+						if (entry->subxid == InvalidSubTransactionId)
+							continue;
+
 						if (entry->indexRelid != currentRelid ||
 							batchCount >= (int) VAMANA_MAX_DELETE_IDS)
 						{
@@ -257,9 +260,9 @@ VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 			batchCount = 0;
 		}
 		batchIds[batchCount++] = (size_t) entry->externalId;
-
-		entry->subxid = InvalidSubTransactionId;
 	}
 	if (batchCount > 0)
 		undo_flush_batch(currentRelid, batchIds, batchCount);
+
+	VamanaSubxidPendingArrayPruneAbortedSubxact(log, mySubid);
 }

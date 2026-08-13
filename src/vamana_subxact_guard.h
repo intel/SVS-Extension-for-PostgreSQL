@@ -30,9 +30,11 @@ typedef void (*VamanaSubXactBody) (void *arg);
 
 /*
  * Returning true tells VamanaRunInSubXact that the caught error is not
- * this unit's to swallow (e.g. a shutdown cancel): the subtransaction is
- * still rolled back and released, but the error is re-thrown instead of
- * being returned. Pass NULL to always swallow.
+ * this unit's to swallow (e.g. an admin shutdown in progress): the
+ * subtransaction is still rolled back and released, but the error is
+ * re-thrown instead of being returned. A query cancel always propagates
+ * regardless of this callback's answer. Pass NULL to swallow everything
+ * else.
  */
 typedef bool (*VamanaSubXactShouldPropagate) (void);
 
