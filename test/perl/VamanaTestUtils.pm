@@ -19,7 +19,7 @@ our @EXPORT_OK = qw(
     $dim $array_sql $query_sql $lv_query_sql
     $N @query_vecs $SYNC_SLEEP
     run_concurrent run_synchronized dir_size
-    wait_for_worker wait_for_worker_db
+    wait_for_worker wait_for_worker_db wait_for_slot_release
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 
@@ -245,6 +245,26 @@ sub wait_for_worker_db
         return $pid if $pid =~ /^\d+$/;
     }
     return '';
+}
+
+# ---------------------------------------------------------------------------
+# wait_for_slot_release: poll pg_stat_vamana_worker, queried from $query_db,
+# until no row remains for $db_oid (up to $attempts x 0.5s).  Returns true on
+# release, false on timeout.
+# ---------------------------------------------------------------------------
+sub wait_for_slot_release
+{
+    my ($node, $query_db, $db_oid, $attempts) = @_;
+    $attempts //= 30;
+    for my $i (1 .. $attempts)
+    {
+        my $count = $node->safe_psql($query_db,
+            "SELECT count(*) FROM pg_stat_vamana_worker WHERE db_oid = $db_oid;");
+        chomp $count;
+        return 1 if $count eq '0';
+        usleep(500_000);
+    }
+    return 0;
 }
 
 1;

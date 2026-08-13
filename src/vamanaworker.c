@@ -1305,7 +1305,7 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 	 * entries (see VamanaWorkerShmemSize), so k is capped to that limit to
 	 * avoid overrun.
 	 */
-	if (dimensions > VAMANA_MAX_DIM || k > VAMANA_MAX_SEARCH_WINDOW)
+	if (dimensions <= 0 || dimensions > VAMANA_MAX_DIM || k > VAMANA_MAX_SEARCH_WINDOW)
 	{
 		ereport(WARNING,
 				(errmsg("vamana worker: query dimensions %d or k %d exceed max (%d/%d)",
@@ -1390,7 +1390,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 				 errhint("Ensure the svs extension is listed in shared_preload_libraries and restart PostgreSQL.")));
 	}
 
-	if (dimensions > VAMANA_MAX_DIM)
+	if (dimensions <= 0 || dimensions > VAMANA_MAX_DIM)
 	{
 		DisownLatch(&slot->latch);
 		ereport(ERROR,

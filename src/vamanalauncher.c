@@ -27,9 +27,9 @@
 #include "vamanaworker.h"
 
 #include "access/xact.h"
-#include "catalog/namespace.h"
 #include "commands/async.h"
 #include "commands/dbcommands.h"
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -37,6 +37,8 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "tcop/tcopprot.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -82,14 +84,16 @@ typedef enum VamanaRestartAction
 /*
  * Why a stopped handle stopped.  A stopped handle has exactly one owner keyed
  * on this reason: a restart drain is completed by the restart machinery
- * (respawn in place, preserving backoff), while a crash or a disable is settled
- * by the liveness pass (accrue or clear backoff, drop the entry).  Conflating
- * the two owners is what let a restart delete the entry it needed to respawn.
+ * (respawn in place, preserving backoff), while a crash, disable, or removal is
+ * settled by the liveness pass (accrue or clear backoff, drop the entry).
+ * Conflating the two owners is what let a restart delete the entry it needed
+ * to respawn.
  */
 typedef enum VamanaStopReason
 {
-	STOP_CRASH,					/* unexpected exit: accrue backoff, drop */
-	STOP_DISABLED,				/* database left the enabled set: drop */
+	STOP_CRASH,					/* unexpected exit: accrue backoff, drop, keep slot */
+	STOP_DISABLED,				/* row still present, enabled = false: drop, keep slot */
+	STOP_REMOVED,				/* row no longer in the table: drop, release slot */
 	STOP_RESTART_DRAIN			/* deliberate restart in flight: respawn */
 } VamanaStopReason;
 
@@ -118,44 +122,53 @@ typedef struct VamanaLauncherWorker
 } VamanaLauncherWorker;
 
 /*
- * One enabled database, as read from the config table.  The name is captured
+ * One row of the config table, as read from the catalog.  The name is captured
  * during the SPI scan and carried alongside the OID so the spawn and
  * initial-scan paths never re-enter the catalogs: those paths run outside the
  * scan's transaction, where a syscache lookup would have no snapshot.
+ *
+ * Every row is represented, not just enabled ones: "disabled" (row present,
+ * enabled = false) and "removed" (no row at all) are different worker-stop
+ * outcomes, and a row is the only place that distinction can be read from.
  */
-typedef struct VamanaEnabledDatabase
+typedef struct VamanaDatabaseRow
 {
 	Oid			dbOid;
 	char	   *datname;
 	int64		restart_generation;
-} VamanaEnabledDatabase;
+	bool		enabled;
+} VamanaDatabaseRow;
 
 /*
  * The launcher's handle ledger, in TopMemoryContext for the process lifetime.
- * Distinct from the per-cycle context used for the enabled-database list.
+ * Distinct from the per-cycle context used for the row list.
  */
 static List *WorkerLedger = NIL;
 
 static long VamanaLauncherReconcileWorkers(void);
-static List *ReadEnabledDatabases(void);
+static char *VamanaDatabasesQualifiedName(void);
+static List *ReadDatabaseRows(void);
+static List *EnabledRowsOf(List *rows);
 static void MaterializeInitialConfig(void);
 static bool VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname);
 static VamanaLauncherWorker *FindLedgerEntry(Oid dbOid);
-static bool IsDatabaseEnabled(List *enabled, Oid dbOid);
-static VamanaStopReason ClassifyWorkerStop(List *enabled,
+static VamanaDatabaseRow *FindDatabaseRow(List *rows, Oid dbOid);
+static VamanaDatabaseRow *FindEnabledDatabase(List *rows, Oid dbOid);
+static bool IsDatabaseEnabled(List *rows, Oid dbOid);
+static VamanaStopReason ClassifyWorkerStop(List *rows,
 										   const VamanaLauncherWorker *w);
 static VamanaRestartAction VamanaRestartStateAdvance(VamanaRestartState *state,
 													 int64 current_generation,
 													 BgwHandleStatus handle_status,
 													 TimestampTz now);
-static BackgroundWorkerHandle *RegisterDatabaseWorker(const VamanaEnabledDatabase *db,
+static BackgroundWorkerHandle *RegisterDatabaseWorker(const VamanaDatabaseRow *db,
 													  TimestampTz now);
-static void SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now);
-static bool RespawnWorker(VamanaLauncherWorker *w, const VamanaEnabledDatabase *db,
+static void SpawnWorker(const VamanaDatabaseRow *db, TimestampTz now);
+static bool RespawnWorker(VamanaLauncherWorker *w, const VamanaDatabaseRow *db,
 						  TimestampTz now);
-static void ReconcileLedgerLiveness(List *enabled, TimestampTz now);
-static void TerminateDisabledWorkers(List *enabled);
-static void ReconcileRestartConvergence(List *enabled, TimestampTz now);
+static void ReconcileLedgerLiveness(List *rows, TimestampTz now);
+static void TerminateDisabledWorkers(List *rows);
+static void ReconcileRestartConvergence(List *rows, TimestampTz now);
 static long BackoffThresholdMs(uint32 consecutiveFailures);
 static long BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now);
 
@@ -257,18 +270,19 @@ VamanaLauncherMain(Datum main_arg)
 
 /*
  * Reconcile the live worker set against the table on every wake, and return the
- * naptime for the following WaitLatch.  The enabled set is read first so the
- * liveness pass can tell a crash (accrue backoff) from a legitimate disable
- * (drop with no accrual); the spawn diff then respawns any enabled database
- * whose worker is gone, subject to its backoff, folding the naptime down to the
- * soonest eligible retry so a backing-off database is not made to oversleep.
+ * naptime for the following WaitLatch.  The full row set is read first so the
+ * liveness pass can tell a crash (accrue backoff) from a legitimate disable or
+ * removal (drop with no accrual); the spawn diff then respawns any enabled
+ * database whose worker is gone, subject to its backoff, folding the naptime
+ * down to the soonest eligible retry so a backing-off database is not made to
+ * oversleep.
  */
 static long
 VamanaLauncherReconcileWorkers(void)
 {
 	MemoryContext cycleCtx;
 	MemoryContext oldCtx;
-	List	   *enabled;
+	List	   *rows;
 	ListCell   *lc;
 	TimestampTz now = GetCurrentTimestamp();
 	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
@@ -278,16 +292,16 @@ VamanaLauncherReconcileWorkers(void)
 									 ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(cycleCtx);
 
-	enabled = ReadEnabledDatabases();
+	rows = ReadDatabaseRows();
 
-	ReconcileLedgerLiveness(enabled, now);
-	TerminateDisabledWorkers(enabled);
+	ReconcileLedgerLiveness(rows, now);
+	TerminateDisabledWorkers(rows);
 	if (WorkerLedger != NIL)
-		ReconcileRestartConvergence(enabled, now);
+		ReconcileRestartConvergence(rows, now);
 
-	foreach(lc, enabled)
+	foreach(lc, EnabledRowsOf(rows))
 	{
-		VamanaEnabledDatabase *db = (VamanaEnabledDatabase *) lfirst(lc);
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
 		VamanaLauncherBackoff backoff;
 		long		remaining;
 
@@ -347,7 +361,7 @@ MaterializeInitialConfig(void)
 {
 	MemoryContext scanCtx;
 	MemoryContext oldCtx;
-	List	   *enabled;
+	List	   *rows;
 	ListCell   *lc;
 
 	scanCtx = AllocSetContextCreate(TopMemoryContext,
@@ -355,11 +369,11 @@ MaterializeInitialConfig(void)
 									ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(scanCtx);
 
-	enabled = ReadEnabledDatabases();
+	rows = ReadDatabaseRows();
 
-	foreach(lc, enabled)
+	foreach(lc, EnabledRowsOf(rows))
 	{
-		VamanaEnabledDatabase *db = (VamanaEnabledDatabase *) lfirst(lc);
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
 
 		(void) VamanaWorkerReserveSlotOrLog(db->dbOid, db->datname);
 	}
@@ -375,27 +389,29 @@ MaterializeInitialConfig(void)
  * ----------------------------------------------------------------------- */
 
 /*
- * Append an enabled-database entry, capturing its name, in callerCtx.  Both the
- * list cell and the name string outlive the SPI transaction, so the spawn and
- * initial-scan paths never re-enter the catalogs.  Deduplicates by OID.
+ * Append a row, capturing its name, in callerCtx.  Both the list cell and the
+ * name string outlive the SPI transaction, so the spawn and initial-scan paths
+ * never re-enter the catalogs.  Deduplicates by OID.
  */
 static List *
-AppendEnabledDatabase(List *list, Oid dbOid, const char *datname,
-					  int64 restart_generation, MemoryContext callerCtx)
+AppendDatabaseRow(List *list, Oid dbOid, const char *datname,
+				  int64 restart_generation, bool enabled,
+				  MemoryContext callerCtx)
 {
-	VamanaEnabledDatabase *db;
+	VamanaDatabaseRow *db;
 	MemoryContext oldCtx;
 	ListCell   *lc;
 
 	foreach(lc, list)
-		if (((VamanaEnabledDatabase *) lfirst(lc))->dbOid == dbOid)
+		if (((VamanaDatabaseRow *) lfirst(lc))->dbOid == dbOid)
 			return list;
 
 	oldCtx = MemoryContextSwitchTo(callerCtx);
-	db = palloc(sizeof(VamanaEnabledDatabase));
+	db = palloc(sizeof(VamanaDatabaseRow));
 	db->dbOid = dbOid;
 	db->datname = pstrdup(datname);
 	db->restart_generation = restart_generation;
+	db->enabled = enabled;
 	list = lappend(list, db);
 	MemoryContextSwitchTo(oldCtx);
 
@@ -403,13 +419,42 @@ AppendEnabledDatabase(List *list, Oid dbOid, const char *datname,
 }
 
 /*
- * Return the currently-enabled databases, allocated in the caller's memory
+ * Schema-qualified "vamana_databases", resolved via the svs extension's own
+ * namespace rather than search_path, so a same-named table planted earlier on
+ * the path can never be read instead of the real one.  NULL if the extension
+ * (and therefore the table) doesn't exist yet in this database; not an error,
+ * since a later NOTIFY or the fallback timeout retries.
+ */
+static char *
+VamanaDatabasesQualifiedName(void)
+{
+	Oid			extOid = get_extension_oid("svs", true);
+	Oid			nspOid;
+
+	if (!OidIsValid(extOid))
+		return NULL;
+
+	nspOid = get_extension_schema(extOid);
+	if (!OidIsValid(get_relname_relid("vamana_databases", nspOid)))
+		return NULL;
+
+	return psprintf("%s.%s", quote_identifier(get_namespace_name(nspOid)),
+					quote_identifier("vamana_databases"));
+}
+
+/*
+ * Return every row of vamana_databases, allocated in the caller's memory
  * context (which must outlive the SPI transaction opened here).  Name-to-OID
  * resolution is tolerant: a row whose database no longer exists is skipped and
  * logged rather than aborting the scan.
+ *
+ * Every row is returned regardless of its enabled flag: callers that need only
+ * the enabled subset filter with EnabledRowsOf(), and callers that need to
+ * distinguish "disabled" from "removed" (no row at all) can only do so by
+ * having the full set to check membership against.
  */
 static List *
-ReadEnabledDatabases(void)
+ReadDatabaseRows(void)
 {
 	List	   *result = NIL;
 	MemoryContext callerCtx = CurrentMemoryContext;
@@ -426,44 +471,49 @@ ReadEnabledDatabases(void)
 		return NIL;
 	}
 
-	/*
-	 * The launcher may connect before CREATE EXTENSION has run in
-	 * launcher_database.  A missing table is not an error: a later NOTIFY or
-	 * the fallback timeout picks it up once the table exists.
-	 */
-	if (OidIsValid(RelnameGetRelid("vamana_databases")))
 	{
-		int			ret = SPI_execute("SELECT datname, restart_generation FROM vamana_databases WHERE enabled",
-									  true, 0);
+		char	   *qualifiedName = VamanaDatabasesQualifiedName();
 
-		if (ret != SPI_OK_SELECT)
-			ereport(WARNING, (errmsg("vamana launcher: failed to read vamana_databases")));
-
-		for (uint64 i = 0; ret == SPI_OK_SELECT && i < SPI_processed; i++)
+		if (qualifiedName != NULL)
 		{
-			bool		isnull;
-			Name		datname = DatumGetName(SPI_getbinval(SPI_tuptable->vals[i],
-															 SPI_tuptable->tupdesc,
-															 1, &isnull));
-			int64		restart_generation = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i],
-																		   SPI_tuptable->tupdesc,
-																		   2, &isnull));
-			Oid			dbOid;
+			int			ret = SPI_execute(psprintf("SELECT datname, restart_generation, enabled FROM %s",
+													qualifiedName),
+										  true, 0);
 
-			if (isnull)
-				continue;
+			if (ret != SPI_OK_SELECT)
+				ereport(WARNING, (errmsg("vamana launcher: failed to read vamana_databases")));
 
-			dbOid = get_database_oid(NameStr(*datname), true);
-			if (!OidIsValid(dbOid))
+			for (uint64 i = 0; ret == SPI_OK_SELECT && i < SPI_processed; i++)
 			{
-				ereport(LOG,
-						(errmsg("vamana launcher: enabled database \"%s\" does not exist; skipping",
-								NameStr(*datname))));
-				continue;
-			}
+				bool		datnameIsNull;
+				bool		restartGenIsNull;
+				bool		enabledIsNull;
+				Name		datname = DatumGetName(SPI_getbinval(SPI_tuptable->vals[i],
+																 SPI_tuptable->tupdesc,
+																 1, &datnameIsNull));
+				int64		restart_generation = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i],
+																			   SPI_tuptable->tupdesc,
+																			   2, &restartGenIsNull));
+				bool		enabled = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[i],
+																 SPI_tuptable->tupdesc,
+																 3, &enabledIsNull));
+				Oid			dbOid;
 
-			result = AppendEnabledDatabase(result, dbOid, NameStr(*datname),
-										   restart_generation, callerCtx);
+				if (datnameIsNull || restartGenIsNull || enabledIsNull)
+					continue;
+
+				dbOid = get_database_oid(NameStr(*datname), true);
+				if (!OidIsValid(dbOid))
+				{
+					ereport(LOG,
+							(errmsg("vamana launcher: database \"%s\" does not exist; skipping",
+									NameStr(*datname))));
+					continue;
+				}
+
+				result = AppendDatabaseRow(result, dbOid, NameStr(*datname),
+										   restart_generation, enabled, callerCtx);
+			}
 		}
 	}
 
@@ -471,6 +521,26 @@ ReadEnabledDatabases(void)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
+	return result;
+}
+
+/*
+ * The enabled subset of rows, as a freshly-built list.  A pure derivation of
+ * rows, not a second independently-sourced result: nothing to keep in sync.
+ */
+static List *
+EnabledRowsOf(List *rows)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rows)
+	{
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
+
+		if (db->enabled)
+			result = lappend(result, db);
+	}
 	return result;
 }
 
@@ -525,27 +595,14 @@ FindLedgerEntry(Oid dbOid)
 	return NULL;
 }
 
-static bool
-IsDatabaseEnabled(List *enabled, Oid dbOid)
+static VamanaDatabaseRow *
+FindDatabaseRow(List *rows, Oid dbOid)
 {
 	ListCell   *lc;
 
-	foreach(lc, enabled)
+	foreach(lc, rows)
 	{
-		if (((VamanaEnabledDatabase *) lfirst(lc))->dbOid == dbOid)
-			return true;
-	}
-	return false;
-}
-
-static VamanaEnabledDatabase *
-FindEnabledDatabase(List *enabled, Oid dbOid)
-{
-	ListCell   *lc;
-
-	foreach(lc, enabled)
-	{
-		VamanaEnabledDatabase *db = (VamanaEnabledDatabase *) lfirst(lc);
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
 
 		if (db->dbOid == dbOid)
 			return db;
@@ -553,17 +610,36 @@ FindEnabledDatabase(List *enabled, Oid dbOid)
 	return NULL;
 }
 
+static VamanaDatabaseRow *
+FindEnabledDatabase(List *rows, Oid dbOid)
+{
+	VamanaDatabaseRow *db = FindDatabaseRow(rows, dbOid);
+
+	return (db != NULL && db->enabled) ? db : NULL;
+}
+
+static bool
+IsDatabaseEnabled(List *rows, Oid dbOid)
+{
+	return FindEnabledDatabase(rows, dbOid) != NULL;
+}
+
 /*
  * Classify why a worker's handle stopped, so exactly one machine owns the
- * transition.  A disable outranks an in-flight restart: a database leaving the
- * enabled set is torn down here (drop, no accrual) even mid-restart, since the
- * restart convergence pass only visits enabled databases and would otherwise
- * leave the entry orphaned between the two owners.
+ * transition.  A disable or removal outranks an in-flight restart: a database
+ * leaving the enabled set is torn down here (drop, no accrual) even
+ * mid-restart, since the restart convergence pass only visits enabled
+ * databases and would otherwise leave the entry orphaned between the two
+ * owners.
  */
 static VamanaStopReason
-ClassifyWorkerStop(List *enabled, const VamanaLauncherWorker *w)
+ClassifyWorkerStop(List *rows, const VamanaLauncherWorker *w)
 {
-	if (!IsDatabaseEnabled(enabled, w->dbOid))
+	VamanaDatabaseRow *db = FindDatabaseRow(rows, w->dbOid);
+
+	if (db == NULL)
+		return STOP_REMOVED;
+	if (!db->enabled)
 		return STOP_DISABLED;
 	if (w->restart_state.restarting)
 		return STOP_RESTART_DRAIN;
@@ -653,7 +729,7 @@ VamanaRestartStateAdvance(VamanaRestartState *state,
  * context is freed.
  */
 static BackgroundWorkerHandle *
-RegisterDatabaseWorker(const VamanaEnabledDatabase *db, TimestampTz now)
+RegisterDatabaseWorker(const VamanaDatabaseRow *db, TimestampTz now)
 {
 	BackgroundWorker bgw;
 	BackgroundWorkerHandle *handle;
@@ -699,7 +775,7 @@ RegisterDatabaseWorker(const VamanaEnabledDatabase *db, TimestampTz now)
  * svs_restart_worker() bump makes convergence see a gap.
  */
 static void
-SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
+SpawnWorker(const VamanaDatabaseRow *db, TimestampTz now)
 {
 	BackgroundWorkerHandle *handle;
 	VamanaLauncherWorker *entry;
@@ -738,7 +814,7 @@ SpawnWorker(const VamanaEnabledDatabase *db, TimestampTz now)
  * so the next cycle retries.  Returns true on success.
  */
 static bool
-RespawnWorker(VamanaLauncherWorker *w, const VamanaEnabledDatabase *db,
+RespawnWorker(VamanaLauncherWorker *w, const VamanaDatabaseRow *db,
 			  TimestampTz now)
 {
 	BackgroundWorkerHandle *handle = RegisterDatabaseWorker(db, now);
@@ -763,14 +839,17 @@ RespawnWorker(VamanaLauncherWorker *w, const VamanaEnabledDatabase *db,
  * A running handle that has not yet been seen started gets its start time
  * stamped, so its eventual uptime can be measured.  A stopped handle is settled
  * by its stop reason: a crash is charged to backoff (a recovery if it stayed up
- * past the dwell threshold, an escalation otherwise) and dropped; a disable is
- * dropped with no accrual, since a deliberate disable must never read as a
- * crash-loop.  Either way the slot stays reserved so the next pass respawns.  A
- * stop that is part of an in-flight restart is left untouched here: the restart
- * convergence pass owns that handle and respawns it in place.
+ * past the dwell threshold, an escalation otherwise) and dropped, keeping its
+ * slot reserved so the next pass respawns; a disable is dropped with no
+ * accrual, since a deliberate disable must never read as a crash-loop, and its
+ * slot stays reserved so the paused database stays configured; a removal is
+ * dropped with no accrual and its slot released, since there is no row left to
+ * respawn for.  A stop that is part of an in-flight restart is left untouched
+ * here: the restart convergence pass owns that handle and respawns it in
+ * place.
  */
 static void
-ReconcileLedgerLiveness(List *enabled, TimestampTz now)
+ReconcileLedgerLiveness(List *rows, TimestampTz now)
 {
 	ListCell   *lc;
 
@@ -786,7 +865,7 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 		if (status != BGWH_STOPPED)
 			continue;
 
-		switch (ClassifyWorkerStop(enabled, w))
+		switch (ClassifyWorkerStop(rows, w))
 		{
 			case STOP_RESTART_DRAIN:
 				/* Convergence owns this handle; do not touch it. */
@@ -794,6 +873,11 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 
 			case STOP_DISABLED:
 				VamanaWorkerBackoffClear(w->dbOid);
+				break;
+
+			case STOP_REMOVED:
+				VamanaWorkerBackoffClear(w->dbOid);
+				VamanaWorkerReleaseSlot(w->dbOid);
 				break;
 
 			case STOP_CRASH:
@@ -814,16 +898,15 @@ ReconcileLedgerLiveness(List *enabled, TimestampTz now)
 }
 
 /*
- * Stop every live worker whose database has left the enabled set.
- * TerminateBackgroundWorker delivers SIGTERM, which the flag-only handler turns
- * into the graceful drain-and-stop; the next reconcile pass observes the
- * stopped handle, drops the ledger entry with no backoff accrual
- * (STOP_DISABLED), and leaves the slot reserved so the paused database stays
- * configured.  Idempotent: a worker still draining reports BGWH_STARTED, so a
- * repeat wakeup re-signals it harmlessly.
+ * Stop every live worker whose database has left the enabled set (disabled or
+ * removed). TerminateBackgroundWorker delivers SIGTERM, which the flag-only
+ * handler turns into the graceful drain-and-stop; the next reconcile pass
+ * observes the stopped handle and settles it via ClassifyWorkerStop.
+ * Idempotent: a worker still draining reports BGWH_STARTED, so a repeat
+ * wakeup re-signals it harmlessly.
  */
 static void
-TerminateDisabledWorkers(List *enabled)
+TerminateDisabledWorkers(List *rows)
 {
 	ListCell   *lc;
 
@@ -832,7 +915,7 @@ TerminateDisabledWorkers(List *enabled)
 		VamanaLauncherWorker *w = (VamanaLauncherWorker *) lfirst(lc);
 		pid_t		pid;
 
-		if (IsDatabaseEnabled(enabled, w->dbOid))
+		if (IsDatabaseEnabled(rows, w->dbOid))
 			continue;
 
 		if (GetBackgroundWorkerPid(w->handle, &pid) == BGWH_STARTED)
@@ -842,7 +925,7 @@ TerminateDisabledWorkers(List *enabled)
 
 static void
 ExecuteRestartAction(VamanaRestartAction action, VamanaLauncherWorker *ledger,
-					  const VamanaEnabledDatabase *db, TimestampTz now)
+					  const VamanaDatabaseRow *db, TimestampTz now)
 {
 	switch (action)
 	{
@@ -868,19 +951,19 @@ ExecuteRestartAction(VamanaRestartAction action, VamanaLauncherWorker *ledger,
 }
 
 static void
-ReconcileRestartConvergence(List *enabled, TimestampTz now)
+ReconcileRestartConvergence(List *rows, TimestampTz now)
 {
 	ListCell   *lc;
 
 	foreach(lc, WorkerLedger)
 	{
 		VamanaLauncherWorker *ledger_entry = (VamanaLauncherWorker *) lfirst(lc);
-		VamanaEnabledDatabase *db;
+		VamanaDatabaseRow *db;
 		BgwHandleStatus handle_status;
 		VamanaRestartAction action;
 		pid_t		pid;
 
-		db = FindEnabledDatabase(enabled, ledger_entry->dbOid);
+		db = FindEnabledDatabase(rows, ledger_entry->dbOid);
 		if (db == NULL)
 			continue;
 

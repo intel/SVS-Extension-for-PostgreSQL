@@ -14,6 +14,8 @@
 
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "vamana_subxid_pending_array.h"
 
 VamanaSubxidPendingArray *
@@ -45,6 +47,9 @@ VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array)
 	{
 		MemoryContext oldCtx = MemoryContextSwitchTo(array->memContext);
 
+		if (array->capacity > INT_MAX / 2)
+			elog(ERROR, "VamanaSubxidPendingArray: capacity overflow at %d entries",
+				 array->capacity);
 		array->capacity *= 2;
 		array->entries = repalloc(array->entries, array->elemSize * array->capacity);
 

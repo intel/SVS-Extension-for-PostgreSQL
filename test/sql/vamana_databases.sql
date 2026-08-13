@@ -31,10 +31,14 @@ INSERT INTO vamana_databases (datname, graph_memory_mb, total_memory_mb, search_
 SELECT datname, graph_memory_mb, total_memory_mb, search_num_threads
 	FROM vamana_databases ORDER BY datname;
 
--- TRUNCATE is revoked from PUBLIC; the table owner retains it
+-- INSERT/UPDATE/DELETE/TRUNCATE are all revoked from PUBLIC; the table owner
+-- retains them
 
 CREATE ROLE vamana_databases_test_nonowner NOLOGIN;
 SET ROLE vamana_databases_test_nonowner;
+INSERT INTO vamana_databases (datname) VALUES ('postgres');
+UPDATE vamana_databases SET enabled = false WHERE datname = 'postgres';
+DELETE FROM vamana_databases WHERE datname = 'postgres';
 TRUNCATE vamana_databases;
 RESET ROLE;
 DROP ROLE vamana_databases_test_nonowner;

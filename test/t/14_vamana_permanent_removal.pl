@@ -72,6 +72,10 @@ is($still_there, '1', 'the rejected DELETE left the row in place');
 # Test 2: after teardown in the target, the launcher-database DELETE succeeds.
 $node->safe_psql($TARGET_DB, "SELECT svs_teardown_database();");
 
+my $target_oid = $node->safe_psql($LAUNCHER_DB,
+    "SELECT oid FROM pg_database WHERE datname = '$TARGET_DB';");
+chomp $target_oid;
+
 my ($ok_ret, undef, $ok_err) = $node->psql($LAUNCHER_DB,
     "DELETE FROM vamana_databases WHERE datname = '$TARGET_DB';");
 is($ok_ret, 0,
@@ -81,6 +85,12 @@ my $gone = $node->safe_psql($LAUNCHER_DB,
     "SELECT count(*) FROM vamana_databases WHERE datname = '$TARGET_DB';");
 chomp $gone;
 is($gone, '0', 'the row is removed after teardown');
+
+# The DELETE removing the catalog row is not the same as the launcher
+# releasing the shmem slot it held; the latter only happens once the launcher
+# observes the stopped worker on a later reconcile pass.
+ok(wait_for_slot_release($node, $LAUNCHER_DB, $target_oid, 30),
+    'the shmem slot is released, not just the catalog row');
 
 $node->stop;
 

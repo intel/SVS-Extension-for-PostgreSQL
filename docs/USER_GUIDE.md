@@ -781,6 +781,10 @@ hot_standby_feedback = on
 
 If `hot_standby_feedback = off`, the primary may remove WAL segments that the standby's Vamana replication slot still needs. PostgreSQL silently invalidates the slot and emits only a WARNING in the standby's server log. After invalidation, the standby BGW cannot replay committed changes, and a full index rebuild from the heap is required the next time the standby BGW restarts. Monitor standby logs for `replication slot ... has been invalidated` warnings.
 
+#### `vamana_databases` Access
+
+INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker. Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly — this is not a privilege escalation: the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
+
 ---
 
 ## 8. Monitoring

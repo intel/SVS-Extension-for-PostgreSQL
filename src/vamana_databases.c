@@ -113,14 +113,17 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	tupdesc = trigdata->tg_relation->rd_att;
 
 	datnameDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_DATNAME, tupdesc, &isnull);
-	Assert(!isnull);			/* datname is the primary key, NOT NULL */
+	if (isnull)
+		elog(ERROR, "vamana_databases_queue_reservation: datname is null");
 	datname = DatumGetName(datnameDatum);
 
 	enabledDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_ENABLED, tupdesc, &isnull);
-	Assert(!isnull);			/* enabled is NOT NULL */
+	if (isnull)
+		elog(ERROR, "vamana_databases_queue_reservation: enabled is null");
 
 	restartGenDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_RESTART_GENERATION, tupdesc, &isnull);
-	Assert(!isnull);			/* restart_generation is NOT NULL */
+	if (isnull)
+		elog(ERROR, "vamana_databases_queue_reservation: restart_generation is null");
 	restart_generation = DatumGetInt64(restartGenDatum);
 
 	dbOid = get_database_oid(NameStr(*datname), false);
@@ -155,6 +158,7 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 	TriggerData *trigdata = (TriggerData *) fcinfo->context;
 	TupleDesc	tupdesc;
 	bool		isnull;
+	Datum		datnameDatum;
 	Name		datname;
 	Oid			dbOid;
 	VamanaWorkerShmem *entry;
@@ -169,10 +173,12 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 		elog(ERROR, "vamana_databases_reject_delete_with_live_indexes: must be a BEFORE DELETE FOR EACH ROW trigger");
 
 	tupdesc = trigdata->tg_relation->rd_att;
-	datname = DatumGetName(heap_getattr(trigdata->tg_trigtuple,
-										VAMANA_DATABASES_ATTNUM_DATNAME,
-										tupdesc, &isnull));
-	Assert(!isnull);			/* datname is the primary key, NOT NULL */
+	datnameDatum = heap_getattr(trigdata->tg_trigtuple,
+								VAMANA_DATABASES_ATTNUM_DATNAME,
+								tupdesc, &isnull);
+	if (isnull)
+		elog(ERROR, "vamana_databases_reject_delete_with_live_indexes: datname is null");
+	datname = DatumGetName(datnameDatum);
 
 	/*
 	 * DROP DATABASE without first removing the row is a reachable sequence: if

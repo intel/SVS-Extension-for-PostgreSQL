@@ -57,9 +57,9 @@ CREATE TABLE vamana_databases (
 	-- Placeholders for a future resource-management phase; NULL means
 	-- "use the GUC default." Nullable with no default so activating them
 	-- later needs no ALTER TABLE.
-	graph_memory_mb     int,
-	total_memory_mb     int,
-	search_num_threads  int
+	graph_memory_mb     int CHECK (graph_memory_mb > 0),
+	total_memory_mb     int CHECK (total_memory_mb > 0),
+	search_num_threads  int CHECK (search_num_threads BETWEEN 1 AND 1024)
 );
 
 CREATE FUNCTION vamana_databases_notify() RETURNS trigger
@@ -67,7 +67,7 @@ CREATE FUNCTION vamana_databases_notify() RETURNS trigger
 $$
 BEGIN
 	PERFORM pg_notify('vamana_databases_changed', '');
-	RETURN NEW;
+	RETURN NULL;
 END;
 $$;
 
@@ -86,6 +86,10 @@ CREATE TRIGGER vamana_databases_queue_reservation
 -- legitimate reason to bulk-wipe this table. The owner retains TRUNCATE
 -- regardless of this revoke.
 REVOKE TRUNCATE ON vamana_databases FROM PUBLIC;
+
+-- Not granted to PUBLIC by default, but explicit so the invariant survives a
+-- future default-privileges change and is grep-able here.
+REVOKE INSERT, UPDATE, DELETE ON vamana_databases FROM PUBLIC;
 
 -- Observability
 --
