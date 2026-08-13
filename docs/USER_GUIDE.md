@@ -175,7 +175,7 @@ These parameters are specified in the `WITH (...)` clause of `CREATE INDEX` and 
 
 ### 4.3 Query-Time Parameters
 
-These are session-scoped GUC parameters that can be changed at any time without rebuilding the index.
+These are session-scoped GUC parameters that can be changed at any time without rebuilding the index. `svs.search_window_size` is settable by any role; `svs.search_num_threads` requires superuser (`PGC_SUSET`).
 
 ```sql
 -- Increase the search window for higher recall (at the cost of latency)
@@ -197,7 +197,7 @@ COMMIT;
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
 | `svs.search_window_size` | `100` | 10 – 10000 | Number of candidates examined during a search. Higher = better recall, higher latency. |
-| `svs.search_num_threads` | `0` | 0 – 1024 | Number of SVS threads used per search. `0` = auto (resolves to `nproc - 1`). Set to a lower value to reduce CPU oversubscription in concurrent workloads. |
+| `svs.search_num_threads` | `0` | 0 – 1024 | Number of SVS threads used per search. `0` = auto (resolves to `nproc - 1`). Set to a lower value to reduce CPU oversubscription in concurrent workloads. Requires superuser to set (`PGC_SUSET`). |
 
 > The session GUC takes precedence over the `search_window_size` index reloption whenever it is set. There is currently no special "disable" value (such as `0`); to stop overriding and return to the default behavior, use `RESET svs.search_window_size`.
 
@@ -539,7 +539,7 @@ To bounce one database's worker without taking the database offline — for exam
 SELECT svs_restart_worker('mydb');
 ```
 
-This drains and cleanly stops the worker (checkpointing every cached index first) and respawns it. It raises an error if the named database is paused or not configured. Only enabled databases can be restarted.
+This drains and cleanly stops the worker (checkpointing every cached index first) and respawns it. It raises an error if the named database is paused or not configured. Only enabled databases can be restarted. Internally it increments the row's `restart_generation` column; the launcher observes the change through its normal reconcile pass and bounces that worker.
 
 #### Removing a database permanently
 
@@ -666,7 +666,7 @@ SELECT * FROM svs_teardown_database();
 DELETE FROM vamana_databases WHERE datname = 'mydb';
 ```
 
-`svs_teardown_database()` runs with **your own privileges** (not elevated), so it can only drop indexes you own; it returns one row per index reporting whether each was dropped and, if skipped, why. It does not abort on the first index you cannot drop — it continues and reports the mixed result.
+`svs_teardown_database()` runs with **your own privileges** (not elevated), so it can only drop indexes you own; it returns one row per index reporting whether each was dropped and, if skipped, why. It does not abort on the first index you cannot drop — it continues and reports the mixed result. Each failed drop also emits a `WARNING` to the server log (mirroring the `reason` column of that row), so failures are visible in logs as well as in the result set.
 
 **Order matters, and the wrong order is rejected.** Running step 2 first — `DELETE` while Vamana indexes still exist — fails immediately:
 
@@ -785,6 +785,8 @@ If `hot_standby_feedback = off`, the primary may remove WAL segments that the st
 
 INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker. Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly — this is not a privilege escalation: the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
 
+The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `total_memory_mb > 0`, and `search_num_threads BETWEEN 1 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
+
 ---
 
 ## 8. Monitoring
@@ -818,6 +820,7 @@ FROM pg_stat_vamana_worker;
 | `worker_pid` | The worker's PID, or `0`/NULL if no worker is currently running (starting, or crashed and awaiting respawn) |
 | `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive`, or `replica` (serving a hot standby) |
 | `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)) |
+| `evict_all` | `true` while the worker is draining every cached index (e.g. during a restart or shutdown); normally `false` |
 | `heartbeat_ts` | Last time the worker updated its heartbeat |
 
 `pg_stat_vamana_worker_slot` reports one row per in-flight IPC work-request slot (`slot_status`, `slot_kind`, `index_relid`, `error_message`) for finer-grained diagnosis of what a worker is currently processing.
@@ -1053,7 +1056,8 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
-| `svs.search_num_threads` | `0` | `0` | `1024` | SVS threads per search; 0 = auto (nproc-1) |
+| `svs.search_num_threads` | `0` | `0` | `1024` | SVS threads per search; 0 = auto (nproc-1). Superuser-only (`PGC_SUSET`) |
+| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
 
 ### Server GUC Parameters (require restart — `postgresql.conf` only, `PGC_POSTMASTER`)
 
@@ -1073,7 +1077,6 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
 | `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |
 | `svs.worker_stop_timeout_ms` | `30000` | `0` | `600000` | Wait for a restarting worker to report stopped before giving up; does not force-kill |
-| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
 | `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
 | `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |

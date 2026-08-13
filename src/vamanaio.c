@@ -22,6 +22,7 @@
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/fd.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
 
 #include <sys/stat.h>
@@ -227,6 +228,24 @@ VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 	return true;
 }
 
+/* Guarantees buf's content lock is released even if GenericXLogFinish throws. */
+static void
+VamanaFinishAndReleaseBuffer(GenericXLogState *state, Buffer buf)
+{
+	PG_TRY();
+	{
+		GenericXLogFinish(state);
+	}
+	PG_CATCH();
+	{
+		UnlockReleaseBuffer(buf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	UnlockReleaseBuffer(buf);
+}
+
 /*
  * Update only the hasSavedIndex flag on the metapage.
  */
@@ -245,8 +264,7 @@ VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum)
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 	metap = VamanaPageGetMeta(page);
 	metap->hasSavedIndex = hasSavedIndex;
-	GenericXLogFinish(state);
-	UnlockReleaseBuffer(buf);
+	VamanaFinishAndReleaseBuffer(state, buf);
 }
 
 /*
@@ -275,8 +293,10 @@ VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache 
 	metap->numDeleted = (uint32) meta->numDeleted;
 	metap->tidMappingCapacity = (uint32) meta->tidMappingCapacity;
 
-	GenericXLogFinish(state);
-	UnlockReleaseBuffer(buf);
+	/* Test hook: TAP forces a failure while buf's exclusive content lock is held. */
+	INJECTION_POINT("vamana-mark-index-saved-error", NULL);
+
+	VamanaFinishAndReleaseBuffer(state, buf);
 }
 
 /*

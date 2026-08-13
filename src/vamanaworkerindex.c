@@ -14,6 +14,7 @@
 
 #include "vamana.h"
 #include "vamana_replication.h"
+#include "vamana_subxact_guard.h"
 #include "vamanaworker.h"
 #include "svs_wrapper.h"
 
@@ -22,6 +23,7 @@
 #include "executor/spi.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -30,11 +32,28 @@
  * Worker-internal helpers
  * ----------------------------------------------------------------------- */
 
+typedef struct SaveAfterRebuildArgs
+{
+	Relation	indexRel;
+	SVSIndexHandle index;
+	VamanaIndexCache *cache;
+} SaveAfterRebuildArgs;
+
+static void
+SaveAfterRebuildBody(void *arg)
+{
+	SaveAfterRebuildArgs *a = (SaveAfterRebuildArgs *) arg;
+
+	VamanaSaveIndexToDisk(a->indexRel, a->index, MAIN_FORKNUM, a->cache);
+}
+
 /* Swallow save failures — the waiting backend's query must not fail due to a BGW-side I/O problem. */
 static void
 TrySaveAfterRebuild(Relation indexRel, SVSIndexHandle index, Oid relid)
 {
 	VamanaIndexCache *cache = VamanaGetCache(relid);
+	SaveAfterRebuildArgs args;
+	VamanaSubXactResult result;
 
 	Assert(cache != NULL);
 
@@ -46,19 +65,19 @@ TrySaveAfterRebuild(Relation indexRel, SVSIndexHandle index, Oid relid)
 	if (!VamanaGetReplayRole()->persists_index)
 		return;
 
-	PG_TRY();
-	{
-		VamanaSaveIndexToDisk(indexRel, index, MAIN_FORKNUM, cache);
-	}
-	PG_CATCH();
-	{
-		VamanaCacheSetNeedsSave(relid, true);
-		FlushErrorState();
-		ereport(LOG,
-				(errmsg("vamana index %u: save after rebuild failed, "
-						"will retry; index durability degraded", relid)));
-	}
-	PG_END_TRY();
+	args.indexRel = indexRel;
+	args.index = index;
+	args.cache = cache;
+
+	result = VamanaRunInSubXact(SaveAfterRebuildBody, &args, NULL);
+	if (result.succeeded)
+		return;
+
+	VamanaCacheSetNeedsSave(relid, true);
+	FreeErrorData(result.edata);
+	ereport(LOG,
+			(errmsg("vamana index %u: save after rebuild failed, "
+					"will retry; index durability degraded", relid)));
 }
 
 void
@@ -159,12 +178,34 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  * Must be called from within an active transaction (or the caller must open
  * one).
  */
+typedef struct GetOrLoadIndexArgs
+{
+	Oid			relid;
+	bool	   *loadedFromDisk;
+	SVSIndexHandle index;		/* output */
+} GetOrLoadIndexArgs;
+
+static void
+GetOrLoadIndexBody(void *arg)
+{
+	GetOrLoadIndexArgs *a = (GetOrLoadIndexArgs *) arg;
+	Relation	indexRel = index_open(a->relid, NoLock);
+
+	/* Test hook: TAP forces a failure while indexRel/lock are held. */
+	INJECTION_POINT("vamana-get-or-load-index-error", NULL);
+
+	a->index = LoadIndexFromDiskOrRebuild(indexRel, a->relid, a->loadedFromDisk);
+	FinalizeIndexCacheEntry(indexRel, a->relid);
+	index_close(indexRel, AccessShareLock);
+}
+
 SVSIndexHandle
 VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 {
 	bool		needsRebuild;
 	SVSIndexHandle index;
-	Relation	indexRel;
+	GetOrLoadIndexArgs args;
+	VamanaSubXactResult result;
 
 	if (loadedFromDisk != NULL)
 		*loadedFromDisk = false;
@@ -188,25 +229,20 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 		return NULL;
 	}
 
-	/* Open the index relation inside the caller's transaction */
-	PG_TRY();
-	{
-		indexRel = index_open(relid, NoLock);
-		index = LoadIndexFromDiskOrRebuild(indexRel, relid, loadedFromDisk);
-		FinalizeIndexCacheEntry(indexRel, relid);
-		index_close(indexRel, AccessShareLock);
-	}
-	PG_CATCH();
-	{
-		UnlockRelationOid(relid, AccessShareLock);
-		FlushErrorState();
-		ereport(WARNING,
-				(errmsg("vamana worker: failed to load index %u", relid)));
-		index = NULL;
-	}
-	PG_END_TRY();
+	args.relid = relid;
+	args.loadedFromDisk = loadedFromDisk;
+	args.index = NULL;
 
-	return index;
+	result = VamanaRunInSubXact(GetOrLoadIndexBody, &args, NULL);
+	if (result.succeeded)
+		return args.index;
+
+	UnlockRelationOid(relid, AccessShareLock);
+	ereport(WARNING,
+			(errmsg("vamana worker: failed to load index %u", relid)));
+	FreeErrorData(result.edata);
+
+	return NULL;
 }
 
 /*

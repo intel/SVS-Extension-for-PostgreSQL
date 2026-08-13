@@ -179,6 +179,46 @@ DROP ROLE vamana_td_other, vamana_td_caller;
 -- Already-clean database: teardown returns zero rows without error.
 SELECT * FROM svs_teardown_database();
 
+-- svs_warmup_index/svs_warmup_database gate on SELECT on the index's table
+-- (same policy as pg_prewarm): warming only makes the index resident, no more
+-- sensitive than reading it.  Contrast svs_teardown_database above, which gates
+-- on ownership because it drops.
+CREATE ROLE vamana_warm_reader;
+CREATE TABLE vamana_warm_a (id int, val vector(3));
+CREATE TABLE vamana_warm_b (id int, val vector(3));
+INSERT INTO vamana_warm_a VALUES (1, '[1,1,1]');
+INSERT INTO vamana_warm_b VALUES (1, '[1,1,1]');
+SET client_min_messages = error;
+CREATE INDEX vamana_warm_ia ON vamana_warm_a USING vamana (val vector_l2_ops);
+CREATE INDEX vamana_warm_ib ON vamana_warm_b USING vamana (val vector_l2_ops);
+RESET client_min_messages;
+
+-- The table owner may warm its index.
+SELECT svs_warmup_index('vamana_warm_ia');
+
+-- A role is granted SELECT on vamana_warm_a only: it may warm that index, but
+-- warming vamana_warm_ib is denied, not silently skipped.
+GRANT SELECT ON vamana_warm_a TO vamana_warm_reader;
+SET ROLE vamana_warm_reader;
+SELECT svs_warmup_index('vamana_warm_ia');
+SELECT svs_warmup_index('vamana_warm_ib');
+RESET ROLE;
+
+-- svs_warmup_database warms exactly the vamana indexes the caller may read and
+-- skips the rest silently, so the count equals the caller's readable count
+-- however many exist: vamana_warm_reader reads vamana_warm_a but not _b.
+SET ROLE vamana_warm_reader;
+SELECT svs_warmup_database() =
+	(SELECT count(*) FROM pg_index i
+	   JOIN pg_class ic ON ic.oid = i.indexrelid
+	   JOIN pg_am am ON am.oid = ic.relam
+	  WHERE am.amname = 'vamana'
+	    AND has_table_privilege(i.indrelid, 'SELECT')) AS warms_only_readable;
+RESET ROLE;
+
+DROP TABLE vamana_warm_a, vamana_warm_b;
+DROP ROLE vamana_warm_reader;
+
 -- BEFORE DELETE guard: a row cannot be removed while vamana indexes still
 -- exist in its database, reading the committed index count from shmem.
 

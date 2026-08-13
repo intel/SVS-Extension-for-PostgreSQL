@@ -242,4 +242,86 @@ SKIP: {
     $node->stop;
 }
 
+# ---------------------------------------------------------------------------
+# pg_stat_vamana_worker_slot() copies scalars out under the header LW_SHARED
+# lock and defers text/tuplestore formatting until after the lock is
+# released, mirroring pg_stat_vamana_worker's hydrate/format split.  A reader
+# parked mid-format must not hold up a concurrent reservation, which needs
+# the header lock LW_EXCLUSIVE.
+# ---------------------------------------------------------------------------
+SKIP: {
+    skip 'server not built with --enable-injection-points', 3
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = start_node('vamana_slot_stat_no_lock_hold');
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 40);
+    $node->safe_psql('postgres', "CREATE DATABASE slot_stat_db2;");
+
+    my $ctl = $node->background_psql('postgres');
+    $ctl->query_safe(
+        "SELECT injection_points_attach('vamana-slot-stat-emit-row', 'wait');");
+
+    my $reader = $node->background_psql('postgres');
+    $reader->query_until(qr//, "SELECT count(*) FROM pg_stat_vamana_worker_slot();\n");
+
+    my $parked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $parked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE wait_event = 'vamana-slot-stat-emit-row';");
+        last if $parked ne '';
+    }
+    isnt($parked, '', 'a slot-stat reader parks mid-format');
+
+    # Reserver: fire-and-forget; an LWLock wait ignores statement_timeout, so
+    # completion is observed by polling pg_stat_activity, never awaited directly.
+    my $reserver = $node->background_psql('postgres');
+    my $reserver_pid = $reserver->query('SELECT pg_backend_pid();');
+    chomp $reserver_pid;
+    $reserver->query_until(qr//,
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('slot_stat_db2', true);\n");
+
+    my $done = '';
+    my $blocked_on_header = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        my $row = $ctl->query(
+            "SELECT wait_event_type, wait_event, state FROM pg_stat_activity "
+          . "WHERE pid = $reserver_pid;");
+        if ($row =~ /\|idle$/) {
+            $done = 1;
+            last;
+        }
+        $blocked_on_header = $row if $row =~ /^LWLock\|vamana_worker_header\|/;
+    }
+    ok($done,
+        'reserving a new slot completes while a slot-stat reader is parked mid-format');
+    is($blocked_on_header, '',
+        'the reservation never blocks on the header lock behind the parked reader');
+
+    # The callback hits this point once per slot, not once overall: detach
+    # BEFORE waking so the reader's next iteration finds no attachment and
+    # just proceeds, instead of parking again.
+    $ctl->query_safe(
+        "SELECT injection_points_detach('vamana-slot-stat-emit-row');");
+    $ctl->query_safe(
+        "SELECT injection_points_wakeup('vamana-slot-stat-emit-row');");
+
+    for (1 .. 100) {
+        usleep(100_000);
+        my $state = $ctl->query(
+            "SELECT state FROM pg_stat_activity WHERE pid = $reserver_pid;");
+        last if $state eq 'idle' || $state eq '';
+    }
+
+    $reader->quit;
+    $reserver->quit;
+    $ctl->quit;
+    $node->stop;
+}
+
 done_testing();

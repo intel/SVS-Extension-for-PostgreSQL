@@ -10,6 +10,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use File::Path qw(remove_tree);
 use File::Temp qw(tempdir);
 use POSIX qw(_exit);
 use Time::HiRes qw(usleep);
@@ -17,6 +18,31 @@ use Time::HiRes qw(usleep);
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
+
+# Kill the worker for $db and wait for its replacement, so the next access is
+# a genuine cold load against an empty in-process cache.  wait_for_worker_db
+# alone can return the dying pid before the launcher reaps it.
+sub restart_worker
+{
+    my ($node, $db) = @_;
+    my $old_pid = wait_for_worker_db($node, $db, 10);
+
+    my $log_pos = length($node->log_content());
+    kill('TERM', $old_pid);
+    $node->wait_for_log(qr/vamana background worker shutting down/, $log_pos);
+
+    for (1 .. 50) {
+        usleep(100_000);
+        my $alive = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = $old_pid;");
+        chomp $alive;
+        last if $alive eq '0';
+    }
+
+    my $new_pid = wait_for_worker_db($node, $db, 40);
+    isnt($new_pid, $old_pid, "worker for $db restarted with an empty cache");
+    return $new_pid;
+}
 
 # ===========================================================================
 # VamanaWorkerResetStaleSlots — all slots empty at BGW startup
@@ -195,6 +221,162 @@ use VamanaTestUtils qw(:all);
 
     ok($result == 10,
         "BGW continues serving t2 after error on dropped idx1 (got $result results)");
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Cold-load failure — VamanaWorkerGetOrLoadIndex catches without an abort
+#
+# The catch there (FlushErrorState, no transaction abort) can leave
+# resource-owner/memory-context state inconsistent for the rest of the
+# process's life.  Force a failure while indexRel and its lock are held,
+# then prove the same worker loads the same index correctly right after.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 3
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_load_error_recovery');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE load_err_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO load_err_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 50) i;
+        CREATE INDEX load_err_idx ON load_err_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    # CREATE INDEX synchronously warms the cache via a LOAD slot, not
+    # VamanaWorkerGetOrLoadIndex; restart so the next access is a cold load.
+    my $worker_pid = restart_worker($node, 'postgres');
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-get-or-load-index-error', 'error');");
+
+    $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM load_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-get-or-load-index-error');");
+
+    is(wait_for_worker_db($node, 'postgres', 10), $worker_pid,
+        'worker survives the injected load failure');
+
+    my ($ret, $stdout) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM load_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    ok($ret == 0 && $stdout =~ /^\d+$/m,
+        'a subsequent, uninjected search on the same index still succeeds');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Save-after-rebuild failure — a leaked buffer content lock must not wedge
+# other backends
+#
+# VamanaMarkIndexSaved holds its buffer's BUFFER_LOCK_EXCLUSIVE across
+# GenericXLogFinish.  TrySaveAfterRebuild's catch sits above
+# VamanaSaveIndexToDisk, so a failure there used to propagate with that lock
+# still held; ordinary commit never releases a leaked LWLock, so it would
+# leak for the worker's lifetime and wedge any later VACUUM on the same
+# index.  Force the rebuild path (no on-disk checkpoint), inject the
+# failure, and prove a concurrent VACUUM on the same index still completes.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 6
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_save_error_recovery');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE save_err_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO save_err_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 50) i;
+        CREATE INDEX save_err_idx ON save_err_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    my $relid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'save_err_idx';");
+    chomp $relid;
+
+    my $worker_pid = restart_worker($node, 'postgres');
+    remove_tree($node->data_dir . "/vamana_indexes/$relid");
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-mark-index-saved-error', 'error');");
+
+    my $log_pos = length($node->log_content());
+    my ($ret, $stdout) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM save_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    ok($ret == 0 && $stdout =~ /^\d+$/m,
+        'the rebuilt-but-unsaved index still serves the triggering search');
+    like(substr($node->log_content(), $log_pos),
+        qr/save after rebuild failed/,
+        'the injected save failure is caught during the post-rebuild save');
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-mark-index-saved-error');");
+
+    # Fire-and-forget: an LWLock wait ignores statement_timeout, so
+    # completion is observed by polling, never awaited directly.
+    my $vacuum = $node->background_psql('postgres');
+    my $vacuum_pid = $vacuum->query('SELECT pg_backend_pid();');
+    chomp $vacuum_pid;
+    $vacuum->query_until(qr//, "VACUUM save_err_tbl;\n");
+
+    my $done = '';
+    my $blocked_on_buffer = '';
+    for (1 .. 50) {    # up to 5s
+        usleep(100_000);
+        my $row = $node->safe_psql('postgres',
+            "SELECT wait_event_type, wait_event, state FROM pg_stat_activity "
+          . "WHERE pid = $vacuum_pid;");
+        if ($row =~ /\|idle$/) {
+            $done = 1;
+            last;
+        }
+        $blocked_on_buffer = $row if $row =~ /^LWLock\|BufferContent\|/;
+    }
+
+    ok($done, 'VACUUM on the same index completes despite the earlier save failure');
+    is($blocked_on_buffer, '', 'VACUUM never blocks on the buffer lock the save failure held');
+
+    is(wait_for_worker_db($node, 'postgres', 10), $worker_pid,
+        'worker survives the injected save failure');
 
     $node->stop;
 }

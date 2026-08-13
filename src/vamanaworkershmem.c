@@ -162,20 +162,44 @@ VamanaWorkerShmemSize(void)
  * lives in shared memory; failing to do so causes undefined behavior on
  * first WaitLatch/SetLatch.
  */
+/*
+ * Per-tenant baseline, shared by VamanaWorkerInitSlot and
+ * VamanaWorkerReleaseSlot so a recycled slot can't inherit the previous
+ * tenant's counters, reload queue, or index-lock reservations.  Excludes
+ * dbOid and the one-time atomic/latch construction, done only in InitSlot.
+ */
+static void
+VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
+{
+	entry->workerPid = 0;
+	entry->backoff.last_attempt_time = 0;
+	entry->backoff.consecutive_failures = 0;
+
+	pg_atomic_write_u32(&entry->accepting, 0);
+	pg_atomic_write_u32(&entry->evict_all, 0);
+	pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+	pg_atomic_write_u32(&entry->indexCount, 0);
+
+	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
+		pg_atomic_write_u32(&entry->reloadRequests[i].relid, 0);
+
+	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
+		pg_atomic_write_u32(&entry->indexLocks[i].relid, 0);
+
+	for (int i = 0; i < entry->maxSlots; i++)
+		pg_atomic_write_u32(&entry->slots[i].status, VAMANA_SLOT_EMPTY);
+}
+
 static void
 VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 {
 	entry->dbOid = InvalidOid;
-	entry->workerPid = 0;
-	pg_atomic_init_u32(&entry->accepting, 0);
 	entry->maxSlots = MaxBackends;
 	entry->slots = (VamanaWorkerSlot *) slotRegion;
 
-	entry->backoff.last_attempt_time = 0;
-	entry->backoff.consecutive_failures = 0;
-
 	InitSharedLatch(&entry->workerLatch);
 
+	pg_atomic_init_u32(&entry->accepting, 0);
 	for (int i = 0; i < MaxBackends; i++)
 	{
 		VamanaWorkerSlot *slot = &entry->slots[i];
@@ -198,6 +222,9 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 		pg_atomic_init_u32(&ls->relid, 0);
 		LWLockInitialize(&ls->lock, VamanaIndexLockTranche);
 	}
+
+	/* Atomics are now constructed; set their logical baseline values. */
+	VamanaWorkerResetEntryState(entry);
 }
 
 void
@@ -703,9 +730,7 @@ VamanaWorkerReleaseSlot(Oid dbOid)
 	if (entry != NULL)
 	{
 		entry->dbOid = InvalidOid;
-		entry->workerPid = 0;
-		entry->backoff.last_attempt_time = 0;
-		entry->backoff.consecutive_failures = 0;
+		VamanaWorkerResetEntryState(entry);
 		VamanaWorkerShmemHeaderPtr->numActive--;
 	}
 

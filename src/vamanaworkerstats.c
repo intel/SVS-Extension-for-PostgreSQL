@@ -31,6 +31,7 @@
 #include "miscadmin.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 
 /*
  * Worker liveness state.  Total: every value has a VamanaWorkerStateName()
@@ -251,7 +252,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
  *   0  db_oid         oid
  *   1  slot_index     int4
  *   2  slot_status    text   ("empty"/"pending"/"processing"/"done"/"error")
- *   3  slot_kind      text   ("search"/"insert"/"delete"/"maintenance"/"load"/NULL)
+ *   3  slot_kind      text   ("search"/"insert"/"delete"/"maintenance"/"load"/"warmup"/NULL)
  *   4  index_relid    oid    (InvalidOid -> NULL)
  *   5  error_message  text   (NULL unless status == error)
  * ----------------------------------------------------------------------- */
@@ -323,60 +324,66 @@ VamanaSlotKindName(uint32 status, uint8 slotKind)
 	return NULL;
 }
 
-typedef struct VamanaSlotEmitCtx
+typedef struct VamanaWorkerSlotRow
+{
+	Oid			dbOid;
+	int			slotIndex;
+	VamanaWorkerSlotSnapshot slot;
+} VamanaWorkerSlotRow;
+
+typedef struct VamanaSlotCollectCtx
 {
 	VamanaStatVisibility vis;
-	ReturnSetInfo *rsinfo;
-} VamanaSlotEmitCtx;
+	VamanaWorkerSlotRow *rows;
+	int			count;
+	int			capacity;
+} VamanaSlotCollectCtx;
 
 /*
- * Emit every work-slot of one visible entry, walking entry->slots INSIDE the
+ * Copy every work-slot of one visible entry, walking entry->slots INSIDE the
  * iterator's header lock: holding LW_SHARED keeps slots/maxSlots and the
  * entry's identity stable, so a released-and-re-reserved entry cannot mis-
  * attribute slots to the wrong tenant.  Per-slot payload freshness is handled
- * independently by the acquire barrier in VamanaWorkerReadSlotSnapshot.
+ * independently by the acquire barrier in VamanaWorkerReadSlotSnapshot.  Must
+ * stay a bounded struct copy per slot — no text/tuplestore work — to respect
+ * VamanaWorkerForEachReserved's no-unbounded-work-under-the-lock contract.
  */
 static void
-VamanaSlotEmitCb(VamanaWorkerShmem *entry, void *ctxArg)
+VamanaSlotCollectCb(VamanaWorkerShmem *entry, void *ctxArg)
 {
-	VamanaSlotEmitCtx *ctx = (VamanaSlotEmitCtx *) ctxArg;
+	VamanaSlotCollectCtx *ctx = (VamanaSlotCollectCtx *) ctxArg;
 
 	if (!VamanaStatEntryVisible(&ctx->vis, entry->dbOid))
 		return;
 
 	for (int i = 0; i < entry->maxSlots; i++)
 	{
-		VamanaWorkerSlotSnapshot snap;
-		const char *kindStr;
-		Datum		values[PG_STAT_VAMANA_WORKER_SLOT_COLS];
-		bool		nulls[PG_STAT_VAMANA_WORKER_SLOT_COLS];
+		VamanaWorkerSlotRow *row;
 
-		VamanaWorkerReadSlotSnapshot(&entry->slots[i], &snap);
-		memset(nulls, 0, sizeof(nulls));
+		Assert(ctx->count < ctx->capacity);
+		row = &ctx->rows[ctx->count++];
 
-		values[0] = ObjectIdGetDatum(entry->dbOid);
-		values[1] = Int32GetDatum(i);
-		values[2] = CStringGetTextDatum(VamanaSlotStatusName(snap.status));
-
-		kindStr = VamanaSlotKindName(snap.status, snap.slotKind);
-		if (kindStr != NULL)
-			values[3] = CStringGetTextDatum(kindStr);
-		else
-			nulls[3] = true;
-
-		if (OidIsValid(snap.indexRelid))
-			values[4] = ObjectIdGetDatum(snap.indexRelid);
-		else
-			nulls[4] = true;
-
-		if (snap.hasError)
-			values[5] = CStringGetTextDatum(snap.errorMessage);
-		else
-			nulls[5] = true;
-
-		tuplestore_putvalues(ctx->rsinfo->setResult, ctx->rsinfo->setDesc,
-							 values, nulls);
+		row->dbOid = entry->dbOid;
+		row->slotIndex = i;
+		VamanaWorkerReadSlotSnapshot(&entry->slots[i], &row->slot);
 	}
+}
+
+/*
+ * Upper bound on total slots across every header entry, reserved or not:
+ * maxSlots is fixed per entry at postmaster startup and never changes
+ * afterward, so this is safe to read without the header lock (same
+ * precondition pg_stat_vamana_worker already relies on for numSlots).
+ */
+static int
+VamanaWorkerTotalSlotCapacity(void)
+{
+	int			total = 0;
+
+	for (int i = 0; i < VamanaWorkerShmemHeaderPtr->numSlots; i++)
+		total += VamanaWorkerShmemHeaderPtr->slots[i].maxSlots;
+
+	return total;
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(pg_stat_vamana_worker_slot);
@@ -384,15 +391,53 @@ Datum
 pg_stat_vamana_worker_slot(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	VamanaSlotEmitCtx ctx;
+	VamanaSlotCollectCtx ctx;
 
 	InitMaterializedSRF(fcinfo, 0);
 	Assert(rsinfo->setDesc->natts == PG_STAT_VAMANA_WORKER_SLOT_COLS);
 
 	ctx.vis = VamanaStatVisibilityForCaller();
-	ctx.rsinfo = rsinfo;
+	ctx.capacity = VamanaWorkerTotalSlotCapacity();
+	ctx.count = 0;
+	ctx.rows = palloc(sizeof(VamanaWorkerSlotRow) * ctx.capacity);
 
-	VamanaWorkerForEachReserved(VamanaSlotEmitCb, &ctx);
+	VamanaWorkerForEachReserved(VamanaSlotCollectCb, &ctx);
+
+	for (int i = 0; i < ctx.count; i++)
+	{
+		const VamanaWorkerSlotRow *row = &ctx.rows[i];
+		const VamanaWorkerSlotSnapshot *snap = &row->slot;
+		const char *kindStr;
+		Datum		values[PG_STAT_VAMANA_WORKER_SLOT_COLS];
+		bool		nulls[PG_STAT_VAMANA_WORKER_SLOT_COLS];
+
+		memset(nulls, 0, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(row->dbOid);
+		values[1] = Int32GetDatum(row->slotIndex);
+		values[2] = CStringGetTextDatum(VamanaSlotStatusName(snap->status));
+
+		kindStr = VamanaSlotKindName(snap->status, snap->slotKind);
+		if (kindStr != NULL)
+			values[3] = CStringGetTextDatum(kindStr);
+		else
+			nulls[3] = true;
+
+		if (OidIsValid(snap->indexRelid))
+			values[4] = ObjectIdGetDatum(snap->indexRelid);
+		else
+			nulls[4] = true;
+
+		if (snap->hasError)
+			values[5] = CStringGetTextDatum(snap->errorMessage);
+		else
+			nulls[5] = true;
+
+		/* Test hook: TAP proves this runs outside the header LW_SHARED hold. */
+		INJECTION_POINT("vamana-slot-stat-emit-row", NULL);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
 
 	return (Datum) 0;
 }

@@ -25,9 +25,13 @@
 
 #include "access/relation.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_index.h"
 #include "commands/defrem.h"
 #include "fmgr.h"
+#include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "utils/acl.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -36,14 +40,17 @@
  * the worker confirmed it resident.  Verifies the relation is a vamana index
  * against the opened, visible relcache entry: a plain relam comparison, not the
  * SnapshotSelf path VamanaRelationIsVamanaIndex uses for not-yet-visible tuples
- * mid-DDL.  Throws on a non-vamana target; callers choosing best-effort must
- * isolate the call in a subtransaction.
+ * mid-DDL.  Requires SELECT on the index's table (warming only makes the index
+ * resident, no more sensitive than reading it; same gate as pg_prewarm).
+ * Throws on a non-vamana target or insufficient privilege; callers choosing
+ * best-effort must isolate the call in a subtransaction.
  */
 static bool
 warmup_one(Oid relid)
 {
 	Relation	rel = relation_open(relid, AccessShareLock);
 	Oid			vamanaAm = get_index_am_oid("vamana", false);
+	AclResult	aclresult;
 	bool		warmed;
 
 	if (rel->rd_rel->relkind != RELKIND_INDEX ||
@@ -55,6 +62,16 @@ warmup_one(Oid relid)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is not a vamana index", name)));
+	}
+
+	aclresult = pg_class_aclcheck(rel->rd_index->indrelid, GetUserId(),
+								  ACL_SELECT);
+	if (aclresult != ACLCHECK_OK)
+	{
+		char	   *name = pstrdup(RelationGetRelationName(rel));
+
+		relation_close(rel, AccessShareLock);
+		aclcheck_error(aclresult, OBJECT_INDEX, name);
 	}
 
 	warmed = VamanaWorkerSubmitWarmup(relid);
@@ -97,6 +114,8 @@ WarmupOneBody(void *arg)
 /*
  * Warm one index under an internal subtransaction so a failure is confined to
  * that index and the batch continues.  Returns true if the index was warmed.
+ * An index the caller cannot read is not theirs to warm: skip it silently
+ * rather than warn, so a batch warms exactly what the caller is entitled to.
  */
 static bool
 warmup_one_guarded(Oid relid)
@@ -108,9 +127,10 @@ warmup_one_guarded(Oid relid)
 
 	if (!result.succeeded)
 	{
-		ereport(WARNING,
-				(errmsg("could not warm up vamana index %u: %s",
-						relid, result.edata->message)));
+		if (result.edata->sqlerrcode != ERRCODE_INSUFFICIENT_PRIVILEGE)
+			ereport(WARNING,
+					(errmsg("could not warm up vamana index %u: %s",
+							relid, result.edata->message)));
 		FreeErrorData(result.edata);
 		return false;
 	}
