@@ -32,6 +32,13 @@ jobs:
     # Cold-cache runs build PostgreSQL and the SVS library from source; the
     # timeout keeps a hung dependency build from consuming the 6 hour default.
     timeout-minutes: 180
+    env:
+      # Prebuilt SVS archives are stale relative to bindings/c (their headers lack
+      # svs::index::vamana::MemoryBreakdown), and the only current archive that has
+      # it links an LTO static library needing GCC 11.2 exactly. Building from the
+      # SVS source tree sidesteps both. Revert to ON once the SVS repo is fixed.
+      # Quoted: bare OFF is a YAML boolean, which would reach cmake as "false".
+      SVS_LVQ_LEANVEC: "OFF"
     permissions:
       # required for all workflows
       security-events: write
@@ -84,7 +91,7 @@ jobs:
         path: |
           docs/build_guide/pgsql_install
           docs/build_guide/svs_install
-        key: svs-deps-${{ runner.os }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
+        key: svs-deps-${{ runner.os }}-lvq${{ env.SVS_LVQ_LEANVEC }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
 
     - name: Build PostgreSQL
       if: steps.deps-cache.outputs.cache-hit != 'true'
