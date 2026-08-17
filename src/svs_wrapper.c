@@ -85,8 +85,9 @@ CheckSVSError(svs_error_h error, const char *operation)
 
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("SVS %s failed: %s (code %d)",
-						operation, msg ? msg : "unknown error", code)));
+				 errmsg("SVS operation failed: %s", operation),
+				 errdetail_log("SVS error: %s (code %d)",
+							   msg ? msg : "unknown error", code)));
 	}
 }
 
@@ -636,8 +637,8 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 		svs_error_free(error);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to save SVS index to \"%s\": %s",
-						path, saved)));
+				 errmsg("failed to save SVS index"),
+				 errdetail_log("Path \"%s\": %s", path, saved)));
 		return -1;				/* unreachable */
 	}
 
@@ -761,8 +762,8 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 		svs_error_free(error);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to load dynamic SVS index from \"%s\": %s",
-						path, msg ? msg : "unknown error")));
+				 errmsg("failed to load SVS index"),
+				 errdetail_log("Path \"%s\": %s", path, msg ? msg : "unknown error")));
 		return NULL;
 	}
 
