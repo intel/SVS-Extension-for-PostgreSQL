@@ -798,8 +798,8 @@ SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int n
 		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("SVS dynamic add points failed: %s",
-						msg ? msg : "unknown error")));
+				 errmsg("SVS dynamic add points failed"),
+				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
 		return -1;
 	}
 
@@ -833,8 +833,8 @@ SVSDeletePoints(SVSIndexHandle index, const size_t *ids, int num_ids)
 		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("SVS dynamic delete points failed: %s",
-						msg ? msg : "unknown error")));
+				 errmsg("SVS dynamic delete points failed"),
+				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
 		return -1;
 	}
 
@@ -864,8 +864,8 @@ SVSConsolidate(SVSIndexHandle index)
 		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("SVS dynamic consolidate failed: %s",
-						msg ? msg : "unknown error")));
+				 errmsg("SVS dynamic consolidate failed"),
+				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
 		return false;
 	}
 
@@ -895,8 +895,8 @@ SVSCompact(SVSIndexHandle index, size_t batchsize)
 		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("SVS dynamic compact failed: %s",
-						msg ? msg : "unknown error")));
+				 errmsg("SVS dynamic compact failed"),
+				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
 		return false;
 	}
 

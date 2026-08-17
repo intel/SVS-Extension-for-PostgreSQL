@@ -98,7 +98,8 @@ VamanaDeleteSaveDir(Oid relid)
 
 	if (rmtree(indexdir, true) == false)
 		ereport(WARNING,
-				(errmsg("could not remove vamana index directory for relation %u", relid),
+				(errcode_for_file_access(),
+				 errmsg("could not remove vamana index directory for relation %u", relid),
 				 errdetail_log("Path: \"%s\"", indexdir)));
 }
 
@@ -312,7 +313,8 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 		VamanaGetIndexSavePath(relid, savepath, sizeof(savepath));
 
 		ereport(DEBUG1,
-				(errmsg("saving vamana index for relation %u to \"%s\"", relid, savepath)));
+				(errmsg("saving vamana index for relation %u", relid),
+				 errdetail_log("Path: \"%s\"", savepath)));
 
 		SVSSaveIndex(svsIndex, savepath);
 
