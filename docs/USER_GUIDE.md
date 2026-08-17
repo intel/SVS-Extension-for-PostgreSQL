@@ -679,7 +679,7 @@ This guarantees on-disk save directories and replication slots are never orphane
 
 **Forgetting step 2 is safe, not harmful.** If you run teardown but never remove the row, the real cleanup already happened; what remains is only an idle worker serving zero indexes. It is wasteful (it holds one worker slot) but harmless, and it is surfaced via `pg_stat_vamana_worker` (`index_count = 0`) and a one-time server-log hint. The launcher deliberately does not auto-remove the row, since a database with zero indexes right now may simply be between `CREATE INDEX` calls.
 
-> `TRUNCATE vamana_databases` is blocked (revoked from `PUBLIC`) because it would bypass the removal-safety check on every row at once. Use the two-step removal per database instead.
+> `TRUNCATE vamana_databases` is revoked from `PUBLIC` (the owner or a superuser retains it) because it would bypass the removal-safety check on every row at once. Use the two-step removal per database instead.
 
 ### TRUNCATE
 
@@ -810,20 +810,21 @@ Phases:
 `pg_stat_vamana_worker` reports one row per enabled database — including databases whose worker is starting, backing off after a crash, or serving zero indexes — mirroring how `pg_stat_replication` shows slots regardless of transient state:
 
 ```sql
-SELECT db_oid::regnamespace, worker_pid, worker_state, index_count, heartbeat_ts
+SELECT (SELECT datname FROM pg_database WHERE oid = db_oid) AS datname,
+       worker_pid, worker_state, index_count, heartbeat_ts
 FROM pg_stat_vamana_worker;
 ```
 
 | Column | Meaning |
 |---|---|
 | `db_oid` | OID of the enabled database |
-| `worker_pid` | The worker's PID, or `0`/NULL if no worker is currently running (starting, or crashed and awaiting respawn) |
+| `worker_pid` | The worker's PID, or NULL if no worker is currently running (starting, or crashed and awaiting respawn) |
 | `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive`, or `replica` (serving a hot standby) |
-| `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)) |
+| `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)). NULL on a standby, where the counter is not maintained. |
 | `evict_all` | `true` while the worker is draining every cached index (e.g. during a restart or shutdown); normally `false` |
 | `heartbeat_ts` | Last time the worker updated its heartbeat |
 
-`pg_stat_vamana_worker_slot` reports one row per in-flight IPC work-request slot (`slot_status`, `slot_kind`, `index_relid`, `error_message`) for finer-grained diagnosis of what a worker is currently processing.
+`pg_stat_vamana_worker_slot` reports one row per worker request slot per visible database — including idle (`empty`) slots, not just in-flight ones — for finer-grained diagnosis of what a worker is currently processing (`slot_status`, `slot_kind`, `index_relid`, `error_message`).
 
 > **Cross-database visibility:** both views are cluster-wide. An ordinary user sees only their own database's rows; a `pg_read_all_stats` member sees all databases. When you care about the current database only, filter by `db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`.
 
@@ -836,10 +837,9 @@ The extension emits `LOG`-level messages to the PostgreSQL server log during lon
 | Index load triggered (first access / after restart) | `loading vamana index <oid> from "<path>"` |
 | TID map being loaded | `vamana index <oid>: loading TID map for N vectors` |
 | Index fully loaded from disk | `vamana index <oid> loaded from disk (N vectors)` |
-| BGW cache miss — rebuilding from table | `vamana index not in memory, rebuilding from table` |
+| No saved copy on disk; rebuilding from table | `vamana worker: no saved copy for index <oid>, rebuilding` |
 | Rebuild started | `rebuilding vamana index from table data` |
 | Rebuild scan progress (every 100,000 tuples) | `vamana index <oid>: scanning table, N vectors collected` |
-| No saved copy; rebuilding from table | `vamana fallback: no saved copy for index <oid>, rebuilding from table` |
 
 To see these messages in `psql`, ensure your client is connected to a session where `client_min_messages = log` (not the default). They are always written to the PostgreSQL log file regardless of client settings.
 
@@ -877,7 +877,7 @@ WHERE relname = 'documents_vamana_idx';
 |---|---|
 | Live vs. deleted vector count | No SQL-level view currently; monitor via server log messages below. |
 | Worker state per database | Query `pg_stat_vamana_worker` (see [Worker Status](#worker-status) above). |
-| Write serialization pressure | Query `pg_stat_activity` for `wait_event_type = 'LWLock'` and `wait_event = 'vamana_index_rwlock'`; backends waiting on this are queued behind an in-progress write. |
+| Write serialization pressure | `vamana_index_rwlock` is only held inside the worker process, not by backends; backends instead block on their own IPC slot latch. Query `pg_stat_vamana_worker_slot` for rows with `slot_status = 'pending'` or `'processing'` to see queued work. |
 | Rebuild frequency | Look for `rebuilding vamana index from table data` in server logs. A healthy dynamic index sees this only on worker cold start after a restart or REINDEX. |
 | Checkpoint activity | Look for slot advance log messages; infrequent checkpoints indicate low write volume. |
 
@@ -936,7 +936,7 @@ RESET enable_seqscan;
 ### New rows not appearing in search results after INSERT
 
 **Cause:** The database's worker must be running before it can accept inserts. If no worker is available, the backend returns an ERROR rather than silently dropping the insert. The two common reasons are: the database is not enabled in `vamana_databases`, or the worker is still starting after a restart.
-**Fix:** Confirm the database is enabled (`SELECT * FROM vamana_databases WHERE datname = current_database()`) and its worker is running (`SELECT worker_state FROM pg_stat_vamana_worker WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`). Ensure `shared_preload_libraries = 'svs'`. If the server just restarted, the first operation waits until the worker finishes startup (controlled by `svs.worker_startup_timeout_ms`); if the timeout is exceeded, increase it or investigate slow startup.
+**Fix:** Confirm the database's worker is running (`SELECT worker_state FROM pg_stat_vamana_worker WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`) — if there is no row at all, the database is not enabled in `vamana_databases` (checking the row directly requires the table owner or a superuser, since `SELECT` on `vamana_databases` is not granted to `PUBLIC`). Ensure `shared_preload_libraries = 'svs'`. If the server just restarted, the first operation waits until the worker finishes startup (controlled by `svs.worker_startup_timeout_ms`); if the timeout is exceeded, increase it or investigate slow startup.
 
 ### Low recall after compression
 
@@ -983,9 +983,9 @@ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 When `SVSAddPoints` fails, the insert invalidates the cache and returns success to the client — no user-visible error is raised. If you see `WARNING: SVS dynamic add points failed:` frequently in the server log, capture the SVS error message. It typically indicates dimension mismatch or an out-of-memory condition.
 
-### "Index will be rebuilt from table on next query" NOTICE after VACUUM
+### "background worker unavailable; dead vector removal skipped" WARNING during VACUUM
 
-This notice fires when VACUUM runs but the worker has not yet loaded that index into its cache (e.g., immediately after a server restart, before the index has been touched). The worker loads the index from disk and replays the replication slot on first access; once loaded, subsequent VACUUM operations use the normal incremental path. If you see this notice persistently, verify the database is enabled and its worker is running (`pg_stat_vamana_worker`), and check server logs for startup errors.
+This warning fires when VACUUM runs but the database's worker is not available (e.g., immediately after a server restart, or while the worker is backing off after a crash). Dead vectors accumulate in the index graph until the worker is running again and VACUUM runs again; this is a temporary recall-quality issue, not a correctness issue. If you see this warning persistently, verify the database is enabled and its worker is running (`pg_stat_vamana_worker`), and check server logs for startup errors.
 
 ---
 
@@ -1086,12 +1086,12 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 
 ### SQL Functions
 
-| Function | Runs in | Purpose |
-|----------|---------|---------|
-| `svs_restart_worker(dbname name)` | launcher's database | Drain, stop, and respawn one enabled database's worker on demand |
-| `svs_teardown_database()` | target database | Drop every Vamana index in the current database (step 1 of permanent removal); returns one row per index |
-| `svs_warmup_index(regclass)` | target database | Load one Vamana index into the worker cache |
-| `svs_warmup_database()` | target database | Load every Vamana index in the current database; returns the count warmed |
+| Function | Runs in | Requires | Purpose |
+|----------|---------|----------|---------|
+| `svs_restart_worker(dbname name)` | launcher's database | `UPDATE` on `vamana_databases` (owner or superuser) | Drain, stop, and respawn one enabled database's worker on demand |
+| `svs_teardown_database()` | target database | Ownership of each index dropped (checked per-index) | Drop every Vamana index in the current database (step 1 of permanent removal); returns one row per index |
+| `svs_warmup_index(regclass)` | target database | `SELECT` on the index's table | Load one Vamana index into the worker cache |
+| `svs_warmup_database()` | target database | `SELECT` on each index's table (unreadable indexes are skipped, not an error) | Load every Vamana index in the current database; returns the count warmed |
 
 ### Catalog and Views
 

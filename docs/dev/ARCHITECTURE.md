@@ -71,7 +71,9 @@ LVQ and LeanVec are **not open-source**. They are distributed in binary form onl
 │                       Vamana Index                          │
 │   vamana.c / vamanabuild.c / vamanainsert.c                 │
 │   vamanascan.c / vamanavacuum.c / vamanautils.c             │
-│   vamanaworker.c / vamana_undo.c                            │
+│   vamanaworker.c / vamana_undo.c / vamanalauncher.c         │
+│   vamana_databases.c / vamana_teardown.c / vamana_warmup.c  │
+│   vamana_subxact_guard.c / vamana_subxid_pending_array.c    │
 └─────────────────────────────────────────────────────────────┘
                         │
                         ▼
@@ -663,7 +665,7 @@ The `svs.max_slot_wal_size` GUC is the safety valve: if lag exceeds the threshol
 | GUC | Type | Default | Range | Scope | Description |
 |---|---|---|---|---|---|
 | `svs.search_window_size` | int | 100 | 10–10000 | `PGC_USERSET` | Search window (L) for index scans. Higher values improve recall at the cost of latency. |
-| `svs.search_num_threads` | int | 0 | 0–1024 | `PGC_USERSET` | Threads SVS uses for search. `0` = auto (`nproc-1`). Lower values reduce oversubscription under concurrent load. |
+| `svs.search_num_threads` | int | 0 | 0–1024 | `PGC_SUSET` | Threads SVS uses for search. `0` = auto (`nproc-1`). Lower values reduce oversubscription under concurrent load. |
 
 ### 6.2 Background Worker Parameters
 
@@ -679,12 +681,14 @@ The launcher runs one background worker per enabled database. Which databases ar
 | `svs.worker_timeout_ms` | int | 5000 | 100–60000 | `PGC_SIGHUP` | Milliseconds a backend waits for the worker to respond to an IPC request (search or write) before throwing an error. |
 | `svs.max_batch_size` | int | 0 | 0–1000 | `PGC_SIGHUP` | Maximum queries per SVS batch search call. `0` = `MaxBackends`. |
 | `svs.compact_threshold_pct` | int | 10 | 0–100 | `PGC_USERSET` | Percent-deleted threshold that triggers SVS compact during VACUUM cleanup. `0` = compact on every VACUUM with pending deletes; `100` = disable compact (consolidate still runs). |
-| `svs.max_slot_wal_size` | string | `10GB` | — | `PGC_SIGHUP` | Maximum WAL retained by the replication slot. If exceeded, the slot is dropped and the index is rebuilt from the heap. |
+| `svs.max_slot_wal_size` | int (MB) | 10240 | 64–2147483647 | `PGC_SIGHUP` | Maximum WAL retained by the replication slot. If exceeded, the slot is dropped and the index is rebuilt from the heap. |
 | `svs.checkpoint_debounce_window` | int | 300 | — | `PGC_SIGHUP` | Seconds of write inactivity required after a burst before a checkpoint is triggered (AND-logic with `checkpoint_min_ops`). |
 | `svs.checkpoint_max_interval` | int | 3600 | — | `PGC_SIGHUP` | Maximum seconds between checkpoints; safety net for constant-write workloads that never go quiet. |
 | `svs.checkpoint_min_ops` | int | 10000 | — | `PGC_SIGHUP` | Minimum write operations required before any checkpoint rule fires. Prevents expensive checkpoints for trivial changes. |
 | `svs.checkpoint_operations` | int | -1 | — | `PGC_SIGHUP` | Legacy op-count checkpoint trigger. `-1` = off. Setting a positive value activates simple mode (overrides debounce logic). |
 | `svs.checkpoint_interval` | int | -1 | — | `PGC_SIGHUP` | Legacy time-based checkpoint trigger in seconds. `-1` = off. Setting a positive value activates simple mode. |
+| `svs.shutdown_drain_budget_ms` | int | 30000 | 0–600000 | `PGC_SIGHUP` | Time budget for the worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
+| `svs.worker_stop_timeout_ms` | int | 30000 | 0–600000 | `PGC_SIGHUP` | Milliseconds the launcher waits for a restarting worker to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
 
 ### 6.3 Index Creation Parameters
 
@@ -800,7 +804,7 @@ This section summarizes the security objectives for each extension-managed asset
 | Extension binaries (`svs.so`, `svs.control`, SQL scripts) | — | Required (RPATH integrity) | — |
 | Intel SVS shared library (`libsvs_c_api.so`) | Required (proprietary) | Required | — |
 | Per-transaction undo log (`vamana_undo.c`) | — | Required | Required (bounded growth) |
-| BGW main loop (single process) | — | Required | Required (restart recovery) |
+| Launcher and per-database BGW main loops (one worker per enabled database) | — | Required | Required (restart recovery, crash backoff) |
 | BGW index cache (`VamanaIndexCache`) | Required (embeddings in memory) | Required | — |
 | Per-index logical replication slot (`pg_replslot/vamana_*`) | — | Required | Required (WAL retention bound) |
 

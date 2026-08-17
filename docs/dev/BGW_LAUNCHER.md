@@ -331,7 +331,7 @@ A per-database statistics view reports one row per reserved slot. It reports a r
 
 Each row carries at least the database OID, the worker's state, and the index count for that database. The index count is the same shared-memory counter the removal safety check reads; an operator auditing idle workers can spot a zero index count directly rather than discovering a forgotten catalog row by accident.
 
-Because the view is cross-database, a query that cares about the current database must filter by its database OID; a superuser otherwise sees rows for every enabled database in the cluster, including the launcher's home-database slots.
+Because the view is cross-database, a query that cares about the current database must filter by its database OID; a `pg_read_all_stats` member (including superusers) otherwise sees rows for every enabled database in the cluster, including the launcher's home-database slots.
 
 ---
 
