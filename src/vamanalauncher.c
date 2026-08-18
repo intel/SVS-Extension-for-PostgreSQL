@@ -308,6 +308,10 @@ VamanaLauncherReconcileWorkers(void)
 		if (FindLedgerEntry(db->dbOid) != NULL)
 			continue;
 
+		/* A restarted launcher's ledger is empty; don't spawn into an already-live worker's slot. */
+		if (VamanaWorkerHasConfirmedLiveOwner(db->dbOid))
+			continue;
+
 		VamanaWorkerBackoffSnapshot(db->dbOid, &backoff);
 		remaining = BackoffRemainingMs(&backoff, now);
 

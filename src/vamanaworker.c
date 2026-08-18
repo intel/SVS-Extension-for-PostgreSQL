@@ -35,6 +35,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
@@ -811,6 +812,12 @@ VamanaWorkerMain(Datum main_arg)
 				 errmsg("cannot start vamana worker: svs.max_databases (%d) already reached",
 						max_vamana_databases)));
 
+	/* Reservation is idempotent; refuse rather than steal a slot still owned by a live worker. */
+	if (VamanaWorkerEntryIsLive(VamanaWorkerShmemPtr))
+		ereport(FATAL,
+				(errmsg("vamana worker: another worker is already serving database %u",
+						MyDatabaseId)));
+
 	/*
 	 * A reused block may carry a previous instance's liveness state: a crash
 	 * exits without releasing the slot, so its pid and heartbeat survive.  The
@@ -894,6 +901,13 @@ VamanaWorkerHeartbeatStale(VamanaWorkerShmem *entry)
 								  GetCurrentTimestamp());
 }
 
+/* True if entry's own bookkeeping (pid published, heartbeat fresh) says a worker is serving it. */
+bool
+VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry)
+{
+	return entry->workerPid != 0 && !VamanaWorkerHeartbeatStale(entry);
+}
+
 /*
  * VamanaWorkerFindActiveSlot: the control block iff a live worker is currently
  * serving this backend's database, else NULL.  NULL distinguishes only
@@ -905,12 +919,22 @@ VamanaWorkerFindActiveSlot(void)
 {
 	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
 
-	if (entry == NULL || entry->workerPid == 0)
-		return NULL;
-	if (VamanaWorkerHeartbeatStale(entry))
+	if (entry == NULL || !VamanaWorkerEntryIsLive(entry))
 		return NULL;
 
 	return entry;
+}
+
+/* Like VamanaWorkerEntryIsLive, but also confirms the pid via the live process registry. */
+bool
+VamanaWorkerHasConfirmedLiveOwner(Oid dbOid)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+
+	if (entry == NULL || !VamanaWorkerEntryIsLive(entry))
+		return false;
+
+	return BackendPidGetProc(entry->workerPid) != NULL;
 }
 
 /*

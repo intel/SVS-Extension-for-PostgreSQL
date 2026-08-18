@@ -412,6 +412,8 @@ bool	VamanaWorkerSubmitWarmup(Oid indexRelid);
 void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
 VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);
+bool	VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry);
+bool	VamanaWorkerHasConfirmedLiveOwner(Oid dbOid);
 bool	VamanaWorkerIsAvailable(void);
 void	VamanaWorkerAssertDatabase(void);
 void	VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation);

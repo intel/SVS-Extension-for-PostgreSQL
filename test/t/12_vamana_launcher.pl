@@ -135,6 +135,61 @@ sub wait_for_worker_count
 }
 
 # ---------------------------------------------------------------------------
+# A launcher restart must not disturb an already-running worker.
+#
+# The restarted launcher's ledger starts empty, even though the per-database
+# worker it lost track of is still running.  It must recognize that and leave
+# the worker alone rather than spawning a second one into its slot.
+# ---------------------------------------------------------------------------
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_launcher_restart_transparency');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.worker_restart_time = 1");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname) VALUES ('postgres');");
+
+    my $before_pid = wait_for_worker_db($node, 'postgres', 30);
+    ok($before_pid =~ /^\d+$/,
+        "worker running before launcher restart (pid=$before_pid)");
+
+    my $lp1 = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana launcher' LIMIT 1;");
+    chomp $lp1;
+    ok($lp1 =~ /^\d+$/, "launcher running (pid=$lp1)");
+
+    kill('TERM', $lp1);
+
+    my $lp2 = '';
+    for (1 .. 100)    # up to 10s
+    {
+        usleep(100_000);
+        $lp2 = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana launcher' LIMIT 1;");
+        chomp $lp2;
+        last if $lp2 =~ /^\d+$/ && $lp2 ne $lp1;
+    }
+    ok($lp2 =~ /^\d+$/ && $lp2 ne $lp1, "postmaster restarts the launcher (pid=$lp2)");
+
+    # Give the restarted launcher's initial reconcile pass time to run.
+    usleep(2_000_000);
+
+    is(worker_count($node, 'postgres'), '1',
+        "exactly one worker still serving 'postgres' after launcher restart");
+    my $after_pid = wait_for_worker_db($node, 'postgres', 1);
+    is($after_pid, $before_pid,
+        "the pre-existing worker survives the launcher restart untouched (pid=$before_pid)");
+
+    $node->stop;
+}
+
+# ---------------------------------------------------------------------------
 # Cross-database enumeration, visibility gate, and per-database availability.
 #
 # pg_stat_vamana_worker reports one row per reserved database.  A privileged
