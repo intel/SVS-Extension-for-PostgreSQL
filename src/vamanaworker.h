@@ -254,7 +254,6 @@ extern int	 vamana_worker_restart_backoff;
 extern int	 vamana_max_batch_size;
 extern char *vamana_launcher_database;
 
-extern VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr;
 extern VamanaWorkerShmem *VamanaWorkerShmemPtr;
 
 Size	VamanaWorkerShmemSize(void);
@@ -301,6 +300,9 @@ bool	VamanaWorkerInitialScanDone(void);
 
 /* vamanaworkershmem.c: true iff every slot is occupied (capacity exhausted). */
 bool	VamanaWorkerSlotsExhausted(void);
+
+/* vamanaworkershmem.c: number of per-database control-block slots. */
+int		VamanaWorkerSlotCapacity(void);
 
 /* vamanaworkershmem.c */
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);

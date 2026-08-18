@@ -33,7 +33,18 @@
  * ----------------------------------------------------------------------- */
 
 /* The per-database control-block array (all processes) */
-VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr = NULL;
+static VamanaWorkerShmemHeader *VamanaWorkerShmemHeaderPtr = NULL;
+
+/* NULL means svs was loaded without shared_preload_libraries. */
+static inline void
+VamanaWorkerRequireShmemInitialized(void)
+{
+	if (unlikely(VamanaWorkerShmemHeaderPtr == NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("vamana shared worker state is not initialized"),
+				 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
+}
 
 /*
  * Convenience pointer to this worker's control block.  Until the launcher
@@ -315,6 +326,8 @@ VamanaWorkerLookupSlot(Oid dbOid)
 
 	Assert(OidIsValid(dbOid));
 
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
 	entry = VamanaWorkerFindSlot(dbOid);
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
@@ -336,6 +349,8 @@ VamanaWorkerLookupSlot(Oid dbOid)
 void
 VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx)
 {
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
 	for (int i = 0; i < VamanaWorkerShmemHeaderPtr->numSlots; i++)
 	{
@@ -365,6 +380,8 @@ VamanaWorkerReserveSlot(Oid dbOid, bool *created)
 
 	if (created)
 		*created = false;
+
+	VamanaWorkerRequireShmemInitialized();
 
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 
@@ -594,6 +611,8 @@ VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out)
 
 	Assert(OidIsValid(dbOid));
 
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
 	entry = VamanaWorkerFindSlot(dbOid);
 	if (entry != NULL)
@@ -630,6 +649,8 @@ VamanaWorkerBackoffStampAttempt(Oid dbOid, TimestampTz now)
 
 	Assert(OidIsValid(dbOid));
 
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 	entry = VamanaWorkerFindSlot(dbOid);
 	if (entry != NULL)
@@ -647,6 +668,8 @@ VamanaWorkerBackoffRecordDeath(Oid dbOid, bool recovered)
 	VamanaWorkerShmem *entry;
 
 	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
 
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 	entry = VamanaWorkerFindSlot(dbOid);
@@ -673,6 +696,8 @@ VamanaWorkerBackoffClear(Oid dbOid)
 
 	Assert(OidIsValid(dbOid));
 
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 	entry = VamanaWorkerFindSlot(dbOid);
 	if (entry != NULL)
@@ -691,6 +716,8 @@ VamanaWorkerBackoffClear(Oid dbOid)
 void
 VamanaWorkerSetInitialScanDone(void)
 {
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 	VamanaWorkerShmemHeaderPtr->initialScanDone = true;
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
@@ -700,6 +727,8 @@ bool
 VamanaWorkerInitialScanDone(void)
 {
 	bool		done;
+
+	VamanaWorkerRequireShmemInitialized();
 
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
 	done = VamanaWorkerShmemHeaderPtr->initialScanDone;
@@ -718,11 +747,22 @@ VamanaWorkerSlotsExhausted(void)
 {
 	bool		full;
 
+	VamanaWorkerRequireShmemInitialized();
+
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
 	full = VamanaWorkerShmemHeaderPtr->numActive >= VamanaWorkerShmemHeaderPtr->numSlots;
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
 
 	return full;
+}
+
+/* Number of per-database control-block slots (svs.max_databases). */
+int
+VamanaWorkerSlotCapacity(void)
+{
+	VamanaWorkerRequireShmemInitialized();
+
+	return VamanaWorkerShmemHeaderPtr->numSlots;
 }
 
 /*
@@ -735,6 +775,8 @@ VamanaWorkerReleaseSlot(Oid dbOid)
 	VamanaWorkerShmem *entry;
 
 	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
 
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 

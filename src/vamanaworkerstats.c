@@ -198,7 +198,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	 * callback never reallocates under the lock.
 	 */
 	ctx.vis = VamanaStatVisibilityForCaller();
-	ctx.capacity = VamanaWorkerShmemHeaderPtr->numSlots;
+	ctx.capacity = VamanaWorkerSlotCapacity();
 	ctx.count = 0;
 	ctx.snapshots = palloc(sizeof(VamanaWorkerSnapshot) * ctx.capacity);
 
@@ -369,21 +369,11 @@ VamanaSlotCollectCb(VamanaWorkerShmem *entry, void *ctxArg)
 	}
 }
 
-/*
- * Upper bound on total slots across every header entry, reserved or not:
- * maxSlots is fixed per entry at postmaster startup and never changes
- * afterward, so this is safe to read without the header lock (same
- * precondition pg_stat_vamana_worker already relies on for numSlots).
- */
+/* Upper bound on total slots across every header entry, reserved or not. */
 static int
 VamanaWorkerTotalSlotCapacity(void)
 {
-	int			total = 0;
-
-	for (int i = 0; i < VamanaWorkerShmemHeaderPtr->numSlots; i++)
-		total += VamanaWorkerShmemHeaderPtr->slots[i].maxSlots;
-
-	return total;
+	return VamanaWorkerSlotCapacity() * MaxBackends;
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(pg_stat_vamana_worker_slot);
