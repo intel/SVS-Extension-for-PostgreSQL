@@ -351,13 +351,20 @@ VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx)
  * Reserve (or return the existing) control block for dbOid.  Returns NULL
  * when the array is full (more distinct databases than max_vamana_databases).
  * The reserved entry has workerPid == 0 until a worker starts for it.
+ *
+ * created, if non-NULL, is set within the same locked section: true only
+ * when this call allocated the entry, false if it already existed or on a
+ * NULL return.
  */
 VamanaWorkerShmem *
-VamanaWorkerReserveSlot(Oid dbOid)
+VamanaWorkerReserveSlot(Oid dbOid, bool *created)
 {
 	VamanaWorkerShmem *entry;
 
 	Assert(OidIsValid(dbOid));
+
+	if (created)
+		*created = false;
 
 	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
 
@@ -369,6 +376,8 @@ VamanaWorkerReserveSlot(Oid dbOid)
 		{
 			entry->dbOid = dbOid;
 			VamanaWorkerShmemHeaderPtr->numActive++;
+			if (created)
+				*created = true;
 
 			/*
 			 * Between publishing dbOid and dropping the exclusive lock the entry

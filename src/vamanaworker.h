@@ -263,7 +263,7 @@ void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_i
 
 /* vamanaworkershmem.c: per-database control-block lookup and reservation */
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
-VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid);
+VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
 

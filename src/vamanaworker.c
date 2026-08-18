@@ -805,7 +805,7 @@ VamanaWorkerMain(Datum main_arg)
 	 * worker's lifetime.  Backends resolve the same block on demand via
 	 * VamanaWorkerLookupSlot(MyDatabaseId).
 	 */
-	VamanaWorkerShmemPtr = VamanaWorkerReserveSlot(MyDatabaseId);
+	VamanaWorkerShmemPtr = VamanaWorkerReserveSlot(MyDatabaseId, NULL);
 	if (VamanaWorkerShmemPtr == NULL)
 		ereport(FATAL,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),

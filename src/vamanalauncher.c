@@ -338,7 +338,7 @@ VamanaLauncherReconcileWorkers(void)
 static bool
 VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname)
 {
-	if (VamanaWorkerReserveSlot(dbOid) != NULL)
+	if (VamanaWorkerReserveSlot(dbOid, NULL) != NULL)
 		return true;
 
 	ereport(LOG,

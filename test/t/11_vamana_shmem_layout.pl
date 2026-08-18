@@ -331,4 +331,42 @@ sub enable_postgres
     $node->stop;
 }
 
+{
+    # ReserveSlotsForEnabledEntries is idempotent, so re-queuing 'postgres'
+    # (what svs_restart_worker does) returns its existing, live slot rather
+    # than creating one. An abort must release only slots this transaction
+    # actually created, not ones it merely found.
+    my $node = start_node('vamana_precommit_abort_preserves_live', 1);
+    enable_postgres($node);
+
+    $node->poll_query_until('postgres', qq{
+        SELECT worker_state = 'running' FROM pg_stat_vamana_worker
+         WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+    }) or die "postgres's worker never reached 'running'";
+
+    $node->safe_psql('postgres', "CREATE DATABASE vamana_precommit_abort_preserves_live_dbb;");
+
+    my ($stdout, $stderr) = ('', '');
+    $node->psql('postgres', qq{
+        BEGIN;
+        UPDATE vamana_databases SET restart_generation = restart_generation + 1
+            WHERE datname = 'postgres';
+        INSERT INTO vamana_databases (datname)
+            VALUES ('vamana_precommit_abort_preserves_live_dbb');
+        COMMIT;
+    }, stdout => \$stdout, stderr => \$stderr);
+
+    like($stderr, qr/svs\.max_databases \(1\) already reached/,
+        "the second database's capacity failure aborted the transaction");
+
+    is($node->safe_psql('postgres', qq{
+            SELECT count(*) FROM pg_stat_vamana_worker
+             WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+        }),
+        '1',
+        "postgres's pre-existing, live slot survives the sibling transaction's abort");
+
+    $node->stop;
+}
+
 done_testing();

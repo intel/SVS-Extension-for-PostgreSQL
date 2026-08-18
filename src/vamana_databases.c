@@ -276,18 +276,21 @@ ReserveSlotsForEnabledEntries(void)
 	for (int i = 0; i < queue->count; i++)
 	{
 		VamanaDatabasesReservationEntry *entry = VamanaSubxidPendingArrayEntryAt(queue, i);
+		bool		created;
 
 		if (!entry->enabled || entry->subxid == InvalidSubTransactionId)
 			continue;
 
-		if (VamanaWorkerReserveSlot(entry->dbOid) == NULL)
+		if (VamanaWorkerReserveSlot(entry->dbOid, &created) == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("cannot enable database \"%s\": svs.max_databases (%d) already reached",
 							NameStr(entry->datname), max_vamana_databases),
 					 errhint("Increase svs.max_databases and restart, or disable another database first.")));
 
-		ReservedThisXactDbOids = lappend_oid(ReservedThisXactDbOids, entry->dbOid);
+		/* A pre-existing live slot found by this idempotent reservation must survive this transaction's abort. */
+		if (created)
+			ReservedThisXactDbOids = lappend_oid(ReservedThisXactDbOids, entry->dbOid);
 	}
 
 	MemoryContextSwitchTo(oldContext);
