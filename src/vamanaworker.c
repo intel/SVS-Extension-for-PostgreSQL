@@ -328,12 +328,12 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 }
 
 /*
- * Drain each cached index's replication slot into its in-memory graph.  A slot
- * that has fallen past max_slot_wal_size is cheaper to drop and rebuild from the
- * heap than to drain, and doing so bounds the WAL it pins on the primary.
+ * Trip the WAL-budget valve for every cached index's slot: past
+ * max_slot_wal_size, a slot is cheaper to drop and rebuild from the heap
+ * than to drain.  Applies to primary and standby alike.
  */
 static void
-VamanaWorkerDrainAllSlots(void)
+VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 {
 	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
 	int			n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
@@ -350,9 +350,25 @@ VamanaWorkerDrainAllSlots(void)
 							relid, vamana_max_slot_wal_size_mb)));
 			VamanaForceHeapRebuild(relid);
 		}
-		else
-			VamanaReplicationDrainSlot(relid);
 	}
+}
+
+/*
+ * Drain each cached index's replication slot into its in-memory graph.
+ * Standby-only: a primary's write-IPC path already applies every change a
+ * decode would replay.
+ */
+static void
+VamanaWorkerDrainAllSlots(void)
+{
+	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
+	int			n;
+
+	VamanaWorkerEnforceWalBudgetOnAllSlots();
+
+	n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
+	for (int i = 0; i < n; i++)
+		VamanaReplicationDrainSlot(relids[i]);
 }
 
 /*
@@ -745,12 +761,9 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 			list_free(relids);
 		}
 
-		/*
-		 * A standby feeds its index by decoding streamed WAL; a primary feeds
-		 * it from write IPC.  These are the two ways index changes arrive, so
-		 * the drain is exactly the branch the write dispatch is not.
-		 */
-		if (!role->processes_write_ipc)
+		if (role->processes_write_ipc)
+			VamanaWorkerEnforceWalBudgetOnAllSlots();
+		else
 			VamanaWorkerDrainAllSlots();
 
 		VamanaWorkerHandlePromotion(&wasReplayingWal, role);

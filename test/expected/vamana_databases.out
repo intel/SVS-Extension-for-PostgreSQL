@@ -154,6 +154,23 @@ SELECT DISTINCT index_count FROM pg_stat_vamana_worker
            0
 (1 row)
 
+-- A savepoint released into its parent, then discarded by a rollback to an
+-- earlier ancestor, must not commit its delta. Nothing new exists after
+-- COMMIT, so the count must stay at 0.
+BEGIN;
+SAVEPOINT outer_sp;
+SAVEPOINT inner_sp;
+CREATE INDEX vamana_counter_nested ON vamana_counter_t USING vamana (val vector_l2_ops);
+RELEASE SAVEPOINT inner_sp;
+ROLLBACK TO SAVEPOINT outer_sp;
+COMMIT;
+SELECT DISTINCT index_count FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+ index_count 
+-------------
+           0
+(1 row)
+
 -- Counter moves only on CREATE/DROP, never on a bare rebuild.  REINDEX and
 -- TRUNCATE both re-run the build with no create or drop, and REINDEX
 -- CONCURRENTLY builds a transient index then drops the old one; none may shift
