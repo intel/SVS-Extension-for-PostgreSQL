@@ -474,9 +474,8 @@ sub count_distinct_worker_pids
 
     # A steady-state checkpoint must create the victim's save dir before we can
     # make it read-only.
-    my $datadir = $node->data_dir;
     my $victim = $idx[1];
-    my $victim_dir = "$datadir/vamana_indexes/$relid{$victim}";
+    my $victim_dir = vamana_save_dir($node, 'postgres', $relid{$victim});
     for (1 .. 100)
     {
         usleep(100_000);

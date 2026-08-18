@@ -261,7 +261,8 @@ use VamanaTestUtils qw(:all);
         'present-but-disabled database gets the same config hard-fail as absent');
 
     # The gate fires before the relation, its catalog row, or its on-disk save
-    # directory ($PGDATA/vamana_indexes/<relid>) exist, so a failure leaves none.
+    # directory ($PGDATA/vamana_indexes/<dboid>/<relid>) exist, so a failure
+    # leaves none.
     $node->safe_psql("disabled_db",
         "CREATE TABLE na_tbl (id serial PRIMARY KEY, val vector($dim));");
 

@@ -514,7 +514,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 	PG_TRY();
 	{
-		VamanaGetIndexSavePath(relid, savepath, sizeof(savepath));
+		VamanaGetIndexSavePath(VamanaWorkerShmemPtr->dbOid, relid, savepath, sizeof(savepath));
 
 		config.dimensions			= params->dimensions;
 		config.graph_degree			= params->graph_degree;
@@ -540,7 +540,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 			tidMapping = (ItemPointerData *)
 				MemoryContextAlloc(TopMemoryContext,
 								   (Size) params->tidMappingCapacity * sizeof(ItemPointerData));
-			if (!VamanaLoadTidMap(relid, tidMapping, params->tidMappingCapacity))
+			if (!VamanaLoadTidMap(VamanaWorkerShmemPtr->dbOid, relid, tidMapping, params->tidMappingCapacity))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("vamana worker: TID map missing or corrupt for index %u",

@@ -18,7 +18,7 @@ use Time::HiRes qw(usleep);
 our @EXPORT_OK = qw(
     $dim $array_sql $query_sql $lv_query_sql
     $N @query_vecs $SYNC_SLEEP
-    run_concurrent run_synchronized dir_size
+    run_concurrent run_synchronized dir_size vamana_save_dir
     wait_for_worker wait_for_worker_db wait_for_slot_release
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -186,6 +186,19 @@ sub run_synchronized
         push @results, $r;
     }
     return @results;
+}
+
+# ---------------------------------------------------------------------------
+# vamana_save_dir: on-disk save-directory path for an index, namespaced by
+# database OID: $PGDATA/vamana_indexes/<dboid>/<relid>/.
+# ---------------------------------------------------------------------------
+sub vamana_save_dir
+{
+    my ($node, $db, $relid) = @_;
+    my $dboid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = '$db';");
+    chomp $dboid;
+    return $node->data_dir . "/vamana_indexes/$dboid/$relid";
 }
 
 # ---------------------------------------------------------------------------

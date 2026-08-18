@@ -49,35 +49,45 @@ StaticAssertDecl(sizeof(VamanaTidMapHeader) == 16,
 
 /*
  * Construct the save-directory path for a vamana index.
- * Convention: $PGDATA/vamana_indexes/<relid>/
+ * Convention: $PGDATA/vamana_indexes/<dboid>/<relid>/
+ *
+ * relid alone would not be unique: pg_class OIDs are per-database, and
+ * CREATE DATABASE ... TEMPLATE can duplicate one across databases.
  */
 void
-VamanaGetIndexSavePath(Oid relid, char *buf, size_t bufsz)
+VamanaGetIndexSavePath(Oid dboid, Oid relid, char *buf, size_t bufsz)
 {
-	snprintf(buf, bufsz, "%s/vamana_indexes/%u", DataDir, relid);
+	snprintf(buf, bufsz, "%s/vamana_indexes/%u/%u", DataDir, dboid, relid);
+}
+
+static void
+VamanaMakeDirectoryOrError(const char *path)
+{
+	if (MakePGDirectory(path) != 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create directory \"%s\": %m", path)));
 }
 
 /*
  * Create the directory hierarchy needed to save an index.
- * Creates $PGDATA/vamana_indexes/ and $PGDATA/vamana_indexes/<relid>/.
+ * Creates $PGDATA/vamana_indexes/, .../<dboid>/, and .../<dboid>/<relid>/.
  */
 void
-VamanaEnsureSaveDir(Oid relid)
+VamanaEnsureSaveDir(Oid dboid, Oid relid)
 {
 	char		parentdir[MAXPGPATH];
+	char		dbdir[MAXPGPATH];
 	char		indexdir[MAXPGPATH];
 
 	snprintf(parentdir, sizeof(parentdir), "%s/vamana_indexes", DataDir);
-	if (MakePGDirectory(parentdir) != 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create directory \"%s\": %m", parentdir)));
+	VamanaMakeDirectoryOrError(parentdir);
 
-	VamanaGetIndexSavePath(relid, indexdir, sizeof(indexdir));
-	if (MakePGDirectory(indexdir) != 0 && errno != EEXIST)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create directory \"%s\": %m", indexdir)));
+	snprintf(dbdir, sizeof(dbdir), "%s/%u", parentdir, dboid);
+	VamanaMakeDirectoryOrError(dbdir);
+
+	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
+	VamanaMakeDirectoryOrError(indexdir);
 }
 
 /*
@@ -85,12 +95,12 @@ VamanaEnsureSaveDir(Oid relid)
  * Silently returns if the directory does not exist.
  */
 void
-VamanaDeleteSaveDir(Oid relid)
+VamanaDeleteSaveDir(Oid dboid, Oid relid)
 {
 	char		indexdir[MAXPGPATH];
 	struct stat st;
 
-	VamanaGetIndexSavePath(relid, indexdir, sizeof(indexdir));
+	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
 
 	if (stat(indexdir, &st) != 0)
 		return;
@@ -110,17 +120,17 @@ VamanaDeleteSaveDir(Oid relid)
  * entire save directory.
  */
 void
-VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
+VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count)
 {
+	char		indexdir[MAXPGPATH];
 	char		tidmappath[MAXPGPATH];
 	char		tidmaptmp[MAXPGPATH];
 	FILE	   *f;
 	VamanaTidMapHeader header;
 
-	snprintf(tidmappath, sizeof(tidmappath),
-			 "%s/vamana_indexes/%u/tidmap.bin", DataDir, relid);
-	snprintf(tidmaptmp, sizeof(tidmaptmp),
-			 "%s/vamana_indexes/%u/tidmap.bin.tmp", DataDir, relid);
+	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
+	snprintf(tidmappath, sizeof(tidmappath), "%s/tidmap.bin", indexdir);
+	snprintf(tidmaptmp, sizeof(tidmaptmp), "%s/tidmap.bin.tmp", indexdir);
 
 	f = AllocateFile(tidmaptmp, PG_BINARY_W);
 	if (f == NULL)
@@ -175,14 +185,15 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
  * tidMapping must be pre-allocated with at least tidMappingCapacity elements.
  */
 bool
-VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
+VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 {
+	char		indexdir[MAXPGPATH];
 	char		tidmappath[MAXPGPATH];
 	FILE	   *f;
 	VamanaTidMapHeader header;
 
-	snprintf(tidmappath, sizeof(tidmappath),
-			 "%s/vamana_indexes/%u/tidmap.bin", DataDir, relid);
+	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
+	snprintf(tidmappath, sizeof(tidmappath), "%s/tidmap.bin", indexdir);
 
 	f = AllocateFile(tidmappath, PG_BINARY_R);
 	if (f == NULL)
@@ -319,8 +330,8 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 
 	PG_TRY();
 	{
-		VamanaEnsureSaveDir(relid);
-		VamanaGetIndexSavePath(relid, savepath, sizeof(savepath));
+		VamanaEnsureSaveDir(MyDatabaseId, relid);
+		VamanaGetIndexSavePath(MyDatabaseId, relid, savepath, sizeof(savepath));
 
 		ereport(DEBUG1,
 				(errmsg("saving vamana index for relation %u to \"%s\"", relid, savepath)));
@@ -333,11 +344,11 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 		 * to wrong TIDs.
 		 */
 		if (meta->tidMapping != NULL && meta->tidMappingCapacity > 0)
-			VamanaSaveTidMapAtomically(relid, meta->tidMapping, meta->tidMappingCapacity);
+			VamanaSaveTidMapAtomically(MyDatabaseId, relid, meta->tidMapping, meta->tidMappingCapacity);
 	}
 	PG_CATCH();
 	{
-		VamanaDeleteSaveDir(relid);
+		VamanaDeleteSaveDir(MyDatabaseId, relid);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

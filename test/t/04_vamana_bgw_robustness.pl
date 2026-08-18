@@ -332,7 +332,7 @@ SKIP: {
     chomp $relid;
 
     my $worker_pid = restart_worker($node, 'postgres');
-    remove_tree($node->data_dir . "/vamana_indexes/$relid");
+    remove_tree(vamana_save_dir($node, 'postgres', $relid));
 
     $node->safe_psql('postgres',
         "SELECT injection_points_attach('vamana-mark-index-saved-error', 'error');");

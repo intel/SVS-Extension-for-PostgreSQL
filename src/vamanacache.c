@@ -366,7 +366,7 @@ VamanaInvalidateCache(Oid indexRelid)
 	 * stale data.  Best-effort: warn rather than error if the directory is
 	 * already gone.
 	 */
-	VamanaDeleteSaveDir(indexRelid);
+	VamanaDeleteSaveDir(MyDatabaseId, indexRelid);
 
 	/*
 	 * Signal the BGW to evict its in-memory copy.  The save directory was
@@ -464,7 +464,7 @@ void
 VamanaForceHeapRebuild(Oid indexRelid)
 {
 	VamanaReplicationDropIfExists(MyDatabaseId, indexRelid);
-	VamanaDeleteSaveDir(indexRelid);
+	VamanaDeleteSaveDir(MyDatabaseId, indexRelid);
 	VamanaEvictCacheEntry(indexRelid);
 }
 
@@ -540,12 +540,18 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 			VamanaWorkerQueueIndexCountDelta(MyDatabaseId, 1);
 	}
 
-	/* On relation drop, remove the corresponding vamana save directory. */
-	if (access == OAT_DROP && classId == RelationRelationId)
+	/*
+	 * On relation drop, remove the corresponding vamana save directory.
+	 * subId == 0 restricts this to the relation itself, not its columns:
+	 * ALTER TABLE ... DROP COLUMN also reaches OAT_DROP, and objectId there
+	 * is the table's own oid, which may collide with an unrelated vamana
+	 * index's relid in another database.
+	 */
+	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
 	{
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
 
-		VamanaDeleteSaveDir(objectId);
+		VamanaDeleteSaveDir(MyDatabaseId, objectId);
 		if (entry != NULL)
 			VamanaReleaseIndexLock(entry, objectId);
 		VamanaReplicationDropIfExists(MyDatabaseId, objectId);

@@ -564,7 +564,7 @@ SELECT svs_warmup_index('documents_vamana_idx');  -- one index
 SELECT svs_warmup_database();                      -- every Vamana index in this database
 ```
 
-`svs_warmup_index()` errors if the argument is not a Vamana index or no worker is available. `svs_warmup_database()` is best-effort: per-index failures warn and are skipped, and it returns the number of indexes warmed.
+`svs_warmup_index()` errors if the argument is not a Vamana index or no worker is available. `svs_warmup_database()` is best-effort: per-index failures other than a privilege denial warn and are skipped; an index the caller lacks `SELECT` on is skipped silently. It returns the number of indexes warmed.
 
 #### Capacity
 
