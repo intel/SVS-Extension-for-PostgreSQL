@@ -188,6 +188,28 @@ COMMIT;
 SELECT * FROM t ORDER BY val <-> '[9,9,9]', id LIMIT 3;
 DROP TABLE t;
 
+-- Nested SAVEPOINT: releasing an inner savepoint into its parent, then
+-- rolling back that parent, must undo the inner savepoint's insert too.
+-- svs.search_window_size overrides the index's search_window_size reloption,
+-- so it must be set here to actually cap the candidate window at 10: with a
+-- leaked graph entry, the closest 10 of 11 candidates displace the farthest
+-- real row, and that row's heap tuple was never invisible, so it should have
+-- been visible; losing it drops the visible result count below 10.
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) SELECT ARRAY[i, i, i]::vector(3) FROM generate_series(1, 10) AS i;
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (search_window_size = 10);
+BEGIN;
+SAVEPOINT outer_sp;
+SAVEPOINT inner_sp;
+INSERT INTO t (val) VALUES ('[0,0,0]');
+RELEASE SAVEPOINT inner_sp;
+ROLLBACK TO SAVEPOINT outer_sp;
+COMMIT;
+SET svs.search_window_size = 10;
+SELECT count(*) FROM (SELECT id FROM t ORDER BY val <-> '[0,0,0]' LIMIT 10) sub;
+RESET svs.search_window_size;
+DROP TABLE t;
+
 -- -------------------------------------------------------------------------
 -- Test A: Large DELETE batch (>1000 rows) exercises VAMANA_MAX_DELETE_IDS
 -- batching loop in vamanabulkdelete.

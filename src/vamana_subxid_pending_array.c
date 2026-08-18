@@ -65,13 +65,32 @@ VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array)
 	return entry;
 }
 
-void
-VamanaSubxidPendingArrayPruneAbortedSubxact(VamanaSubxidPendingArray *array,
-											 SubTransactionId mySubid)
+static void
+ReplaceMatchingSubxid(VamanaSubxidPendingArray *array, SubTransactionId mySubid,
+					   SubTransactionId replacement)
 {
 	for (int i = 0; i < array->count; i++)
 	{
 		if (VamanaSubxidPendingArraySubxidAt(array, i) == mySubid)
-			VamanaSubxidPendingArraySubxidAt(array, i) = InvalidSubTransactionId;
+			VamanaSubxidPendingArraySubxidAt(array, i) = replacement;
 	}
+}
+
+void
+VamanaSubxidPendingArrayPruneAbortedSubxact(VamanaSubxidPendingArray *array,
+											 SubTransactionId mySubid)
+{
+	ReplaceMatchingSubxid(array, mySubid, InvalidSubTransactionId);
+}
+
+/*
+ * A released savepoint's entries must stay findable by an ancestor's later
+ * ROLLBACK TO SAVEPOINT, so give them the parent's subxid.
+ */
+void
+VamanaSubxidPendingArrayReparentSubxact(VamanaSubxidPendingArray *array,
+										 SubTransactionId mySubid,
+										 SubTransactionId parentSubid)
+{
+	ReplaceMatchingSubxid(array, mySubid, parentSubid);
 }

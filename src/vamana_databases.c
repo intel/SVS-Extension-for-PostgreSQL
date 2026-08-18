@@ -252,10 +252,13 @@ static void
 VamanaDatabasesSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 								SubTransactionId parentSubid, void *arg)
 {
-	if (event != SUBXACT_EVENT_ABORT_SUB || CurrentReservationQueue == NULL)
+	if (CurrentReservationQueue == NULL)
 		return;
 
-	VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentReservationQueue, mySubid);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentReservationQueue, mySubid);
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		VamanaSubxidPendingArrayReparentSubxact(CurrentReservationQueue, mySubid, parentSubid);
 }
 
 /*

@@ -50,6 +50,23 @@ DROP DATABASE vamana_databases_test_dbc;
 DROP DATABASE vamana_databases_test_dbd;
 DROP DATABASE vamana_databases_test_dbe;
 
+-- Enabling a database from a savepoint that is released into its parent,
+-- then discarded by rolling back that parent, must reserve no worker slot.
+-- The reservation happens at PRE_COMMIT of the whole transaction, so a
+-- leaked entry would show up immediately, before COMMIT returns.
+CREATE DATABASE vamana_databases_test_leak;
+BEGIN;
+SAVEPOINT outer_sp;
+SAVEPOINT inner_sp;
+INSERT INTO vamana_databases (datname, enabled) VALUES ('vamana_databases_test_leak', true);
+RELEASE SAVEPOINT inner_sp;
+ROLLBACK TO SAVEPOINT outer_sp;
+COMMIT;
+SELECT count(*) FROM vamana_databases WHERE datname = 'vamana_databases_test_leak';
+SELECT count(*) FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'vamana_databases_test_leak');
+DROP DATABASE vamana_databases_test_leak;
+
 -- Enable this database for the remaining regression files, which share this
 -- one contrib_regression database and build vamana indexes.  The launcher
 -- reserves the slot at COMMIT and spawns the worker; the first search then

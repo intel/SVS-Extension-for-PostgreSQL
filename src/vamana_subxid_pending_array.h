@@ -46,6 +46,14 @@ extern void *VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array);
 extern void VamanaSubxidPendingArrayPruneAbortedSubxact(VamanaSubxidPendingArray *array,
 														  SubTransactionId mySubid);
 
+/*
+ * Retag every element appended under mySubid with parentSubid, so a released
+ * savepoint's entries stay reachable by an ancestor's later abort.
+ */
+extern void VamanaSubxidPendingArrayReparentSubxact(VamanaSubxidPendingArray *array,
+													 SubTransactionId mySubid,
+													 SubTransactionId parentSubid);
+
 #define VamanaSubxidPendingArrayEntryAt(array, i) \
 	((void *) ((char *) (array)->entries + (size_t) (i) * (array)->elemSize))
 

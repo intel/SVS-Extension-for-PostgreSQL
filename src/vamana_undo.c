@@ -232,10 +232,16 @@ VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 	int			batchCount = 0;
 	Oid			currentRelid = InvalidOid;
 
-	if (event != SUBXACT_EVENT_ABORT_SUB)
+	if (log == NULL)
 		return;
 
-	if (log == NULL || log->count == 0 || !VamanaWorkerIsAvailable())
+	if (event == SUBXACT_EVENT_COMMIT_SUB)
+	{
+		VamanaSubxidPendingArrayReparentSubxact(log, mySubid, parentSubid);
+		return;
+	}
+
+	if (event != SUBXACT_EVENT_ABORT_SUB || log->count == 0 || !VamanaWorkerIsAvailable())
 		return;
 
 	/*

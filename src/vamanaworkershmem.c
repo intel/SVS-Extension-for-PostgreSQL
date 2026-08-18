@@ -564,10 +564,13 @@ static void
 VamanaIndexCountSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 								SubTransactionId parentSubid, void *arg)
 {
-	if (event != SUBXACT_EVENT_ABORT_SUB || CurrentIndexCountDeltas == NULL)
+	if (CurrentIndexCountDeltas == NULL)
 		return;
 
-	VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentIndexCountDeltas, mySubid);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentIndexCountDeltas, mySubid);
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		VamanaSubxidPendingArrayReparentSubxact(CurrentIndexCountDeltas, mySubid, parentSubid);
 }
 
 /* -----------------------------------------------------------------------
