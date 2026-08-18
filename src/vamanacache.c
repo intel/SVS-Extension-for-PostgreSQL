@@ -198,7 +198,6 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	if (entry->tidMapping != NULL && capacity > 0)
 	{
 		HASHCTL		hctl;
-		MemoryContext oldCtx;
 		int			liveCount = 0;
 		uint64		maxExternalId PG_USED_FOR_ASSERTS_ONLY = 0;
 

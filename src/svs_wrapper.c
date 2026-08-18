@@ -418,12 +418,13 @@ SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensio
 	/* PG_FINALLY ensures search_params is freed even if search throws */
 	PG_TRY();
 	{
-		search_results = svs_index_search(
-										  (svs_index_h) index,
-										  query,
-										  1,	/* num_queries */
-										  (size_t) k,
-										  search_params,
+		search_results = svs_index_search_topK(
+											  (svs_index_h) index,
+											  query,
+											  1,	/* num_queries */
+											  (size_t) k,
+											  search_params,
+											  NULL,	/* id_filter */
 										  error);
 	}
 	PG_FINALLY();
@@ -511,7 +512,7 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 	svs_search_results_t search_results;
 	svs_search_params_h search_params;
 	VamanaIndexCache *cachedIndex;
-	int			total = 0;
+	volatile int total = 0;		/* volatile: crosses PG_TRY/longjmp boundary */
 
 	if (numQueries <= 0)
 		return 0;
@@ -543,12 +544,13 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 	/* PG_FINALLY ensures search_params is freed even if search throws */
 	PG_TRY();
 	{
-		search_results = svs_index_search(
-										  (svs_index_h) index,
-										  queryData,
-										  (size_t) numQueries,
-										  (size_t) k,
-										  search_params,
+		search_results = svs_index_search_topK(
+											  (svs_index_h) index,
+											  queryData,
+											  (size_t) numQueries,
+											  (size_t) k,
+											  search_params,
+											  NULL,	/* id_filter */
 										  error);
 	}
 	PG_FINALLY();

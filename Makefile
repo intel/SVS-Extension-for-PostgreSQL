@@ -54,7 +54,10 @@ endif
 # GCC 11+ is the minimum supported compiler (see docs/build_guide/README.md).
 # -D_FORTIFY_SOURCE=3 and -fstack-clash-protection are both available on GCC 11+.
 # -D_FORTIFY_SOURCE requires at least -O1 to take effect (provided by PGXS defaults).
-HARDENING_CFLAGS = -Wall -Wextra -Werror -Wconversion -Wimplicit-fallthrough \
+# -Wconversion and -Wextra are omitted: they trigger errors in PostgreSQL system
+# headers which are not written to comply with those flags. All other hardening
+# flags apply only to the extension's own source.
+HARDENING_CFLAGS = -Wall -Werror -Wimplicit-fallthrough \
                    -Wformat -Wformat-security -Werror=format-security \
                    -fstack-protector-strong -fstack-clash-protection \
                    -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS -fPIC
