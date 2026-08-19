@@ -51,7 +51,32 @@ ifeq ($(shell uname -m), riscv64)
 	OPTFLAGS =
 endif
 
-PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
+# Hardening flags. -Wall, -Wformat, -Wformat-security, -Wimplicit-fallthrough,
+# and -fPIC already come from pg_config; they are restated here for clarity.
+# New protections added by this Makefile: -Werror=format-security,
+# -fstack-protector-strong, -fstack-clash-protection, _FORTIFY_SOURCE uplift,
+# and -Wl,-z,now (see HARDENING_LDFLAGS).
+# -Werror is opt-in via WERROR=1 (e.g. in CI): a shipped -Werror is not safe
+# across future compiler and PostgreSQL releases. -Werror=format-security is
+# unconditional as it guards a specific, narrow class of bug.
+# -Wconversion/-Wextra omitted: trigger errors in PostgreSQL system headers.
+# -U_FORTIFY_SOURCE before -D avoids a redefinition diagnostic on distros that
+# predefine it. Level 3 requires GCC 12+; GCC 11 gets 2.
+FORTIFY_LEVEL := $(shell [ "$$(${CC:-gcc} -dumpversion 2>/dev/null | cut -d. -f1)" -ge 12 ] 2>/dev/null && echo 3 || echo 2)
+HARDENING_CFLAGS = -Wall -Wimplicit-fallthrough \
+                   -Wformat -Wformat-security -Werror=format-security \
+                   -fstack-protector-strong -fstack-clash-protection \
+                   -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=$(FORTIFY_LEVEL) -fPIC
+ifeq ($(WERROR),1)
+HARDENING_CFLAGS += -Werror
+endif
+
+# Linker hardening flags. -z,noexecstack and -z,relro are distro defaults;
+# -z,now is the load-bearing addition (full RELRO; not a default for shared libs).
+# -z,nodlopen omitted: PostgreSQL loads extensions via dlopen.
+HARDENING_LDFLAGS = -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now
+
+PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math $(HARDENING_CFLAGS)
 
 # Coverage instrumentation, opt-in via 'make COVERAGE=1'. Kept out of default
 # builds because --coverage slows the binary and writes .gcda files at runtime.
@@ -69,7 +94,7 @@ $(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run build_s
 endif
 
 PG_CPPFLAGS += -DUSE_SVS -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
-SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib
+SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib $(HARDENING_LDFLAGS)
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
