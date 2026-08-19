@@ -573,9 +573,11 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 		pg_atomic_read_u64(&VamanaWorkerShmemPtr->heartbeat_ts) != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("vamana background worker unavailable after waiting up to %d ms; cannot %s index %u",
-						VAMANA_HEARTBEAT_STALE_MS, operation, indexRelid),
-				 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
+				 errmsg("vamana background worker unavailable; cannot %s index %u",
+						operation, indexRelid),
+				 errdetail("The worker's last heartbeat is older than %d ms.",
+						   VAMANA_HEARTBEAT_STALE_MS),
+				 errhint("Check the server log for background worker errors; a server restart may be required.")));
 
 	while (total_waited_ms < vamana_worker_startup_timeout_ms)
 	{

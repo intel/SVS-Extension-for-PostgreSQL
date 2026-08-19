@@ -667,15 +667,17 @@ The extension emits `LOG`-level messages to the PostgreSQL server log during lon
 
 | Situation | Log message |
 |-----------|-------------|
-| Index load triggered (first access / after restart) | `loading vamana index <oid> from "<path>"` |
-| TID map being loaded | `vamana index <oid>: loading TID map for N vectors` |
-| Index fully loaded from disk | `vamana index <oid> loaded from disk (N vectors)` |
+| Index load triggered (first access / after restart) | `loading vamana index <oid>`, with the save directory path on the accompanying `DETAIL:` line |
+| TID map being loaded | `vamana index <oid>: loading TID map for N vectors (M slots total)` |
+| Index fully loaded from disk | `vamana index <oid> loaded from disk (N vectors, capacity M)` |
 | BGW cache miss — rebuilding from table | `vamana index not in memory, rebuilding from table` |
 | Rebuild started | `rebuilding vamana index from table data` |
 | Rebuild scan progress (every 100,000 tuples) | `vamana index <oid>: scanning table, N vectors collected` |
 | No saved copy; rebuilding from table | `vamana fallback: no saved copy for index <oid>, rebuilding from table` |
 
 To see these messages in `psql`, ensure your client is connected to a session where `client_min_messages = log` (not the default). They are always written to the PostgreSQL log file regardless of client settings.
+
+File system paths and library diagnostics are attached as log-only detail, so they appear on the `DETAIL:` line in the server log but are never sent to a client session at any `client_min_messages` setting. Read the server log file when you need the path.
 
 ```sql
 -- Temporarily surface LOG messages in the client session
@@ -814,7 +816,7 @@ SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'vamana background wo
 
 ### SVSAddPoints failure warning in server log
 
-When `SVSAddPoints` fails, the insert invalidates the cache and returns success to the client — no user-visible error is raised. If you see `WARNING: SVS dynamic add points failed:` frequently in the server log, capture the SVS error message. It typically indicates dimension mismatch or an out-of-memory condition.
+When `SVSAddPoints` fails, the insert invalidates the cache and returns success to the client, so no user-visible error is raised. If you see `WARNING: SVS dynamic add points failed` frequently in the server log, read the SVS error text from the `DETAIL:` line that follows it. It typically indicates dimension mismatch or an out-of-memory condition.
 
 ### "Index will be rebuilt from table on next query" NOTICE after VACUUM
 

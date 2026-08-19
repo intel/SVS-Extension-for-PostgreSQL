@@ -101,14 +101,14 @@ use VamanaTestUtils qw(:all);
         }
         ok($all_ok, 'all 5 concurrent post-restart queries return results');
 
-        unlike($burst_log, qr/loading vamana index \d+ from/,
+        unlike($burst_log, qr/loading vamana index \d+/,
             'no disk load during concurrent query burst — cache was warm at dispatch');
     }
 
     # SLOTKIND_LOAD: cache warm after CREATE INDEX — first INSERT must not
     # trigger a cold load.  The BGW guarantees the cache is warm before
     # vamanabuild returns, so the first INSERT slot must not emit
-    # "loading vamana index %u from" before calling SVSAddPoints.
+    # "loading vamana index %u" before calling SVSAddPoints.
     {
         $node->safe_psql("postgres", qq(
             CREATE TABLE warm_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -129,7 +129,7 @@ use VamanaTestUtils qw(:all);
         ));
 
         my $insert_log = substr($node->log_content(), $log_pos_after_create);
-        unlike($insert_log, qr/loading vamana index \d+ from/,
+        unlike($insert_log, qr/loading vamana index \d+/,
             'first INSERT after CREATE INDEX does not trigger a cold BGW cache load');
 
         my $warm_result = $node->safe_psql("postgres", qq(
