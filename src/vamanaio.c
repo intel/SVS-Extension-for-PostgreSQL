@@ -139,8 +139,12 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 	if (fwrite(&header, sizeof(header), 1, f) != 1 ||
 		(int) fwrite(tidMapping, sizeof(ItemPointerData), count, f) != count)
 	{
+		int			save_errno = errno;
+
+		/* Cleanup would overwrite the write failure's errno before %m reads it. */
 		FreeFile(f);
 		unlink(tidmaptmp);
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write TID map for vamana index %u: %m", relid),
@@ -149,7 +153,10 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 
 	if (FreeFile(f) != 0)
 	{
+		int			save_errno = errno;
+
 		unlink(tidmaptmp);
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not flush TID map for vamana index %u: %m", relid),
