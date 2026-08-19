@@ -97,7 +97,7 @@ LoadIndexFromPages(Relation index)
 
 	ereport(LOG,
 			(errmsg("loading vamana index %u", relid),
-			 errdetail_log("Path: \"%s\"", savepath)));
+			 errdetail_log("Path: \"%s\".", savepath)));
 
 	/*
 	 * Attempt the load.  Wrap in PG_TRY to convert a load failure into a
@@ -112,7 +112,7 @@ LoadIndexFromPages(Relation index)
 		FlushErrorState();
 		ereport(WARNING,
 				(errmsg("vamana index %u: failed to load, will rebuild from table", relid),
-				 errdetail_log("Path: \"%s\"", savepath)));
+				 errdetail_log("Path: \"%s\".", savepath)));
 
 		VamanaDeleteSaveDir(relid);
 		return NULL;

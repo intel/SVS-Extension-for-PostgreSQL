@@ -86,7 +86,7 @@ CheckSVSError(svs_error_h error, const char *operation)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS operation failed: %s", operation),
-				 errdetail_log("SVS error: %s (code %d)",
+				 errdetail_log("SVS error: %s (code %d).",
 							   msg ? msg : "unknown error", code)));
 	}
 }
@@ -638,7 +638,7 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to save SVS index"),
-				 errdetail_log("Path \"%s\": %s", path, saved)));
+				 errdetail_log("Path: \"%s\". SVS error: %s.", path, saved)));
 		return -1;				/* unreachable */
 	}
 
@@ -763,7 +763,8 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to load SVS index"),
-				 errdetail_log("Path \"%s\": %s", path, msg ? msg : "unknown error")));
+				 errdetail_log("Path: \"%s\". SVS error: %s.",
+							   path, msg ? msg : "unknown error")));
 		return NULL;
 	}
 
@@ -799,7 +800,7 @@ SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int n
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic add points failed"),
-				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
 		return -1;
 	}
 
@@ -834,7 +835,7 @@ SVSDeletePoints(SVSIndexHandle index, const size_t *ids, int num_ids)
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic delete points failed"),
-				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
 		return -1;
 	}
 
@@ -865,7 +866,7 @@ SVSConsolidate(SVSIndexHandle index)
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic consolidate failed"),
-				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
 		return false;
 	}
 
@@ -896,7 +897,7 @@ SVSCompact(SVSIndexHandle index, size_t batchsize)
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic compact failed"),
-				 errdetail_log("SVS error: %s", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
 		return false;
 	}
 

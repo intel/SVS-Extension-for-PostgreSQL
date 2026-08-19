@@ -399,7 +399,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to build SVS index"),
-				 errdetail_log("SVS error code: %d", error_code),
+				 errdetail_log("SVS error code: %d.", error_code),
 				 errhint("Try increasing maintenance_work_mem or reducing vector dimensions.")));
 	}
 
@@ -755,7 +755,7 @@ VamanaRebuildFromTable(Relation index)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to rebuild vamana index from table"),
-				 errdetail("SVS build failed with error code %d", errorCode)));
+				 errdetail("SVS build failed with error code %d.", errorCode)));
 	}
 
 	SVSSetIndexSearchThreads(svsIndex, SVSDefaultSearchThreads());

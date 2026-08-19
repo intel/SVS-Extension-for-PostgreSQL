@@ -71,14 +71,14 @@ VamanaEnsureSaveDir(Oid relid)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create vamana index directory: %m"),
-				 errdetail_log("Path: \"%s\"", parentdir)));
+				 errdetail_log("Path: \"%s\".", parentdir)));
 
 	VamanaGetIndexSavePath(relid, indexdir, sizeof(indexdir));
 	if (MakePGDirectory(indexdir) != 0 && errno != EEXIST)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create vamana index directory for relation %u: %m", relid),
-				 errdetail_log("Path: \"%s\"", indexdir)));
+				 errdetail_log("Path: \"%s\".", indexdir)));
 }
 
 /*
@@ -98,9 +98,8 @@ VamanaDeleteSaveDir(Oid relid)
 
 	if (rmtree(indexdir, true) == false)
 		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove vamana index directory for relation %u", relid),
-				 errdetail_log("Path: \"%s\"", indexdir)));
+				(errmsg("could not remove vamana index directory for relation %u", relid),
+				 errdetail_log("Path: \"%s\".", indexdir)));
 }
 
 /*
@@ -130,7 +129,7 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create TID map file for vamana index %u: %m", relid),
-				 errdetail_log("Path: \"%s\"", tidmaptmp)));
+				 errdetail_log("Path: \"%s\".", tidmaptmp)));
 
 	header.magic = VAMANA_TIDMAP_MAGIC;
 	header.version = VAMANA_TIDMAP_VERSION;
@@ -145,7 +144,7 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write TID map for vamana index %u: %m", relid),
-				 errdetail_log("Path: \"%s\"", tidmaptmp)));
+				 errdetail_log("Path: \"%s\".", tidmaptmp)));
 	}
 
 	if (FreeFile(f) != 0)
@@ -154,14 +153,14 @@ VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not flush TID map for vamana index %u: %m", relid),
-				 errdetail_log("Path: \"%s\"", tidmaptmp)));
+				 errdetail_log("Path: \"%s\".", tidmaptmp)));
 	}
 
 	if (rename(tidmaptmp, tidmappath) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not save TID map for vamana index %u: %m", relid),
-				 errdetail_log("Rename \"%s\" -> \"%s\"", tidmaptmp, tidmappath)));
+				 errdetail_log("Rename \"%s\" to \"%s\".", tidmaptmp, tidmappath)));
 }
 
 /*
@@ -198,7 +197,7 @@ VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 		ereport(WARNING,
 				(errcode_for_file_access(),
 				 errmsg("could not open TID map for vamana index %u: %m", relid),
-				 errdetail_log("Path: \"%s\"", tidmappath)));
+				 errdetail_log("Path: \"%s\".", tidmappath)));
 		return false;
 	}
 
@@ -212,7 +211,7 @@ VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 				(errmsg("vamana index %u: TID map is malformed or larger "
 						"than expected (%d slots), will rebuild",
 						relid, tidMappingCapacity),
-				 errdetail_log("Path: \"%s\"", tidmappath)));
+				 errdetail_log("Path: \"%s\".", tidmappath)));
 		return false;
 	}
 
@@ -224,7 +223,7 @@ VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
 				(errmsg("vamana index %u: TID map is truncated "
 						"(expected %u slots), will rebuild",
 						relid, header.capacity),
-				 errdetail_log("Path: \"%s\"", tidmappath)));
+				 errdetail_log("Path: \"%s\".", tidmappath)));
 		return false;
 	}
 
@@ -314,7 +313,7 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 
 		ereport(DEBUG1,
 				(errmsg("saving vamana index for relation %u", relid),
-				 errdetail_log("Path: \"%s\"", savepath)));
+				 errdetail_log("Path: \"%s\".", savepath)));
 
 		SVSSaveIndex(svsIndex, savepath);
 
