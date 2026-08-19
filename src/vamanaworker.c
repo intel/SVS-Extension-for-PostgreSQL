@@ -618,7 +618,7 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 	VamanaWorkerSlot *slot;
 	int			slotIdx;
 	uint32		status;
-	volatile int total_waited_ms = 0;	/* volatile: crosses PG_TRY/longjmp boundary */
+	int			total_waited_ms = 0;
 
 	if (!VamanaWorkerIsAvailable())
 		return -1;

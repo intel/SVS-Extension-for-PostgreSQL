@@ -51,19 +51,16 @@ ifeq ($(shell uname -m), riscv64)
 	OPTFLAGS =
 endif
 
-# GCC 11+ is the minimum supported compiler (see docs/build_guide/README.md).
-# -D_FORTIFY_SOURCE=3 and -fstack-clash-protection are both available on GCC 11+.
-# -D_FORTIFY_SOURCE requires at least -O1 to take effect (provided by PGXS defaults).
-# -Wconversion and -Wextra are omitted: they trigger errors in PostgreSQL system
-# headers which are not written to comply with those flags. All other hardening
-# flags apply only to the extension's own source.
+# -U_FORTIFY_SOURCE before -D avoids a redefinition diagnostic on distros that
+# predefine it; FORTIFY_LEVEL is probed after include $(PGXS) where $(CC) is set.
+# -Wconversion/-Wextra omitted: trigger errors in PostgreSQL system headers.
 HARDENING_CFLAGS = -Wall -Werror -Wimplicit-fallthrough \
                    -Wformat -Wformat-security -Werror=format-security \
                    -fstack-protector-strong -fstack-clash-protection \
-                   -D_FORTIFY_SOURCE=3 -D_GLIBCXX_ASSERTIONS -fPIC
+                   -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=$(FORTIFY_LEVEL) -fPIC
 
-# Linker hardening flags
-HARDENING_LDFLAGS = -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now -Wl,-z,nodlopen
+# Linker hardening flags (-z,nodlopen omitted: PostgreSQL loads extensions via dlopen)
+HARDENING_LDFLAGS = -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now
 
 PG_CFLAGS += $(OPTFLAGS) -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math $(HARDENING_CFLAGS)
 
@@ -92,6 +89,9 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 EXTRA_CLEAN = $(wildcard src/*.gcda) $(wildcard src/*.gcno)
 
 include $(PGXS)
+
+# Probed here (after PGXS) where $(CC) is defined; GCC 12+ gets level 3, GCC 11 gets 2.
+FORTIFY_LEVEL := $(shell [ "$$($(CC) -dumpversion 2>/dev/null | cut -d. -f1)" -ge 12 ] 2>/dev/null && echo 3 || echo 2)
 
 # Expose the build's injection-point setting to TAP tests (fault-path tests
 # skip themselves when it is not 'yes').
