@@ -13,5 +13,10 @@ regression.*
 *.lib
 *.exp
 
+# GCC coverage instrumentation artefacts
+*.gcda
+*.gcno
+coverage_reports/
+
 .vscode/
 .local/

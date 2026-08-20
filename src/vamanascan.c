@@ -97,8 +97,8 @@ LoadIndexFromPages(Relation index)
 	config.leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 
 	ereport(LOG,
-			(errmsg("loading vamana index %u from \"%s\"",
-					relid, savepath)));
+			(errmsg("loading vamana index %u", relid),
+			 errdetail_log("Path: \"%s\".", savepath)));
 
 	/*
 	 * Attempt the load.  Wrap in PG_TRY to convert a load failure into a
@@ -112,8 +112,8 @@ LoadIndexFromPages(Relation index)
 	{
 		FlushErrorState();
 		ereport(WARNING,
-				(errmsg("vamana index %u: failed to load from \"%s\", will rebuild from table",
-						relid, savepath)));
+				(errmsg("vamana index %u: failed to load, will rebuild from table", relid),
+				 errdetail_log("Path: \"%s\".", savepath)));
 
 		VamanaDeleteSaveDir(MyDatabaseId, relid);
 		return NULL;

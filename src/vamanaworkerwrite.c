@@ -550,8 +550,8 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		if (svsIndex == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("vamana worker: failed to load index %u from \"%s\"",
-							relid, savepath)));
+					 errmsg("vamana worker: failed to load index %u", relid),
+					 errdetail_log("Path: \"%s\".", savepath)));
 
 		if (params->tidMappingCapacity > 0)
 		{

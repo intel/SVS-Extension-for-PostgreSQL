@@ -49,11 +49,26 @@ use VamanaTestUtils qw(:all);
         "SELECT oid FROM pg_class WHERE relname = 'vp_idx';");
     chomp $index_oid;
 
-    my $index_dir = vamana_save_dir($node, 'postgres', $index_oid);
+    my $parent_dir = $node->data_dir . "/vamana_indexes";
+    my $index_dir  = vamana_save_dir($node, 'postgres', $index_oid);
     ok(-d $index_dir, "on-disk index directory exists after CREATE INDEX");
 
     my @initial_files = glob("$index_dir/*");
     ok(scalar @initial_files > 0, 'on-disk index directory is non-empty');
+
+    # Index vectors are user data and must not be readable by other OS accounts.
+    # VamanaEnsureSaveDir (src/vamanaio.c) creates both directories with
+    # MakePGDirectory, which applies pg_dir_create_mode (0700, or 0750 when the
+    # cluster was initialized with group access). These assertions guard that
+    # choice: a naked mkdir() with an explicit mode, or one subject to the
+    # ambient umask, would leave the vectors group- or world-readable.
+    for my $dir ($parent_dir, $index_dir)
+    {
+        my $mode = (stat($dir))[2] & 07777;
+        ok($mode == 0700 || $mode == 0750,
+            sprintf('%s mode is %04o (expect 0700, or 0750 with group access)',
+                    $dir, $mode));
+    }
 
     my $baseline = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
