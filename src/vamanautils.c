@@ -332,3 +332,24 @@ VamanaGetDistanceMetric(Relation index)
 			 errhint("Use vector_l2_ops, vector_ip_ops, or vector_cosine_ops")));
 	return SVS_DISTANCE_L2;		/* unreachable */
 }
+
+/*
+ * Reject vectors containing NaN or Inf before passing them to the SVS
+ * library. SVS performs no input validation; non-finite values propagate
+ * silently through distance computations (IEEE 754), corrupting k-NN
+ * ranking without error. context is a short label used in the error
+ * message ("insert", "query", "build").
+ */
+void
+VamanaValidateVectorData(const float *data, int dim, const char *context)
+{
+	for (int i = 0; i < dim; i++)
+	{
+		if (isnan(data[i]) || isinf(data[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("vector contains invalid floating-point value "
+							"(NaN or Infinity) at position %d in %s",
+							i, context)));
+	}
+}

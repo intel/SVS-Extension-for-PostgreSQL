@@ -41,6 +41,7 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	VamanaWorkerWaitUntilAvailable(relid, "insert into");
 
 	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
+	VamanaValidateVectorData(vec->x, vec->dim, "insert");
 
 	/* Submit to BGW — blocks until the worker ACKs or errors. */
 	VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid, &externalId);

@@ -246,6 +246,7 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		 * past the palloc block boundary.
 		 */
 		queryVec = (Vector *) PG_DETOAST_DATUM_COPY(so->queryValue);
+		VamanaValidateVectorData(queryVec->x, queryVec->dim, "query");
 
 		if (so->results)
 			pfree(so->results);
