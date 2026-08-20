@@ -755,7 +755,13 @@ This section describes security-relevant deployment considerations that operator
 
 #### On-Disk Index Protection
 
-The serialized SVS index directory (`$PGDATA/vamana_indexes/<oid>/`) contains raw embedding vectors. Its confidentiality and integrity are protected by PostgreSQL's `$PGDATA` permission posture: the postmaster process umask applies `0700` to all directories under `$PGDATA`, including the Vamana index save directory. The extension does not enforce permissions independently.
+The serialized SVS index directory (`$PGDATA/vamana_indexes/<dboid>/<relid>/`) contains raw embedding vectors. Its confidentiality and integrity follow PostgreSQL's `$PGDATA` permission posture, which the server derives from the mode of `$PGDATA` itself at startup — not from the umask of whoever started it. The extension states the modes it controls explicitly at the point of creation:
+
+- **Directories** (`vamana_indexes/`, `vamana_indexes/<dboid>/` and `vamana_indexes/<dboid>/<relid>/`) are created through `MakePGDirectory`, which applies `pg_dir_create_mode`: `0700`, or `0750` on a cluster initialized with group access (`initdb -g`).
+- **The TID map** (`tidmap.bin`) is created with `pg_file_create_mode` — `0600`, or `0640` with group access — and that mode is applied to the file descriptor before any data is written, so the published file's mode is exactly the requested one rather than a umask-reduced approximation of it. There is no execute bit in either case.
+- **The SVS payload** (the `config/`, `data/` and `graph/` subdirectories and their contents) is created entirely by the Intel SVS library, whose save call takes no mode from the extension. The library requests `0777` for those subdirectories and `0666` for the files in them. They still land at `0700` and `0600` (`0750` and `0640` with group access), but only because the server's process umask is `pg_mode_mask` — the extension does not enforce their mode itself.
+
+Temporary files are removed as soon as they are no longer needed. `tidmap.bin` is published by writing `tidmap.bin.tmp` and renaming it into place; the temp file is removed on every error path, and any leftover is removed before a new one is created. A temp file orphaned by a crash between the write and the rename is removed at the next load or save of that index.
 
 **Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE` is a **silent no-op** for Vamana indexes in the current release (v0.1). This limitation is tracked for resolution in v0.2.
 
