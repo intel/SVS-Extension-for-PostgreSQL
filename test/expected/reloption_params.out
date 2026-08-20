@@ -1,0 +1,232 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+--
+-- Reloption bounds regression tests: every vamana index reloption enforces
+-- its declared min/max, at the exact boundary and one step outside it.
+-- GUC bounds live in runtime_params.sql.
+-- graph_degree: [16, 256]
+-- Exact minimum is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 16);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- Exact maximum is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 256);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 15);
+ERROR:  value 15 out of bounds for option "graph_degree"
+DETAIL:  Valid values are between "16" and "256".
+DROP TABLE t;
+-- One above maximum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 257);
+ERROR:  value 257 out of bounds for option "graph_degree"
+DETAIL:  Valid values are between "16" and "256".
+DROP TABLE t;
+-- alpha: [-1, 200]
+-- -1 is the sentinel "use SVS default" and must be accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = -1);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- Exact maximum is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = 200);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- One below minimum (-2) is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = -2);
+ERROR:  value -2 out of bounds for option "alpha"
+DETAIL:  Valid values are between "-1" and "200".
+DROP TABLE t;
+-- One above maximum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = 201);
+ERROR:  value 201 out of bounds for option "alpha"
+DETAIL:  Valid values are between "-1" and "200".
+DROP TABLE t;
+-- build_window_size: [-1, 1000]
+-- -1 is the sentinel for 2 * graph_degree; 0 is accepted by the reloption
+-- layer since min=-1, but the application treats it the same as -1.
+-- Exact minimum (-1 sentinel for 2 * graph_degree) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = -1);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- Exact maximum is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = 1000);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- One above maximum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = 1001);
+ERROR:  value 1001 out of bounds for option "build_window_size"
+DETAIL:  Valid values are between "-1" and "1000".
+DROP TABLE t;
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = -2);
+ERROR:  value -2 out of bounds for option "build_window_size"
+DETAIL:  Valid values are between "-1" and "1000".
+DROP TABLE t;
+-- search_window_size (reloption): [10, 10000]
+-- Exact minimum is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (search_window_size = 10);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- Exact maximum is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (search_window_size = 10000);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (search_window_size = 9);
+ERROR:  value 9 out of bounds for option "search_window_size"
+DETAIL:  Valid values are between "10" and "10000".
+DROP TABLE t;
+-- One above maximum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (search_window_size = 10001);
+ERROR:  value 10001 out of bounds for option "search_window_size"
+DETAIL:  Valid values are between "10" and "10000".
+DROP TABLE t;
+-- leanvec_dims: [-1, 2000]
+-- Exact minimum (-1 sentinel for SVS default) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (leanvec_dims = -1);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- Exact maximum is accepted (requires sufficient dimension; use dim=2000)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(2000));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, leanvec_dims = 2000);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- One above maximum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(2000));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, leanvec_dims = 2001);
+ERROR:  value 2001 out of bounds for option "leanvec_dims"
+DETAIL:  Valid values are between "-1" and "2000".
+DROP TABLE t;
+-- One below minimum is rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (leanvec_dims = -2);
+ERROR:  value -2 out of bounds for option "leanvec_dims"
+DETAIL:  Valid values are between "-1" and "2000".
+DROP TABLE t;
+-- compression_type: [0, 2]
+-- Valid lower boundary (0 = none) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 0);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- Valid upper boundary (2 = lvq) is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 2);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- One below minimum is rejected at reloption layer
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = -1);
+ERROR:  value -1 out of bounds for option "compression_type"
+DETAIL:  Valid values are between "0" and "2".
+DROP TABLE t;
+-- One above maximum is rejected at reloption layer
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 3);
+ERROR:  value 3 out of bounds for option "compression_type"
+DETAIL:  Valid values are between "0" and "2".
+DROP TABLE t;
+-- compression_primary / compression_secondary valid set {+/-4, +/-8}
+-- All cases set compression_type = 1 (LEANVEC) so the cross-check runs.
+-- Invalid: value inside [-8,8] but not in {+-4,+-8} rejected (primary = 5)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 5, compression_secondary = 8);
+ERROR:  invalid compression_primary value: 5
+HINT:  Valid values are: 4 (UINT4), -4 (INT4), 8 (UINT8), -8 (INT8)
+DROP TABLE t;
+-- Invalid: secondary = 5, primary = 4 (valid) isolates the secondary failure
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 5);
+ERROR:  invalid compression_secondary value: 5
+HINT:  Valid values are: 4 (UINT4), -4 (INT4), 8 (UINT8), -8 (INT8)
+DROP TABLE t;
+-- Valid: each member of {+-4, +-8} accepted as equal-bit primary/secondary
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 4);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = -4);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = -8);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- compression_primary precision > compression_secondary cross-check
+-- (8-bit primary with 4-bit secondary must be rejected)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 4);
+ERROR:  compression_primary (8-bit) cannot have higher precision than compression_secondary (4-bit)
+HINT:  Primary quantization must be <= secondary precision (e.g., 4-bit primary with 8-bit secondary is valid)
+DROP TABLE t;
+-- Valid: 4-bit primary with 8-bit secondary is accepted
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+DROP TABLE t;
+-- compression_primary / compression_secondary reloption-layer boundary
+-- Values outside [-8, 8] are rejected before the cross-check runs.
+-- Invalid: outside reloption range (primary = 9)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 9, compression_secondary = 8);
+ERROR:  value 9 out of bounds for option "compression_primary"
+DETAIL:  Valid values are between "-8" and "8".
+DROP TABLE t;
+-- Invalid: outside reloption range (secondary = -9)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = -9);
+ERROR:  value -9 out of bounds for option "compression_secondary"
+DETAIL:  Valid values are between "-8" and "8".
+DROP TABLE t;

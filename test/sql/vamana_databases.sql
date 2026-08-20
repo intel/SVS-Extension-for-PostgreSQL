@@ -28,8 +28,14 @@ DELETE FROM vamana_databases WHERE datname = 'template1';
 INSERT INTO vamana_databases (datname) VALUES ('vamana_databases_test_dbd');
 INSERT INTO vamana_databases (datname, graph_memory_mb, total_memory_mb, search_num_threads)
 	VALUES ('vamana_databases_test_dbe', 512, 4096, 8);
+-- Scoped to the rows this test created: other regression files may have
+-- already self-enrolled their own database (e.g. contrib_regression) by the
+-- time this file runs, and this assertion must not depend on run order.
 SELECT datname, graph_memory_mb, total_memory_mb, search_num_threads
-	FROM vamana_databases ORDER BY datname;
+	FROM vamana_databases
+	WHERE datname IN ('postgres', 'vamana_databases_test_dbc',
+					   'vamana_databases_test_dbd', 'vamana_databases_test_dbe')
+	ORDER BY datname;
 
 -- INSERT/UPDATE/DELETE/TRUNCATE are all revoked from PUBLIC; the table owner
 -- retains them

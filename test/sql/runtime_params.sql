@@ -23,9 +23,6 @@ SET enable_seqscan = off;
 
 SHOW svs.search_window_size;
 
-SET svs.search_window_size = 9;
-SET svs.search_window_size = 10001;
-
 -- compression invalid parameters
 
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
@@ -83,3 +80,163 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops);
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 RESET svs.search_num_threads;
 DROP TABLE t;
+
+-- svs.search_window_size GUC bounds: [10, 10000]
+
+-- Exact minimum is accepted
+SET svs.search_window_size = 10;
+SHOW svs.search_window_size;
+RESET svs.search_window_size;
+
+-- Exact maximum is accepted
+SET svs.search_window_size = 10000;
+SHOW svs.search_window_size;
+RESET svs.search_window_size;
+
+-- One below minimum is rejected
+SET svs.search_window_size = 9;
+
+-- One above maximum is rejected
+SET svs.search_window_size = 10001;
+
+-- svs.search_num_threads GUC bounds: [0, 1024]
+
+-- Exact minimum is accepted
+SET svs.search_num_threads = 0;
+SHOW svs.search_num_threads;
+RESET svs.search_num_threads;
+
+-- Exact maximum is accepted
+SET svs.search_num_threads = 1024;
+SHOW svs.search_num_threads;
+RESET svs.search_num_threads;
+
+-- One above maximum is rejected
+SET svs.search_num_threads = 1025;
+
+-- One below minimum is rejected
+SET svs.search_num_threads = -1;
+
+-- Checkpoint GUCs are PGC_SIGHUP: SET always errors "cannot be changed now",
+-- so bounds are exercised via ALTER SYSTEM instead.
+
+-- svs.checkpoint_debounce_window: [0, 86400] s
+
+-- Out-of-range: rejected at ALTER SYSTEM time
+ALTER SYSTEM SET svs.checkpoint_debounce_window = -1;
+ALTER SYSTEM SET svs.checkpoint_debounce_window = 86401;
+
+-- Valid lower boundary
+ALTER SYSTEM SET svs.checkpoint_debounce_window = 0;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_debounce_window;
+ALTER SYSTEM RESET svs.checkpoint_debounce_window;
+SELECT pg_reload_conf();
+
+-- Valid upper boundary
+ALTER SYSTEM SET svs.checkpoint_debounce_window = 86400;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_debounce_window;
+ALTER SYSTEM RESET svs.checkpoint_debounce_window;
+SELECT pg_reload_conf();
+
+-- svs.checkpoint_max_interval: [1, 86400] s
+
+-- Out-of-range
+ALTER SYSTEM SET svs.checkpoint_max_interval = 0;
+ALTER SYSTEM SET svs.checkpoint_max_interval = 86401;
+
+-- Valid lower boundary
+ALTER SYSTEM SET svs.checkpoint_max_interval = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_max_interval;
+ALTER SYSTEM RESET svs.checkpoint_max_interval;
+SELECT pg_reload_conf();
+
+-- Valid upper boundary
+ALTER SYSTEM SET svs.checkpoint_max_interval = 86400;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_max_interval;
+ALTER SYSTEM RESET svs.checkpoint_max_interval;
+SELECT pg_reload_conf();
+
+-- svs.checkpoint_min_ops: [0, INT_MAX]
+
+-- Out-of-range (below min)
+ALTER SYSTEM SET svs.checkpoint_min_ops = -1;
+
+-- Valid lower boundary
+ALTER SYSTEM SET svs.checkpoint_min_ops = 0;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_min_ops;
+ALTER SYSTEM RESET svs.checkpoint_min_ops;
+SELECT pg_reload_conf();
+
+-- Valid upper boundary
+ALTER SYSTEM SET svs.checkpoint_min_ops = 2147483647;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_min_ops;
+ALTER SYSTEM RESET svs.checkpoint_min_ops;
+SELECT pg_reload_conf();
+
+-- svs.max_slot_wal_size: [64, MAX_KILOBYTES] MB
+
+-- Out-of-range (below min)
+ALTER SYSTEM SET svs.max_slot_wal_size = '63MB';
+
+-- Valid lower boundary
+ALTER SYSTEM SET svs.max_slot_wal_size = '64MB';
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_slot_wal_size;
+ALTER SYSTEM RESET svs.max_slot_wal_size;
+SELECT pg_reload_conf();
+
+-- svs.checkpoint_operations: [-1, INT_MAX]
+
+-- Out-of-range (below min)
+ALTER SYSTEM SET svs.checkpoint_operations = -2;
+
+-- Valid lower boundary
+ALTER SYSTEM SET svs.checkpoint_operations = -1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_operations;
+ALTER SYSTEM RESET svs.checkpoint_operations;
+SELECT pg_reload_conf();
+
+-- Valid mid-range
+ALTER SYSTEM SET svs.checkpoint_operations = 0;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_operations;
+ALTER SYSTEM RESET svs.checkpoint_operations;
+SELECT pg_reload_conf();
+
+-- svs.checkpoint_interval: [-1, 86400] s
+
+-- Out-of-range
+ALTER SYSTEM SET svs.checkpoint_interval = -2;
+ALTER SYSTEM SET svs.checkpoint_interval = 86401;
+
+-- Valid lower boundary
+ALTER SYSTEM SET svs.checkpoint_interval = -1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_interval;
+ALTER SYSTEM RESET svs.checkpoint_interval;
+SELECT pg_reload_conf();
+
+-- Valid upper boundary
+ALTER SYSTEM SET svs.checkpoint_interval = 86400;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.checkpoint_interval;
+ALTER SYSTEM RESET svs.checkpoint_interval;
+SELECT pg_reload_conf();
