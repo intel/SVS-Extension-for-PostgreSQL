@@ -331,3 +331,15 @@ REINDEX INDEX CONCURRENTLY t_loadwin_val_idx;
 SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5) sub;
 
 DROP TABLE t_loadwin;
+
+-- SDL425: NaN/Inf rejected on incremental INSERT (dynamic/live index path)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+INSERT INTO t (val) VALUES ('[1,NaN,3]');
+INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+INSERT INTO t (val) VALUES ('[1,-Infinity,3]');
+-- NULL must still be silently skipped (must not regress)
+INSERT INTO t (val) VALUES (NULL);
+SELECT COUNT(*) FROM t;
+DROP TABLE t;

@@ -515,3 +515,21 @@ INSERT INTO t (val) VALUES ('[2,2,2]');
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
+
+-- SDL425: NaN/Inf input validation (vector type)
+
+-- NaN/Inf in INSERT at build time must be rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+INSERT INTO t (val) VALUES ('[1,NaN,3]');
+INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+INSERT INTO t (val) VALUES ('[1,-Infinity,3]');
+DROP TABLE t;
+
+-- NaN/Inf in query vector must be rejected
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+SELECT * FROM t ORDER BY val <-> '[1,NaN,3]' LIMIT 1;
+SELECT * FROM t ORDER BY val <-> '[1,Infinity,3]' LIMIT 1;
+DROP TABLE t;
