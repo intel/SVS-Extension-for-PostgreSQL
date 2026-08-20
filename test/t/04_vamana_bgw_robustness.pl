@@ -44,6 +44,16 @@ sub restart_worker
     return $new_pid;
 }
 
+# Overwrite a file's first few bytes so any format validation on read fails,
+# without changing the file's size.
+sub clobber_file_header
+{
+    my ($path) = @_;
+    open(my $fh, '+<:raw', $path) or die "open $path: $!";
+    print $fh "\xDE\xAD\xBE\xEF";
+    close $fh;
+}
+
 # ===========================================================================
 # VamanaWorkerResetStaleSlots — all slots empty at BGW startup
 #
@@ -284,6 +294,133 @@ SKIP: {
     ));
     ok($ret == 0 && $stdout =~ /^\d+$/m,
         'a subsequent, uninjected search on the same index still succeeds');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Load-handoff failure — VamanaWorkerProcessLoadSlot catches without an abort
+#
+# Same class of bug as the cold-load failure above (CopyErrorData() called
+# without switching CurrentMemoryContext off ErrorContext first), but on the
+# CREATE INDEX handoff LOAD slot path instead of the cold-reload path, and
+# without needing an injection point: the worker is frozen (SIGSTOP) before a
+# build starts and resumed (SIGCONT) only after its freshly-written TID map
+# is corrupted on disk, forcing the load to fail on schedule. Repeated across
+# several indexes in one process, since the corruption this guards against
+# only surfaces after a few occurrences.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_load_handoff_fault');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $worker_pid = wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE handoff_tbl (
+            id  serial PRIMARY KEY,
+            c1  vector($dim), c2 vector($dim), c3 vector($dim), c4 vector($dim), c5 vector($dim)
+        );
+        INSERT INTO handoff_tbl (c1, c2, c3, c4, c5)
+            SELECT ARRAY[$array_sql]::vector, ARRAY[$array_sql]::vector, ARRAY[$array_sql]::vector,
+                   ARRAY[$array_sql]::vector, ARRAY[$array_sql]::vector
+            FROM generate_series(1, 2000) i;
+    ));
+
+    my $dboid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'postgres';");
+    chomp $dboid;
+    my $indexes_dir = $node->data_dir . "/vamana_indexes/$dboid";
+
+    my @columns = ('c1', 'c2', 'c3', 'c4', 'c5');
+    my $crashed_after_iteration;
+    my $crash_log = '';
+
+    for my $iter (0 .. $#columns)
+    {
+        my $col        = $columns[$iter];
+        my $index_name = "handoff_idx_$col";
+
+        my %before_dirs = map { $_ => 1 } glob("$indexes_dir/*");
+
+        kill('STOP', $worker_pid) or die "kill STOP $worker_pid: $!";
+
+        my $bg = $node->background_psql('postgres');
+        $bg->query_until(
+            qr/build_issued/,
+            qq(
+                \\echo build_issued
+                CREATE INDEX $index_name ON handoff_tbl USING vamana ($col vector_l2_ops);
+            ));
+
+        my $new_dir;
+        for (1 .. 60)
+        {
+            my @now = grep { !$before_dirs{$_} } glob("$indexes_dir/*");
+            if (@now == 1)
+            {
+                $new_dir = $now[0];
+                last;
+            }
+            usleep(200_000);
+        }
+        die "new save directory for $index_name did not appear" unless defined $new_dir;
+
+        my $tidmap = "$new_dir/tidmap.bin";
+        my $prev_size = -1;
+        for (1 .. 60)
+        {
+            if (-f $tidmap)
+            {
+                my $size = -s $tidmap;
+                last if $size == $prev_size && $size > 0;
+                $prev_size = $size;
+            }
+            usleep(100_000);
+        }
+        ok(-f $tidmap, "$index_name: TID map written while worker is frozen");
+
+        clobber_file_header($tidmap);
+
+        kill('CONT', $worker_pid) or die "kill CONT $worker_pid: $!";
+
+        my $log_pos = length($node->log_content());
+        my $query_survived = eval { $bg->query("SELECT 1;"); 1 };
+        eval { $bg->quit; };
+
+        my $log = substr($node->log_content(), $log_pos);
+        if (!$query_survived || $log =~ /terminated by signal|Segmentation fault/)
+        {
+            $crashed_after_iteration = $iter + 1;
+            $crash_log = $log;
+            last;
+        }
+
+        like($log,
+            qr/vamana index "$index_name": background worker load failed/,
+            "$index_name: backend falls back to on-demand load after the worker's load fails");
+
+        my $live_pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
+        chomp $live_pid;
+        is($live_pid, $worker_pid,
+            "$index_name: worker survives the failed load without restarting");
+    }
+
+    ok(!defined $crashed_after_iteration,
+        'repeated failed post-build loads do not crash the worker')
+      or diag("crashed after $crashed_after_iteration failed load(s); server log:\n$crash_log");
 
     $node->stop;
 }

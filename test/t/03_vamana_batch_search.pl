@@ -178,4 +178,87 @@ sub make_search_sql
     $node->stop;
 }
 
+# ===========================================================================
+# Search-slot fault injection — VamanaWorkerRunBatch's PG_CATCH must release
+# its rwlock and reset CurrentMemoryContext correctly on a search failure.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 6
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_search_fault');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $worker_pid = wait_for_worker($node);
+    ok($worker_pid =~ /^\d+$/, 'worker is running before the search-fault loop');
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE search_fault_tbl (id serial PRIMARY KEY, c1 vector($dim));
+        INSERT INTO search_fault_tbl (c1)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 2000) i;
+        CREATE INDEX search_fault_idx ON search_fault_tbl USING vamana (c1 vector_l2_ops);
+    ));
+
+    my $query_vec = "[" . join(',', (0) x $dim) . "]";
+
+    my $baseline = $node->safe_psql('postgres',
+        "SELECT count(*) FROM (SELECT id FROM search_fault_tbl "
+      . "ORDER BY c1 <-> '$query_vec'::vector LIMIT 5) s;");
+    chomp $baseline;
+    is($baseline, '5', 'baseline search succeeds before fault injection');
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-worker-search-error', 'error');");
+
+    my $crashed_after_iteration;
+    my $crash_log = '';
+
+    for my $iter (1 .. 3)
+    {
+        my $log_pos = length($node->log_content());
+
+        eval {
+            $node->safe_psql('postgres',
+                "SELECT id FROM search_fault_tbl "
+              . "ORDER BY c1 <-> '$query_vec'::vector LIMIT 5;");
+        };
+
+        my $log = substr($node->log_content(), $log_pos);
+        if ($log =~ /terminated by signal|Segmentation fault/)
+        {
+            $crashed_after_iteration = $iter;
+            $crash_log = $log;
+            last;
+        }
+
+        my $live_pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
+        chomp $live_pid;
+        is($live_pid, $worker_pid,
+            "iteration $iter: worker survives the injected search failure without restarting");
+    }
+
+    ok(!defined $crashed_after_iteration,
+        'repeated injected search failures do not crash the worker')
+      or diag("crashed after $crashed_after_iteration failed search(es); server log:\n$crash_log");
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-worker-search-error');")
+      if !defined $crashed_after_iteration;
+
+    $node->stop;
+}
+
 done_testing();

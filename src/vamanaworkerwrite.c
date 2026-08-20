@@ -528,7 +528,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 	ItemPointerData * volatile tidMapping = NULL;
 	char		savepath[MAXPGPATH];
 	volatile bool loadSucceeded = false;
-
+	MemoryContext oldcontext = CurrentMemoryContext;
 
 	PG_TRY();
 	{
@@ -621,6 +621,9 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 		vamana_eviction_suppressed = false;
 
+		/* Leave ErrorContext before allocating anything; errfinish() left us in it. */
+		MemoryContextSwitchTo(oldcontext);
+
 		/* Allocated in TopMemoryContext; nothing else frees these on failure. */
 		if (svsIndex != NULL)
 		{
@@ -689,6 +692,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 {
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 	Oid			relid = slot->indexRelid;
+	MemoryContext oldcontext = CurrentMemoryContext;
 
 	PG_TRY();
 	{
@@ -714,6 +718,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 
 		if (IsTransactionState())
 			AbortCurrentTransaction();
+		MemoryContextSwitchTo(oldcontext);
 
 		edata = CopyErrorData();
 		FlushErrorState();

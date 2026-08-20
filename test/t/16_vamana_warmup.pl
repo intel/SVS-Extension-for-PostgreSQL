@@ -50,7 +50,7 @@ my $relid = $node->safe_psql("postgres", "SELECT 'warm_idx'::regclass::oid;");
     my $log_pos = length($node->log_content());
     $node->safe_psql("postgres", "SELECT svs_warmup_index('warm_idx');");
     my $warmup_log = substr($node->log_content(), $log_pos);
-    like($warmup_log, qr/loading vamana index $relid from/,
+    like($warmup_log, qr/loading vamana index $relid/,
         'svs_warmup_index loads the index into the worker cache');
 
     $log_pos = length($node->log_content());
@@ -60,7 +60,7 @@ my $relid = $node->safe_psql("postgres", "SELECT 'warm_idx'::regclass::oid;");
     ));
     isnt($res, '', 'query returns results after warm-up');
     my $query_log = substr($node->log_content(), $log_pos);
-    unlike($query_log, qr/loading vamana index $relid from/,
+    unlike($query_log, qr/loading vamana index $relid/,
         'query after warm-up hits the resident cache — no cold load');
 }
 
@@ -69,7 +69,7 @@ my $relid = $node->safe_psql("postgres", "SELECT 'warm_idx'::regclass::oid;");
     my $log_pos = length($node->log_content());
     $node->safe_psql("postgres", "SELECT svs_warmup_index('warm_idx');");
     my $warmup_log = substr($node->log_content(), $log_pos);
-    unlike($warmup_log, qr/loading vamana index $relid from/,
+    unlike($warmup_log, qr/loading vamana index $relid/,
         'repeated svs_warmup_index on a resident index does not reload');
 }
 
@@ -167,7 +167,7 @@ my $relid = $node->safe_psql("postgres", "SELECT 'warm_idx'::regclass::oid;");
     }
 
     my $idle_log = substr($node->log_content(), $log_pos);
-    unlike($idle_log, qr/loading vamana index $guard_relid from/,
+    unlike($idle_log, qr/loading vamana index $guard_relid/,
         'no automatic path loads the index after restart — warm-up is not auto-invoked');
 
     # The first query must now demand-load it, confirming it was genuinely cold
@@ -178,7 +178,7 @@ my $relid = $node->safe_psql("postgres", "SELECT 'warm_idx'::regclass::oid;");
         SELECT id FROM warm_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
     my $query_log = substr($node->log_content(), $log_pos);
-    like($query_log, qr/loading vamana index $guard_relid from/,
+    like($query_log, qr/loading vamana index $guard_relid/,
         'first query demand-loads the index, proving it was cold');
 }
 

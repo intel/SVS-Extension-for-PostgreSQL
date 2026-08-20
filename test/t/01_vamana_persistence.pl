@@ -847,7 +847,7 @@ use VamanaTestUtils qw(:all);
     chomp $count;
 
     my $log = substr($node->log_content(), $log_pos);
-    like($log, qr/TID map .* is malformed or larger than expected/,
+    like($log, qr/vamana index $ioid: TID map is malformed or larger than expected/,
         'corrupt tidmap.bin header rejected on load');
     like($log, qr/rebuilding vamana index from table data/,
         'index rebuilt from heap after rejection');

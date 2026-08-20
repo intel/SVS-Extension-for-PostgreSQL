@@ -19,6 +19,7 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
+#include "utils/injection_point.h"
 #include "utils/snapmgr.h"
 
 /* -----------------------------------------------------------------------
@@ -97,12 +98,16 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	{
 		LWLock	   *rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
 		bool		batch_done = false;
+		MemoryContext oldcontext = CurrentMemoryContext;
 
 		if (rwlock != NULL)
 			LWLockAcquire(rwlock, LW_SHARED);
 
 		PG_TRY();
 		{
+			/* Test hook: TAP forces a search failure while the rwlock is held. */
+			INJECTION_POINT("vamana-worker-search-error", NULL);
+
 			/*
 			 * Native batch path: if all slots share the same k and dimensions,
 			 * pack query vectors into one buffer and call SVSBatchSearch once.
@@ -251,8 +256,8 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 		{
 			ErrorData  *edata;
 
-			if (rwlock != NULL)
-				LWLockRelease(rwlock);
+			LWLockReleaseAll();
+			MemoryContextSwitchTo(oldcontext);
 
 			edata = CopyErrorData();
 			FlushErrorState();
