@@ -43,6 +43,13 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
 	VamanaValidateVectorData(vec->x, vec->dim, "insert");
 
+	/* Defense-in-depth: PostgreSQL's type system normally prevents this. */
+	if (vec->dim != TupleDescAttr(index->rd_att, 0)->atttypmod)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("vector dimension %d does not match index dimension %d",
+						vec->dim, TupleDescAttr(index->rd_att, 0)->atttypmod)));
+
 	/* Submit to BGW — blocks until the worker ACKs or errors. */
 	VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid, &externalId);
 
