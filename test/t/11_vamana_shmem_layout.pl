@@ -369,4 +369,63 @@ sub enable_postgres
     $node->stop;
 }
 
+# ---------------------------------------------------------------------------
+# index_relid on an empty slot is masked at read time, so a database that
+# recycles a freed worker entry never observes a leftover index OID from the
+# previous tenant.
+# ---------------------------------------------------------------------------
+{
+    my $node = start_node('vamana_slot_relid_leak', 1);
+
+    $node->safe_psql('postgres', "CREATE DATABASE leak_tenant_a;");
+    $node->safe_psql('postgres', "CREATE DATABASE leak_tenant_b;");
+    $node->safe_psql('leak_tenant_a', "CREATE EXTENSION vector;");
+    $node->safe_psql('leak_tenant_a', "CREATE EXTENSION svs;");
+    $node->safe_psql('leak_tenant_b', "CREATE EXTENSION vector;");
+    $node->safe_psql('leak_tenant_b', "CREATE EXTENSION svs;");
+
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('leak_tenant_a', true);");
+    wait_for_worker_db($node, 'leak_tenant_a', 30);
+
+    $node->safe_psql('leak_tenant_a', qq{
+        CREATE TABLE t (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO t (val) SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20);
+        CREATE INDEX t_idx ON t USING vamana (val vector_l2_ops);
+    });
+    $node->safe_psql('leak_tenant_a', qq{
+        SET enable_seqscan = off;
+        SELECT id FROM t ORDER BY val <-> '[$query_sql]' LIMIT 1;
+    });
+    my $idx_a_oid = $node->safe_psql('leak_tenant_a', "SELECT 't_idx'::regclass::oid;");
+    chomp $idx_a_oid;
+
+    my $a_oid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'leak_tenant_a';");
+    chomp $a_oid;
+
+    $node->safe_psql('leak_tenant_a', "SELECT svs_teardown_database();");
+    $node->safe_psql('postgres',
+        "DELETE FROM vamana_databases WHERE datname = 'leak_tenant_a';");
+    ok(wait_for_slot_release($node, 'postgres', $a_oid, 30),
+        'leak_tenant_a releases its worker entry');
+
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('leak_tenant_b', true);");
+    wait_for_worker_db($node, 'leak_tenant_b', 30);
+
+    my $b_oid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'leak_tenant_b';");
+    chomp $b_oid;
+
+    my $leaked = $node->safe_psql('postgres',
+        "SELECT count(*) FROM pg_stat_vamana_worker_slot "
+      . "WHERE db_oid = $b_oid AND slot_status = 'empty' AND index_relid = $idx_a_oid;");
+    chomp $leaked;
+    is($leaked, '0',
+        'no empty slot in the recycled entry carries a leftover index_relid from the previous database');
+
+    $node->stop;
+}
+
 done_testing();

@@ -94,7 +94,7 @@ bool	VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb);
 bool	VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid);
 
 /* BGW: advance confirmed_flush_lsn. Safe to call with slot == NULL. */
-void	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
+bool	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
 
 /* BGW: free the handle (does not drop the underlying slot). Safe with NULL. */
 void	VamanaReplicationClose(VamanaReplicationSlot *slot);

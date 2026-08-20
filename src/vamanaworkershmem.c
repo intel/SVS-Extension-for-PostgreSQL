@@ -791,6 +791,35 @@ VamanaWorkerReleaseSlot(Oid dbOid)
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
 }
 
+/*
+ * Clear a dead worker's liveness bookkeeping so a fast respawn does not
+ * mistake it for still live. Callers must have independent proof the worker
+ * is gone (e.g. GetBackgroundWorkerPid() == BGWH_STOPPED); a worker that is
+ * merely stuck must be left for VamanaWorkerEntryIsLive's heartbeat check to
+ * catch instead. Backoff counters, index locks, and queued reloads are left
+ * untouched for the replacement to inherit.
+ */
+void
+VamanaWorkerClearDeadEntry(Oid dbOid)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		entry->workerPid = 0;
+		pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
 /* -----------------------------------------------------------------------
  * Worker registration
  * ----------------------------------------------------------------------- */
@@ -926,4 +955,17 @@ VamanaSlotErrcode(uint8 category)
 		case VAMANA_ERR_IO:		return ERRCODE_IO_ERROR;
 		default:				return ERRCODE_INTERNAL_ERROR;
 	}
+}
+
+/*
+ * Sole writer of a slot's terminal error state: message, category, then the
+ * status transition that publishes both to the waiting backend.
+ */
+void
+VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 category)
+{
+	snprintf(slot->errorMessage, sizeof(slot->errorMessage), "%s", message);
+	slot->errorCategory = category;
+	pg_write_barrier();
+	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
 }

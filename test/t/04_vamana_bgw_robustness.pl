@@ -1020,4 +1020,192 @@ SKIP: {
     $node->stop;
 }
 
+# ===========================================================================
+# Slot promotion uses a compare-and-swap from PENDING to PROCESSING, so the
+# worker cannot resurrect a slot the backend has already abandoned via cancel.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 4
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_promote_race');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker($node, 30);
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE promote_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO promote_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20);
+        CREATE INDEX promote_idx ON promote_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($node, 30);
+
+    my $ctl = $node->background_psql('postgres');
+    $ctl->query_safe(
+        "SELECT injection_points_attach('vamana-worker-promote-before-write', 'wait');");
+
+    my $req = $node->background_psql('postgres', on_error_stop => 0);
+    my $req_pid = $req->query('SELECT pg_backend_pid();');
+    chomp $req_pid;
+    $req->query_until(qr//, qq{
+        SET enable_seqscan = off;
+        SELECT id FROM promote_tbl ORDER BY val <-> '[$query_sql]' LIMIT 1;
+    });
+
+    my $slot_index = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $slot_index = $ctl->query(
+            "SELECT slot_index FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_kind = 'search' AND slot_status = 'pending';");
+        chomp $slot_index;
+        last if $slot_index =~ /^\d+$/;
+    }
+    ok($slot_index =~ /^\d+$/, 'a search request is pending on a slot');
+
+    my $parked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $parked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE wait_event = 'vamana-worker-promote-before-write';");
+        last if $parked ne '';
+    }
+    isnt($parked, '', 'the worker parks between reading PENDING and storing PROCESSING');
+
+    $ctl->query_safe("SELECT pg_cancel_backend($req_pid);");
+
+    my $status = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $status = $ctl->query(
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_index = $slot_index;");
+        chomp $status;
+        last if $status eq 'empty';
+    }
+    is($status, 'empty', 'the cancelled backend CASes its slot back to empty while the worker is still parked');
+
+    $ctl->query_safe(
+        "SELECT injection_points_wakeup('vamana-worker-promote-before-write');");
+    $ctl->query_safe(
+        "SELECT injection_points_detach('vamana-worker-promote-before-write');");
+
+    my $resurrected = 0;
+    for (1 .. 30) {
+        usleep(100_000);
+        my $st = $ctl->query(
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_index = $slot_index;");
+        chomp $st;
+        if ($st eq 'processing' || $st eq 'done') {
+            $resurrected = 1;
+            last;
+        }
+    }
+    is($resurrected, 0,
+        'the worker does not resurrect a slot the backend already abandoned');
+
+    $req->quit;
+    $ctl->quit;
+    $node->stop;
+}
+
+# ===========================================================================
+# The write path's metadata persist takes a non-blocking lock attempt, so DDL
+# holding a conflicting lock on the index makes it skip and retry instead of
+# blocking the whole database's worker (and its heartbeat).
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 2
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_write_lock_stall');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.worker_timeout_ms = 60000");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 30);
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE lock_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO lock_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+        CREATE INDEX lock_idx ON lock_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker_db($node, 'postgres', 30);
+
+    my $ctl = $node->background_psql('postgres');
+    $ctl->query_safe(
+        "SELECT injection_points_attach('vamana-persist-meta-before-lock', 'wait');");
+
+    my $inserter = $node->background_psql('postgres');
+    $inserter->query_until(qr//,
+        "INSERT INTO lock_tbl (val) VALUES (ARRAY[$array_sql]::vector);\n");
+
+    my $parked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $parked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE wait_event = 'vamana-persist-meta-before-lock';");
+        last if $parked ne '';
+    }
+    isnt($parked, '', 'the worker parks just before opening the index, holding no lock yet');
+
+    my $locker = $node->background_psql('postgres');
+    $locker->query_safe("BEGIN;");
+    $locker->query_safe("ALTER INDEX lock_idx SET (use_search_history = false);");
+
+    my $heartbeat_before = $node->safe_psql('postgres',
+        "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
+      . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+    chomp $heartbeat_before;
+
+    $ctl->query_safe(
+        "SELECT injection_points_wakeup('vamana-persist-meta-before-lock');");
+    $ctl->query_safe(
+        "SELECT injection_points_detach('vamana-persist-meta-before-lock');");
+
+    my $heartbeat_stalled = 1;
+    for (1 .. 3) {
+        usleep(1_000_000);
+        my $hb = $node->safe_psql('postgres',
+            "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
+          . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+        chomp $hb;
+        if ($hb ne $heartbeat_before) {
+            $heartbeat_stalled = 0;
+            last;
+        }
+    }
+    is($heartbeat_stalled, 0,
+        'the database worker keeps heartbeating while it waits for the index lock');
+
+    $locker->query_safe("COMMIT;");
+    $locker->quit;
+    eval { $inserter->quit };
+    $ctl->quit;
+    $node->stop;
+}
+
 done_testing();

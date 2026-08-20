@@ -172,7 +172,10 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 		MemoryContextSwitchTo(oldCtx);
 	}
 	else
+	{
 		entry->tidMapping = NULL;
+		capacity = 0;
+	}
 
 	entry->svsIndex = svsIndex;
 	entry->indexRelid = indexRelid;

@@ -86,11 +86,6 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = 50);
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (alpha = 201);
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (graph_degree = 64, alpha = 120);
 
-SHOW svs.search_window_size;
-
-SET svs.search_window_size = 9;
-SET svs.search_window_size = 10001;
-
 DROP TABLE t;
 
 -- compression with LeanVec UINT8
@@ -114,14 +109,6 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, c
 INSERT INTO t (val) VALUES ('[1,2,4]');
 
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
-
-DROP TABLE t;
-
--- compression invalid parameters
-
-CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
-CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 3);
-CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_primary = 16);
 
 DROP TABLE t;
 
@@ -528,53 +515,4 @@ INSERT INTO t (val) VALUES ('[2,2,2]');
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
-
--- search_window_size forwarding to SVS
--- Verify that the GUC value is actually forwarded to svs_index_search() at query
--- time.  Build a dataset large enough that search_window_size has a
--- meaningful effect, then query with the minimum and a large value and confirm
--- both return the expected nearest neighbors.
-
-CREATE TABLE t (id int, val vector(3));
-INSERT INTO t SELECT i, array_fill(i, ARRAY[3])::vector(3)
-    FROM generate_series(1, 50) i;
-CREATE INDEX ON t USING vamana (val vector_l2_ops);
-
--- Both should return non-empty results; COUNT must equal k.
-SET svs.search_window_size = 10;
-SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
-
-SET svs.search_window_size = 500;
-SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
-
--- Nearest neighbor should be id=25 at both extremes.
-SET svs.search_window_size = 10;
-SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
-
-SET svs.search_window_size = 500;
-SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
-
-RESET svs.search_window_size;
-DROP TABLE t;
-
--- max_parallel_maintenance_workers does not limit search
--- The build thread count (governed by this GUC) must be decoupled from the
--- search thread count.  Setting it to 1 must not prevent correct search results.
-SET max_parallel_maintenance_workers = 1;
-CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
-INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
-CREATE INDEX ON t USING vamana (val vector_l2_ops);
-SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
-DROP TABLE t;
-RESET max_parallel_maintenance_workers;
-
--- svs.search_num_threads GUC controls search thread count
--- 0 = auto (nproc-1); explicit value overrides auto.
--- Correctness must be preserved regardless of thread count.
-SET svs.search_num_threads = 1;
-CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
-INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
-CREATE INDEX ON t USING vamana (val vector_l2_ops);
-SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
-RESET svs.search_num_threads;
 DROP TABLE t;

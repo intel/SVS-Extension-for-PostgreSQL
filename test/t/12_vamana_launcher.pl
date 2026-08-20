@@ -19,6 +19,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep gettimeofday tv_interval);
+use File::Temp qw(tempdir);
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -759,6 +760,52 @@ sub wait_for_worker_count
     ok($repid =~ /^\d+$/ && $scan eq '5',
         're-enabling respawns a worker and the index answers from disk');
 
+    $node->stop;
+}
+
+# Extension-owned tables are excluded from pg_dump by default unless they
+# opt in via pg_extension_config_dump.
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_databases_dump');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', qq(
+        INSERT INTO vamana_databases (datname, enabled, search_num_threads)
+            VALUES ('postgres', true, 4);
+    ));
+
+    my $before_rows = $node->safe_psql('postgres',
+        "SELECT count(*) FROM vamana_databases WHERE datname = 'postgres';");
+    chomp $before_rows;
+    is($before_rows, '1', 'vamana_databases row is present before dump');
+
+    my $dumpfile = tempdir(CLEANUP => 1) . "/postgres.dump.sql";
+    $node->command_ok(
+        [ 'pg_dump', '-d', $node->connstr('postgres'), '-f', $dumpfile ],
+        'pg_dump of the enabled database succeeds');
+
+    $node->safe_psql('postgres', "CREATE DATABASE restored_db;");
+    $node->safe_psql('restored_db', "CREATE EXTENSION vector;");
+    $node->safe_psql('restored_db', "CREATE EXTENSION svs;");
+    $node->command_ok(
+        [ 'psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1',
+          '-d', $node->connstr('restored_db'), '-f', $dumpfile ],
+        'restoring the dump into a fresh database succeeds');
+
+    my $after_rows = $node->safe_psql('restored_db',
+        "SELECT count(*) FROM vamana_databases WHERE datname = 'postgres';");
+    chomp $after_rows;
+    is($after_rows, $before_rows,
+        'vamana_databases row enabling "postgres" survives the dump/restore round trip');
+
+    $node->safe_psql('postgres', "DROP DATABASE restored_db;");
     $node->stop;
 }
 

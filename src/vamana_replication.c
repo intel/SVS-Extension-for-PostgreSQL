@@ -576,24 +576,44 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 }
 
 /*
- * VamanaAcquireDecodingSlot
+ * VamanaTryAcquireSlotNoWait
  *
  * Acquire the named slot without blocking. Returns false, with no slot held,
- * if it does not exist or is already active in another process.
+ * if it does not exist or is already active in another process -- both
+ * ordinary, retryable outcomes, not decoding failures. Any other error from
+ * ReplicationSlotAcquire still propagates.
  */
 static bool
-VamanaAcquireDecodingSlot(const char *slotName)
+VamanaTryAcquireSlotNoWait(const char *slotName)
 {
-	ReplicationSlotAcquire(slotName, /*nowait=*/ true,
-						   /*error_if_invalid=*/ false);
-	return MyReplicationSlot != NULL;
+	bool		acquired = true;
+
+	PG_TRY();
+	{
+		ReplicationSlotAcquire(slotName, /*nowait=*/ true,
+							   /*error_if_invalid=*/ false);
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		if (sqlerrcode != ERRCODE_OBJECT_IN_USE &&
+			sqlerrcode != ERRCODE_UNDEFINED_OBJECT)
+			PG_RE_THROW();
+
+		FlushErrorState();
+		acquired = false;
+	}
+	PG_END_TRY();
+
+	return acquired;
 }
 
 /*
  * VamanaOpenDecoder
  *
  * Build a LogicalDecodingContext against the slot already acquired by
- * VamanaAcquireDecodingSlot, and position its reader at restart_lsn.  Shared
+ * VamanaTryAcquireSlotNoWait, and position its reader at restart_lsn.  Shared
  * by every caller that walks WAL from the slot's last confirmed point.
  */
 static LogicalDecodingContext *
@@ -694,7 +714,7 @@ VamanaReplayPendingChanges(VamanaIndexCache *cache)
 			return;
 	}
 
-	if (!VamanaAcquireDecodingSlot(slot->slotName))
+	if (!VamanaTryAcquireSlotNoWait(slot->slotName))
 		return;
 
 	/* test/t/08_vamana_standby_replay.pl counts these to bound idle decode attempts. */
@@ -947,7 +967,7 @@ VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid)
 	if (SearchNamedReplicationSlot(slotName, true) == NULL)
 		return;
 
-	if (!VamanaAcquireDecodingSlot(slotName))
+	if (!VamanaTryAcquireSlotNoWait(slotName))
 		return;
 
 	PG_TRY();
@@ -1002,7 +1022,7 @@ VamanaReplicationActivateSlotBounded(Oid dboid, Oid indexRelid)
 	if (SearchNamedReplicationSlot(slotName, true) == NULL)
 		return;
 
-	if (!VamanaAcquireDecodingSlot(slotName))
+	if (!VamanaTryAcquireSlotNoWait(slotName))
 		return;
 
 	PG_TRY();
@@ -1100,20 +1120,19 @@ VamanaReplicationOpen(Oid dboid, Oid indexRelid)
 }
 
 /*
- * Advance confirmed_flush_lsn by briefly acquiring the slot.
- * A persistent non-active slot can be acquired and released in a tight window.
+ * Advance confirmed_flush_lsn by briefly acquiring the slot.  A persistent
+ * non-active slot can be acquired and released in a tight window.  Returns
+ * false, advancing nothing, if the slot is busy or gone; the caller decides
+ * whether that makes its own checkpoint incomplete.
  */
-void
+bool
 VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 {
 	if (slot == NULL)
-		return;
+		return true;
 
-	ReplicationSlotAcquire(slot->slotName, /*nowait=*/ true,
-						   /*error_if_invalid=*/ false);
-
-	if (MyReplicationSlot == NULL)
-		return;
+	if (!VamanaTryAcquireSlotNoWait(slot->slotName))
+		return false;
 
 	PG_TRY();
 	{
@@ -1127,6 +1146,8 @@ VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	return true;
 }
 
 /*

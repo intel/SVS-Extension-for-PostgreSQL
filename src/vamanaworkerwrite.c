@@ -27,6 +27,7 @@
 #include "miscadmin.h"
 #include "replication/slot.h"
 #include "storage/lwlock.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -38,6 +39,13 @@
 /*
  * Persist the cached counters to the index metapage in a short-lived
  * transaction.  Shared by every write path that mutates the cache.
+ *
+ * A background worker must never block on a relation-level lock (the same
+ * rule VamanaWorkerGetOrLoadIndex follows): DDL holding AccessExclusiveLock
+ * elsewhere would otherwise stall this worker's whole database, including its
+ * heartbeat.  A skipped persist just leaves the metapage one operation
+ * behind; the next write to this index tries again, and WAL replay covers
+ * the gap if the worker crashes before that happens.
  */
 static void
 VamanaWorkerPersistMetaCounters(Oid relid, VamanaIndexCache *cache)
@@ -47,7 +55,20 @@ VamanaWorkerPersistMetaCounters(Oid relid, VamanaIndexCache *cache)
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	indexRel = index_open(relid, AccessShareLock);
+
+	INJECTION_POINT("vamana-persist-meta-before-lock", NULL);
+
+	if (!ConditionalLockRelationOid(relid, AccessShareLock))
+	{
+		ereport(LOG,
+				(errmsg("vamana worker: index %u locked by DDL, skipping meta persist",
+						relid)));
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
+
+	indexRel = index_open(relid, NoLock);
 	VamanaWriteMetaPageDynamic(indexRel,
 							   cache->nextExternalId,
 							   (uint32) cache->numVectors,
@@ -467,13 +488,9 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 		FlushErrorState();
 		RESUME_INTERRUPTS();
 
-		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-				 "%s", edata->message ? edata->message : "unknown error");
-		slot->errorCategory = VamanaCategorizeSQLState(edata->sqlerrcode);
+		VamanaWorkerFailSlot(slot, edata->message ? edata->message : "unknown error",
+							 VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
-
-		pg_write_barrier();
-		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
 
 		vamana_eviction_suppressed = false;
 		return;
@@ -506,10 +523,10 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 	Oid			relid = slot->indexRelid;
 	VamanaLoadParams *params = (VamanaLoadParams *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 	SVSBuildConfig	config;
-	SVSIndexHandle	svsIndex = NULL;
-	ItemPointerData *tidMapping = NULL;
+	SVSIndexHandle	volatile svsIndex = NULL;
+	ItemPointerData * volatile tidMapping = NULL;
 	char		savepath[MAXPGPATH];
-	bool		loadSucceeded = false;
+	volatile bool loadSucceeded = false;
 
 
 	PG_TRY();
@@ -599,16 +616,24 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 		vamana_eviction_suppressed = false;
 
+		/* Allocated in TopMemoryContext; nothing else frees these on failure. */
+		if (svsIndex != NULL)
+		{
+			SVSFreeIndex(svsIndex);
+			svsIndex = NULL;
+		}
+		if (tidMapping != NULL)
+		{
+			pfree(tidMapping);
+			tidMapping = NULL;
+		}
+
 		edata = CopyErrorData();
 		FlushErrorState();
 
-		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-				 "%s", edata->message ? edata->message : "unknown error");
-		slot->errorCategory = VamanaCategorizeSQLState(edata->sqlerrcode);
+		VamanaWorkerFailSlot(slot, edata->message ? edata->message : "unknown error",
+							 VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
-
-		pg_write_barrier();
-		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
 	}
 	PG_END_TRY();
 
@@ -688,13 +713,9 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 		edata = CopyErrorData();
 		FlushErrorState();
 
-		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-				 "%s", edata->message ? edata->message : "unknown error");
-		slot->errorCategory = VamanaCategorizeSQLState(edata->sqlerrcode);
+		VamanaWorkerFailSlot(slot, edata->message ? edata->message : "unknown error",
+							 VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
-
-		pg_write_barrier();
-		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
 	}
 	PG_END_TRY();
 }

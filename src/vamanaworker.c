@@ -146,11 +146,13 @@ VamanaWorkerDispatchWriteSlot(int slotIdx)
 /*
  * VamanaWorkerProcessRequests
  *
- * Collect all PENDING slots, transition them to PROCESSING.
- * SEARCH slots are batched and dispatched together via VamanaWorkerDispatchBatch.
- * Write slots (INSERT/DELETE/MAINTENANCE) are processed individually via
- * VamanaWorkerDispatchWriteSlot, which holds LW_EXCLUSIVE for the duration.
- * After all processing, wake every waiting backend.
+ * Collect all PENDING slots, transition each to either PROCESSING (accepted
+ * for dispatch below) or ERROR (rejected outright: a write-kind request on a
+ * role that cannot execute writes). SEARCH slots are batched and dispatched
+ * together via VamanaWorkerDispatchBatch. Write slots (INSERT/DELETE/
+ * MAINTENANCE) are processed individually via VamanaWorkerDispatchWriteSlot,
+ * which holds LW_EXCLUSIVE for the duration. After all processing, wake
+ * every waiting backend.
  */
 static void
 VamanaWorkerProcessRequests(void)
@@ -162,6 +164,7 @@ VamanaWorkerProcessRequests(void)
 	int			maxBatch;
 	int			numTotal = 0;
 	int		   *allPending;
+	bool		acceptsWrites = VamanaGetReplayRole()->processes_write_ipc;
 
 	maxBatch = (vamana_max_batch_size > 0) ? vamana_max_batch_size : MaxBackends;
 
@@ -175,17 +178,28 @@ VamanaWorkerProcessRequests(void)
 		 i++)
 	{
 		VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[i];
+		uint32		expected = VAMANA_SLOT_PENDING;
 
-		if (pg_atomic_read_u32(&slot->status) == VAMANA_SLOT_PENDING)
-		{
-			pg_atomic_write_u32(&slot->status, VAMANA_SLOT_PROCESSING);
-			allPending[numTotal++] = i;
+		if (pg_atomic_read_u32(&slot->status) != VAMANA_SLOT_PENDING)
+			continue;
 
-			if (slot->slotKind == VAMANA_SLOTKIND_SEARCH)
-				searchPending[numSearch++] = i;
-			else
-				writePending[numWrite++] = i;
-		}
+		/* Backend's abandon-path CAS can race this one. */
+		INJECTION_POINT("vamana-worker-promote-before-write", NULL);
+
+		if (!pg_atomic_compare_exchange_u32(&slot->status, &expected,
+											VAMANA_SLOT_PROCESSING))
+			continue;		/* the backend abandoned it first; leave it alone */
+
+		allPending[numTotal++] = i;
+
+		if (slot->slotKind == VAMANA_SLOTKIND_SEARCH)
+			searchPending[numSearch++] = i;	/* searches run in either role */
+		else if (acceptsWrites)
+			writePending[numWrite++] = i;
+		else
+			VamanaWorkerFailSlot(slot,
+								 "write requests are not accepted on a standby",
+								 VAMANA_ERR_INTERNAL);
 	}
 
 	if (numTotal == 0)
@@ -200,22 +214,13 @@ VamanaWorkerProcessRequests(void)
 			(errmsg("vamana worker: dispatching %d search + %d write request(s)",
 					numSearch, numWrite)));
 
-	/* Process searches as a batch (LW_SHARED). Searches run in either role. */
 	if (numSearch > 0)
 		VamanaWorkerDispatchBatch(searchPending, numSearch);
 
-	/*
-	 * Write/load slots mutate the index and open write transactions, which is
-	 * illegal in recovery.  A read-only standby never enqueues them; the role
-	 * gate makes that a hard guarantee rather than an assumption.
-	 */
-	if (VamanaGetReplayRole()->processes_write_ipc)
-	{
-		for (int i = 0; i < numWrite; i++)
-			VamanaWorkerDispatchWriteSlot(writePending[i]);
-	}
+	for (int i = 0; i < numWrite; i++)
+		VamanaWorkerDispatchWriteSlot(writePending[i]);
 
-	/* Wake all waiting backends */
+	/* Wake all waiting backends, including those just rejected above. */
 	for (int i = 0; i < numTotal; i++)
 	{
 		VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[allPending[i]];
@@ -474,6 +479,35 @@ VamanaWorkerStopAccepting(void)
 }
 
 /*
+ * VamanaTryCheckpointCachedIndex
+ *
+ * Attempt one index's checkpoint, absorbing any error so a single bad index
+ * cannot take its caller down with it. On failure the current transaction is
+ * aborted and the error is reported but not re-raised; the caller decides
+ * what, if anything, to log about the skip.
+ */
+static bool
+VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
+{
+	bool		succeeded;
+
+	PG_TRY();
+	{
+		succeeded = VamanaCheckpointCachedIndex(cache);
+	}
+	PG_CATCH();
+	{
+		EmitErrorReport();
+		FlushErrorState();
+		AbortCurrentTransaction();
+		succeeded = false;
+	}
+	PG_END_TRY();
+
+	return succeeded;
+}
+
+/*
  * VamanaWorkerDrainFinalCheckpoint: flush every cached index to disk one last
  * time before exit.  Unlike the steady-state sweep this ignores ShouldCheckpoint
  * debounce.  Best-effort: one index's failure must not abandon the rest, so each
@@ -513,20 +547,10 @@ VamanaWorkerDrainFinalCheckpoint(void)
 			return;
 		}
 
-		PG_TRY();
-		{
-			VamanaCheckpointCachedIndex(cache);
-		}
-		PG_CATCH();
-		{
-			EmitErrorReport();
-			FlushErrorState();
-			AbortCurrentTransaction();
+		if (!VamanaTryCheckpointCachedIndex(cache))
 			ereport(LOG,
 					(errmsg("vamana shutdown: index %u not checkpointed",
 							cached_relids[ci])));
-		}
-		PG_END_TRY();
 
 		INJECTION_POINT("vamana-drain-checkpoint-slow", NULL);
 
@@ -654,7 +678,8 @@ VamanaWorkerHandlePromotion(bool *wasReplayingWal, const VamanaReplayRole *role)
  * VamanaWorkerCheckpointDueIndexes: flush each cached index whose debounce
  * policy says it is time.  The snapshot of OIDs is taken before the loop so
  * a mid-loop eviction does not invalidate the iterator; VamanaGetCache
- * returns NULL for any OID that was evicted by then.
+ * returns NULL for any OID that was evicted by then.  One index's checkpoint
+ * failure only skips that index; ShouldCheckpoint tries it again next cycle.
  */
 static void
 VamanaWorkerCheckpointDueIndexes(void)
@@ -670,7 +695,10 @@ VamanaWorkerCheckpointDueIndexes(void)
 		if (cache == NULL || !ShouldCheckpoint(cache))
 			continue;
 
-		VamanaCheckpointCachedIndex(cache);
+		if (!VamanaTryCheckpointCachedIndex(cache))
+			ereport(LOG,
+					(errmsg("vamana checkpoint: index %u not checkpointed this cycle, will retry",
+							cached_relids[ci])));
 	}
 }
 
@@ -721,6 +749,9 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 
 		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts,
 							(uint64) GetCurrentTimestamp());
+
+		/* Test hook: forces an uncaught ERROR after a fresh heartbeat is published. */
+		INJECTION_POINT("vamana-worker-tick-crash", NULL);
 
 		if (rc & WL_POSTMASTER_DEATH)
 		{
@@ -914,11 +945,31 @@ VamanaWorkerHeartbeatStale(VamanaWorkerShmem *entry)
 								  GetCurrentTimestamp());
 }
 
-/* True if entry's own bookkeeping (pid published, heartbeat fresh) says a worker is serving it. */
+/*
+ * VamanaWorkerEntryIsLive: true if a worker is currently, healthily serving
+ * this entry.
+ *
+ * Process existence is checked first and is authoritative: PGPROC frees a
+ * pid's slot immediately on exit, crash or not, so a dead pid can be told
+ * apart from a live one instantly, with no timer involved.  A crashed
+ * worker's pid can never pass this check, regardless of how recently it
+ * last beat.
+ *
+ * Heartbeat staleness is checked only once existence is confirmed, and
+ * answers a different question: a live pid that has stopped making
+ * progress (hung inside a library call, not crashed).  Checking heartbeat
+ * before pid existence would let a crashed worker's stale bookkeeping read
+ * as live for up to VAMANA_HEARTBEAT_STALE_MS, racing a respawn decision
+ * that already knows, from the process table, that no worker is running.
+ * Keep pid existence first if this is ever touched again.
+ */
 bool
 VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry)
 {
-	return entry->workerPid != 0 && !VamanaWorkerHeartbeatStale(entry);
+	if (entry->workerPid == 0 || BackendPidGetProc(entry->workerPid) == NULL)
+		return false;
+
+	return !VamanaWorkerHeartbeatStale(entry);
 }
 
 /*
@@ -936,18 +987,6 @@ VamanaWorkerFindActiveSlot(void)
 		return NULL;
 
 	return entry;
-}
-
-/* Like VamanaWorkerEntryIsLive, but also confirms the pid via the live process registry. */
-bool
-VamanaWorkerHasConfirmedLiveOwner(Oid dbOid)
-{
-	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
-
-	if (entry == NULL || !VamanaWorkerEntryIsLive(entry))
-		return false;
-
-	return BackendPidGetProc(entry->workerPid) != NULL;
 }
 
 /*

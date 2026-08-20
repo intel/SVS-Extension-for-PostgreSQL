@@ -20,6 +20,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
+use IPC::Run;
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -196,6 +197,29 @@ sub wait_for_lsn_advance
     return 0;
 }
 
+# Starts pg_recvlogical against $slot_name and blocks until active_pid is set
+# to something other than $excluded_pid.  Returns the IPC::Run handle; caller
+# must kill_kill it.
+sub hold_slot_externally
+{
+    my ($node, $slot_name, $excluded_pid) = @_;
+
+    my $handle = IPC::Run::start([
+        $node->installed_command('pg_recvlogical'),
+        '--dbname' => $node->connstr('postgres'),
+        '--slot'   => $slot_name,
+        '--file'   => '-',
+        '--start',
+    ]);
+
+    $node->poll_query_until('postgres', qq{
+        SELECT active_pid IS NOT NULL AND active_pid <> $excluded_pid
+        FROM pg_replication_slots WHERE slot_name = '$slot_name';
+    }) or die "slot \"$slot_name\" never became externally active";
+
+    return $handle;
+}
+
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_debounce');
     $node->init;
@@ -366,6 +390,50 @@ sub wait_for_lsn_advance
     });
     ok(wait_for_lsn_advance($node, $slot4, $baseline4, 10),
         "simple ops mode: checkpoint fires when ops reaches checkpoint_operations (3)");
+
+    # ---------------------------------------------------------------- Case 5 --
+    # One index's checkpoint failure must not stop any other cached index's
+    # checkpoint, and must not disturb the worker.
+
+    $node->safe_psql('postgres',
+        "ALTER SYSTEM SET svs.checkpoint_operations = 0;");
+    $node->safe_psql('postgres',
+        "ALTER SYSTEM SET svs.checkpoint_min_ops = 1;");
+    $node->safe_psql('postgres',
+        "ALTER SYSTEM SET svs.checkpoint_debounce_window = 1;");
+    $node->safe_psql('postgres', "SELECT pg_reload_conf();");
+    sleep(1);
+
+    my ($tbl5held, $slot5held, $baseline5held) = $make_index->();
+    my ($tbl5sib,  $slot5sib,  $baseline5sib)  = $make_index->();
+
+    # $make_index's seed rows are inserted before CREATE INDEX (the initial
+    # build), which does not count toward opsSinceCheckpoint; an explicit
+    # post-build INSERT is what actually makes each index checkpoint-due.
+    $node->safe_psql('postgres', qq{
+        INSERT INTO $tbl5held (val) VALUES (ARRAY[$array_sql]::vector);
+        INSERT INTO $tbl5sib (val) VALUES (ARRAY[$array_sql]::vector);
+    });
+
+    my $pid_before = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker' LIMIT 1;");
+    chomp $pid_before;
+
+    my $held = hold_slot_externally($node, $slot5held, $pid_before);
+
+    ok(wait_for_lsn_advance($node, $slot5sib, $baseline5sib, 15),
+        'checkpoint isolation: the sibling index checkpoints normally while the other index\'s slot is contended');
+
+    my $pid_after = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker' LIMIT 1;");
+    chomp $pid_after;
+    is($pid_after, $pid_before,
+        'checkpoint isolation: the worker is never disturbed by one index\'s contended slot');
+
+    $held->kill_kill;
+
+    ok(wait_for_lsn_advance($node, $slot5held, $baseline5held, 15),
+        'checkpoint isolation: once its slot frees up, the held-back index catches up and checkpoints too');
 
     $node->stop;
 }

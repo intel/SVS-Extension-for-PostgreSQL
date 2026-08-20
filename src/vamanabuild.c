@@ -354,7 +354,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
 	for (int i = 0; i < buildstate.numVectors; i++)
 	{
-		memcpy(flatData + (i * buildstate.dimensions),
+		memcpy(flatData + (Size) i * buildstate.dimensions,
 			   buildstate.vectorBuffer[i],
 			   buildstate.dimensions * sizeof(float));
 	}
@@ -713,7 +713,7 @@ VamanaRebuildFromTable(Relation index)
 
 	for (int i = 0; i < numVectors; i++)
 	{
-		memcpy(flatData + (i * dimensions),
+		memcpy(flatData + (Size) i * dimensions,
 			   vectorBuffer[i],
 			   dimensions * sizeof(float));
 	}

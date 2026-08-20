@@ -9,7 +9,7 @@
 #include "vamana.h"
 
 bool	ShouldCheckpoint(VamanaIndexCache *cache);
-void	PerformCheckpoint(VamanaIndexCache *cache);
-void	VamanaCheckpointCachedIndex(VamanaIndexCache *cache);
+bool	PerformCheckpoint(VamanaIndexCache *cache);
+bool	VamanaCheckpointCachedIndex(VamanaIndexCache *cache);
 
 #endif							/* VAMANA_CHECKPOINT_H */

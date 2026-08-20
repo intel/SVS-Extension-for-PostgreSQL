@@ -183,4 +183,83 @@ my $relid = $node->safe_psql("postgres", "SELECT 'warm_idx'::regclass::oid;");
 }
 
 $node->stop;
+
+# A write-kind request (including warm-up) is rejected at intake on a role
+# that cannot execute writes, so it never gets stuck at PROCESSING when write
+# dispatch is skipped on a standby.
+{
+    my $primary = PostgreSQL::Test::Cluster->new('vamana_standby_warmup_primary');
+    $primary->init(allows_streaming => 1);
+    $primary->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $primary->append_conf('postgresql.conf', "wal_level = logical");
+    $primary->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $primary->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $primary->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $primary->start;
+
+    $primary->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $primary->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $primary->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    $primary->safe_psql('postgres', qq{
+        CREATE TABLE standby_warm_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO standby_warm_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20);
+        CREATE INDEX standby_warm_idx ON standby_warm_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($primary, 30);
+
+    $primary->safe_psql('postgres', "CREATE ROLE unpriv LOGIN;");
+    $primary->safe_psql('postgres', "GRANT SELECT ON standby_warm_tbl TO unpriv;");
+
+    my $backup = 'standby_warmup_backup';
+    $primary->backup($backup);
+
+    my $standby = PostgreSQL::Test::Cluster->new('vamana_standby_warmup_standby');
+    $standby->init_from_backup($primary, $backup, has_streaming => 1);
+    $standby->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $standby->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $standby->append_conf('postgresql.conf', "hot_standby = on");
+    $standby->start;
+    $primary->wait_for_replay_catchup($standby);
+
+    # The standby worker activates every existing index's replication slot
+    # before it publishes workerPid, and that activation waits for a
+    # not-yet-replayed xl_running_xacts record. Force one so it converges
+    # promptly instead of waiting for the next naturally-occurring checkpoint.
+    $primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    $primary->wait_for_replay_catchup($standby);
+
+    my $worker_pid = '';
+    for (1 .. 100) {
+        usleep(200_000);
+        $worker_pid = $standby->safe_psql('postgres',
+            "SELECT worker_pid FROM pg_stat_vamana_worker "
+          . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+        chomp $worker_pid;
+        last if $worker_pid =~ /^\d+$/;
+    }
+    ok($worker_pid =~ /^\d+$/, "the standby worker finishes its startup activation (pid=$worker_pid)");
+
+    my $bg = $standby->background_psql('postgres',
+        extra_params => [ '-U', 'unpriv' ], on_error_stop => 0);
+
+    my ($out1, $err1) = $bg->query("SELECT svs_warmup_index('standby_warm_idx'::regclass);");
+    is($err1, 1, 'a warm-up request on a standby fails instead of hanging forever');
+
+    my $stuck = $standby->safe_psql('postgres',
+        "SELECT count(*) FROM pg_stat_vamana_worker_slot "
+      . "WHERE slot_kind = 'warmup' AND slot_status != 'empty';");
+    chomp $stuck;
+    is($stuck, '0', 'the warm-up request does not permanently strand its slot');
+
+    my ($out2, $err2) = $bg->query("SELECT svs_warmup_index('standby_warm_idx'::regclass);");
+    is($err2, 1, 'a second warm-up on the same backend also fails cleanly, not silently ignored');
+
+    $bg->quit;
+    $standby->stop;
+    $primary->stop;
+}
+
 done_testing();

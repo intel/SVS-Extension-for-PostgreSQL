@@ -264,6 +264,7 @@ void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_i
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
+void	VamanaWorkerClearDeadEntry(Oid dbOid);
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
 
 /*
@@ -308,6 +309,7 @@ int		VamanaWorkerSlotCapacity(void);
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
 int		VamanaSlotErrcode(uint8 category);
+void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 category);
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
@@ -415,7 +417,6 @@ void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
 VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);
 bool	VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry);
-bool	VamanaWorkerHasConfirmedLiveOwner(Oid dbOid);
 bool	VamanaWorkerIsAvailable(void);
 void	VamanaWorkerAssertDatabase(void);
 void	VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation);

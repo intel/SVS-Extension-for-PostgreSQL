@@ -91,7 +91,7 @@ typedef enum VamanaRestartAction
  */
 typedef enum VamanaStopReason
 {
-	STOP_CRASH,					/* unexpected exit: accrue backoff, drop, keep slot */
+	STOP_CRASH,					/* unexpected exit: accrue backoff, clear liveness, drop, keep slot */
 	STOP_DISABLED,				/* row still present, enabled = false: drop, keep slot */
 	STOP_REMOVED,				/* row no longer in the table: drop, release slot */
 	STOP_RESTART_DRAIN			/* deliberate restart in flight: respawn */
@@ -309,8 +309,12 @@ VamanaLauncherReconcileWorkers(void)
 			continue;
 
 		/* A restarted launcher's ledger is empty; don't spawn into an already-live worker's slot. */
-		if (VamanaWorkerHasConfirmedLiveOwner(db->dbOid))
-			continue;
+		{
+			VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
+
+			if (entry != NULL && VamanaWorkerEntryIsLive(entry))
+				continue;
+		}
 
 		VamanaWorkerBackoffSnapshot(db->dbOid, &backoff);
 		remaining = BackoffRemainingMs(&backoff, now);
@@ -891,6 +895,7 @@ ReconcileLedgerLiveness(List *rows, TimestampTz now)
 						VAMANA_BACKOFF_DWELL_RESET_MS;
 
 					VamanaWorkerBackoffRecordDeath(w->dbOid, recovered);
+					VamanaWorkerClearDeadEntry(w->dbOid);
 					break;
 				}
 		}

@@ -383,6 +383,67 @@ SELECT count(*) FROM (SELECT * FROM t_undo ORDER BY val <-> '[0,0,0]' LIMIT 2000
 
 DROP TABLE t_undo;
 -- -------------------------------------------------------------------------
+-- Test C: ROLLBACK TO SAVEPOINT skips the consolidate a full abort runs, so a
+-- deleted entry point goes unrepaired. Insert a large batch inside the
+-- savepoint to raise the odds one of them is the entry point.
+-- -------------------------------------------------------------------------
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) SELECT ARRAY[random(), random(), random()]::vector(3)
+	FROM generate_series(1, 30);
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+NOTICE:  buffered 30 vectors for SVS index build
+NOTICE:  building SVS index with 30 vectors of dimension 3
+NOTICE:  SVS index built successfully
+BEGIN;
+SAVEPOINT sp_entry;
+INSERT INTO t (val) SELECT ARRAY[random(), random(), random()]::vector(3)
+	FROM generate_series(1, 200);
+ROLLBACK TO SAVEPOINT sp_entry;
+COMMIT;
+-- Reports a fixed NOTICE instead of the search's own (library-internal) error text.
+DO $$
+DECLARE
+	probe vector(3);
+BEGIN
+	FOR probe IN
+		SELECT * FROM (VALUES
+			('[0,0,0]'::vector(3)), ('[1,1,1]'::vector(3)), ('[1,0,0]'::vector(3)),
+			('[0,1,0]'::vector(3)), ('[0,0,1]'::vector(3))
+		) AS probes (v)
+	LOOP
+		BEGIN
+			PERFORM id FROM t ORDER BY val <-> probe LIMIT 5;
+			RAISE NOTICE 'search after ROLLBACK TO SAVEPOINT: succeeded';
+		EXCEPTION WHEN OTHERS THEN
+			RAISE NOTICE 'search after ROLLBACK TO SAVEPOINT: raised an error';
+		END;
+	END LOOP;
+END $$;
+NOTICE:  search after ROLLBACK TO SAVEPOINT: succeeded
+NOTICE:  search after ROLLBACK TO SAVEPOINT: succeeded
+NOTICE:  search after ROLLBACK TO SAVEPOINT: succeeded
+NOTICE:  search after ROLLBACK TO SAVEPOINT: succeeded
+NOTICE:  search after ROLLBACK TO SAVEPOINT: succeeded
+-- A crash caused by the above is this file's own problem to clean up after,
+-- so later files sharing this server don't inherit a worker mid-restart.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+SELECT count(*) FROM (SELECT id FROM t ORDER BY val <-> '[0,0,0]' LIMIT 100) sub;
+ count 
+-------
+    30
+(1 row)
+
+DROP TABLE t;
+-- -------------------------------------------------------------------------
 -- TRUNCATE must not leave stale cache — post-TRUNCATE query returns empty.
 -- -------------------------------------------------------------------------
 CREATE TABLE t_trunc (id serial PRIMARY KEY, val vector(3));

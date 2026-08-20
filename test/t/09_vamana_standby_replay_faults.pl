@@ -26,6 +26,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
+use IPC::Run;
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -114,6 +115,84 @@ sub standby_ann_count
 		last if defined $count && $count == $want;
 	}
 	return $count;
+}
+
+# Starts pg_recvlogical against $slot_name and blocks until active_pid is set
+# to something other than $excluded_pid.  Returns the IPC::Run handle; caller
+# must kill_kill it.
+sub hold_slot_externally
+{
+	my ($node, $slot_name, $excluded_pid) = @_;
+
+	my $handle = IPC::Run::start([
+		$node->installed_command('pg_recvlogical'),
+		'--dbname' => $node->connstr('postgres'),
+		'--slot'   => $slot_name,
+		'--file'   => '-',
+		'--start',
+	]);
+
+	$node->poll_query_until('postgres', qq{
+		SELECT active_pid IS NOT NULL AND active_pid <> $excluded_pid
+		FROM pg_replication_slots WHERE slot_name = '$slot_name';
+	}) or die "slot \"$slot_name\" never became externally active";
+
+	return $handle;
+}
+
+# True if $pattern never appears in $node's log, in the $seconds after $log_pos.
+sub log_stays_clean
+{
+	my ($node, $pattern, $log_pos, $seconds) = @_;
+	usleep($seconds * 1_000_000);
+	my $log = substr($node->log_content(), $log_pos);
+	return $log !~ $pattern;
+}
+
+# ===========================================================================
+# A busy slot is a reason to retry later, not a reason to rebuild the index
+#
+# A slot that is merely held by another process (e.g. a monitoring tool
+# briefly reading it) is not a decoding failure.  Replay must skip the pass
+# and retry once the slot frees up, not drop it and force a full rebuild the
+# way an actual unrecoverable decode error does above.
+# ===========================================================================
+{
+	my ($primary, $standby) = setup_primary_standby('busy', 5);
+
+	my $dboid = $standby->safe_psql('postgres',
+		"SELECT oid FROM pg_database WHERE datname = 'postgres';");
+	chomp $dboid;
+	my $indexoid = $standby->safe_psql('postgres',
+		"SELECT oid FROM pg_class WHERE relname = 'rep_idx';");
+	chomp $indexoid;
+	my $slot_name = "vamana_${dboid}_${indexoid}";
+
+	my $pid_before = wait_for_worker($standby, 30);
+	ok($pid_before =~ /^\d+$/, 'busy slot: standby worker running before its slot is contended');
+
+	my $held = hold_slot_externally($standby, $slot_name, $pid_before);
+
+	my $log_pos = -s $standby->logfile;
+
+	$primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+	$primary->safe_psql('postgres',
+		"INSERT INTO rep_tbl (val) VALUES (ARRAY[$array_sql]::vector);");
+	$primary->wait_for_replay_catchup($standby);
+
+	ok(log_stays_clean($standby, qr/vamana replay: unrecoverable decoding error/, $log_pos, 3),
+		'busy slot: not treated as an unrecoverable decoding error');
+
+	$held->kill_kill;
+
+	my $after = standby_ann_count($standby, 6);
+	is($after, 6, 'busy slot: once it frees up, the deferred row is applied on the next retry');
+
+	is(wait_for_worker($standby, 5), $pid_before,
+		'busy slot: the standby worker was never disturbed by the contention');
+
+	$standby->stop;
+	$primary->stop;
 }
 
 # ===========================================================================

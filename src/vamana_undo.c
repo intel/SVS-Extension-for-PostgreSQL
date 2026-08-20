@@ -128,6 +128,85 @@ undo_flush_batch(Oid relid, const size_t *ids, int count)
 	PG_END_TRY();
 }
 
+/*
+ * ConsolidatingUndoBatch — groups undone entries by index and, once every
+ * entry has been fed in, consolidates each affected index to repair its
+ * graph entry point if one of the undone nodes was serving as it.  Without
+ * this, a search that starts its traversal from a deleted entry point gets
+ * an error from the SVS library.
+ *
+ * Shared by the full-abort and subxact-abort callbacks: both need "batch
+ * deletes by relid, then consolidate every relid touched," and only differ
+ * in which entries they feed it.
+ */
+typedef struct ConsolidatingUndoBatch
+{
+	Oid			currentRelid;
+	size_t		batchIds[VAMANA_MAX_DELETE_IDS];
+	int			batchCount;
+	Oid			consolidateRelids[VAMANA_MAX_INDEXES];
+	int			nConsolidate;
+}			ConsolidatingUndoBatch;
+
+static void
+ConsolidatingUndoBatchInit(ConsolidatingUndoBatch *batch)
+{
+	batch->currentRelid = InvalidOid;
+	batch->batchCount = 0;
+	batch->nConsolidate = 0;
+}
+
+static void
+ConsolidatingUndoBatchTrackConsolidate(ConsolidatingUndoBatch *batch, Oid relid)
+{
+	if (!OidIsValid(relid))
+		return;
+
+	if (batch->nConsolidate > 0 &&
+		batch->consolidateRelids[batch->nConsolidate - 1] == relid)
+		return;
+
+	if (batch->nConsolidate < VAMANA_MAX_INDEXES)
+		batch->consolidateRelids[batch->nConsolidate++] = relid;
+}
+
+/*
+ * Feed one undone entry into the batch.  Entries for the same relid must
+ * arrive together (sorted, or naturally adjacent by insertion order); a
+ * change in relid flushes the pending batch and records it for consolidate.
+ */
+static void
+ConsolidatingUndoBatchAdd(ConsolidatingUndoBatch *batch, const VamanaUndoEntry *entry)
+{
+	if (entry->indexRelid != batch->currentRelid ||
+		batch->batchCount >= (int) VAMANA_MAX_DELETE_IDS)
+	{
+		if (batch->batchCount > 0)
+			undo_flush_batch(batch->currentRelid, batch->batchIds, batch->batchCount);
+
+		ConsolidatingUndoBatchTrackConsolidate(batch, batch->currentRelid);
+
+		batch->currentRelid = entry->indexRelid;
+		batch->batchCount = 0;
+	}
+	batch->batchIds[batch->batchCount++] = (size_t) entry->externalId;
+}
+
+/* Flush whatever is still pending, then consolidate every affected index. */
+static void
+ConsolidatingUndoBatchFinish(ConsolidatingUndoBatch *batch)
+{
+	if (batch->batchCount > 0)
+	{
+		undo_flush_batch(batch->currentRelid, batch->batchIds, batch->batchCount);
+		ConsolidatingUndoBatchTrackConsolidate(batch, batch->currentRelid);
+	}
+
+	for (int i = 0; i < batch->nConsolidate; i++)
+		VamanaWorkerSubmitMaintenance(batch->consolidateRelids[i],
+									  VAMANA_MAINTENANCE_CONSOLIDATE);
+}
+
 /* -----------------------------------------------------------------------
  * Xact callbacks
  * ----------------------------------------------------------------------- */
@@ -149,15 +228,12 @@ VamanaXactCallback(XactEvent event, void *arg)
 
 				if (log != NULL && log->count > 0 && VamanaWorkerIsAvailable())
 				{
-					size_t		batchIds[VAMANA_MAX_DELETE_IDS];
-					int			batchCount = 0;
-					Oid			currentRelid = InvalidOid;
-					Oid			consolidateRelids[VAMANA_MAX_INDEXES];
-					int			nConsolidate = 0;
+					ConsolidatingUndoBatch batch;
 
 					qsort(log->entries, log->count,
 						  sizeof(VamanaUndoEntry), undo_entry_cmp_by_relid);
 
+					ConsolidatingUndoBatchInit(&batch);
 					for (int i = 0; i < log->count; i++)
 					{
 						VamanaUndoEntry *entry = VamanaSubxidPendingArrayEntryAt(log, i);
@@ -165,46 +241,9 @@ VamanaXactCallback(XactEvent event, void *arg)
 						if (entry->subxid == InvalidSubTransactionId)
 							continue;
 
-						if (entry->indexRelid != currentRelid ||
-							batchCount >= (int) VAMANA_MAX_DELETE_IDS)
-						{
-							if (batchCount > 0)
-								undo_flush_batch(currentRelid, batchIds, batchCount);
-
-							if (OidIsValid(currentRelid) &&
-								(nConsolidate == 0 ||
-								 consolidateRelids[nConsolidate - 1] != currentRelid))
-							{
-								if (nConsolidate < VAMANA_MAX_INDEXES)
-									consolidateRelids[nConsolidate++] = currentRelid;
-							}
-
-							currentRelid = entry->indexRelid;
-							batchCount = 0;
-						}
-						batchIds[batchCount++] = (size_t) entry->externalId;
+						ConsolidatingUndoBatchAdd(&batch, entry);
 					}
-					if (batchCount > 0)
-					{
-						undo_flush_batch(currentRelid, batchIds, batchCount);
-						if (OidIsValid(currentRelid) &&
-							(nConsolidate == 0 ||
-							 consolidateRelids[nConsolidate - 1] != currentRelid))
-						{
-							if (nConsolidate < VAMANA_MAX_INDEXES)
-								consolidateRelids[nConsolidate++] = currentRelid;
-						}
-					}
-
-					/*
-					 * Consolidate each affected index to repair the entry point
-					 * if any of the deleted nodes was the graph entry point.
-					 * Without this, searches after a large ROLLBACK hit a deleted
-					 * entry point and SVS returns an error.
-					 */
-					for (int i = 0; i < nConsolidate; i++)
-						VamanaWorkerSubmitMaintenance(consolidateRelids[i],
-													  VAMANA_MAINTENANCE_CONSOLIDATE);
+					ConsolidatingUndoBatchFinish(&batch);
 				}
 
 				CurrentUndoLog = NULL;
@@ -228,9 +267,6 @@ VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 					  SubTransactionId parentSubid, void *arg)
 {
 	VamanaSubxidPendingArray *log = CurrentUndoLog;
-	size_t		batchIds[VAMANA_MAX_DELETE_IDS];
-	int			batchCount = 0;
-	Oid			currentRelid = InvalidOid;
 
 	if (log == NULL)
 		return;
@@ -245,30 +281,25 @@ VamanaSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 		return;
 
 	/*
-	 * Collect entries belonging to the aborting subtransaction, batched by
-	 * relid.  We iterate in insertion order; entries for the same index are
-	 * typically adjacent, so batching works without a full qsort.
+	 * Collect entries belonging to the aborting subtransaction.  We iterate
+	 * in insertion order; entries for the same index are typically
+	 * adjacent, so batching works without a full qsort.
 	 */
-	for (int i = 0; i < log->count; i++)
 	{
-		VamanaUndoEntry *entry = VamanaSubxidPendingArrayEntryAt(log, i);
+		ConsolidatingUndoBatch batch;
 
-		if (entry->subxid != mySubid)
-			continue;
-
-		if (entry->indexRelid != currentRelid ||
-			batchCount >= (int) VAMANA_MAX_DELETE_IDS)
+		ConsolidatingUndoBatchInit(&batch);
+		for (int i = 0; i < log->count; i++)
 		{
-			if (batchCount > 0)
-				undo_flush_batch(currentRelid, batchIds, batchCount);
+			VamanaUndoEntry *entry = VamanaSubxidPendingArrayEntryAt(log, i);
 
-			currentRelid = entry->indexRelid;
-			batchCount = 0;
+			if (entry->subxid != mySubid)
+				continue;
+
+			ConsolidatingUndoBatchAdd(&batch, entry);
 		}
-		batchIds[batchCount++] = (size_t) entry->externalId;
+		ConsolidatingUndoBatchFinish(&batch);
 	}
-	if (batchCount > 0)
-		undo_flush_batch(currentRelid, batchIds, batchCount);
 
 	VamanaSubxidPendingArrayPruneAbortedSubxact(log, mySubid);
 }

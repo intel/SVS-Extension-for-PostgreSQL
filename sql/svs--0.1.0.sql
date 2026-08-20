@@ -62,6 +62,8 @@ CREATE TABLE vamana_databases (
 	search_num_threads  int CHECK (search_num_threads BETWEEN 1 AND 1024)
 );
 
+SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');
+
 CREATE FUNCTION vamana_databases_notify() RETURNS trigger
 	LANGUAGE plpgsql AS
 $$

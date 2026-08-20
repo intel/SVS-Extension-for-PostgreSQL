@@ -1,0 +1,85 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+
+-- Enable this database and wait for its worker before any index work, so this
+-- file runs standalone.  Enrollment reserves the slot synchronously (the gate
+-- then passes), but the worker spawns asynchronously; the first INSERT would
+-- otherwise race its cold start and time out.  Idempotent and a no-op in the
+-- full suite, where vamana_databases.sql (ordered first) has already warmed it.
+INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true)
+	ON CONFLICT (datname) DO NOTHING;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+SET enable_seqscan = off;
+
+SHOW svs.search_window_size;
+
+SET svs.search_window_size = 9;
+SET svs.search_window_size = 10001;
+
+-- compression invalid parameters
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 3);
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_primary = 16);
+
+DROP TABLE t;
+
+-- search_window_size forwarding to SVS
+-- Verify that the GUC value is actually forwarded to svs_index_search() at query
+-- time.  Build a dataset large enough that search_window_size has a
+-- meaningful effect, then query with the minimum and a large value and confirm
+-- both return the expected nearest neighbors.
+
+CREATE TABLE t (id int, val vector(3));
+INSERT INTO t SELECT i, array_fill(i, ARRAY[3])::vector(3)
+    FROM generate_series(1, 50) i;
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+
+-- Both should return non-empty results; COUNT must equal k.
+SET svs.search_window_size = 10;
+SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
+
+SET svs.search_window_size = 500;
+SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 5) sub;
+
+-- Nearest neighbor should be id=25 at both extremes.
+SET svs.search_window_size = 10;
+SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
+
+SET svs.search_window_size = 500;
+SELECT id FROM t ORDER BY val <-> '[25,25,25]' LIMIT 1;
+
+RESET svs.search_window_size;
+DROP TABLE t;
+
+-- max_parallel_maintenance_workers does not limit search
+-- The build thread count (governed by this GUC) must be decoupled from the
+-- search thread count.  Setting it to 1 must not prevent correct search results.
+SET max_parallel_maintenance_workers = 1;
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+DROP TABLE t;
+RESET max_parallel_maintenance_workers;
+
+-- svs.search_num_threads GUC controls search thread count
+-- 0 = auto (nproc-1); explicit value overrides auto.
+-- Correctness must be preserved regardless of thread count.
+SET svs.search_num_threads = 1;
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+RESET svs.search_num_threads;
+DROP TABLE t;

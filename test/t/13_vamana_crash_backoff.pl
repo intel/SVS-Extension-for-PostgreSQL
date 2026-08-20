@@ -154,6 +154,54 @@ sub start_node
 }
 
 # ---------------------------------------------------------------------------
+# A worker that dies with a fresh heartbeat must not leave stale liveness
+# bookkeeping for its replacement to trip over.
+#
+# vamana-worker-tick-crash fires once the worker has already published a
+# heartbeat, unlike vamana-worker-startup-crash below which fires before one
+# is ever set.  The replacement must start well inside the 3s heartbeat-stale
+# window, not only once it happens to elapse.
+# ---------------------------------------------------------------------------
+{
+    my $node = start_node('vamana_backoff_tick_crash');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $pid1 = wait_for_worker_db($node, 'postgres', 40);
+    ok($pid1 =~ /^\d+$/, "worker running before it is made to crash (pid=$pid1)");
+
+    my $log_pos = -s $node->logfile;
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-worker-tick-crash', 'error');");
+
+    $node->wait_for_log(qr/error triggered for injection point vamana-worker-tick-crash/,
+        $log_pos);
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-worker-tick-crash');");
+
+    my $pid2 = '';
+    for (1 .. 10)    # up to 2s, well inside the 3s heartbeat-stale window
+    {
+        usleep(200_000);
+        $pid2 = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' AND datname = 'postgres' LIMIT 1;");
+        chomp $pid2;
+        last if $pid2 =~ /^\d+$/ && $pid2 ne $pid1;
+    }
+    ok($pid2 =~ /^\d+$/ && $pid2 ne $pid1,
+        "a replacement worker starts well inside the heartbeat-stale window (pid=$pid2)");
+
+    my $log = substr($node->log_content(), $log_pos);
+    unlike($log, qr/another worker is already serving database/,
+        'the replacement never self-refuses on the dead worker\'s stale bookkeeping');
+
+    $node->stop;
+}
+
+# ---------------------------------------------------------------------------
 # Escalating capped backoff, then forgiveness.
 #
 # Attaching the startup-crash injection makes every spawn FATAL, so the worker
@@ -273,6 +321,71 @@ sub start_node
 
     $node->safe_psql('postgres',
         "SELECT injection_points_detach('vamana-worker-startup-crash');");
+    $node->stop;
+}
+
+# A crash leaves the dead worker's slot marked live (pid set, heartbeat not
+# yet stale) for up to VAMANA_HEARTBEAT_STALE_MS. The launcher reacts to an
+# unexpected stop well within that window, so its first respawn attempt
+# always finds the stale reservation and FATALs, even though the launcher
+# already knows (via the worker handle reporting BGWH_STOPPED) that no
+# worker is actually live.
+#
+# A signal-terminated worker (SIGKILL, SIGSEGV) takes the whole postmaster
+# down first, here, before the launcher can even attempt a respawn
+# (restart_after_crash is off), so neither can be used to observe the
+# respawn sequence at all. SIGTERM does not reproduce the bug either: it is
+# caught and drives a graceful shutdown that cleans up the slot itself. An
+# injection point forcing a clean ereport(ERROR) at worker startup is the
+# one death that is both unexpected (so the launcher treats it as a crash)
+# and clean (so the postmaster does not tear down the cluster over it).
+{
+    my $node = start_node('vamana_worker_crash_respawn');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 30);
+
+    my $log_pos = length($node->log_content());
+
+    # vamana-worker-tick-crash fires from the main loop, after the worker has
+    # already reserved its slot and published a heartbeat, unlike
+    # vamana-worker-startup-crash which fires before either happens (and so
+    # leaves nothing stale for a replacement to trip over). Left attached
+    # across two respawns in a row, so a replacement that itself dies with a
+    # fresh heartbeat is exercised too, not just a single isolated crash.
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-worker-tick-crash', 'error');");
+
+    $node->wait_for_log(
+        qr/error triggered for injection point vamana-worker-tick-crash/,
+        $log_pos);
+
+    my $second_signal = 0;
+    for (1 .. 100)    # up to 10s
+    {
+        my $log = substr($node->log_content(), $log_pos);
+        my $n_crashes = () = $log =~ /error triggered for injection point vamana-worker-tick-crash/g;
+
+        if ($n_crashes >= 2 || $log =~ /another worker is already serving database/)
+        {
+            $second_signal = 1;
+            last;
+        }
+        usleep(100_000);
+    }
+    ok($second_signal, 'a second respawn attempt is observed within 10s');
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-worker-tick-crash');");
+
+    my $recovered = wait_for_worker_db($node, 'postgres', 30);
+    my $log = substr($node->log_content(), $log_pos);
+
+    ok($recovered, 'worker resumes serving the database once the injection is detached');
+    unlike($log,
+        qr/another worker is already serving database/,
+        'an unexpected worker stop does not make the next respawn attempt fail on a stale reservation');
+
     $node->stop;
 }
 

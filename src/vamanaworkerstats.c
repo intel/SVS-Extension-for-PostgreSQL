@@ -253,7 +253,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
  *   1  slot_index     int4
  *   2  slot_status    text   ("empty"/"pending"/"processing"/"done"/"error")
  *   3  slot_kind      text   ("search"/"insert"/"delete"/"maintenance"/"load"/"warmup"/NULL)
- *   4  index_relid    oid    (InvalidOid -> NULL)
+ *   4  index_relid    oid    (NULL when empty or InvalidOid)
  *   5  error_message  text   (NULL unless status == error)
  * ----------------------------------------------------------------------- */
 
@@ -413,7 +413,7 @@ pg_stat_vamana_worker_slot(PG_FUNCTION_ARGS)
 		else
 			nulls[3] = true;
 
-		if (OidIsValid(snap->indexRelid))
+		if (snap->status != VAMANA_SLOT_EMPTY && OidIsValid(snap->indexRelid))
 			values[4] = ObjectIdGetDatum(snap->indexRelid);
 		else
 			nulls[4] = true;
