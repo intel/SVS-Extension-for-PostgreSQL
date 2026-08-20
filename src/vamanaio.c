@@ -17,6 +17,7 @@
 #include "svs_wrapper.h"
 
 #include "access/generic_xlog.h"
+#include "common/file_perm.h"
 #include "miscadmin.h"
 #include "port.h"
 #include "storage/bufmgr.h"
@@ -113,10 +114,85 @@ VamanaDeleteSaveDir(Oid dboid, Oid relid)
 }
 
 /*
+ * Construct the path of the temp file used to publish the TID map, given an
+ * index save directory from VamanaGetIndexSavePath.
+ *
+ * The name is deterministic — no pid or random suffix — so that a temp file
+ * orphaned by a crash can be recognized and removed later.  See the sweep at
+ * the top of VamanaLoadTidMap.
+ */
+static void
+VamanaGetTidMapTmpPath(const char *indexdir, char *buf, size_t bufsz)
+{
+	snprintf(buf, bufsz, "%s/tidmap.bin.tmp", indexdir);
+}
+
+/*
+ * write() the whole buffer, looping over short writes.  Returns false with
+ * errno set on failure; a short write that leaves errno clear means the
+ * filesystem is full.
+ *
+ * Deliberately contains no CHECK_FOR_INTERRUPTS: throwing from here would leak
+ * the caller's transient fd and leave the temp file behind.  The loop is
+ * bounded by the size of the TID map and makes forward progress on every
+ * iteration.
+ */
+static bool
+VamanaWriteFully(int fd, const void *data, size_t len)
+{
+	const char *p = (const char *) data;
+
+	while (len > 0)
+	{
+		ssize_t		written;
+
+		errno = 0;
+		written = write(fd, p, len);
+
+		if (written < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return false;
+		}
+		if (written == 0)
+		{
+			if (errno == 0)
+				errno = ENOSPC;
+			return false;
+		}
+
+		p += written;
+		len -= (size_t) written;
+	}
+
+	return true;
+}
+
+/*
  * Write the TID mapping for a vamana index to a sidecar file inside its
  * save directory.  The file is a VamanaTidMapHeader followed by <count>
  * ItemPointerData slots.  Uses a write-to-tmp-then-rename pattern so a crash
  * mid-write does not leave a partial file that looks valid.
+ *
+ * The temp file's permissions are stated outright rather than left to any
+ * creation default: it is created with pg_file_create_mode and fchmod()ed to
+ * exactly that mode before any data is written, so the mode the rename
+ * publishes onto tidmap.bin is the cluster's file mode and nothing else.
+ * pg_file_create_mode is used in preference to a hardcoded 0600 so that a
+ * cluster initialized with group access (initdb -g) keeps working.
+ *
+ * Any leftover temp file is removed before the new one is created.  That is
+ * both cleanup and a correctness requirement: O_CREAT does not change the mode
+ * of a file that already exists, so a stale temp left at a wider mode would
+ * keep it and the rename would publish that mode onto tidmap.bin.  Removing it
+ * first means O_EXCL below always creates the inode, so our mode applies.
+ *
+ * This relies on there being at most one saver per index at a time.  CREATE
+ * INDEX holds AccessExclusiveLock on the index, and the background-worker save
+ * paths for a given index all run inside that database's single worker; the
+ * save directory is namespaced by database OID, so workers for different
+ * databases never contend for the same temp file.
  *
  * Ereports ERROR on I/O failure; caller's PG_TRY handles cleanup of the
  * entire save directory.
@@ -127,32 +203,60 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 	char		indexdir[MAXPGPATH];
 	char		tidmappath[MAXPGPATH];
 	char		tidmaptmp[MAXPGPATH];
-	FILE	   *f;
+	int			fd;
 	VamanaTidMapHeader header;
 
 	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
 	snprintf(tidmappath, sizeof(tidmappath), "%s/tidmap.bin", indexdir);
-	snprintf(tidmaptmp, sizeof(tidmaptmp), "%s/tidmap.bin.tmp", indexdir);
+	VamanaGetTidMapTmpPath(indexdir, tidmaptmp, sizeof(tidmaptmp));
 
-	f = AllocateFile(tidmaptmp, PG_BINARY_W);
-	if (f == NULL)
+	/* ENOENT is the expected case: usually there is nothing to clean up. */
+	if (unlink(tidmaptmp) != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale TID map temp file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", tidmaptmp)));
+
+	fd = OpenTransientFilePerm(tidmaptmp,
+							   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
+							   pg_file_create_mode);
+	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create TID map file for vamana index %u: %m", relid),
 				 errdetail_log("Path: \"%s\".", tidmaptmp)));
+
+	/*
+	 * Make the mode exact rather than merely no wider than requested.  Safe to
+	 * do on the fd before writing: the file is still empty.
+	 */
+	if (fchmod(fd, (mode_t) pg_file_create_mode) != 0)
+	{
+		int			save_errno = errno;
+
+		/* Cleanup would overwrite the fchmod failure's errno before %m reads it. */
+		CloseTransientFile(fd);
+		unlink(tidmaptmp);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not set permissions on TID map file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", tidmaptmp)));
+	}
 
 	header.magic = VAMANA_TIDMAP_MAGIC;
 	header.version = VAMANA_TIDMAP_VERSION;
 	header.capacity = (uint32) count;
 	header.reserved = 0;
 
-	if (fwrite(&header, sizeof(header), 1, f) != 1 ||
-		(int) fwrite(tidMapping, sizeof(ItemPointerData), count, f) != count)
+	if (!VamanaWriteFully(fd, &header, sizeof(header)) ||
+		!VamanaWriteFully(fd, tidMapping,
+						  (size_t) count * sizeof(ItemPointerData)))
 	{
 		int			save_errno = errno;
 
 		/* Cleanup would overwrite the write failure's errno before %m reads it. */
-		FreeFile(f);
+		CloseTransientFile(fd);
 		unlink(tidmaptmp);
 		errno = save_errno;
 		ereport(ERROR,
@@ -161,7 +265,7 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 				 errdetail_log("Path: \"%s\".", tidmaptmp)));
 	}
 
-	if (FreeFile(f) != 0)
+	if (CloseTransientFile(fd) != 0)
 	{
 		int			save_errno = errno;
 
@@ -174,10 +278,16 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 	}
 
 	if (rename(tidmaptmp, tidmappath) != 0)
+	{
+		int			save_errno = errno;
+
+		unlink(tidmaptmp);		/* do not leave the temp file behind */
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not save TID map for vamana index %u: %m", relid),
 				 errdetail_log("Rename \"%s\" to \"%s\".", tidmaptmp, tidmappath)));
+	}
 }
 
 /*
