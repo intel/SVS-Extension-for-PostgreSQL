@@ -26,6 +26,7 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "replication/slot.h"
+#include "storage/lmgr.h"
 #include "storage/lwlock.h"
 #include "utils/injection_point.h"
 #include "utils/memutils.h"
@@ -583,6 +584,10 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 						 params->tidMappingCapacity,
 						 params->nextExternalId,
 						 params->numDeleted);
+
+		/* Ownership passed to the cache entry; a later error must not free these. */
+		svsIndex = NULL;
+		tidMapping = NULL;
 
 		{
 			VamanaIndexCache *cache = VamanaGetCache(relid);

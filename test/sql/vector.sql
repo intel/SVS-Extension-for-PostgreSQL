@@ -515,4 +515,3 @@ INSERT INTO t (val) VALUES ('[2,2,2]');
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
-DROP TABLE t;
