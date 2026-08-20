@@ -25,6 +25,7 @@
 #include "storage/fd.h"
 #include "utils/injection_point.h"
 #include "utils/rel.h"
+#include "utils/timestamp.h"
 
 #include <sys/stat.h>
 
@@ -311,11 +312,48 @@ VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappi
 {
 	char		indexdir[MAXPGPATH];
 	char		tidmappath[MAXPGPATH];
+	char		tidmaptmp[MAXPGPATH];
+	struct stat tmpst;
 	FILE	   *f;
 	VamanaTidMapHeader header;
 
 	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
 	snprintf(tidmappath, sizeof(tidmappath), "%s/tidmap.bin", indexdir);
+
+	/*
+	 * Remove a temp file orphaned by a crash between the write and the rename
+	 * in VamanaSaveTidMapAtomically.  That save path clears its own leftovers,
+	 * but it never runs again for an index that is only ever read from here on,
+	 * so without this the orphan would persist indefinitely.  This has to
+	 * happen before the ENOENT check below, since a missing tidmap.bin next to
+	 * an orphaned temp file is exactly what a crash mid-save looks like.
+	 *
+	 * Only sweep a temp file older than this postmaster's start time.  Saves
+	 * and loads do overlap — a BGW checkpoint and a backend load both hold only
+	 * AccessShareLock — and unlinking a live writer's temp file between its
+	 * close and its rename would fail that save and cost it the whole save
+	 * directory.  A live writer's temp file is always newer than PgStartTime.
+	 * A same-lifetime orphan is left to the next save's cleanup.
+	 *
+	 * Best effort only: this is hygiene on a read path whose contract is to
+	 * return false and let the caller rebuild, so a failure here must not turn
+	 * into a failed load.
+	 */
+	VamanaGetTidMapTmpPath(indexdir, tidmaptmp, sizeof(tidmaptmp));
+	if (lstat(tidmaptmp, &tmpst) == 0 &&
+		S_ISREG(tmpst.st_mode) &&
+		tmpst.st_mtime < timestamptz_to_time_t(PgStartTime))
+	{
+		if (unlink(tidmaptmp) == 0)
+			ereport(DEBUG1,
+					(errmsg("vamana index %u: removed orphaned TID map temp file", relid),
+					 errdetail_log("Path: \"%s\".", tidmaptmp)));
+		else
+			ereport(DEBUG1,
+					(errcode_for_file_access(),
+					 errmsg("vamana index %u: could not remove orphaned TID map temp file: %m", relid),
+					 errdetail_log("Path: \"%s\".", tidmaptmp)));
+	}
 
 	f = AllocateFile(tidmappath, PG_BINARY_R);
 	if (f == NULL)
