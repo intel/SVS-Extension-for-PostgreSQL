@@ -501,3 +501,31 @@ SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5
 (1 row)
 
 DROP TABLE t_loadwin;
+-- SDL425: NaN/Inf rejected on incremental INSERT (dynamic/live index path)
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+NOTICE:  buffered 2 vectors for SVS index build
+NOTICE:  building SVS index with 2 vectors of dimension 3
+NOTICE:  SVS index built successfully
+INSERT INTO t (val) VALUES ('[1,NaN,3]');
+ERROR:  NaN not allowed in vector
+LINE 1: INSERT INTO t (val) VALUES ('[1,NaN,3]');
+                                    ^
+INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+ERROR:  infinite value not allowed in vector
+LINE 1: INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+                                    ^
+INSERT INTO t (val) VALUES ('[1,-Infinity,3]');
+ERROR:  infinite value not allowed in vector
+LINE 1: INSERT INTO t (val) VALUES ('[1,-Infinity,3]');
+                                    ^
+-- NULL must still be silently skipped (must not regress)
+INSERT INTO t (val) VALUES (NULL);
+SELECT COUNT(*) FROM t WHERE val IS NULL;
+ count 
+-------
+     1
+(1 row)
+
+DROP TABLE t;

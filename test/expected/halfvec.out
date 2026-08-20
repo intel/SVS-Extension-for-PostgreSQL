@@ -981,3 +981,33 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 (5 rows)
 
 DROP TABLE t;
+
+-- SDL425: NaN/Inf input validation (halfvec type)
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
+NOTICE:  buffered 0 vectors for SVS index build
+NOTICE:  no vectors to index, skipping SVS build
+INSERT INTO t (val) VALUES ('[1,NaN,3]');
+ERROR:  NaN not allowed in halfvec
+LINE 1: INSERT INTO t (val) VALUES ('[1,NaN,3]');
+                                    ^
+INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+ERROR:  infinite value not allowed in halfvec
+LINE 1: INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+                                    ^
+DROP TABLE t;
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
+NOTICE:  buffered 2 vectors for SVS index build
+NOTICE:  building SVS index with 2 vectors of dimension 3
+NOTICE:  SVS index built successfully
+SELECT * FROM t ORDER BY val <-> '[1,NaN,3]' LIMIT 1;
+ERROR:  NaN not allowed in halfvec
+LINE 1: SELECT * FROM t ORDER BY val <-> '[1,NaN,3]' LIMIT 1;
+                                         ^
+SELECT * FROM t ORDER BY val <-> '[1,Infinity,3]' LIMIT 1;
+ERROR:  infinite value not allowed in halfvec
+LINE 1: SELECT * FROM t ORDER BY val <-> '[1,Infinity,3]' LIMIT 1;
+                                         ^
+DROP TABLE t;
