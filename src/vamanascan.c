@@ -229,6 +229,12 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		Vector	   *queryVec;
 		int			k = Max(so->k, 1);
 
+		if (k > VAMANA_MAX_K)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("requested k (%d) exceeds maximum allowed (%d)",
+							k, VAMANA_MAX_K)));
+
 		so->queryValue = orderbys[0].sk_argument;
 
 		if (DatumGetPointer(so->queryValue) == NULL)
