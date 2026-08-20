@@ -56,6 +56,12 @@ use VamanaTestUtils qw(:all);
     my @initial_files = glob("$index_dir/*");
     ok(scalar @initial_files > 0, 'on-disk index directory is non-empty');
 
+    # VamanaSaveTidMapAtomically (src/vamanaio.c) publishes tidmap.bin by
+    # renaming tidmap.bin.tmp onto it, and unlinks the temp file on every error
+    # path.  Either way nothing named *.tmp should survive a completed save.
+    is(scalar(grep { /\.tmp$/ } @initial_files), 0,
+        'no temp files left behind after CREATE INDEX');
+
     # Index vectors are user data and must not be readable by other OS accounts.
     # VamanaEnsureSaveDir (src/vamanaio.c) creates both directories with
     # MakePGDirectory, which applies pg_dir_create_mode (0700, or 0750 when the
@@ -254,6 +260,8 @@ use VamanaTestUtils qw(:all);
 
         my @saved_files = glob("$index_dir/*");
         ok(scalar @saved_files > 0, 'on-disk index directory non-empty after save');
+        is(scalar(grep { /\.tmp$/ } @saved_files), 0,
+            'no temp files left behind after deferred save');
 
         my $chkpt_logged = 0;
         for (1 .. 20) {
@@ -827,6 +835,19 @@ use VamanaTestUtils qw(:all);
     $node->stop;
     ok(-f $tidmap, 'tidmap.bin written before corruption');
 
+    # tidmap.bin holds heap TIDs and inherits its mode from the temp file the
+    # rename published, so this is the observable test of that mode.
+    # VamanaSaveTidMapAtomically (src/vamanaio.c) creates the temp file with
+    # pg_file_create_mode and fchmod()s it to exactly that, so the result does
+    # not depend on the postmaster's umask.  Expect 0600, or 0640 when the
+    # cluster was initialized with group access.  No execute bit either way.
+    my $tidmap_mode = (stat($tidmap))[2] & 07777;
+    ok($tidmap_mode == 0600 || $tidmap_mode == 0640,
+        sprintf('tidmap.bin mode is %04o (expect 0600, or 0640 with group access)',
+                $tidmap_mode));
+
+    ok(!-e "$tidmap.tmp", 'no tidmap.bin.tmp left behind after save');
+
     # Clobber the 4-byte magic in the header.
     open(my $fh, '+<:raw', $tidmap) or die "open $tidmap: $!";
     print $fh "\xDE\xAD\xBE\xEF";
@@ -953,6 +974,101 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($result, '',
         "$SRC_DB index still queryable after the unrelated clone_db DROP INDEX");
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Crash-orphan cleanup — a tidmap.bin.tmp left behind by a crash between the
+# write and the rename must be removed, without disturbing the load.
+# Covers: the orphan sweep at the top of VamanaLoadTidMap
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_tidmap_orphan');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
+
+    # debug1 so the sweep's own message is visible: it distinguishes the sweep
+    # from the save path, which also clears leftovers before it creates its
+    # temp file.
+    $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE orph_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO orph_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+        CREATE INDEX orph_idx ON orph_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($node, 30);
+
+    my $ioid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'orph_idx';");
+    chomp $ioid;
+    my $tidmap = vamana_save_dir($node, 'postgres', $ioid) . "/tidmap.bin";
+    my $orphan = "$tidmap.tmp";
+
+    # One more insert forces a checkpoint (min_ops=1) that persists tidmap.bin.
+    $node->safe_psql('postgres',
+        "INSERT INTO orph_tbl (val) VALUES (ARRAY[$array_sql]::vector);");
+    for (1 .. 20)
+    {
+        last if -f $tidmap;
+        usleep(500_000);
+    }
+    ok(-f $tidmap, 'tidmap.bin written before orphan is planted');
+
+    my $baseline = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT id FROM orph_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    });
+    isnt($baseline, '', 'pre-orphan query returns results');
+
+    $node->stop;
+
+    # Plant the orphan a crash mid-save would leave.  Mode 0666 is deliberately
+    # wider than anything the extension would create: it is the mode a leftover
+    # temp file could carry into tidmap.bin, and it also shows the sweep does
+    # not care what mode it finds.
+    open(my $ofh, '>', $orphan) or die "open $orphan: $!";
+    print $ofh "junk that is not a valid TID map";
+    close($ofh);
+    chmod(0666, $orphan) == 1 or die "chmod 0666 $orphan: $!";
+
+    # Backdate it so it predates the next postmaster start.  The sweep skips
+    # temp files newer than that, on the assumption they belong to a live writer.
+    my $backdated = time() - 3600;
+    utime($backdated, $backdated, $orphan) == 1 or die "utime $orphan: $!";
+
+    my $log_pos = length($node->log_content());
+    $node->start;
+
+    # The load happens on the first query against the index.
+    my $after = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT id FROM orph_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    });
+
+    ok(!-e $orphan, 'orphaned tidmap.bin.tmp removed on load');
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/removed orphaned TID map temp file/,
+        'orphan removal logged by the load-path sweep');
+
+    ok(-f $tidmap, 'tidmap.bin untouched by orphan cleanup');
+    is($after, $baseline, 'query results unchanged by orphan cleanup');
+    unlike($log, qr/TID map is malformed/,
+        'orphan did not interfere with loading the real TID map');
 
     $node->stop;
 }
