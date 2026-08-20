@@ -456,6 +456,13 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		goto cleanup;
 	}
 
+	if (buildstate.numVectors > 0 &&
+		buildstate.dimensions > (int) (SIZE_MAX / sizeof(float) / (size_t) buildstate.numVectors))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("vector dataset too large to index "
+						"(%d vectors × %d dimensions exceeds memory limit)",
+						buildstate.numVectors, buildstate.dimensions)));
 	dataSize = (Size) buildstate.numVectors * buildstate.dimensions * sizeof(float);
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
 	for (int i = 0; i < buildstate.numVectors; i++)
@@ -786,6 +793,13 @@ VamanaRebuildFromTable(Relation index)
 	}
 
 	/* Flatten vector data for SVS */
+	if (numVectors > 0 &&
+		dimensions > (int) (SIZE_MAX / sizeof(float) / (size_t) numVectors))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("vector dataset too large to index "
+						"(%d vectors × %d dimensions exceeds memory limit)",
+						numVectors, dimensions)));
 	dataSize = (Size) numVectors * dimensions * sizeof(float);
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
 
