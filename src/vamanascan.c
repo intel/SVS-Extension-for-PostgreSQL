@@ -16,6 +16,7 @@
 #include "svs_wrapper.h"
 
 #include "access/relscan.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -56,7 +57,7 @@ LoadIndexFromPages(Relation index)
 		return NULL;
 	}
 
-	VamanaGetIndexSavePath(relid, savepath, sizeof(savepath));
+	VamanaGetIndexSavePath(MyDatabaseId, relid, savepath, sizeof(savepath));
 
 	/*
 	 * hasSavedIndex may be stale if VamanaInvalidateCache deleted the
@@ -114,7 +115,7 @@ LoadIndexFromPages(Relation index)
 				(errmsg("vamana index %u: failed to load, will rebuild from table", relid),
 				 errdetail_log("Path: \"%s\".", savepath)));
 
-		VamanaDeleteSaveDir(relid);
+		VamanaDeleteSaveDir(MyDatabaseId, relid);
 		return NULL;
 	}
 	PG_END_TRY();
@@ -135,14 +136,14 @@ LoadIndexFromPages(Relation index)
 				(errmsg("vamana index %u: loading TID map for %u vectors (%u slots total)",
 						relid, meta.numVectors, tidMappingCapacity)));
 
-		if (!VamanaLoadTidMap(relid, tidMapping, (int) tidMappingCapacity))
+		if (!VamanaLoadTidMap(MyDatabaseId, relid, tidMapping, (int) tidMappingCapacity))
 		{
 			ereport(WARNING,
 					(errmsg("vamana index %u: TID map missing or corrupt, rebuilding",
 							relid)));
 			SVSFreeIndex(svsIndex);
 			pfree(tidMapping);
-			VamanaDeleteSaveDir(relid);
+			VamanaDeleteSaveDir(MyDatabaseId, relid);
 			return NULL;
 		}
 

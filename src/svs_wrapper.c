@@ -80,8 +80,13 @@ CheckSVSError(svs_error_h error, const char *operation)
 {
 	if (error && !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
+		char	   *msg = pstrdup(svs_error_get_message(error)
+								   ? svs_error_get_message(error) : "unknown error");
 		svs_error_code_t code = svs_error_get_code(error);
+
+		/* Every caller's own error-object cleanup is unreachable once this
+		 * throws, so free it here before doing so. */
+		svs_error_free(error);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -384,7 +389,7 @@ SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensio
 		  int search_window_size, ItemPointer results, float *distances)
 {
 #ifdef USE_SVS
-	svs_error_h error = svs_error_create();
+	svs_error_h error;
 	svs_search_results_t search_results;
 	svs_search_params_h search_params;
 	int			num_results;
@@ -406,6 +411,8 @@ SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensio
 				 errmsg("TID mapping not found in cached index"),
 				 errhint("Index may need to be rebuilt")));
 	}
+
+	error = svs_error_create();
 
 	search_params = svs_search_params_create_vamana((size_t) search_window_size, error);
 

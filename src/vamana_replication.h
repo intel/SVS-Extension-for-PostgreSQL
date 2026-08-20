@@ -19,12 +19,10 @@ struct VamanaIndexCache;
 /*
  * BGW-side handle for one logical replication slot.
  * Allocated in TopMemoryContext by VamanaReplicationOpen.
- * decodingCtx is NULL until WAL replay is initialized.
  */
 typedef struct VamanaReplicationSlot
 {
-	char					slotName[NAMEDATALEN];
-	LogicalDecodingContext *decodingCtx;
+	char	slotName[NAMEDATALEN];
 } VamanaReplicationSlot;
 
 /*
@@ -44,6 +42,9 @@ typedef struct VamanaReplayRole
 /* Resolve the current role. The sole reader of RecoveryInProgress() on this path. */
 const VamanaReplayRole *VamanaGetReplayRole(void);
 
+/* True when this node is the primary (not in recovery). */
+bool	VamanaNodeIsPrimary(void);
+
 /* BGW: create and persist a slot anchored at the current WAL position. */
 void	VamanaReplicationCreate(Oid dboid, Oid indexRelid);
 
@@ -60,8 +61,20 @@ void	VamanaReplicationCreateOnStandby(Oid dboid, Oid indexRelid);
  */
 void	VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid);
 
+/*
+ * BGW: scan WAL to CONSISTENT or role->current_wal_end, whichever comes
+ * first; never blocks waiting on the primary.  Safe to call repeatedly.
+ */
+void	VamanaReplicationActivateSlotBounded(Oid dboid, Oid indexRelid);
+
 /* BGW: open a handle to the slot. Returns NULL if the slot does not exist. */
 VamanaReplicationSlot *VamanaReplicationOpen(Oid dboid, Oid indexRelid);
+
+/*
+ * BGW: create the index's slot on a standby if none exists yet.  Idempotent;
+ * no-op on a primary.  Must be called outside any transaction.
+ */
+void	VamanaReplicationEnsureSlot(Oid dboid, Oid indexRelid);
 
 /*
  * BGW: drain one index's replication slot into its cache within a
@@ -77,8 +90,11 @@ void	VamanaReplicationDrainSlot(Oid indexRelid);
  */
 bool	VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb);
 
+/* BGW: true once the index's slot has reached snapshot consistency. */
+bool	VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid);
+
 /* BGW: advance confirmed_flush_lsn. Safe to call with slot == NULL. */
-void	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
+bool	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
 
 /* BGW: free the handle (does not drop the underlying slot). Safe with NULL. */
 void	VamanaReplicationClose(VamanaReplicationSlot *slot);

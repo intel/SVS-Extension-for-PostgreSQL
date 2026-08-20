@@ -14,6 +14,7 @@
 
 #include "vamana.h"
 #include "vamana_replication.h"
+#include "vamana_subxact_guard.h"
 #include "vamanaworker.h"
 
 #include "access/heapam_xlog.h"
@@ -76,6 +77,12 @@ SlotName(Oid dboid, Oid indexRelid, char *buf)
 	snprintf(buf, NAMEDATALEN, "vamana_%u_%u", dboid, indexRelid);
 }
 
+/* Shared by every CreateDecodingContext/CreateInitDecodingContext call. */
+#define VAMANA_XLOG_ROUTINE \
+	XL_ROUTINE(.page_read = read_local_xlog_page, \
+			   .segment_open = wal_segment_open, \
+			   .segment_close = wal_segment_close)
+
 static const VamanaReplayRole PrimaryReplayRole = {
 	.current_wal_end     = GetFlushRecPtr,
 	.creates_slot_on_load = false,
@@ -94,6 +101,19 @@ const VamanaReplayRole *
 VamanaGetReplayRole(void)
 {
 	return RecoveryInProgress() ? &StandbyReplayRole : &PrimaryReplayRole;
+}
+
+/*
+ * Is this node the primary (not in recovery)?
+ *
+ * A node fact, evaluated against the calling process at call time; recovery
+ * state is node-global.  Derived from the replay role rather than a second
+ * RecoveryInProgress() call so this file stays that predicate's sole reader.
+ */
+bool
+VamanaNodeIsPrimary(void)
+{
+	return VamanaGetReplayRole()->processes_write_ipc;
 }
 
 static void
@@ -438,6 +458,26 @@ ApplyDeleteChange(VamanaReplayContext *priv, ItemPointerData tid,
 	priv->opsDecoded++;
 }
 
+/* Arguments for ApplyChangeBody, bundled for VamanaRunInSubXact. */
+typedef struct ApplyChangeArgs
+{
+	VamanaReplayContext	   *priv;
+	Relation				relation;
+	ReorderBufferChange	   *change;
+	ItemPointerData			tid;
+} ApplyChangeArgs;
+
+static void
+ApplyChangeBody(void *arg)
+{
+	ApplyChangeArgs *args = (ApplyChangeArgs *) arg;
+
+	if (args->change->action == REORDER_BUFFER_CHANGE_INSERT)
+		ApplyInsertChange(args->priv, args->relation, args->tid, args->change->lsn);
+	else
+		ApplyDeleteChange(args->priv, args->tid, args->change->lsn);
+}
+
 /*
  * ReplayChangeGuarded
  *
@@ -446,7 +486,9 @@ ApplyDeleteChange(VamanaReplayContext *priv, ItemPointerData tid,
  * of aborting the whole replay pass.  This is the in-tree "catch, log, skip,
  * continue" pattern (PL/pgSQL exec_stmt_block, ReorderBufferProcessTXN); a
  * bare PG_TRY would not work because a heap/TOAST ERROR aborts the surrounding
- * transaction, which cannot then be reused.
+ * transaction, which cannot then be reused. A shutdown cancel is not a
+ * corrupt change, so VamanaRunInSubXact re-throws it instead of swallowing it,
+ * letting the drain owner run rather than dropping a good change.
  *
  * A skipped INSERT costs only recall (the vector is absent from the graph) and
  * is self-consistent, so no failure state is recorded.
@@ -455,40 +497,18 @@ static void
 ReplayChangeGuarded(VamanaReplayContext *priv, Relation relation,
 					ReorderBufferChange *change, ItemPointerData tid)
 {
-	MemoryContext	oldcontext = CurrentMemoryContext;
-	ResourceOwner	oldowner = CurrentResourceOwner;
+	ApplyChangeArgs		args = {priv, relation, change, tid};
+	VamanaSubXactResult	result;
 
-	BeginInternalSubTransaction(NULL);
-	MemoryContextSwitchTo(oldcontext);
+	result = VamanaRunInSubXact(ApplyChangeBody, &args, VamanaShutdownCancelPending);
 
-	PG_TRY();
+	if (!result.succeeded)
 	{
-		if (change->action == REORDER_BUFFER_CHANGE_INSERT)
-			ApplyInsertChange(priv, relation, tid, change->lsn);
-		else
-			ApplyDeleteChange(priv, tid, change->lsn);
-
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
-	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
-
-		MemoryContextSwitchTo(oldcontext);
-		edata = CopyErrorData();
-		FlushErrorState();
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcontext);
-		CurrentResourceOwner = oldowner;
-
 		ereport(WARNING,
 				(errmsg("vamana replay: skipping change at %X/%X: %s",
-						LSN_FORMAT_ARGS(change->lsn), edata->message)));
-		FreeErrorData(edata);
+						LSN_FORMAT_ARGS(change->lsn), result.edata->message)));
+		FreeErrorData(result.edata);
 	}
-	PG_END_TRY();
 }
 
 /*
@@ -556,6 +576,117 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 }
 
 /*
+ * VamanaTryAcquireSlotNoWait
+ *
+ * Acquire the named slot without blocking. Returns false, with no slot held,
+ * if it does not exist or is already active in another process -- both
+ * ordinary, retryable outcomes, not decoding failures. Any other error from
+ * ReplicationSlotAcquire still propagates.
+ */
+static bool
+VamanaTryAcquireSlotNoWait(const char *slotName)
+{
+	bool		acquired = true;
+
+	PG_TRY();
+	{
+		ReplicationSlotAcquire(slotName, /*nowait=*/ true,
+							   /*error_if_invalid=*/ false);
+	}
+	PG_CATCH();
+	{
+		int			sqlerrcode = geterrcode();
+
+		if (sqlerrcode != ERRCODE_OBJECT_IN_USE &&
+			sqlerrcode != ERRCODE_UNDEFINED_OBJECT)
+			PG_RE_THROW();
+
+		FlushErrorState();
+		acquired = false;
+	}
+	PG_END_TRY();
+
+	return acquired;
+}
+
+/*
+ * VamanaOpenDecoder
+ *
+ * Build a LogicalDecodingContext against the slot already acquired by
+ * VamanaTryAcquireSlotNoWait, and position its reader at restart_lsn.  Shared
+ * by every caller that walks WAL from the slot's last confirmed point.
+ */
+static LogicalDecodingContext *
+VamanaOpenDecoder(void)
+{
+	LogicalDecodingContext *ctx;
+
+	ctx = CreateDecodingContext(InvalidXLogRecPtr,
+								NIL,
+								/*fast_forward=*/ false,
+								VAMANA_XLOG_ROUTINE,
+								NULL, NULL, NULL);
+	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
+	return ctx;
+}
+
+/*
+ * VamanaRunDecodeLoop
+ *
+ * Read WAL records from ctx->reader up to endOfWal.  perRecord owns all
+ * per-record work, including the LogicalDecodingProcessRecord call itself
+ * (callers differ in whether other work must happen before or after it), and
+ * may return true to stop the loop early (e.g. once the SnapBuild reaches
+ * CONSISTENT).  errContext tags the WAL-read-error message so each caller's
+ * existing wording survives as an argument rather than a copy.
+ */
+static void
+VamanaRunDecodeLoop(LogicalDecodingContext *ctx, XLogRecPtr endOfWal,
+					 const char *errContext,
+					 bool (*perRecord) (LogicalDecodingContext *ctx, void *arg),
+					 void *arg)
+{
+	while (ctx->reader->EndRecPtr < endOfWal)
+	{
+		XLogRecord *record;
+		char	   *errm = NULL;
+
+		record = XLogReadRecord(ctx->reader, &errm);
+		if (errm != NULL)
+			elog(ERROR, "%s: WAL read error: %s", errContext, errm);
+		if (record == NULL)
+			break;
+
+		if (perRecord(ctx, arg))
+			break;
+
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/* Release ctx and the slot it was opened against, on the success path. */
+static void
+VamanaCloseDecoder(LogicalDecodingContext *ctx)
+{
+	FreeDecodingContext(ctx);
+	ReplicationSlotRelease();
+}
+
+/* Per-record callback for VamanaReplayPendingChanges's decode loop. */
+static bool
+ReplayRecordCallback(LogicalDecodingContext *ctx, void *arg)
+{
+	VamanaReplayContext *priv = (VamanaReplayContext *) arg;
+
+	/* Models an unrecoverable decode error escaping to the drain handler. */
+	INJECTION_POINT("vamana-replay-decode-record", NULL);
+
+	VamanaPreScanWalRecord(ctx, priv);
+	LogicalDecodingProcessRecord(ctx, ctx->reader);
+	return false;
+}
+
+/*
  * VamanaReplayPendingChanges
  *
  * Acquire the index's replication slot, open a LogicalDecodingContext starting
@@ -574,7 +705,6 @@ VamanaReplayPendingChanges(VamanaIndexCache *cache)
 	LogicalDecodingContext *ctx;
 	VamanaReplayContext	   *priv;
 	XLogRecPtr				endOfWal;
-	char				   *errm = NULL;
 
 	{
 		XLogRecPtr currentEnd = VamanaGetReplayRole()->current_wal_end(NULL);
@@ -584,44 +714,20 @@ VamanaReplayPendingChanges(VamanaIndexCache *cache)
 			return;
 	}
 
-	ReplicationSlotAcquire(slot->slotName, /*nowait=*/ true,
-						   /*error_if_invalid=*/ false);
-	if (MyReplicationSlot == NULL)
+	if (!VamanaTryAcquireSlotNoWait(slot->slotName))
 		return;
 
+	/* test/t/08_vamana_standby_replay.pl counts these to bound idle decode attempts. */
 	ereport(DEBUG1,
 			(errmsg("vamana replay: entering CreateDecodingContext for slot \"%s\" confirmed_flush=%X/%X",
 					slot->slotName,
 					LSN_FORMAT_ARGS(MyReplicationSlot->data.confirmed_flush))));
 
-	ctx = CreateDecodingContext(InvalidXLogRecPtr,
-								NIL,
-								/*fast_forward=*/ false,
-								XL_ROUTINE(.page_read = read_local_xlog_page,
-										   .segment_open = wal_segment_open,
-										   .segment_close = wal_segment_close),
-								NULL, NULL, NULL);
-	ereport(DEBUG1,
-			(errmsg("vamana replay: returned from CreateDecodingContext")));
-
+	ctx = VamanaOpenDecoder();
 	priv = (VamanaReplayContext *) ctx->output_plugin_private;
 	priv->cache = cache;
 
-	ereport(DEBUG1,
-			(errmsg("vamana replay: restart_lsn=%X/%X confirmed_flush=%X/%X snapbuild_state=%d consistent=%s",
-					LSN_FORMAT_ARGS(MyReplicationSlot->data.restart_lsn),
-					LSN_FORMAT_ARGS(MyReplicationSlot->data.confirmed_flush),
-					(int) SnapBuildCurrentState(ctx->snapshot_builder),
-					DecodingContextReady(ctx) ? "yes" : "no")));
-
-	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
-
 	endOfWal = VamanaGetReplayRole()->current_wal_end(NULL);
-
-	ereport(DEBUG1,
-			(errmsg("vamana replay: EndRecPtr=%X/%X endOfWal=%X/%X",
-					LSN_FORMAT_ARGS(ctx->reader->EndRecPtr),
-					LSN_FORMAT_ARGS(endOfWal))));
 
 	InvalidateSystemCaches();
 
@@ -635,28 +741,7 @@ VamanaReplayPendingChanges(VamanaIndexCache *cache)
 			RelationClose(heapRel);
 	}
 
-	while (ctx->reader->EndRecPtr < endOfWal)
-	{
-		XLogRecord *record = XLogReadRecord(ctx->reader, &errm);
-
-		if (errm != NULL)
-			elog(ERROR, "vamana replay: WAL read error: %s", errm);
-		if (record == NULL)
-			break;
-
-		/* Models an unrecoverable decode error escaping to the drain handler. */
-		INJECTION_POINT("vamana-replay-decode-record", NULL);
-
-		VamanaPreScanWalRecord(ctx, priv);
-		LogicalDecodingProcessRecord(ctx, ctx->reader);
-
-		ereport(DEBUG1,
-				(errmsg("vamana replay: processed lsn=%X/%X snapbuild_state=%d",
-						LSN_FORMAT_ARGS(ctx->reader->ReadRecPtr),
-						(int) SnapBuildCurrentState(ctx->snapshot_builder))));
-
-		CHECK_FOR_INTERRUPTS();
-	}
+	VamanaRunDecodeLoop(ctx, endOfWal, "vamana replay", ReplayRecordCallback, priv);
 
 	if (priv->lastChangeLsn != InvalidXLogRecPtr)
 		cache->lastReplayLsn = priv->lastChangeLsn;
@@ -664,14 +749,9 @@ VamanaReplayPendingChanges(VamanaIndexCache *cache)
 	if (priv->opsDecoded > 0)
 		LogicalConfirmReceivedLocation(ctx->reader->EndRecPtr);
 
-	ereport(DEBUG1,
-			(errmsg("vamana replay: %d ops decoded for index %u",
-					priv->opsDecoded, cache->indexRelid)));
-
 	cache->lastReplayWalEnd = endOfWal;
 
-	FreeDecodingContext(ctx);
-	ReplicationSlotRelease();
+	VamanaCloseDecoder(ctx);
 }
 
 /*
@@ -709,6 +789,32 @@ VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb)
 	currentEnd = VamanaGetReplayRole()->current_wal_end(NULL);
 
 	return currentEnd - restartLsn > (uint64) maxLagMb * 1024 * 1024;
+}
+
+/*
+ * True once the index's slot has reached snapshot consistency (confirmed_flush
+ * is set).  A freshly created slot has confirmed_flush unset until snapshot
+ * build reaches CONSISTENT, so a slot handle existing is not by itself proof
+ * of consistency.  False if the slot does not exist.
+ */
+bool
+VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid)
+{
+	char				slotName[NAMEDATALEN];
+	ReplicationSlot	   *slot;
+	XLogRecPtr			confirmedFlush;
+
+	SlotName(dboid, indexRelid, slotName);
+
+	slot = SearchNamedReplicationSlot(slotName, true);
+	if (slot == NULL)
+		return false;
+
+	SpinLockAcquire(&slot->mutex);
+	confirmedFlush = slot->data.confirmed_flush;
+	SpinLockRelease(&slot->mutex);
+
+	return confirmedFlush != InvalidXLogRecPtr;
 }
 
 /*
@@ -786,11 +892,15 @@ VamanaReplicationDrainSlot(Oid indexRelid)
 	}
 	PG_CATCH();
 	{
-		/*
-		 * Restore before the rebuild so the flag is correct even if
-		 * VamanaForceHeapRebuild itself throws.
-		 */
 		vamana_eviction_suppressed = prevSuppressed;
+
+		/*
+		 * A shutdown cancel is not a decode failure: re-throw so the drain owner
+		 * runs, rather than dropping the slot and forcing a needless rebuild.
+		 */
+		if (VamanaShutdownCancelPending())
+			PG_RE_THROW();
+
 		VamanaRecoverFromReplayError(indexRelid);
 	}
 	PG_END_TRY();
@@ -822,9 +932,7 @@ VamanaReplicationCreate(Oid dboid, Oid indexRelid)
 										NIL,
 										/*need_full_snapshot=*/ false,
 										InvalidXLogRecPtr,
-										XL_ROUTINE(.page_read = read_local_xlog_page,
-												   .segment_open = wal_segment_open,
-												   .segment_close = wal_segment_close),
+										VAMANA_XLOG_ROUTINE,
 										NULL, NULL, NULL);
 	FreeDecodingContext(initCtx);
 
@@ -859,46 +967,80 @@ VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid)
 	if (SearchNamedReplicationSlot(slotName, true) == NULL)
 		return;
 
-	ReplicationSlotAcquire(slotName, /*nowait=*/ true,
-						   /*error_if_invalid=*/ false);
-	if (MyReplicationSlot == NULL)
+	if (!VamanaTryAcquireSlotNoWait(slotName))
 		return;
 
 	PG_TRY();
 	{
-		ereport(DEBUG1,
-				(errmsg("vamana buildsnapshot: slot \"%s\" restart_lsn=%X/%X confirmed_flush=%X/%X",
-						slotName,
-						LSN_FORMAT_ARGS(MyReplicationSlot->data.restart_lsn),
-						LSN_FORMAT_ARGS(MyReplicationSlot->data.confirmed_flush))));
-
 		ctx = CreateDecodingContext(InvalidXLogRecPtr,
 									NIL,
 									/*fast_forward=*/ false,
-									XL_ROUTINE(.page_read = read_local_xlog_page,
-											   .segment_open = wal_segment_open,
-											   .segment_close = wal_segment_close),
+									VAMANA_XLOG_ROUTINE,
 									NULL, NULL, NULL);
 
-		ereport(DEBUG1,
-				(errmsg("vamana buildsnapshot: snapbuild state after CreateDecodingContext = %d (CONSISTENT=%d)",
-						(int) SnapBuildCurrentState(ctx->snapshot_builder),
-						(int) SNAPBUILD_CONSISTENT)));
-
-		ereport(DEBUG1,
-				(errmsg("vamana buildsnapshot: entering DecodingContextFindStartpoint")));
+		/* Waits for a not-yet-replayed xl_running_xacts; positions its own reader. */
 		DecodingContextFindStartpoint(ctx);
-		ereport(DEBUG1,
-				(errmsg("vamana buildsnapshot: returned from DecodingContextFindStartpoint")));
 
-		ereport(DEBUG1,
-				(errmsg("vamana buildsnapshot: snapbuild state after FindStartpoint = %d consistent=%s confirmed_flush=%X/%X",
-						(int) SnapBuildCurrentState(ctx->snapshot_builder),
-						DecodingContextReady(ctx) ? "yes" : "no",
-						LSN_FORMAT_ARGS(MyReplicationSlot->data.confirmed_flush))));
+		VamanaCloseDecoder(ctx);
+	}
+	PG_CATCH();
+	{
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
 
-		FreeDecodingContext(ctx);
-		ReplicationSlotRelease();
+/* Per-record callback for VamanaReplicationActivateSlotBounded's decode loop. */
+static bool
+ActivateSlotRecordCallback(LogicalDecodingContext *ctx, void *arg)
+{
+	LogicalDecodingProcessRecord(ctx, ctx->reader);
+	return DecodingContextReady(ctx);
+}
+
+/*
+ * Scan WAL from restart_lsn up to role->current_wal_end and stop, whether or
+ * not the SnapBuild reaches CONSISTENT.  Unlike VamanaReplicationBuildSnapshot
+ * this never waits for a not-yet-replayed xl_running_xacts record, so it is
+ * safe to call from the main loop.  A pass that stops short of CONSISTENT
+ * discards its progress (the builder is freed with the decoding context; a
+ * snapshot is serialized only once CONSISTENT is reached), so the next pass
+ * starts over from restart_lsn; convergence needs only that the primary keep
+ * emitting xl_running_xacts.
+ */
+void
+VamanaReplicationActivateSlotBounded(Oid dboid, Oid indexRelid)
+{
+	char					slotName[NAMEDATALEN];
+	LogicalDecodingContext *ctx;
+	XLogRecPtr				endOfWal;
+
+	SlotName(dboid, indexRelid, slotName);
+
+	if (SearchNamedReplicationSlot(slotName, true) == NULL)
+		return;
+
+	if (!VamanaTryAcquireSlotNoWait(slotName))
+		return;
+
+	PG_TRY();
+	{
+		ctx = VamanaOpenDecoder();
+		endOfWal = VamanaGetReplayRole()->current_wal_end(NULL);
+
+		VamanaRunDecodeLoop(ctx, endOfWal, "vamana slot activation",
+							ActivateSlotRecordCallback, NULL);
+
+		if (DecodingContextReady(ctx))
+		{
+			SpinLockAcquire(&MyReplicationSlot->mutex);
+			MyReplicationSlot->data.confirmed_flush = ctx->reader->EndRecPtr;
+			SpinLockRelease(&MyReplicationSlot->mutex);
+		}
+
+		VamanaCloseDecoder(ctx);
 	}
 	PG_CATCH();
 	{
@@ -928,6 +1070,28 @@ VamanaReplicationCreateOnStandby(Oid dboid, Oid indexRelid)
 }
 
 /*
+ * Create the index's slot if this is a standby and none exists yet.  A standby
+ * must bootstrap its own slots: its base backup excludes pg_replslot and the
+ * primary write path that creates them never runs here.  Idempotent; must be
+ * called outside any transaction.
+ */
+void
+VamanaReplicationEnsureSlot(Oid dboid, Oid indexRelid)
+{
+	VamanaIndexCache *cache;
+
+	if (!VamanaGetReplayRole()->creates_slot_on_load)
+		return;
+
+	cache = VamanaGetCache(indexRelid);
+	if (cache == NULL || cache->replicationSlot != NULL)
+		return;
+
+	VamanaReplicationCreateOnStandby(dboid, indexRelid);
+	cache->replicationSlot = VamanaReplicationOpen(dboid, indexRelid);
+}
+
+/*
  * Open a lightweight handle referencing the persistent slot.
  * The slot is not acquired; it remains inactive and droppable.
  * Returns NULL if the slot does not exist.
@@ -947,7 +1111,6 @@ VamanaReplicationOpen(Oid dboid, Oid indexRelid)
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	vslot = palloc0(sizeof(VamanaReplicationSlot));
 	strlcpy(vslot->slotName, slotName, NAMEDATALEN);
-	vslot->decodingCtx = NULL;
 	MemoryContextSwitchTo(oldCtx);
 
 	ereport(DEBUG1,
@@ -957,20 +1120,19 @@ VamanaReplicationOpen(Oid dboid, Oid indexRelid)
 }
 
 /*
- * Advance confirmed_flush_lsn by briefly acquiring the slot.
- * A persistent non-active slot can be acquired and released in a tight window.
+ * Advance confirmed_flush_lsn by briefly acquiring the slot.  A persistent
+ * non-active slot can be acquired and released in a tight window.  Returns
+ * false, advancing nothing, if the slot is busy or gone; the caller decides
+ * whether that makes its own checkpoint incomplete.
  */
-void
+bool
 VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 {
 	if (slot == NULL)
-		return;
+		return true;
 
-	ReplicationSlotAcquire(slot->slotName, /*nowait=*/ true,
-						   /*error_if_invalid=*/ false);
-
-	if (MyReplicationSlot == NULL)
-		return;
+	if (!VamanaTryAcquireSlotNoWait(slot->slotName))
+		return false;
 
 	PG_TRY();
 	{
@@ -984,6 +1146,8 @@ VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	return true;
 }
 
 /*
@@ -995,12 +1159,6 @@ VamanaReplicationClose(VamanaReplicationSlot *slot)
 {
 	if (slot == NULL)
 		return;
-
-	if (slot->decodingCtx != NULL)
-	{
-		MyReplicationSlot = slot->decodingCtx->slot;
-		FreeDecodingContext(slot->decodingCtx);
-	}
 
 	pfree(slot);
 }

@@ -10,13 +10,49 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use File::Temp;
+use File::Path qw(remove_tree);
+use File::Temp qw(tempdir);
 use POSIX qw(_exit);
 use Time::HiRes qw(usleep);
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
+
+# Kill the worker for $db and wait for its replacement, so the next access is
+# a genuine cold load against an empty in-process cache.  wait_for_worker_db
+# alone can return the dying pid before the launcher reaps it.
+sub restart_worker
+{
+    my ($node, $db) = @_;
+    my $old_pid = wait_for_worker_db($node, $db, 10);
+
+    my $log_pos = length($node->log_content());
+    kill('TERM', $old_pid);
+    $node->wait_for_log(qr/vamana background worker shutting down/, $log_pos);
+
+    for (1 .. 50) {
+        usleep(100_000);
+        my $alive = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = $old_pid;");
+        chomp $alive;
+        last if $alive eq '0';
+    }
+
+    my $new_pid = wait_for_worker_db($node, $db, 40);
+    isnt($new_pid, $old_pid, "worker for $db restarted with an empty cache");
+    return $new_pid;
+}
+
+# Overwrite a file's first few bytes so any format validation on read fails,
+# without changing the file's size.
+sub clobber_file_header
+{
+    my ($path) = @_;
+    open(my $fh, '+<:raw', $path) or die "open $path: $!";
+    print $fh "\xDE\xAD\xBE\xEF";
+    close $fh;
+}
 
 # ===========================================================================
 # VamanaWorkerResetStaleSlots — all slots empty at BGW startup
@@ -37,11 +73,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $ss_dim  = 4;
     my $ss_seed = join(",", ('random()') x $ss_dim);
@@ -71,7 +109,7 @@ use VamanaTestUtils qw(:all);
     sleep(2);
 
     my $nonempty = $node->safe_psql('postgres',
-        "SELECT count(*) FROM pg_stat_vamana_worker "
+        "SELECT count(*) FROM pg_stat_vamana_worker_slot "
       . "WHERE slot_status <> 'empty';");
     chomp $nonempty;
     ok($nonempty eq '0', 'all slots empty after BGW startup (VamanaWorkerResetStaleSlots)');
@@ -98,11 +136,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
     $node->safe_psql('postgres', 'CREATE EXTENSION vector');
     $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE t_cold (id serial PRIMARY KEY, val vector($dim));
@@ -147,11 +187,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
     $node->start;
     $node->safe_psql('postgres', 'CREATE EXTENSION vector');
     $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE t1 (id serial PRIMARY KEY, val vector($dim));
@@ -194,6 +236,389 @@ use VamanaTestUtils qw(:all);
 }
 
 # ===========================================================================
+# Cold-load failure — VamanaWorkerGetOrLoadIndex catches without an abort
+#
+# The catch there (FlushErrorState, no transaction abort) can leave
+# resource-owner/memory-context state inconsistent for the rest of the
+# process's life.  Force a failure while indexRel and its lock are held,
+# then prove the same worker loads the same index correctly right after.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 3
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_load_error_recovery');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE load_err_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO load_err_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 50) i;
+        CREATE INDEX load_err_idx ON load_err_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    # CREATE INDEX synchronously warms the cache via a LOAD slot, not
+    # VamanaWorkerGetOrLoadIndex; restart so the next access is a cold load.
+    my $worker_pid = restart_worker($node, 'postgres');
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-get-or-load-index-error', 'error');");
+
+    $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM load_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-get-or-load-index-error');");
+
+    is(wait_for_worker_db($node, 'postgres', 10), $worker_pid,
+        'worker survives the injected load failure');
+
+    my ($ret, $stdout) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM load_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    ok($ret == 0 && $stdout =~ /^\d+$/m,
+        'a subsequent, uninjected search on the same index still succeeds');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Load-handoff failure — VamanaWorkerProcessLoadSlot catches without an abort
+#
+# Same class of bug as the cold-load failure above (CopyErrorData() called
+# without switching CurrentMemoryContext off ErrorContext first), but on the
+# CREATE INDEX handoff LOAD slot path instead of the cold-reload path, and
+# without needing an injection point: the worker is frozen (SIGSTOP) before a
+# build starts and resumed (SIGCONT) only after its freshly-written TID map
+# is corrupted on disk, forcing the load to fail on schedule. Repeated across
+# several indexes in one process, since the corruption this guards against
+# only surfaces after a few occurrences.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_load_handoff_fault');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $worker_pid = wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE handoff_tbl (
+            id  serial PRIMARY KEY,
+            c1  vector($dim), c2 vector($dim), c3 vector($dim), c4 vector($dim), c5 vector($dim)
+        );
+        INSERT INTO handoff_tbl (c1, c2, c3, c4, c5)
+            SELECT ARRAY[$array_sql]::vector, ARRAY[$array_sql]::vector, ARRAY[$array_sql]::vector,
+                   ARRAY[$array_sql]::vector, ARRAY[$array_sql]::vector
+            FROM generate_series(1, 2000) i;
+    ));
+
+    my $dboid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'postgres';");
+    chomp $dboid;
+    my $indexes_dir = $node->data_dir . "/vamana_indexes/$dboid";
+
+    my @columns = ('c1', 'c2', 'c3', 'c4', 'c5');
+    my $crashed_after_iteration;
+    my $crash_log = '';
+
+    for my $iter (0 .. $#columns)
+    {
+        my $col        = $columns[$iter];
+        my $index_name = "handoff_idx_$col";
+
+        my %before_dirs = map { $_ => 1 } glob("$indexes_dir/*");
+
+        kill('STOP', $worker_pid) or die "kill STOP $worker_pid: $!";
+
+        my $bg = $node->background_psql('postgres');
+        $bg->query_until(
+            qr/build_issued/,
+            qq(
+                \\echo build_issued
+                CREATE INDEX $index_name ON handoff_tbl USING vamana ($col vector_l2_ops);
+            ));
+
+        my $new_dir;
+        for (1 .. 60)
+        {
+            my @now = grep { !$before_dirs{$_} } glob("$indexes_dir/*");
+            if (@now == 1)
+            {
+                $new_dir = $now[0];
+                last;
+            }
+            usleep(200_000);
+        }
+        die "new save directory for $index_name did not appear" unless defined $new_dir;
+
+        my $tidmap = "$new_dir/tidmap.bin";
+        my $prev_size = -1;
+        for (1 .. 60)
+        {
+            if (-f $tidmap)
+            {
+                my $size = -s $tidmap;
+                last if $size == $prev_size && $size > 0;
+                $prev_size = $size;
+            }
+            usleep(100_000);
+        }
+        ok(-f $tidmap, "$index_name: TID map written while worker is frozen");
+
+        clobber_file_header($tidmap);
+
+        kill('CONT', $worker_pid) or die "kill CONT $worker_pid: $!";
+
+        my $log_pos = length($node->log_content());
+        my $query_survived = eval { $bg->query("SELECT 1;"); 1 };
+        eval { $bg->quit; };
+
+        my $log = substr($node->log_content(), $log_pos);
+        if (!$query_survived || $log =~ /terminated by signal|Segmentation fault/)
+        {
+            $crashed_after_iteration = $iter + 1;
+            $crash_log = $log;
+            last;
+        }
+
+        like($log,
+            qr/vamana index "$index_name": background worker load failed/,
+            "$index_name: backend falls back to on-demand load after the worker's load fails");
+
+        my $live_pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
+        chomp $live_pid;
+        is($live_pid, $worker_pid,
+            "$index_name: worker survives the failed load without restarting");
+    }
+
+    ok(!defined $crashed_after_iteration,
+        'repeated failed post-build loads do not crash the worker')
+      or diag("crashed after $crashed_after_iteration failed load(s); server log:\n$crash_log");
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Save-after-rebuild failure — a leaked buffer content lock must not wedge
+# other backends
+#
+# VamanaMarkIndexSaved holds its buffer's BUFFER_LOCK_EXCLUSIVE across
+# GenericXLogFinish.  TrySaveAfterRebuild's catch sits above
+# VamanaSaveIndexToDisk, so a failure there used to propagate with that lock
+# still held; ordinary commit never releases a leaked LWLock, so it would
+# leak for the worker's lifetime and wedge any later VACUUM on the same
+# index.  Force the rebuild path (no on-disk checkpoint), inject the
+# failure, and prove a concurrent VACUUM on the same index still completes.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 6
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_save_error_recovery');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE save_err_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO save_err_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 50) i;
+        CREATE INDEX save_err_idx ON save_err_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    my $relid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'save_err_idx';");
+    chomp $relid;
+
+    my $worker_pid = restart_worker($node, 'postgres');
+    remove_tree(vamana_save_dir($node, 'postgres', $relid));
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-mark-index-saved-error', 'error');");
+
+    my $log_pos = length($node->log_content());
+    my ($ret, $stdout) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM save_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    ok($ret == 0 && $stdout =~ /^\d+$/m,
+        'the rebuilt-but-unsaved index still serves the triggering search');
+    like(substr($node->log_content(), $log_pos),
+        qr/save after rebuild failed/,
+        'the injected save failure is caught during the post-rebuild save');
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-mark-index-saved-error');");
+
+    # Fire-and-forget: an LWLock wait ignores statement_timeout, so
+    # completion is observed by polling, never awaited directly.
+    my $vacuum = $node->background_psql('postgres');
+    my $vacuum_pid = $vacuum->query('SELECT pg_backend_pid();');
+    chomp $vacuum_pid;
+    $vacuum->query_until(qr//, "VACUUM save_err_tbl;\n");
+
+    my $done = '';
+    my $blocked_on_buffer = '';
+    for (1 .. 50) {    # up to 5s
+        usleep(100_000);
+        my $row = $node->safe_psql('postgres',
+            "SELECT wait_event_type, wait_event, state FROM pg_stat_activity "
+          . "WHERE pid = $vacuum_pid;");
+        if ($row =~ /\|idle$/) {
+            $done = 1;
+            last;
+        }
+        $blocked_on_buffer = $row if $row =~ /^LWLock\|BufferContent\|/;
+    }
+
+    ok($done, 'VACUUM on the same index completes despite the earlier save failure');
+    is($blocked_on_buffer, '', 'VACUUM never blocks on the buffer lock the save failure held');
+
+    is(wait_for_worker_db($node, 'postgres', 10), $worker_pid,
+        'worker survives the injected save failure');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Empty-table first INSERT that throws — worker must survive
+#
+# An empty-table CREATE INDEX caches an entry with svsIndex=NULL; the dynamic
+# index is built lazily on the first INSERT, which also creates the index's
+# replication slot.  That build path runs inside VamanaWorkerProcessWriteSlot,
+# whose contract is "must not throw: all errors become VAMANA_SLOT_ERROR".
+# Here we exhaust the replication-slot budget so slot creation throws.  The
+# error must be converted to a per-request slot error, NOT escape and kill the
+# worker.  The observable guarantee is a stable worker PID and continued
+# service.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('empty_insert_fault');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 4");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 4");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.worker_timeout_ms = 3000");
+    $node->start;
+
+    $node->safe_psql('postgres', 'CREATE EXTENSION vector');
+    $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $ef_dim = 4;
+    my $ef_vec = join(",", map { sprintf("%.4f", rand()) } 1 .. $ef_dim);
+
+    # Empty-table CREATE INDEX: caches an svsIndex=NULL entry, creates no slot.
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE t_empty (id serial PRIMARY KEY, val vector($ef_dim));
+        CREATE INDEX ON t_empty USING vamana (val vector_l2_ops);
+    });
+
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid =~ /^\d+$/, "worker running before fault (pid=$worker_pid)");
+
+    # Warm the empty index so the first INSERT takes the empty-table build path.
+    $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT id FROM t_empty ORDER BY val <-> '[$ef_vec]' LIMIT 1;
+    });
+
+    # Exhaust the replication-slot budget so VamanaReplicationCreate throws.
+    my $filled = 0;
+    for my $i (1 .. 8)
+    {
+        last unless eval {
+            $node->safe_psql('postgres',
+                "SELECT pg_create_physical_replication_slot('fill_$i');");
+            1;
+        };
+        $filled++;
+    }
+    ok($filled > 0, "replication slot budget exhausted ($filled slots)");
+
+    # First INSERT into the empty index throws in the build path.  The backend
+    # gets an error either way; what this pins down is that the worker survives.
+    eval {
+        $node->safe_psql('postgres',
+            "INSERT INTO t_empty (val) VALUES ('[$ef_vec]');");
+    };
+
+    my $worker_survived = 1;
+    for (1 .. 20)
+    {
+        usleep(250_000);
+        my $pid = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker' LIMIT 1;");
+        chomp $pid;
+        if ($pid ne $worker_pid) { $worker_survived = 0; last; }
+    }
+    ok($worker_survived,
+        "worker survives a throwing empty-table first INSERT (pid stable at $worker_pid)");
+
+    # Free a slot and confirm the worker still serves end to end.
+    $node->safe_psql('postgres', "SELECT pg_drop_replication_slot('fill_1');");
+    my $live_seed = join(",", ('random()') x $ef_dim);
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE t_live (id serial PRIMARY KEY, val vector($ef_dim));
+        INSERT INTO t_live (val)
+            SELECT ARRAY[$live_seed]::vector FROM generate_series(1, 20);
+        CREATE INDEX ON t_live USING vamana (val vector_l2_ops);
+    });
+
+    my $served = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT count(*) FROM (
+            SELECT id FROM t_live ORDER BY val <-> '[$ef_vec]' LIMIT 5
+        ) sub;
+    });
+    chomp $served;
+    ok($served == 5, "worker still serving after the fault (got $served results)");
+
+    $node->stop;
+}
+
+# ===========================================================================
 # BGW evicts cache after VACUUM FULL / CLUSTER
 #
 # VACUUM FULL and CLUSTER replace the heap relfilenode without calling any
@@ -207,11 +632,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $ri_dim  = 4;
     my $ri_seed = join(",", ('random()') x $ri_dim);
@@ -229,7 +656,7 @@ use VamanaTestUtils qw(:all);
         usleep(500_000);
         my $pid = $node->safe_psql('postgres',
             "SELECT pid FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana background worker' LIMIT 1;");
+          . "WHERE backend_type = 'vamana worker' LIMIT 1;");
         chomp $pid;
         if ($pid =~ /^\d+$/) { $worker_up = 1; last; }
     }
@@ -286,12 +713,14 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $rw_dim = 8;
     my $rw_seed = join(",", ('random()') x $rw_dim);
@@ -373,12 +802,14 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "log_min_messages = 'warning'");
     $node->start;
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE lock_leak_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -451,11 +882,13 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     my $cw_dim  = 4;
     my $cw_seed = join(",", ('random()') x $cw_dim);
@@ -508,7 +941,7 @@ use VamanaTestUtils qw(:all);
     {
         usleep(100_000);
         my $status = $node->safe_psql('postgres',
-            "SELECT slot_status FROM pg_stat_vamana_worker "
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
           . "WHERE slot_status = 'pending' LIMIT 1;");
         chomp $status;
         if ($status eq 'pending') { $slot_pending = 1; last; }
@@ -535,7 +968,7 @@ use VamanaTestUtils qw(:all);
     {
         usleep(100_000);
         my $nonempty = $node->safe_psql('postgres',
-            "SELECT count(*) FROM pg_stat_vamana_worker "
+            "SELECT count(*) FROM pg_stat_vamana_worker_slot "
           . "WHERE slot_status <> 'empty';");
         chomp $nonempty;
         if ($nonempty eq '0') { $slot_empty = 1; last; }
@@ -567,6 +1000,348 @@ use VamanaTestUtils qw(:all);
     chomp $after;
     ok($after == 5, "subsequent query returns correct results after cancel (got $after)");
 
+    $node->stop;
+}
+
+# ===========================================================================
+# Query cancel during svs_warmup_database() — PG_CATCH in VamanaRunInSubXact
+#
+# svs_warmup_database() and svs_teardown_database() run each item's work in
+# its own subtransaction via VamanaRunInSubXact, so one bad item doesn't abort
+# the whole batch.  That guard must never swallow a query cancel: the caller
+# issued it and expects the whole batch to stop, not just the item in flight.
+#
+# Determinism: SIGSTOP the worker before calling svs_warmup_database() so the
+# backend is guaranteed to be blocked in VamanaWorkerWaitForSlot's WaitLatch
+# loop (which calls CHECK_FOR_INTERRUPTS() every iteration) when the cancel
+# arrives.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_warmup_cancel');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE warmup_cancel_t (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO warmup_cancel_t (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+        CREATE INDEX ON warmup_cancel_t USING vamana (val vector_l2_ops);
+    });
+
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid =~ /^\d+$/, "worker running (pid=$worker_pid)");
+
+    kill('STOP', $worker_pid);
+    usleep(100_000);
+
+    my $tmpdir = tempdir(CLEANUP => 1);
+    my $child_pid = fork();
+    die "fork: $!" unless defined $child_pid;
+    if ($child_pid == 0)
+    {
+        my $result = eval { $node->safe_psql('postgres', "SELECT svs_warmup_database();") };
+        my $outcome = defined $result ? "OK:$result" : "ERR:$@";
+        if (open(my $fh, '>', "$tmpdir/result.txt"))
+        {
+            print $fh $outcome;
+            close $fh;
+        }
+        _exit(0);
+    }
+
+    my $slot_pending = 0;
+    for (1 .. 50)
+    {
+        usleep(100_000);
+        my $status = $node->safe_psql('postgres',
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_status = 'pending' AND slot_kind = 'warmup' LIMIT 1;");
+        chomp $status;
+        if ($status eq 'pending') { $slot_pending = 1; last; }
+    }
+    ok($slot_pending, 'warmup slot is PENDING while backend waits in WaitLatch');
+
+    my $backend_pid = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity "
+      . "WHERE query LIKE '%svs_warmup_database%' AND state = 'active' "
+      . "AND pid <> pg_backend_pid() LIMIT 1;");
+    chomp $backend_pid;
+    ok($backend_pid =~ /^\d+$/, "found blocked backend (pid=$backend_pid)");
+
+    $node->safe_psql('postgres', "SELECT pg_cancel_backend($backend_pid);");
+
+    kill('CONT', $worker_pid);
+
+    waitpid($child_pid, 0);
+
+    my $outcome = '';
+    if (open(my $fh, '<', "$tmpdir/result.txt"))
+    {
+        local $/;
+        $outcome = <$fh>;
+        close $fh;
+    }
+
+    like($outcome, qr/^ERR:.*canceling statement due to user request/s,
+        'cancel during svs_warmup_database() propagates to the caller, not swallowed by the subxact guard');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# SAVEPOINT then outer ROLLBACK — undo must not resubmit a subxact's DELETE
+#
+# A row inserted inside a savepoint is undone once by ROLLBACK TO.  On the
+# outer ROLLBACK the abort-time undo must skip that row: its externalId is
+# already gone from the graph, so a second DELETE fails in the worker and
+# surfaces as "SVSDeletePoints failed".  The search result is correct either
+# way (the double-delete is idempotent), so the WARNING in the server log is
+# the only observable signal — hence a TAP log assertion rather than a
+# regression diff.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_undo_subxact');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid =~ /^\d+$/, "worker running (pid=$worker_pid)");
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE undo_subxact_t (id serial PRIMARY KEY, val vector(3));
+        INSERT INTO undo_subxact_t (val) VALUES ('[0,0,0]'), ('[1,1,1]'), ('[2,2,2]');
+        CREATE INDEX ON undo_subxact_t USING vamana (val vector_l2_ops);
+    });
+
+    my $log_pos = length($node->log_content());
+
+    $node->safe_psql('postgres', qq{
+        BEGIN;
+        INSERT INTO undo_subxact_t (val) VALUES ('[5,5,5]');
+        SAVEPOINT sp1;
+        INSERT INTO undo_subxact_t (val) VALUES ('[9,9,9]');
+        ROLLBACK TO sp1;
+        ROLLBACK;
+    });
+
+    my $undo_log = substr($node->log_content(), $log_pos);
+    unlike($undo_log, qr/SVSDeletePoints failed/,
+        'outer ROLLBACK does not resubmit the savepoint-undone DELETE');
+
+    my $survivors = $node->safe_psql('postgres',
+        "SELECT string_agg(val::text, ',' ORDER BY id) FROM undo_subxact_t;");
+    chomp $survivors;
+    is($survivors, '[0,0,0],[1,1,1],[2,2,2]',
+        'only the original rows survive the aborted transaction');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Slot promotion uses a compare-and-swap from PENDING to PROCESSING, so the
+# worker cannot resurrect a slot the backend has already abandoned via cancel.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 4
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_promote_race');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker($node, 30);
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE promote_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO promote_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20);
+        CREATE INDEX promote_idx ON promote_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($node, 30);
+
+    my $ctl = $node->background_psql('postgres');
+    $ctl->query_safe(
+        "SELECT injection_points_attach('vamana-worker-promote-before-write', 'wait');");
+
+    my $req = $node->background_psql('postgres', on_error_stop => 0);
+    my $req_pid = $req->query('SELECT pg_backend_pid();');
+    chomp $req_pid;
+    $req->query_until(qr//, qq{
+        SET enable_seqscan = off;
+        SELECT id FROM promote_tbl ORDER BY val <-> '[$query_sql]' LIMIT 1;
+    });
+
+    my $slot_index = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $slot_index = $ctl->query(
+            "SELECT slot_index FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_kind = 'search' AND slot_status = 'pending';");
+        chomp $slot_index;
+        last if $slot_index =~ /^\d+$/;
+    }
+    ok($slot_index =~ /^\d+$/, 'a search request is pending on a slot');
+
+    my $parked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $parked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE wait_event = 'vamana-worker-promote-before-write';");
+        last if $parked ne '';
+    }
+    isnt($parked, '', 'the worker parks between reading PENDING and storing PROCESSING');
+
+    $ctl->query_safe("SELECT pg_cancel_backend($req_pid);");
+
+    my $status = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $status = $ctl->query(
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_index = $slot_index;");
+        chomp $status;
+        last if $status eq 'empty';
+    }
+    is($status, 'empty', 'the cancelled backend CASes its slot back to empty while the worker is still parked');
+
+    $ctl->query_safe(
+        "SELECT injection_points_wakeup('vamana-worker-promote-before-write');");
+    $ctl->query_safe(
+        "SELECT injection_points_detach('vamana-worker-promote-before-write');");
+
+    my $resurrected = 0;
+    for (1 .. 30) {
+        usleep(100_000);
+        my $st = $ctl->query(
+            "SELECT slot_status FROM pg_stat_vamana_worker_slot "
+          . "WHERE slot_index = $slot_index;");
+        chomp $st;
+        if ($st eq 'processing' || $st eq 'done') {
+            $resurrected = 1;
+            last;
+        }
+    }
+    is($resurrected, 0,
+        'the worker does not resurrect a slot the backend already abandoned');
+
+    $req->quit;
+    $ctl->quit;
+    $node->stop;
+}
+
+# ===========================================================================
+# The write path's metadata persist takes a non-blocking lock attempt, so DDL
+# holding a conflicting lock on the index makes it skip and retry instead of
+# blocking the whole database's worker (and its heartbeat).
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 2
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_write_lock_stall');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.worker_timeout_ms = 60000");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 30);
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE lock_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO lock_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+        CREATE INDEX lock_idx ON lock_tbl USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker_db($node, 'postgres', 30);
+
+    my $ctl = $node->background_psql('postgres');
+    $ctl->query_safe(
+        "SELECT injection_points_attach('vamana-persist-meta-before-lock', 'wait');");
+
+    my $inserter = $node->background_psql('postgres');
+    $inserter->query_until(qr//,
+        "INSERT INTO lock_tbl (val) VALUES (ARRAY[$array_sql]::vector);\n");
+
+    my $parked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $parked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE wait_event = 'vamana-persist-meta-before-lock';");
+        last if $parked ne '';
+    }
+    isnt($parked, '', 'the worker parks just before opening the index, holding no lock yet');
+
+    my $locker = $node->background_psql('postgres');
+    $locker->query_safe("BEGIN;");
+    $locker->query_safe("ALTER INDEX lock_idx SET (use_search_history = false);");
+
+    my $heartbeat_before = $node->safe_psql('postgres',
+        "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
+      . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+    chomp $heartbeat_before;
+
+    $ctl->query_safe(
+        "SELECT injection_points_wakeup('vamana-persist-meta-before-lock');");
+    $ctl->query_safe(
+        "SELECT injection_points_detach('vamana-persist-meta-before-lock');");
+
+    my $heartbeat_stalled = 1;
+    for (1 .. 3) {
+        usleep(1_000_000);
+        my $hb = $node->safe_psql('postgres',
+            "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
+          . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+        chomp $hb;
+        if ($hb ne $heartbeat_before) {
+            $heartbeat_stalled = 0;
+            last;
+        }
+    }
+    is($heartbeat_stalled, 0,
+        'the database worker keeps heartbeating while it waits for the index lock');
+
+    $locker->query_safe("COMMIT;");
+    $locker->quit;
+    eval { $inserter->quit };
+    $ctl->quit;
     $node->stop;
 }
 

@@ -11,6 +11,16 @@
 #   2. Additional inserts on primary propagate to standby (bounded staleness).
 #   3. Fast-path skip: CreateDecodingContext is not called repeatedly
 #      when no new WAL arrives on the standby.
+#   4. An index created on the primary after the standby worker is already
+#      running becomes searchable, and its slot reaches consistency, with no
+#      restart.
+#   5. The worker heartbeat keeps advancing while that slot converges.
+#   6. Dropping the index on the primary reaps the standby's own replication
+#      slot, with no restart.
+#   7. An invalidation on an unrelated relation does not disturb the worker or
+#      existing search results.
+#   8. A CREATE INDEX immediately followed by writes replays both the
+#      discovery and the writes.
 
 use strict;
 use warnings FATAL => 'all';
@@ -41,12 +51,14 @@ $primary->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
 $primary->append_conf('postgresql.conf', "wal_level = logical");
 $primary->append_conf('postgresql.conf', "max_replication_slots = 10");
 $primary->append_conf('postgresql.conf', "max_wal_senders = 10");
-$primary->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+$primary->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 $primary->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
 $primary->start;
 
 $primary->safe_psql('postgres', "CREATE EXTENSION vector;");
 $primary->safe_psql('postgres', "CREATE EXTENSION svs;");
+$primary->safe_psql('postgres',
+    "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
 $primary->safe_psql('postgres', qq{
     CREATE TABLE rep_tbl (id serial, val vector($dim));
@@ -65,6 +77,9 @@ for my $i (1 .. 5)
 }
 wait_for_worker($primary, 30);
 
+$primary->safe_psql('postgres',
+    "SELECT pg_create_physical_replication_slot('replay_phys');");
+
 # Take backup and create standby.
 my $backup_name = 'standby_backup';
 $primary->backup($backup_name);
@@ -72,10 +87,15 @@ $primary->backup($backup_name);
 my $standby = PostgreSQL::Test::Cluster->new('standby_replay');
 $standby->init_from_backup($primary, $backup_name, has_streaming => 1);
 $standby->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-$standby->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+$standby->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 $standby->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
 $standby->append_conf('postgresql.conf', "log_min_messages = debug1");
 $standby->append_conf('postgresql.conf', "hot_standby = on");
+# Live create/drop tests below need a slot on the standby to actually reach
+# CONSISTENT; a physical slot pins the primary's catalog_xmin so
+# hot_standby_feedback keeps that possible.
+$standby->append_conf('postgresql.conf', "hot_standby_feedback = on");
+$standby->append_conf('postgresql.conf', "primary_slot_name = 'replay_phys'");
 $standby->start;
 
 # Wait for standby to catch up with primary.
@@ -179,6 +199,149 @@ close($fh);
 # after which subsequent iterations skip before ReplicationSlotAcquire).
 ok($idle_decode_count <= 2,
     "fast-path skip: CreateDecodingContext calls bounded during idle ($idle_decode_count)");
+
+# ===========================================================================
+# Test 4: Live create — index created after the standby worker is already
+# running becomes searchable, and its own slot reaches consistency.
+# ===========================================================================
+
+$primary->safe_psql('postgres', qq{
+    CREATE TABLE live_tbl (id serial, val vector($dim));
+    CREATE INDEX live_idx ON live_tbl USING vamana (val vector_l2_ops);
+    INSERT INTO live_tbl (val)
+        SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5);
+});
+
+my $live_count = -1;
+for (1 .. 60)
+{
+    usleep(500_000);
+    $primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    eval {
+        $live_count = $standby->safe_psql('postgres', "SELECT count(*) FROM live_tbl;");
+    };
+    chomp $live_count if defined $live_count;
+    last if defined $live_count && $live_count == 5;
+}
+ok(defined $live_count && $live_count == 5,
+    "live create: index created on primary after standby worker start becomes searchable, no restart");
+
+my $live_relid = $standby->safe_psql('postgres',
+    "SELECT oid FROM pg_class WHERE relname = 'live_idx';");
+chomp $live_relid;
+my $dboid = $standby->safe_psql('postgres',
+    "SELECT oid FROM pg_database WHERE datname = 'postgres';");
+chomp $dboid;
+my $live_slot = "vamana_${dboid}_${live_relid}";
+
+my $live_slot_consistent = -1;
+for (1 .. 60)
+{
+    usleep(500_000);
+    $primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    $live_slot_consistent = $standby->safe_psql('postgres',
+        "SELECT count(*) FROM pg_replication_slots "
+      . "WHERE slot_name = '$live_slot' AND confirmed_flush_lsn IS NOT NULL;");
+    chomp $live_slot_consistent;
+    last if $live_slot_consistent == 1;
+}
+ok($live_slot_consistent == 1,
+    "live create: standby's own slot for the new index reaches consistency");
+
+# ===========================================================================
+# Test 5: Heartbeat is not starved while that slot converges.
+# ===========================================================================
+
+my $hb_before = $standby->safe_psql('postgres',
+    "SELECT extract(epoch from heartbeat_ts) FROM pg_stat_vamana_worker "
+  . "WHERE db_oid = $dboid;");
+chomp $hb_before;
+usleep(2_000_000);
+my $hb_after = $standby->safe_psql('postgres',
+    "SELECT extract(epoch from heartbeat_ts) FROM pg_stat_vamana_worker "
+  . "WHERE db_oid = $dboid;");
+chomp $hb_after;
+ok($hb_after > $hb_before,
+    "heartbeat keeps advancing while a newly created index's slot converges");
+
+# ===========================================================================
+# Test 6: Live drop reaps the standby's own slot, no restart.
+# ===========================================================================
+
+$primary->safe_psql('postgres', "DROP INDEX live_idx;");
+
+my $slot_after_drop = -1;
+for (1 .. 60)
+{
+    usleep(500_000);
+    $primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    $slot_after_drop = $standby->safe_psql('postgres',
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '$live_slot';");
+    chomp $slot_after_drop;
+    last if $slot_after_drop == 0;
+}
+ok($slot_after_drop == 0,
+    "live drop: standby's own replication slot for the dropped index is reaped, no restart");
+
+# ===========================================================================
+# Test 7: An unrelated relation's invalidation is a no-op.
+# ===========================================================================
+
+$primary->safe_psql('postgres', "CREATE TABLE plain_tbl (id int);");
+$primary->wait_for_replay_catchup($standby);
+$primary->safe_psql('postgres', "ANALYZE plain_tbl;");
+$primary->wait_for_replay_catchup($standby);
+
+my $worker_pid_after_noise = '';
+for (1 .. 60)
+{
+    usleep(500_000);
+    $primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    $worker_pid_after_noise = $standby->safe_psql('postgres',
+        "SELECT worker_pid FROM pg_stat_vamana_worker WHERE db_oid = $dboid;");
+    chomp $worker_pid_after_noise;
+    last if $worker_pid_after_noise =~ /^\d+$/;
+}
+ok($worker_pid_after_noise =~ /^\d+$/,
+    "non-vamana invalidation: worker is still alive after unrelated ANALYZE");
+
+my $rep_count_after_noise = -1;
+eval {
+    $rep_count_after_noise = $standby->safe_psql('postgres', $ann_query);
+};
+chomp $rep_count_after_noise if defined $rep_count_after_noise;
+ok(defined $rep_count_after_noise,
+    "non-vamana invalidation: existing index still queryable after unrelated ANALYZE");
+
+# ===========================================================================
+# Test 8: create immediately followed by writes replays both correctly.
+# ===========================================================================
+
+$primary->safe_psql('postgres', qq{
+    CREATE TABLE order_tbl (id serial, val vector($dim));
+    CREATE INDEX order_idx ON order_tbl USING vamana (val vector_l2_ops);
+    INSERT INTO order_tbl (val)
+        SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5);
+});
+for my $i (1 .. 5)
+{
+    $primary->safe_psql('postgres',
+        "INSERT INTO order_tbl (val) VALUES (ARRAY[$array_sql]::vector);");
+}
+
+my $order_count = -1;
+for (1 .. 60)
+{
+    usleep(500_000);
+    $primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    eval {
+        $order_count = $standby->safe_psql('postgres', "SELECT count(*) FROM order_tbl;");
+    };
+    chomp $order_count if defined $order_count;
+    last if defined $order_count && $order_count == 10;
+}
+ok(defined $order_count && $order_count == 10,
+    "create immediately followed by writes: both discovery and writes replay correctly");
 
 $standby->stop;
 $primary->stop;

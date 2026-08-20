@@ -18,6 +18,7 @@
 
 #include "access/genam.h"
 #include "commands/vacuum.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
 
@@ -79,7 +80,7 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	tidMapping = palloc0((Size) tidMappingCapacity * sizeof(ItemPointerData));
 
-	if (!VamanaLoadTidMap(relid, tidMapping, tidMappingCapacity))
+	if (!VamanaLoadTidMap(MyDatabaseId, relid, tidMapping, tidMappingCapacity))
 	{
 		pfree(tidMapping);
 		ereport(LOG,

@@ -103,6 +103,8 @@ extern int	vamana_checkpoint_min_ops;
 extern int	vamana_max_slot_wal_size_mb;
 extern int	vamana_checkpoint_operations;
 extern int	vamana_checkpoint_interval;
+extern int	vamana_shutdown_drain_budget_ms;
+extern int	vamana_worker_stop_timeout_ms;
 
 /* Vamana index options */
 typedef struct VamanaOptions 
@@ -299,13 +301,13 @@ bool		vamanavalidate(Oid opclassoid);
 SVSDistanceType VamanaGetDistanceMetric(Relation index);
 
 /* On-disk serialization helpers */
-void		VamanaGetIndexSavePath(Oid relid, char *buf, size_t bufsz);
-void		VamanaEnsureSaveDir(Oid relid);
-void		VamanaDeleteSaveDir(Oid relid);
+void		VamanaGetIndexSavePath(Oid dboid, Oid relid, char *buf, size_t bufsz);
+void		VamanaEnsureSaveDir(Oid dboid, Oid relid);
+void		VamanaDeleteSaveDir(Oid dboid, Oid relid);
 void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum,
 								  const VamanaIndexCache *meta);
-bool		VamanaLoadTidMap(Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
-void		VamanaSaveTidMapAtomically(Oid relid, ItemPointerData *tidMapping, int count);
+bool		VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
+void		VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count);
 void		VamanaInstallObjectAccessHook(void);
 
 /* Dynamic index support */

@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "vamana.h"
+#include "vamanalauncher.h"
 #include "vamanaworker.h"
 
 #include "access/amapi.h"
@@ -42,11 +43,13 @@ int			vamana_search_window_size = VAMANA_DEFAULT_SEARCH_WINDOW;
 int			vamana_search_num_threads = 0;
 int			vamana_compact_threshold_pct = 10;
 
+int			max_vamana_databases = 8;
 int			vamana_worker_timeout_ms = 5000;
 int			vamana_worker_startup_timeout_ms = 60000;
 int			vamana_worker_restart_time = 5;
+int			vamana_worker_restart_backoff = 1000;
 int			vamana_max_batch_size = 0;
-char	   *vamana_worker_database = NULL;
+char	   *vamana_launcher_database = NULL;
 
 int			vamana_checkpoint_debounce_window = 300;
 int			vamana_checkpoint_max_interval = 3600;
@@ -54,6 +57,8 @@ int			vamana_checkpoint_min_ops = 10000;
 int			vamana_max_slot_wal_size_mb = 10240;	/* 10 GB */
 int			vamana_checkpoint_operations = -1;		/* -1 = off (simple count-based trigger) */
 int			vamana_checkpoint_interval = -1;		/* -1 = off (simple time-based trigger) */
+int			vamana_shutdown_drain_budget_ms = 30000;
+int			vamana_worker_stop_timeout_ms = 30000;
 
 relopt_kind vamana_relopt_kind;
 
@@ -123,17 +128,15 @@ VamanaInit(void)
 		GucContext	worker_startup_ctx = process_shared_preload_libraries_in_progress
 			? PGC_POSTMASTER : PGC_SIGHUP;
 
-		DefineCustomStringVariable("svs.worker_database",
-								   "Database the background worker connects to for catalog access",
-								   "Must be the database where the vector extension and Vamana indexes "
-								   "are created.  Defaults to \"postgres\"; set this if your indexes "
-								   "live in a different database or the worker will not find them."
-								   " Changing this requires a server restart to take effect.",
-								   &vamana_worker_database,
-								   "postgres",
-								   worker_startup_ctx,
-								   0,
-								   NULL, NULL, NULL);
+		DefineCustomIntVariable("svs.max_databases",
+								"Maximum number of databases that can run a vamana background worker",
+								"Sizes the per-database control-block array in shared memory. "
+								"Requires a server restart to take effect.",
+								&max_vamana_databases,
+								8, 1, 128,
+								worker_startup_ctx,
+								0,
+								NULL, NULL, NULL);
 
 		DefineCustomIntVariable("svs.worker_restart_time",
 								"Seconds to wait before restarting the background worker after a crash",
@@ -144,7 +147,30 @@ VamanaInit(void)
 								worker_startup_ctx,
 								0,
 								NULL, NULL, NULL);
+
+		DefineCustomStringVariable("svs.launcher_database",
+								   "Database the launcher connects to in order to read vamana_databases",
+								   "The launcher reads its list of enabled databases from the "
+								   "vamana_databases catalog table in this database.  Set this once at "
+								   "install time; changing it requires a server restart to take effect.",
+								   &vamana_launcher_database,
+								   "postgres",
+								   worker_startup_ctx,
+								   0,
+								   NULL, NULL, NULL);
 	}
+
+	DefineCustomIntVariable("svs.worker_restart_backoff",
+							"Base milliseconds the launcher waits before respawning a crashed per-database worker",
+							"Applied with escalating backoff on repeated crashes of the same "
+							"database's worker.  Read only by the launcher's crash-restart logic; "
+							"distinct from svs.worker_restart_time, which governs the launcher's own "
+							"restart by the postmaster.",
+							&vamana_worker_restart_backoff,
+							1000, 100, 300000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
 
 	DefineCustomIntVariable("svs.worker_timeout_ms",
 							"Milliseconds to wait for background worker IPC response",
@@ -252,6 +278,28 @@ VamanaInit(void)
 							GUC_UNIT_S,
 							NULL, NULL, NULL);
 
+	DefineCustomIntVariable("svs.shutdown_drain_budget_ms",
+							"Time budget for the worker's shutdown drain, checked between indexes",
+							"Must stay under the server's shutdown escalation window. A single "
+							"in-progress checkpoint is not preemptible, so the real bound is "
+							"this budget plus one checkpoint's worst case.",
+							&vamana_shutdown_drain_budget_ms,
+							30000, 0, 600000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.worker_stop_timeout_ms",
+							"Timeout for waiting for a restarting worker to exit",
+							"The launcher waits this long for a terminated worker handle to report "
+							"BGWH_STOPPED before giving up. Does not force-kill; if a worker does not "
+							"stop within this window, the restart stays pending until it exits naturally.",
+							&vamana_worker_stop_timeout_ms,
+							30000, 0, 600000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("svs");
 
 	/*
@@ -261,7 +309,7 @@ VamanaInit(void)
 	if (process_shared_preload_libraries_in_progress)
 	{
 		VamanaWorkerInstallHooks();
-		VamanaWorkerRegister();
+		VamanaLauncherRegister();
 	}
 
 	/*

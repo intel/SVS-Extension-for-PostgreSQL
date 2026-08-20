@@ -1,7 +1,37 @@
 -- Copyright (C) 2026 Intel Corporation
 -- SPDX-License-Identifier: PostgreSQL
 
+-- Enable this database and wait for its worker before any index work, so this
+-- file runs standalone.  Enrollment reserves the slot synchronously (the gate
+-- then passes), but the worker spawns asynchronously; the first INSERT would
+-- otherwise race its cold start and time out.  Idempotent and a no-op in the
+-- full suite, where vamana_databases.sql (ordered first) has already warmed it.
+INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true)
+	ON CONFLICT (datname) DO NOTHING;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
 SET enable_seqscan = off;
+
+-- Empty-table build: CREATE INDEX on a table with no rows defers the dynamic
+-- index to the first INSERT (VamanaWorkerBuildFirstInsert).  Every row entered
+-- afterward must be searchable without a rebuild.
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+
+INSERT INTO t (val) VALUES ('[0,0,0]');
+INSERT INTO t (val) VALUES ('[1,1,1]'), ('[2,2,2]');
+SELECT * FROM t ORDER BY val <-> '[2,2,2]', id LIMIT 3;
+
+DROP TABLE t;
 
 -- Incremental INSERT: new rows are searchable without REINDEX or rebuild.
 -- After CREATE INDEX the cache is warm and dynamic, so INSERT uses SVSAddPoints
@@ -158,6 +188,28 @@ COMMIT;
 SELECT * FROM t ORDER BY val <-> '[9,9,9]', id LIMIT 3;
 DROP TABLE t;
 
+-- Nested SAVEPOINT: releasing an inner savepoint into its parent, then
+-- rolling back that parent, must undo the inner savepoint's insert too.
+-- svs.search_window_size overrides the index's search_window_size reloption,
+-- so it must be set here to actually cap the candidate window at 10: with a
+-- leaked graph entry, the closest 10 of 11 candidates displace the farthest
+-- real row, and that row's heap tuple was never invisible, so it should have
+-- been visible; losing it drops the visible result count below 10.
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) SELECT ARRAY[i, i, i]::vector(3) FROM generate_series(1, 10) AS i;
+CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (search_window_size = 10);
+BEGIN;
+SAVEPOINT outer_sp;
+SAVEPOINT inner_sp;
+INSERT INTO t (val) VALUES ('[0,0,0]');
+RELEASE SAVEPOINT inner_sp;
+ROLLBACK TO SAVEPOINT outer_sp;
+COMMIT;
+SET svs.search_window_size = 10;
+SELECT count(*) FROM (SELECT id FROM t ORDER BY val <-> '[0,0,0]' LIMIT 10) sub;
+RESET svs.search_window_size;
+DROP TABLE t;
+
 -- -------------------------------------------------------------------------
 -- Test A: Large DELETE batch (>1000 rows) exercises VAMANA_MAX_DELETE_IDS
 -- batching loop in vamanabulkdelete.
@@ -193,6 +245,55 @@ ROLLBACK;
 -- Only the original 3 rows should be searchable
 SELECT count(*) FROM (SELECT * FROM t_undo ORDER BY val <-> '[0,0,0]' LIMIT 2000) sub;
 DROP TABLE t_undo;
+
+-- -------------------------------------------------------------------------
+-- Test C: ROLLBACK TO SAVEPOINT skips the consolidate a full abort runs, so a
+-- deleted entry point goes unrepaired. Insert a large batch inside the
+-- savepoint to raise the odds one of them is the entry point.
+-- -------------------------------------------------------------------------
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) SELECT ARRAY[random(), random(), random()]::vector(3)
+	FROM generate_series(1, 30);
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+BEGIN;
+SAVEPOINT sp_entry;
+INSERT INTO t (val) SELECT ARRAY[random(), random(), random()]::vector(3)
+	FROM generate_series(1, 200);
+ROLLBACK TO SAVEPOINT sp_entry;
+COMMIT;
+-- Reports a fixed NOTICE instead of the search's own (library-internal) error text.
+DO $$
+DECLARE
+	probe vector(3);
+BEGIN
+	FOR probe IN
+		SELECT * FROM (VALUES
+			('[0,0,0]'::vector(3)), ('[1,1,1]'::vector(3)), ('[1,0,0]'::vector(3)),
+			('[0,1,0]'::vector(3)), ('[0,0,1]'::vector(3))
+		) AS probes (v)
+	LOOP
+		BEGIN
+			PERFORM id FROM t ORDER BY val <-> probe LIMIT 5;
+			RAISE NOTICE 'search after ROLLBACK TO SAVEPOINT: succeeded';
+		EXCEPTION WHEN OTHERS THEN
+			RAISE NOTICE 'search after ROLLBACK TO SAVEPOINT: raised an error';
+		END;
+	END LOOP;
+END $$;
+-- A crash caused by the above is this file's own problem to clean up after,
+-- so later files sharing this server don't inherit a worker mid-restart.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+SELECT count(*) FROM (SELECT id FROM t ORDER BY val <-> '[0,0,0]' LIMIT 100) sub;
+DROP TABLE t;
 
 -- -------------------------------------------------------------------------
 -- TRUNCATE must not leave stale cache — post-TRUNCATE query returns empty.

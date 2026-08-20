@@ -19,7 +19,7 @@ A PostgreSQL extension that adds the **Vamana** approximate nearest neighbor (AN
 
 | Dependency | Version |
 |---|---|
-| PostgreSQL | 13+ |
+| PostgreSQL | 17+ |
 | pgvector extension | latest |
 | Intel SVS C API (`libsvs_c_api.so`) | see [build guide](docs/build_guide/README.md) |
 | GCC | 11+ |
@@ -62,7 +62,7 @@ For index options, compression tuning, session parameters, the background worker
 
 ## Architecture
 
-The extension implements a PostgreSQL index access method backed by a background worker that owns the SVS graph in shared memory, communicating with backends over IPC. Writes are synchronous for visibility and use an undo log plus WAL/replication-slot replay for crash recovery and durability. See the [architecture doc](docs/dev/ARCHITECTURE.md) for the full design, including ACID compliance, checkpointing, and GUC reference.
+The extension implements a PostgreSQL index access method backed by a per-database background worker that owns the SVS graph in its own process-private memory, communicating with backends over IPC. Writes are synchronous for visibility and use an undo log plus WAL/replication-slot replay for crash recovery and durability. See the [architecture doc](docs/dev/ARCHITECTURE.md) for the full design, including ACID compliance, checkpointing, and GUC reference.
 
 ## Running Tests
 

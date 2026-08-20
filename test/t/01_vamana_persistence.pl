@@ -27,10 +27,15 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    # The 100k-row rebuild later in this block can take longer than the
+    # default 5000ms on a loaded machine; the backend's wait must outlast it.
+    $node->append_conf('postgresql.conf', "svs.worker_timeout_ms = 30000");
     $node->start;
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE vp_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -45,7 +50,7 @@ use VamanaTestUtils qw(:all);
     chomp $index_oid;
 
     my $parent_dir = $node->data_dir . "/vamana_indexes";
-    my $index_dir  = "$parent_dir/$index_oid";
+    my $index_dir  = vamana_save_dir($node, 'postgres', $index_oid);
     ok(-d $index_dir, "on-disk index directory exists after CREATE INDEX");
 
     my @initial_files = glob("$index_dir/*");
@@ -142,12 +147,19 @@ use VamanaTestUtils qw(:all);
         "SELECT oid FROM pg_class WHERE relname = 'vp_progress_idx';");
     chomp $progress_index_oid;
     my $progress_index_dir =
-        $node->data_dir . "/vamana_indexes/$progress_index_oid";
+        vamana_save_dir($node, 'postgres', $progress_index_oid);
 
     $node->stop;
     remove_tree($progress_index_dir);
     my $log_pos_before_rebuild = length($node->log_content());
     $node->start;
+
+    # Demand-driven load: the rebuild fires only when a backend queries the
+    # index.  Issue the query, then read the progress LOG it produced.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM vp_progress_tbl ORDER BY val <-> '[0]' LIMIT 1;
+    ));
 
     my $rebuild_log = '';
     for (1 .. 30) {
@@ -177,7 +189,7 @@ use VamanaTestUtils qw(:all);
         chomp $oid;
         $oid;
     };
-    my $index_dir2 = $node->data_dir . "/vamana_indexes/$index_oid2";
+    my $index_dir2 = vamana_save_dir($node, 'postgres', $index_oid2);
     ok(-d $index_dir2,
         "on-disk directory exists for fresh index before DROP TABLE ($index_dir2)");
 
@@ -207,6 +219,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     # Deferred save after INSERT
     {
@@ -221,7 +235,7 @@ use VamanaTestUtils qw(:all);
         my $index_oid = $node->safe_psql("postgres",
             "SELECT oid FROM pg_class WHERE relname = 'ds_idx';");
         chomp $index_oid;
-        my $index_dir = "$pgdata/vamana_indexes/$index_oid";
+        my $index_dir = vamana_save_dir($node, 'postgres', $index_oid);
         my $log_pos   = length($node->log_content());
 
         $node->safe_psql("postgres", qq(
@@ -268,7 +282,7 @@ use VamanaTestUtils qw(:all);
         my $index_oid = $node->safe_psql("postgres",
             "SELECT oid FROM pg_class WHERE relname = 'vc_idx';");
         chomp $index_oid;
-        my $index_dir   = "$pgdata/vamana_indexes/$index_oid";
+        my $index_dir   = vamana_save_dir($node, 'postgres', $index_oid);
         my $save_parent = "$pgdata/vamana_indexes";
 
         my $bg = $node->background_psql("postgres");
@@ -313,6 +327,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE bi_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -353,7 +369,7 @@ use VamanaTestUtils qw(:all);
     my $index_oid = $node->safe_psql("postgres",
         "SELECT oid FROM pg_class WHERE relname = 'bi_idx';");
     chomp $index_oid;
-    ok(-d "$save_parent/$index_oid",
+    ok(-d vamana_save_dir($node, 'postgres', $index_oid),
         'CREATE INDEX succeeds and on-disk directory exists after disk is writable');
 
     $node->safe_psql("postgres", "DROP TABLE bi_tbl;");
@@ -379,6 +395,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE rb_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -392,7 +410,7 @@ use VamanaTestUtils qw(:all);
         "SELECT oid FROM pg_class WHERE relname = 'rb_idx';");
     chomp $index_oid;
     my $save_parent = "$pgdata/vamana_indexes";
-    my $index_dir   = "$save_parent/$index_oid";
+    my $index_dir   = vamana_save_dir($node, 'postgres', $index_oid);
 
     # Remove the on-disk copy to force VamanaRebuildFromTable on next BGW load.
     remove_tree($index_dir) if -d $index_dir;
@@ -402,12 +420,28 @@ use VamanaTestUtils qw(:all);
 
     my $log_pos = length($node->log_content());
 
-    # Restart to trigger the rebuild path in VamanaWorkerGetOrLoadIndex.
+    # Restart to evict the cache; the rebuild fires on the first query.
     $node->restart;
-
-    # Wait for the BGW to come up and attempt the load/rebuild.
     wait_for_worker($node);
-    sleep(2);
+
+    # Query while the save dir is still locked so the post-rebuild save fails.
+    # An ORDER BY ... LIMIT is required: a distance predicate is not an
+    # indexable qual, so it would seqscan and never reach the worker.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM rb_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    my $save_failed = 0;
+    for (1 .. 20) {
+        if (substr($node->log_content(), $log_pos) =~
+            /save after rebuild failed, will retry; index durability degraded/)
+        {
+            $save_failed = 1;
+            last;
+        }
+        usleep(500_000);
+    }
 
     chmod(0755, $save_parent) or die "chmod 0755 $save_parent: $!";
 
@@ -456,6 +490,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE st_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -502,6 +538,12 @@ use VamanaTestUtils qw(:all);
     my $log_pos_before_test4 = length($node->log_content());
     $node->restart;
 
+    # Demand-driven load: query so SVSLoadIndex runs and logs its thread count.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM st_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
     my $log_test4 = '';
     for (1 .. 20) {
         $log_test4 = substr($node->log_content(), $log_pos_before_test4);
@@ -535,6 +577,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql("postgres", qq(
         CREATE TABLE lv_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -548,7 +592,7 @@ use VamanaTestUtils qw(:all);
     my $index_oid = $node->safe_psql("postgres",
         "SELECT oid FROM pg_class WHERE relname = 'lv_idx';");
     chomp $index_oid;
-    my $index_dir = $node->data_dir . "/vamana_indexes/$index_oid";
+    my $index_dir = vamana_save_dir($node, 'postgres', $index_oid);
 
     ok(-d $index_dir, "on-disk index directory exists after CREATE INDEX with LeanVec");
     my @initial_files = glob("$index_dir/*");
@@ -594,9 +638,19 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($after_insert, '', 'LeanVec query after INSERT returns results');
 
+    # Remove the on-disk index while the server is stopped: a running-server
+    # delete would be undone by the shutdown drain re-checkpointing the live
+    # index, so the restart would load from disk instead of rebuilding.
+    $node->stop;
     remove_tree($index_dir);
     my $log_pos_before_second_restart = length($node->log_content());
-    $node->restart;
+    $node->start;
+
+    # Demand-driven rebuild: query so the BGW scans the table and re-saves.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
 
     my $rebuild_wait_log = '';
     for (1 .. 20) {
@@ -661,6 +715,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     # Create LeanVec index without specifying leanvec_dims — defaults to -1
     $node->safe_psql("postgres", qq(
@@ -675,7 +731,7 @@ use VamanaTestUtils qw(:all);
     my $index_oid = $node->safe_psql("postgres",
         "SELECT oid FROM pg_class WHERE relname = 'lv_default_idx';");
     chomp $index_oid;
-    my $index_dir = $node->data_dir . "/vamana_indexes/$index_oid";
+    my $index_dir = vamana_save_dir($node, 'postgres', $index_oid);
 
     my $baseline = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
@@ -683,10 +739,19 @@ use VamanaTestUtils qw(:all);
     ));
     isnt($baseline, '', 'LeanVec default-dims: initial query returns results');
 
-    # Force VamanaRebuildFromTable by removing the on-disk index before restart
+    # Force VamanaRebuildFromTable by removing the on-disk index while the
+    # server is stopped; a running-server delete would be undone by the
+    # shutdown drain re-checkpointing the live index.
+    $node->stop;
     remove_tree($index_dir);
     my $log_pos = length($node->log_content());
-    $node->restart;
+    $node->start;
+
+    # Demand-driven rebuild: query so the BGW scans the table and re-saves.
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_default_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
 
     # Wait for BGW to complete rebuild
     my $rebuild_log = '';
@@ -727,7 +792,7 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
-    $node->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
     $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
@@ -735,6 +800,8 @@ use VamanaTestUtils qw(:all);
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE hdr_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -747,7 +814,7 @@ use VamanaTestUtils qw(:all);
     my $ioid = $node->safe_psql('postgres',
         "SELECT oid FROM pg_class WHERE relname = 'hdr_idx';");
     chomp $ioid;
-    my $tidmap = $node->data_dir . "/vamana_indexes/$ioid/tidmap.bin";
+    my $tidmap = vamana_save_dir($node, 'postgres', $ioid) . "/tidmap.bin";
 
     # One more insert forces a checkpoint (min_ops=1) that persists tidmap.bin.
     $node->safe_psql('postgres',
@@ -769,12 +836,8 @@ use VamanaTestUtils qw(:all);
     $node->start;
     wait_for_worker($node, 30);
 
-    my $log = substr($node->log_content(), $log_pos);
-    like($log, qr/vamana index $ioid: TID map is malformed or larger than expected/,
-        'corrupt tidmap.bin header rejected on load');
-    like($log, qr/rebuilding vamana index from table data/,
-        'index rebuilt from heap after rejection');
-
+    # Demand-driven load: the corrupt-TID-map rejection and heap rebuild fire
+    # only when a backend queries the index.
     my $count = $node->safe_psql('postgres', qq{
         SET enable_seqscan = off;
         SELECT count(*) FROM (
@@ -782,7 +845,114 @@ use VamanaTestUtils qw(:all);
         ) s;
     });
     chomp $count;
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/vamana index $ioid: TID map is malformed or larger than expected/,
+        'corrupt tidmap.bin header rejected on load');
+    like($log, qr/rebuilding vamana index from table data/,
+        'index rebuilt from heap after rejection');
+
     is($count, 51, 'all 51 rows searchable after rebuild');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Save directories are namespaced by database — pg_class OIDs are unique per
+# database, not per cluster, so CREATE DATABASE ... TEMPLATE can duplicate a
+# relid across databases. A drop in one database must not touch another
+# database's save directory at the same relid.
+# ===========================================================================
+{
+    my $LAUNCHER_DB = 'postgres';
+    my $SRC_DB      = 'src_db';
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_savedir_ns');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = '$LAUNCHER_DB'");
+    $node->append_conf('postgresql.conf', "svs.max_databases = 4");
+    $node->start;
+
+    $node->safe_psql($LAUNCHER_DB, "CREATE EXTENSION vector;");
+    $node->safe_psql($LAUNCHER_DB, "CREATE EXTENSION svs;");
+    $node->safe_psql($LAUNCHER_DB, "CREATE DATABASE $SRC_DB;");
+    $node->safe_psql($SRC_DB, "CREATE EXTENSION vector;");
+    $node->safe_psql($SRC_DB, "CREATE EXTENSION svs;");
+
+    $node->safe_psql($LAUNCHER_DB,
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('$SRC_DB', true);");
+    wait_for_worker_db($node, $SRC_DB, 30);
+
+    $node->safe_psql($SRC_DB, qq(
+        CREATE TABLE src_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO src_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 200) i;
+        CREATE INDEX src_idx ON src_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    # Force the on-disk save so a directory actually exists to collide over.
+    $node->safe_psql($SRC_DB, qq(
+        SET enable_seqscan = off;
+        SELECT id FROM src_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    my $relid = $node->safe_psql($SRC_DB,
+        "SELECT oid FROM pg_class WHERE relname = 'src_idx';");
+    chomp $relid;
+
+    my $save_dir = vamana_save_dir($node, $SRC_DB, $relid);
+    ok(-d $save_dir, "$SRC_DB: src_idx save directory exists before the clone");
+
+    # CREATE DATABASE ... TEMPLATE requires the source to have no other active
+    # connections, including the vamana worker's own backend. Disable src_db
+    # and wait for its worker to drain and exit before cloning. The launcher's
+    # own persistent connection is to $LAUNCHER_DB, not $SRC_DB, so it does
+    # not block this.
+    $node->safe_psql($LAUNCHER_DB,
+        "UPDATE vamana_databases SET enabled = false WHERE datname = '$SRC_DB';");
+    for (1 .. 100) {
+        usleep(100_000);
+        my $count = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' AND datname = '$SRC_DB';");
+        chomp $count;
+        last if $count eq '0';
+    }
+
+    # Clone: pg_class OIDs are preserved by TEMPLATE, so clone_db's src_idx has
+    # the identical relid as src_db's src_idx.
+    $node->safe_psql($LAUNCHER_DB, "CREATE DATABASE clone_db TEMPLATE $SRC_DB;");
+
+    my $clone_relid = $node->safe_psql('clone_db',
+        "SELECT oid FROM pg_class WHERE relname = 'src_idx';");
+    chomp $clone_relid;
+    is($clone_relid, $relid,
+        'clone_db src_idx has the same relid as src_db src_idx (collision set up)');
+
+    # Re-enable src_db so its index is live again.
+    $node->safe_psql($LAUNCHER_DB,
+        "UPDATE vamana_databases SET enabled = true WHERE datname = '$SRC_DB';");
+    wait_for_worker_db($node, $SRC_DB, 30);
+
+    # Drop the index in the unrelated clone. clone_db was never enabled in
+    # vamana_databases, so this exercises the object-access hook with no
+    # worker slot for clone_db at all.
+    $node->safe_psql('clone_db', "DROP INDEX src_idx;");
+
+    ok(-d $save_dir,
+        "dropping the clone's same-relid index does not delete ${SRC_DB}'s save directory");
+
+    my $result = $node->safe_psql($SRC_DB, qq(
+        SET enable_seqscan = off;
+        SELECT id FROM src_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    isnt($result, '',
+        "$SRC_DB index still queryable after the unrelated clone_db DROP INDEX");
 
     $node->stop;
 }

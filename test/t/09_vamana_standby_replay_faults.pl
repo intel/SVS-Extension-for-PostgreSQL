@@ -26,6 +26,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
+use IPC::Run;
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -54,13 +55,15 @@ sub setup_primary_standby
 	$primary->append_conf('postgresql.conf', "wal_level = logical");
 	$primary->append_conf('postgresql.conf', "max_replication_slots = 10");
 	$primary->append_conf('postgresql.conf', "max_wal_senders = 10");
-	$primary->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+	$primary->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 	$primary->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
 	$primary->start;
 
 	$primary->safe_psql('postgres', "CREATE EXTENSION vector;");
 	$primary->safe_psql('postgres', "CREATE EXTENSION svs;");
 	$primary->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+	$primary->safe_psql('postgres',
+		"INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
 	$primary->safe_psql('postgres', qq{
 		CREATE TABLE rep_tbl (id serial, val vector($dim));
@@ -81,7 +84,7 @@ sub setup_primary_standby
 	my $standby = PostgreSQL::Test::Cluster->new("standby_$name");
 	$standby->init_from_backup($primary, $backup, has_streaming => 1);
 	$standby->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
-	$standby->append_conf('postgresql.conf', "svs.worker_database = 'postgres'");
+	$standby->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 	$standby->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 999999");
 	$standby->append_conf('postgresql.conf', "log_min_messages = debug1");
 	$standby->append_conf('postgresql.conf', "hot_standby = on");
@@ -112,6 +115,84 @@ sub standby_ann_count
 		last if defined $count && $count == $want;
 	}
 	return $count;
+}
+
+# Starts pg_recvlogical against $slot_name and blocks until active_pid is set
+# to something other than $excluded_pid.  Returns the IPC::Run handle; caller
+# must kill_kill it.
+sub hold_slot_externally
+{
+	my ($node, $slot_name, $excluded_pid) = @_;
+
+	my $handle = IPC::Run::start([
+		$node->installed_command('pg_recvlogical'),
+		'--dbname' => $node->connstr('postgres'),
+		'--slot'   => $slot_name,
+		'--file'   => '-',
+		'--start',
+	]);
+
+	$node->poll_query_until('postgres', qq{
+		SELECT active_pid IS NOT NULL AND active_pid <> $excluded_pid
+		FROM pg_replication_slots WHERE slot_name = '$slot_name';
+	}) or die "slot \"$slot_name\" never became externally active";
+
+	return $handle;
+}
+
+# True if $pattern never appears in $node's log, in the $seconds after $log_pos.
+sub log_stays_clean
+{
+	my ($node, $pattern, $log_pos, $seconds) = @_;
+	usleep($seconds * 1_000_000);
+	my $log = substr($node->log_content(), $log_pos);
+	return $log !~ $pattern;
+}
+
+# ===========================================================================
+# A busy slot is a reason to retry later, not a reason to rebuild the index
+#
+# A slot that is merely held by another process (e.g. a monitoring tool
+# briefly reading it) is not a decoding failure.  Replay must skip the pass
+# and retry once the slot frees up, not drop it and force a full rebuild the
+# way an actual unrecoverable decode error does above.
+# ===========================================================================
+{
+	my ($primary, $standby) = setup_primary_standby('busy', 5);
+
+	my $dboid = $standby->safe_psql('postgres',
+		"SELECT oid FROM pg_database WHERE datname = 'postgres';");
+	chomp $dboid;
+	my $indexoid = $standby->safe_psql('postgres',
+		"SELECT oid FROM pg_class WHERE relname = 'rep_idx';");
+	chomp $indexoid;
+	my $slot_name = "vamana_${dboid}_${indexoid}";
+
+	my $pid_before = wait_for_worker($standby, 30);
+	ok($pid_before =~ /^\d+$/, 'busy slot: standby worker running before its slot is contended');
+
+	my $held = hold_slot_externally($standby, $slot_name, $pid_before);
+
+	my $log_pos = -s $standby->logfile;
+
+	$primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+	$primary->safe_psql('postgres',
+		"INSERT INTO rep_tbl (val) VALUES (ARRAY[$array_sql]::vector);");
+	$primary->wait_for_replay_catchup($standby);
+
+	ok(log_stays_clean($standby, qr/vamana replay: unrecoverable decoding error/, $log_pos, 3),
+		'busy slot: not treated as an unrecoverable decoding error');
+
+	$held->kill_kill;
+
+	my $after = standby_ann_count($standby, 6);
+	is($after, 6, 'busy slot: once it frees up, the deferred row is applied on the next retry');
+
+	is(wait_for_worker($standby, 5), $pid_before,
+		'busy slot: the standby worker was never disturbed by the contention');
+
+	$standby->stop;
+	$primary->stop;
 }
 
 # ===========================================================================
@@ -309,6 +390,92 @@ sub standby_ann_count
 
 	$standby->stop;
 	$primary->stop;
+}
+
+# ===========================================================================
+# WAL budget exceeded on a primary: the valve fires there too, not only on
+# standby.  No standby, no injected fault — the worker stays healthy the
+# whole time; its own write-IPC path never decodes the slot, but the slot
+# still pins WAL until something checks it.
+# ===========================================================================
+{
+	my $node = PostgreSQL::Test::Cluster->new('vamana_primary_wal_valve');
+	$node->init;
+	$node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+	$node->append_conf('postgresql.conf', "wal_level = logical");
+	$node->append_conf('postgresql.conf', "max_replication_slots = 10");
+	$node->append_conf('postgresql.conf', "max_wal_senders = 10");
+	$node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+	$node->append_conf('postgresql.conf', "svs.max_slot_wal_size = 64");
+	$node->start;
+
+	$node->safe_psql('postgres', "CREATE EXTENSION vector;");
+	$node->safe_psql('postgres', "CREATE EXTENSION svs;");
+	$node->safe_psql('postgres',
+		"INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+	wait_for_worker($node, 30);
+
+	$node->safe_psql('postgres', qq{
+		CREATE TABLE valve_tbl (id serial PRIMARY KEY, val vector($dim));
+		INSERT INTO valve_tbl (val)
+			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 100) i;
+		CREATE INDEX valve_idx ON valve_tbl USING vamana (val vector_l2_ops);
+	});
+	my $worker_pid = wait_for_worker_db($node, 'postgres', 30);
+	ok($worker_pid =~ /^\d+$/,
+		"WAL budget exceeded (primary): worker running normally (pid=$worker_pid)");
+
+	my $log_pos = -s $node->logfile;
+	my $wal_before = $node->safe_psql('postgres', "SELECT pg_current_wal_lsn();");
+	chomp $wal_before;
+
+	$node->safe_psql('postgres', qq{
+		CREATE TABLE lag_filler (id int, pad text);
+		INSERT INTO lag_filler
+		SELECT g, repeat('x', 1024)
+		FROM generate_series(1, 80000) g;
+	});
+	$node->safe_psql('postgres', "CHECKPOINT;");
+
+	# Keep the indexed table itself active too, so this is unmistakably a
+	# live, working primary, not a stalled one.
+	$node->safe_psql('postgres', qq{
+		INSERT INTO valve_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+	});
+
+	# Measured against pg_current_wal_lsn() rather than the slot's
+	# restart_lsn, since a working valve may have already dropped that slot.
+	my $wal_generated = $node->safe_psql('postgres',
+		"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '$wal_before');");
+	chomp $wal_generated;
+	ok($wal_generated > 64 * 1024 * 1024,
+		"WAL budget exceeded (primary): generated WAL ($wal_generated bytes) exceeds svs.max_slot_wal_size (64 MB)");
+
+	my $fired = 0;
+	for (1 .. 60)
+	{
+		my $log = substr($node->log_content(), $log_pos);
+		if ($log =~ /exceeds max_slot_wal_size.*rebuilding from heap/)
+		{
+			$fired = 1;
+			last;
+		}
+		usleep(500_000);
+	}
+	ok($fired,
+		'WAL budget exceeded (primary): slot past WAL budget triggers rebuild from heap');
+
+	my $count = $node->safe_psql('postgres', qq{
+		SET enable_seqscan = off;
+		SELECT count(*) FROM (
+			SELECT id FROM valve_tbl ORDER BY val <-> ARRAY[$array_sql]::vector LIMIT 200
+		) sub;
+	});
+	chomp $count;
+	is($count, '101',
+		'WAL budget exceeded (primary): index still answers correctly for all rows after the valve acts');
+
+	$node->stop;
 }
 
 done_testing();

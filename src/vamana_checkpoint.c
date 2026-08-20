@@ -27,6 +27,7 @@
 #include "vamana.h"
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
+#include "vamanaworker.h"
 
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -99,11 +100,19 @@ ShouldCheckpoint(VamanaIndexCache *cache)
 	return false;
 }
 
-void
+/*
+ * Returns true once the on-disk save and the slot advance both complete.
+ * A busy slot leaves the on-disk save durable but the debounce counters
+ * untouched, so ShouldCheckpoint retries the whole checkpoint -- including
+ * the slot advance -- on a later cycle instead of this call being mistaken
+ * for done.
+ */
+bool
 PerformCheckpoint(VamanaIndexCache *cache)
 {
 	Relation	indexRel;
 	XLogRecPtr	checkpoint_lsn;
+	bool		slotAdvanced;
 
 	Assert(!RecoveryInProgress());
 	Assert(cache != NULL && cache->isValid);
@@ -118,7 +127,7 @@ PerformCheckpoint(VamanaIndexCache *cache)
 	 */
 	checkpoint_lsn = GetFlushRecPtr(NULL);
 
-	indexRel = index_open(cache->indexRelid, AccessShareLock);
+	indexRel = NULL;
 
 	PG_TRY();
 	{
@@ -127,32 +136,75 @@ PerformCheckpoint(VamanaIndexCache *cache)
 		 * atomic rename, fsync directory.
 		 * VamanaSaveIndexToDisk calls VamanaSaveTidMapAtomically internally.
 		 */
+		indexRel = index_open(cache->indexRelid, AccessShareLock);
 		VamanaSaveIndexToDisk(indexRel, cache->svsIndex, MAIN_FORKNUM, cache);
 
 		index_close(indexRel, AccessShareLock);
 		indexRel = NULL;
 
-		/* Phase 5: advance slot only after on-disk state is durable. */
-		VamanaSlotAdvance(cache->replicationSlot, checkpoint_lsn);
+		/* Advance slot only after on-disk state is durable. */
+		slotAdvanced = VamanaSlotAdvance(cache->replicationSlot, checkpoint_lsn);
 	}
 	PG_CATCH();
 	{
 		if (indexRel != NULL)
 			index_close(indexRel, AccessShareLock);
-		cache->checkpointInProgress = false;
 		/*
-		 * Re-throw so the BGW restarts.  The slot LSN has not advanced, so
-		 * replay from the prior confirmed_flush_lsn recovers all changes.
+		 * The slot LSN has not advanced, so replay from the prior
+		 * confirmed_flush_lsn recovers all changes regardless of how the
+		 * caller handles this error.
 		 */
+		cache->checkpointInProgress = false;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
+	cache->checkpointInProgress = false;
+
+	if (!slotAdvanced)
+		return false;
+
 	cache->opsSinceCheckpoint = 0;
 	cache->lastCheckpointTime = GetCurrentTimestamp();
-	cache->checkpointInProgress = false;
 
 	ereport(DEBUG1,
 			(errmsg("vamana index %u: checkpoint complete, slot advanced to %X/%X",
 					cache->indexRelid, LSN_FORMAT_ARGS(checkpoint_lsn))));
+
+	return true;
+}
+
+/*
+ * Checkpoint one cached index: the transaction/snapshot ritual around
+ * PerformCheckpoint.  Suppresses eviction for the duration, because
+ * AcceptInvalidationMessages inside StartTransactionCommand/index_open can fire
+ * VamanaRelcacheCallback and free the SVSIndexHandle mid-save.  The PG_CATCH
+ * only restores the suppression global and re-throws; it never absorbs the
+ * error.
+ */
+bool
+VamanaCheckpointCachedIndex(VamanaIndexCache *cache)
+{
+	bool		prevSuppressed = vamana_eviction_suppressed;
+	bool		completed;
+
+	PG_TRY();
+	{
+		vamana_eviction_suppressed = true;
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		completed = PerformCheckpoint(cache);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		vamana_eviction_suppressed = prevSuppressed;
+	}
+	PG_CATCH();
+	{
+		vamana_eviction_suppressed = prevSuppressed;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return completed;
 }
