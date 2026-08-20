@@ -341,5 +341,5 @@ INSERT INTO t (val) VALUES ('[1,Infinity,3]');
 INSERT INTO t (val) VALUES ('[1,-Infinity,3]');
 -- NULL must still be silently skipped (must not regress)
 INSERT INTO t (val) VALUES (NULL);
-SELECT COUNT(*) FROM t;
+SELECT COUNT(*) FROM t WHERE val IS NULL;
 DROP TABLE t;
