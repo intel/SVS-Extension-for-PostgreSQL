@@ -45,6 +45,7 @@ CREATE INDEX ON t USING vamana (val vector_l2_ops);
 NOTICE:  buffered 3 vectors for SVS index build
 NOTICE:  building SVS index with 3 vectors of dimension 3
 NOTICE:  SVS index built successfully
+WARNING:  vamana index "t_val_idx": background worker not yet available; index will be adopted by the worker on startup
 -- Insert a single row and verify it appears in results (no rebuild expected)
 INSERT INTO t (val) VALUES ('[3,3,3]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id LIMIT 3;

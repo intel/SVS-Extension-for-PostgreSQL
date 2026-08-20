@@ -149,7 +149,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
@@ -158,8 +159,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   5 | [1,2,4]
   3 | [1,1,1]
   1 | [0,0,0]
-  4 | 
-(5 rows)
+(4 rows)
 
 DROP TABLE t;
 -- compression with LeanVec UINT4 primary
@@ -168,7 +168,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
@@ -177,8 +178,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   5 | [1,2,4]
   3 | [1,1,1]
   1 | [0,0,0]
-  4 | 
-(5 rows)
+(4 rows)
 
 DROP TABLE t;
 -- compression detailed parameters
@@ -203,7 +203,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -219,7 +220,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -234,7 +236,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = -4, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -249,7 +252,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -264,7 +268,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = -8, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -280,7 +285,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 4, compression_secondary = 4);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -295,7 +301,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 4, compression_secondary = -4);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -310,7 +317,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 8, compression_secondary = -8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -326,7 +334,8 @@ INSERT INTO t (val) VALUES (array_fill(1, ARRAY[128])::vector), (array_fill(2, A
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, leanvec_dims = -1);
 NOTICE:  buffered 2 vectors for SVS index build
 WARNING:  building LeanVec index with only 2 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 2 vectors of dimension 128
+NOTICE:  SVS index built successfully
 SELECT id FROM t ORDER BY val <-> array_fill(1.5, ARRAY[128])::vector, id;
  id 
 ----
@@ -340,7 +349,8 @@ INSERT INTO t (val) VALUES (array_fill(1, ARRAY[128])::vector), (array_fill(2, A
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, leanvec_dims = 32);
 NOTICE:  buffered 2 vectors for SVS index build
 WARNING:  building LeanVec index with only 2 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 2 vectors of dimension 128
+NOTICE:  SVS index built successfully
 SELECT id FROM t ORDER BY val <-> array_fill(1.5, ARRAY[128])::vector, id;
  id 
 ----
@@ -354,7 +364,8 @@ INSERT INTO t (val) VALUES (array_fill(1, ARRAY[128])::vector), (array_fill(2, A
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, leanvec_dims = 48);
 NOTICE:  buffered 2 vectors for SVS index build
 WARNING:  building LeanVec index with only 2 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 2 vectors of dimension 128
+NOTICE:  SVS index built successfully
 SELECT id FROM t ORDER BY val <-> array_fill(1.5, ARRAY[128])::vector, id;
  id 
 ----
@@ -369,7 +380,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_ip_ops) WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <#> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -385,7 +397,8 @@ INSERT INTO t (val) VALUES ('[1,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_cosine_ops) WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
 NOTICE:  buffered 3 vectors for SVS index build
 WARNING:  building LeanVec index with only 3 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 3 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <=> '[3,3,3]', id;
  id |   val   
 ----+---------
@@ -626,7 +639,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), ('[2,2,2]'), (
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (build_window_size = 150, compression_type = 1, compression_primary = 8);
 NOTICE:  buffered 5 vectors for SVS index build
 WARNING:  building LeanVec index with only 5 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 5 vectors of dimension 3
+NOTICE:  SVS index built successfully
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id LIMIT 3;
  id |   val   
 ----+---------
@@ -753,7 +767,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), ('[2,2,2]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 8);
 NOTICE:  buffered 4 vectors for SVS index build
 WARNING:  building LeanVec index with only 4 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 4 vectors of dimension 3
+NOTICE:  SVS index built successfully
 -- Update with compressed index
 UPDATE t SET val = '[5,5,5]' WHERE id = 2;
 SELECT * FROM t ORDER BY val <-> '[4,4,4]', id;
@@ -974,7 +989,8 @@ INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), ('[3,3,3]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops) WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
 NOTICE:  buffered 4 vectors for SVS index build
 WARNING:  building LeanVec index with only 4 vectors; recall may be poor (recommend >= 100000, minimum 10000)
-ERROR:  SVS operation failed: LeanVec storage creation
+NOTICE:  building SVS index with 4 vectors of dimension 3
+NOTICE:  SVS index built successfully
 INSERT INTO t (val) VALUES ('[2,2,2]');
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
  id |   val   
