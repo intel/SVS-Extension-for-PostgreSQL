@@ -51,7 +51,6 @@
 #define VAMANA_DEFAULT_SEARCH_WINDOW	100
 #define VAMANA_MIN_SEARCH_WINDOW		10
 #define VAMANA_MAX_SEARCH_WINDOW		10000
-#define VAMANA_MAX_K					10000
 #define VAMANA_DEFAULT_USE_SEARCH_HISTORY	true
 
 /* Compression types (internal representation) */
