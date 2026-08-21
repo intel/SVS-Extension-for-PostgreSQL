@@ -15,9 +15,7 @@
 
 #include <unistd.h>
 
-#ifdef USE_SVS
-#include <svs/c_api/svs_c.h>
-#endif
+#include <svs/c/svs_c.h>
 
 /* Returns nproc-1, minimum 1, reserving one CPU for the PG backend. */
 static int
@@ -57,8 +55,6 @@ SVSDefaultSearchThreads(void)
 
 	return OnlineCpusMinus1();
 }
-
-#ifdef USE_SVS
 
 typedef struct CompressionMapping
 {
@@ -115,13 +111,15 @@ MapCompressionParamToSVSType(int param, const char *param_name)
 
 	return SVS_DATA_TYPE_VOID;	/* unreachable */
 }
-#endif
+
+/* Never freed: reuse across calls is the point, and one worker process
+ * serves one database single-threaded, so there's no concurrent access. */
+static svs_search_results_t svsWorkerSearchResults = SVS_INIT_SEARCH_RESULTS();
 
 SVSAlgorithmHandle
 SVSCreateAlgorithm(int graph_degree, int build_window, int search_window, int alpha,
 				   bool use_search_history)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	svs_algorithm_h algorithm;
 
@@ -153,28 +151,18 @@ SVSCreateAlgorithm(int graph_degree, int build_window, int search_window, int al
 	}
 
 	return (SVSAlgorithmHandle) algorithm;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in"),
-			 errhint("Rebuild with SVS library support enabled.")));
-	return NULL;
-#endif
 }
 
 void
 SVSFreeAlgorithm(SVSAlgorithmHandle algorithm)
 {
-#ifdef USE_SVS
 	if (algorithm)
 		svs_algorithm_free((svs_algorithm_h) algorithm);
-#endif
 }
 
 SVSStorageHandle
 SVSCreateSimpleStorage(SVSDType data_type)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	svs_storage_h storage;
 	svs_data_type_t svs_dtype;
@@ -207,18 +195,11 @@ SVSCreateSimpleStorage(SVSDType data_type)
 	svs_error_free(error);
 
 	return (SVSStorageHandle) storage;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return NULL;
-#endif
 }
 
 SVSStorageHandle
 SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int primary_param, int secondary_param)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	svs_storage_h storage;
 	svs_data_type_t svs_primary;
@@ -242,27 +223,18 @@ SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int primary_param, int
 	svs_error_free(error);
 
 	return (SVSStorageHandle) storage;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return NULL;
-#endif
 }
 
 void
 SVSFreeStorage(SVSStorageHandle storage)
 {
-#ifdef USE_SVS
 	if (storage)
 		svs_storage_free((svs_storage_h) storage);
-#endif
 }
 
 SVSBuilderHandle
 SVSCreateBuilder(SVSDistanceType metric, int dimensions, SVSAlgorithmHandle algorithm)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	svs_index_builder_h builder;
 	svs_distance_metric_t svs_metric;
@@ -296,27 +268,18 @@ SVSCreateBuilder(SVSDistanceType metric, int dimensions, SVSAlgorithmHandle algo
 	svs_error_free(error);
 
 	return (SVSBuilderHandle) builder;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return NULL;
-#endif
 }
 
 void
 SVSFreeBuilder(SVSBuilderHandle builder)
 {
-#ifdef USE_SVS
 	if (builder)
 		svs_index_builder_free((svs_index_builder_h) builder);
-#endif
 }
 
 void
 SVSBuilderSetStorage(SVSBuilderHandle builder, SVSStorageHandle storage)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 
 	svs_index_builder_set_storage(
@@ -326,11 +289,6 @@ SVSBuilderSetStorage(SVSBuilderHandle builder, SVSStorageHandle storage)
 
 	CheckSVSError(error, "setting storage on builder");
 	svs_error_free(error);
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-#endif
 }
 
 /*
@@ -341,7 +299,6 @@ SVSBuilderSetStorage(SVSBuilderHandle builder, SVSStorageHandle storage)
 void
 SVSBuilderSetThreadpool(SVSBuilderHandle builder, int num_threads)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 
 	svs_index_builder_set_threadpool(
@@ -352,47 +309,36 @@ SVSBuilderSetThreadpool(SVSBuilderHandle builder, int num_threads)
 
 	CheckSVSError(error, "setting thread pool on builder");
 	svs_error_free(error);
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-#endif
 }
 
 void
 SVSSetIndexSearchThreads(SVSIndexHandle index, int num_threads)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 
 	svs_index_set_num_threads((svs_index_h) index, (size_t) num_threads, error);
 	CheckSVSError(error, "setting search threads on index");
 	svs_error_free(error);
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-#endif
 }
 
 void
 SVSFreeIndex(SVSIndexHandle index)
 {
-#ifdef USE_SVS
 	if (index)
 		svs_index_free((svs_index_h) index);
-#endif
 }
 
 int
 SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensions, int k,
 		  int search_window_size, ItemPointer results, float *distances)
 {
-#ifdef USE_SVS
 	svs_error_h error;
-	svs_search_results_t search_results;
 	svs_search_params_h search_params;
-	int			num_results;
+	bool		ok;
+	const size_t *row_ids;
+	const float *row_distances;
+	size_t		num_results;
+	int			out;
 	VamanaIndexCache *cachedIndex;
 
 	cachedIndex = VamanaGetCache(indexRelid);
@@ -426,13 +372,15 @@ SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensio
 	/* PG_FINALLY ensures search_params is freed even if search throws */
 	PG_TRY();
 	{
-		search_results = svs_index_search(
-										  (svs_index_h) index,
-										  query,
-										  1,	/* num_queries */
-										  (size_t) k,
-										  search_params,
-										  error);
+		ok = svs_index_search_topk(
+									(svs_index_h) index,
+									query,
+									1,	/* num_queries */
+									(size_t) k,
+									&svsWorkerSearchResults,
+									search_params,
+									NULL,	/* id_filter: no qual pushdown yet */
+									error);
 	}
 	PG_FINALLY();
 	{
@@ -440,7 +388,7 @@ SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensio
 	}
 	PG_END_TRY();
 
-	if (!svs_error_ok(error) || search_results == NULL)
+	if (!ok || !svs_error_ok(error))
 	{
 		CheckSVSError(error, "search");
 		svs_error_free(error);
@@ -448,57 +396,44 @@ SVSSearch(Oid indexRelid, SVSIndexHandle index, const float *query, int dimensio
 	}
 	svs_error_free(error);
 
-	num_results = (search_results->num_queries > 0) ?
-		(int) search_results->results_per_query[0] : 0;
+	svs_search_results_row(&svsWorkerSearchResults, 0, &row_ids, &row_distances, &num_results);
 
 	/* Limit results to actual number of vectors in index to avoid duplicates */
-	if (num_results > cachedIndex->numVectors)
-		num_results = cachedIndex->numVectors;
+	if (num_results > (size_t) cachedIndex->numVectors)
+		num_results = (size_t) cachedIndex->numVectors;
 
+	out = 0;
+	for (size_t i = 0; i < num_results && out < k; i++)
 	{
-		int			out = 0;	/* write index into results/distances */
+		size_t		vector_index = row_ids[i];
 
-		for (int i = 0; i < num_results && out < k; i++)
+		/*
+		 * Bounds check against mapping capacity (may exceed numVectors
+		 * after deletes)
+		 */
+		if (vector_index >= (size_t) cachedIndex->tidMappingCapacity)
 		{
-			size_t		vector_index = search_results->indices[i];
-
-			/*
-			 * Bounds check against mapping capacity (may exceed numVectors
-			 * after deletes)
-			 */
-			if (vector_index >= (size_t) cachedIndex->tidMappingCapacity)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("SVS returned invalid vector index %zu (capacity %d)",
-								vector_index, cachedIndex->tidMappingCapacity)));
-			}
-
-			/*
-			 * Skip soft-deleted entries (tidMapping slot is
-			 * InvalidItemPointer)
-			 */
-			if (!ItemPointerIsValid(&cachedIndex->tidMapping[vector_index]))
-				continue;
-
-			ItemPointerCopy(&cachedIndex->tidMapping[vector_index], &results[out]);
-
-			if (search_results->distances)
-				distances[out] = search_results->distances[i];
-			out++;
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("SVS returned invalid vector index %zu (capacity %d)",
+							vector_index, cachedIndex->tidMappingCapacity)));
 		}
-		num_results = out;
+
+		/*
+		 * Skip soft-deleted entries (tidMapping slot is
+		 * InvalidItemPointer)
+		 */
+		if (!ItemPointerIsValid(&cachedIndex->tidMapping[vector_index]))
+			continue;
+
+		ItemPointerCopy(&cachedIndex->tidMapping[vector_index], &results[out]);
+
+		if (row_distances)
+			distances[out] = row_distances[i];
+		out++;
 	}
 
-	svs_search_results_free(search_results);
-
-	return num_results;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return 0;
-#endif
+	return out;
 }
 
 /*
@@ -514,10 +449,9 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 			   ItemPointer results, float *distances,
 			   int *numResultsPerQuery)
 {
-#ifdef USE_SVS
 	svs_error_h error;
-	svs_search_results_t search_results;
 	svs_search_params_h search_params;
+	bool		ok;
 	VamanaIndexCache *cachedIndex;
 	int			total = 0;
 
@@ -551,13 +485,15 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 	/* PG_FINALLY ensures search_params is freed even if search throws */
 	PG_TRY();
 	{
-		search_results = svs_index_search(
-										  (svs_index_h) index,
-										  queryData,
-										  (size_t) numQueries,
-										  (size_t) k,
-										  search_params,
-										  error);
+		ok = svs_index_search_topk(
+									(svs_index_h) index,
+									queryData,
+									(size_t) numQueries,
+									(size_t) k,
+									&svsWorkerSearchResults,
+									search_params,
+									NULL,	/* id_filter: no qual pushdown yet */
+									error);
 	}
 	PG_FINALLY();
 	{
@@ -565,7 +501,7 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 	}
 	PG_END_TRY();
 
-	if (!svs_error_ok(error) || search_results == NULL)
+	if (!ok || !svs_error_ok(error))
 	{
 		CheckSVSError(error, "batch search");
 		svs_error_free(error);
@@ -575,62 +511,51 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 
 	for (int q = 0; q < numQueries; q++)
 	{
-		int			nr;
+		const size_t *row_ids;
+		const float *row_distances;
+		size_t		nr;
 		ItemPointer qresults = results + (size_t) q * k;
 		float	   *qdists = distances + (size_t) q * k;
+		int			out = 0;
 
-		nr = ((size_t) q < search_results->num_queries) ?
-			(int) search_results->results_per_query[q] : 0;
+		svs_search_results_row(&svsWorkerSearchResults, (size_t) q,
+								&row_ids, &row_distances, &nr);
 
-		if (nr > cachedIndex->numVectors)
-			nr = cachedIndex->numVectors;
+		if (nr > (size_t) cachedIndex->numVectors)
+			nr = (size_t) cachedIndex->numVectors;
 
+		for (size_t j = 0; j < nr && out < k; j++)
 		{
-			int			out = 0;
+			size_t		vector_index = row_ids[j];
 
-			for (int j = 0; j < nr && out < k; j++)
-			{
-				/* indices array is row-major with stride k: indices[q*k + j] */
-				size_t		vector_index = search_results->indices[(size_t) q * k + j];
+			if (vector_index >= (size_t) cachedIndex->tidMappingCapacity)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("SVS returned invalid vector index %zu (capacity %d)",
+								vector_index, cachedIndex->tidMappingCapacity)));
 
-				if (vector_index >= (size_t) cachedIndex->tidMappingCapacity)
-					ereport(ERROR,
-							(errcode(ERRCODE_INTERNAL_ERROR),
-							 errmsg("SVS returned invalid vector index %zu (capacity %d)",
-									vector_index, cachedIndex->tidMappingCapacity)));
+			/* Skip soft-deleted entries */
+			if (!ItemPointerIsValid(&cachedIndex->tidMapping[vector_index]))
+				continue;
 
-				/* Skip soft-deleted entries */
-				if (!ItemPointerIsValid(&cachedIndex->tidMapping[vector_index]))
-					continue;
+			ItemPointerCopy(&cachedIndex->tidMapping[vector_index], &qresults[out]);
 
-				ItemPointerCopy(&cachedIndex->tidMapping[vector_index], &qresults[out]);
-
-				if (search_results->distances)
-					qdists[out] = search_results->distances[(size_t) q * k + j];
-				out++;
-			}
-			nr = out;
+			if (row_distances)
+				qdists[out] = row_distances[j];
+			out++;
 		}
 
 		if (numResultsPerQuery)
-			numResultsPerQuery[q] = nr;
-		total += nr;
+			numResultsPerQuery[q] = out;
+		total += out;
 	}
 
-	svs_search_results_free(search_results);
 	return total;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return 0;
-#endif
 }
 
 int
 SVSSaveIndex(SVSIndexHandle index, const char *path)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	bool		ok;
 
@@ -651,19 +576,12 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 
 	svs_error_free(error);
 	return 0;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return -1;
-#endif
 }
 
 SVSIndexHandle
 SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
 					 const size_t *ids, int num_vectors, int *error_code)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	svs_index_h index;
 
@@ -687,20 +605,11 @@ SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
 
 	svs_error_free(error);
 	return (SVSIndexHandle) index;
-#else
-	if (error_code)
-		*error_code = -1;
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return NULL;
-#endif
 }
 
 SVSIndexHandle
 SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 {
-#ifdef USE_SVS
 	SVSAlgorithmHandle algorithm = NULL;
 	SVSBuilderHandle builder = NULL;
 	SVSStorageHandle storage = NULL;
@@ -777,29 +686,24 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 
 	svs_error_free(error);
 	return (SVSIndexHandle) loaded;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return NULL;
-#endif
 }
 
 int
 SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int num_vectors)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
-	size_t		added;
+	size_t		added = 0;
+	bool		ok;
 
-	added = svs_index_dynamic_add_points(
-										 (svs_index_h) index,
-										 points,
-										 ids,
-										 (size_t) num_vectors,
-										 error);
+	ok = svs_index_dynamic_add_points(
+									  (svs_index_h) index,
+									  points,
+									  ids,
+									  (size_t) num_vectors,
+									  &added,
+									  error);
 
-	if (!svs_error_ok(error))
+	if (!ok || !svs_error_ok(error))
 	{
 		const char *msg = svs_error_get_message(error);
 
@@ -813,28 +717,23 @@ SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int n
 
 	svs_error_free(error);
 	return (int) added;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return -1;
-#endif
 }
 
 int
 SVSDeletePoints(SVSIndexHandle index, const size_t *ids, int num_ids)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
-	size_t		deleted;
+	size_t		deleted = 0;
+	bool		ok;
 
-	deleted = svs_index_dynamic_delete_points(
-											  (svs_index_h) index,
-											  ids,
-											  (size_t) num_ids,
-											  error);
+	ok = svs_index_dynamic_delete_points(
+										 (svs_index_h) index,
+										 ids,
+										 (size_t) num_ids,
+										 &deleted,
+										 error);
 
-	if (!svs_error_ok(error))
+	if (!ok || !svs_error_ok(error))
 	{
 		const char *msg = svs_error_get_message(error);
 
@@ -848,18 +747,11 @@ SVSDeletePoints(SVSIndexHandle index, const size_t *ids, int num_ids)
 
 	svs_error_free(error);
 	return (int) deleted;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return -1;
-#endif
 }
 
 bool
 SVSConsolidate(SVSIndexHandle index)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	bool		ok;
 
@@ -879,18 +771,11 @@ SVSConsolidate(SVSIndexHandle index)
 
 	svs_error_free(error);
 	return true;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return false;
-#endif
 }
 
 bool
 SVSCompact(SVSIndexHandle index, size_t batchsize)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	bool		ok;
 
@@ -910,18 +795,11 @@ SVSCompact(SVSIndexHandle index, size_t batchsize)
 
 	svs_error_free(error);
 	return true;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("SVS library support not compiled in")));
-	return false;
-#endif
 }
 
 bool
 SVSHasId(SVSIndexHandle index, size_t id)
 {
-#ifdef USE_SVS
 	svs_error_h error = svs_error_create();
 	bool		has_id = false;
 	bool		ok;
@@ -936,7 +814,4 @@ SVSHasId(SVSIndexHandle index, size_t id)
 
 	svs_error_free(error);
 	return has_id;
-#else
-	return false;
-#endif
 }

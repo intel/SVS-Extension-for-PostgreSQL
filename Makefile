@@ -100,7 +100,7 @@ ifeq (,$(wildcard $(SVS_INSTALL)/lib/libsvs_c_api.so))
 $(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run build_svs_public.sh first or set SVS_INSTALL correctly)
 endif
 
-PG_CPPFLAGS += -DUSE_SVS -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
+PG_CPPFLAGS += -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
 SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib $(HARDENING_LDFLAGS)
 
 PG_CONFIG ?= pg_config

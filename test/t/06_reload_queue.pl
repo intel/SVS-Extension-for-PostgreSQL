@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 06_vamana_reload_queue.pl — evict_all fallback when the per-OID reload
+# 06_reload_queue.pl — evict_all fallback when the per-OID reload
 # queue overflows.
 #
 # VAMANA_MAX_RELOAD_QUEUE is 16.  When 17 distinct index OIDs are enqueued

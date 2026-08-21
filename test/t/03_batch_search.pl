@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 03_vamana_batch_search.pl — native SVS batch search path in the BGW.
+# 03_batch_search.pl — native SVS batch search path in the BGW.
 #
 # When N backends submit search requests concurrently, VamanaWorkerRunBatch
 # detects n > 1 with uniform k/dimensions, packs all query vectors into a
