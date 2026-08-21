@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 07_replication_slots.pl — replication slot lifecycle for Vamana indexes.
+# replication slot lifecycle for Vamana indexes.
 #
 # Verifies four observable guarantees:
 #

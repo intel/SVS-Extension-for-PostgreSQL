@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 17_missing_preload.pl — svs loaded without shared_preload_libraries.
+# svs loaded without shared_preload_libraries.
 #
 # CREATE EXTENSION svs succeeds even without preload; VamanaWorkerShmemHeaderPtr
 # stays NULL. Three independent SQL paths reach it afterward: the stats views,

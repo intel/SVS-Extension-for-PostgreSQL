@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 02_bgw_core.pl — BGW lifecycle: startup, query correctness,
+# BGW lifecycle: startup, query correctness,
 # restart/crash recovery, multi-database, GUC reload, timeout, and
 # search_window_size boundary.
 

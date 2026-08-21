@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 15_worker_lifecycle.pl — worker drain-and-stop shutdown routine.
+# worker drain-and-stop shutdown routine.
 
 use strict;
 use warnings FATAL => 'all';

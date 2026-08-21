@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 10_idle_worker_visibility.pl — worker visibility in pg_stat_vamana_worker.
+# worker visibility in pg_stat_vamana_worker.
 #
 # A worker for an enabled database with no vamana indexes is still a live,
 # reserved slot: pg_stat_vamana_worker reports it 'running' with a pid, a
