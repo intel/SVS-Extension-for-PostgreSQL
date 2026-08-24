@@ -715,7 +715,7 @@ Specified in the `WITH (...)` clause of `CREATE INDEX`.
 The extension is built with `pgxs` and requires the Intel SVS C API library:
 
 ```makefile
-SVS_INSTALL ?= svs_install_public
+SVS_INSTALL ?= docs/build_guide/svs_install
 # Requires: $(SVS_INSTALL)/lib/libsvs_c_api.so
 ```
 

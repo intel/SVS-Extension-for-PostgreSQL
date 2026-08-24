@@ -17,6 +17,11 @@ SVS_BRANCH=dev/c-api
 SVS_SRC_DIR=${BASE_DIR}/ScalableVectorSearch
 SVS_BUILD_DIR=${SVS_SRC_DIR}/build
 SVS_INSTALL_DIR=${BASE_DIR}/svs_install
+# LVQ/LeanVec support. ON makes bindings/c download a prebuilt SVS archive and
+# compile against its headers instead of the local include/ tree; that archive is
+# currently stale, so OFF is the only configuration that builds outside GCC 11.2.
+# Overridable from the environment (CI sets OFF).
+SVS_LVQ_LEANVEC=${SVS_LVQ_LEANVEC:-ON}
 
 # ── vanilla pgvector (provides vector/halfvec types) ─────────────────────────
 PGV_VANILLA_REPO=https://github.com/pgvector/pgvector.git
