@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# shmem control-block array.
+# 11_shmem_layout.pl — shmem control-block array.
 #
 # Covers the structural and concurrency guarantees that have an observable
 # surface in the single-worker interim:
@@ -11,7 +11,7 @@
 #
 # Arbitrary-position lookup and no-torn-read during a reservation need several
 # databases at arbitrary array positions and the cross-database stat scope to
-# observe them; covered elsewhere.
+# observe them; they live in 10_idle_worker_visibility.pl.
 
 use strict;
 use warnings FATAL => 'all';

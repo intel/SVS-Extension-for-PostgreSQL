@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# row-offset overflow in the build path.
+# 18_build_offset_overflow.pl — row-offset overflow in the build path.
 #
 # The build path fills a correctly-sized buffer using a per-vector offset
 # computed as a plain int multiplication, which silently wraps once

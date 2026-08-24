@@ -112,8 +112,10 @@ MapCompressionParamToSVSType(int param, const char *param_name)
 	return SVS_DATA_TYPE_VOID;	/* unreachable */
 }
 
-/* Never freed: reuse across calls is the point, and one worker process
- * serves one database single-threaded, so there's no concurrent access. */
+/*
+ * Never freed: reuse across calls is the point, and one worker process
+ * serves one database single-threaded, so there's no concurrent access.
+ */
 static svs_search_results_t svsWorkerSearchResults = SVS_INIT_SEARCH_RESULTS();
 
 SVSAlgorithmHandle

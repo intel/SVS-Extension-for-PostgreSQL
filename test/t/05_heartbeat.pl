@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# heartbeat timestamp for hung worker detection.
+# 05_heartbeat.pl — heartbeat timestamp for hung worker detection.
 #
 # The BGW writes heartbeat_ts to VamanaWorkerShmem each main loop iteration
 # (~1 s).  Backends read it in VamanaWorkerIsAvailable: if the timestamp is

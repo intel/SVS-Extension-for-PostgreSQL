@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# explicit warm-up: svs_warmup_index() and
+# 16_warmup.pl — explicit warm-up: svs_warmup_index() and
 # svs_warmup_database() force indexes resident in the worker cache on demand.
 
 use strict;

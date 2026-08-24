@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# the BEFORE DELETE guard across databases.
+# 14_permanent_removal.pl — the BEFORE DELETE guard across databases.
 #
 # The guard on vamana_databases reads the target database's live-index count
 # from shared memory, so it works from the launcher database without any

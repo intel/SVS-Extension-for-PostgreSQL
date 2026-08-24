@@ -717,6 +717,7 @@ VamanaReplayPendingChanges(VamanaIndexCache *cache)
 	if (!VamanaTryAcquireSlotNoWait(slot->slotName))
 		return;
 
+	/* test/t/08_standby_replay.pl counts these to bound idle decode attempts. */
 	ereport(DEBUG1,
 			(errmsg("vamana replay: entering CreateDecodingContext for slot \"%s\" confirmed_flush=%X/%X",
 					slot->slotName,
