@@ -250,6 +250,13 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 	header.capacity = (uint32) count;
 	header.reserved = 0;
 
+	if ((size_t) count > SIZE_MAX / sizeof(ItemPointerData))
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("TID map too large to save for vamana index %u "
+						"(%d entries exceeds size limit)",
+						relid, count)));
+
 	if (!VamanaWriteFully(fd, &header, sizeof(header)) ||
 		!VamanaWriteFully(fd, tidMapping,
 						  (size_t) count * sizeof(ItemPointerData)))
