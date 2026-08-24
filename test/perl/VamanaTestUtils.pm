@@ -11,6 +11,7 @@ package VamanaTestUtils;
 use strict;
 use warnings FATAL => 'all';
 use Exporter qw(import);
+use Fcntl      qw(O_WRONLY O_CREAT O_EXCL);
 use File::Temp qw(tempdir);
 use POSIX      qw(waitpid _exit);
 use Time::HiRes qw(usleep);
@@ -62,6 +63,11 @@ sub run_concurrent
     my ($node, $db, $n, $sql_of, $pre_sql) = @_;
     $pre_sql //= '';
     my $tmpdir = tempdir(CLEANUP => 1);
+
+    # Set the mode explicitly rather than trusting File::Temp's default.
+    chmod(0700, $tmpdir) == 1
+      or die "could not set permissions on $tmpdir: $!";
+
     my @pids;
 
     for my $i (0 .. $n - 1)
@@ -76,7 +82,10 @@ sub run_concurrent
             # cleaned up by forked children.
             my $result =
               eval { $node->safe_psql($db, $pre_sql . $sql_of->($i)) } // '';
-            if (open(my $fh, '>', "$tmpdir/r$i.txt"))
+            # sysopen, not open: the mode is ours to state, not the umask's.
+            # O_EXCL is safe here — $tmpdir is fresh and $i is unique.
+            if (sysopen(my $fh, "$tmpdir/r$i.txt",
+                    O_WRONLY | O_CREAT | O_EXCL, 0600))
             {
                 print $fh $result;
                 close $fh;
@@ -119,6 +128,10 @@ sub run_synchronized
 
     my $tmpdir = tempdir(CLEANUP => 1);
 
+    # Set the mode explicitly rather than trusting File::Temp's default.
+    chmod(0700, $tmpdir) == 1
+      or die "could not set permissions on $tmpdir: $!";
+
     # Hold exclusive advisory lock so children block on the shared acquire.
     my $coord = $node->background_psql($db);
     $coord->query_safe("SELECT pg_advisory_lock($barrier_key);");
@@ -143,7 +156,10 @@ sub run_synchronized
               . "END \$adv_rel\$;\n";
 
             my $result = eval { $node->safe_psql($db, $full_sql) } // '';
-            if (open(my $fh, '>', "$tmpdir/r$i.txt"))
+            # sysopen, not open: the mode is ours to state, not the umask's.
+            # O_EXCL is safe here — $tmpdir is fresh and $i is unique.
+            if (sysopen(my $fh, "$tmpdir/r$i.txt",
+                    O_WRONLY | O_CREAT | O_EXCL, 0600))
             {
                 print $fh $result;
                 close $fh;
@@ -202,8 +218,9 @@ sub vamana_save_dir
 }
 
 # ---------------------------------------------------------------------------
-# dir_size: sum file sizes in a flat directory.
-# Vamana index directories contain only top-level files — no subdirectories.
+# dir_size: sum file sizes at the top level of a directory only.
+# Note this does not recurse: a vamana index directory holds the SVS payload
+# in config/, data/ and graph/ subdirectories, which are not counted.
 # ---------------------------------------------------------------------------
 sub dir_size
 {
