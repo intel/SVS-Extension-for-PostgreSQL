@@ -516,9 +516,9 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
 
--- SDL425: NaN/Inf input validation (vector type)
+-- NaN/Inf input validation (vector type)
 
--- NaN/Inf in INSERT at build time must be rejected
+-- NaN/Inf in INSERT must be rejected
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
 INSERT INTO t (val) VALUES ('[1,NaN,3]');

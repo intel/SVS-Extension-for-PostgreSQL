@@ -41,7 +41,8 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	VamanaWorkerWaitUntilAvailable(relid, "insert into");
 
 	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
-	VamanaValidateVectorData(vec->x, vec->dim, "insert");
+	if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
+		VamanaValidateVectorData(vec->x, vec->dim, "insert");
 
 	/* Defense-in-depth: PostgreSQL's type system normally prevents this. */
 	if (vec->dim != TupleDescAttr(index->rd_att, 0)->atttypmod)

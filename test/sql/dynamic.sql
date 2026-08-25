@@ -332,7 +332,7 @@ SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5
 
 DROP TABLE t_loadwin;
 
--- SDL425: NaN/Inf rejected on incremental INSERT (dynamic/live index path)
+-- NaN/Inf rejected on incremental INSERT (dynamic/live index path)
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);

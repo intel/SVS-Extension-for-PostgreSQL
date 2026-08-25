@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+#include <math.h>
+
 #include "vamana.h"
 
 #include "access/amapi.h"
@@ -350,6 +352,6 @@ VamanaValidateVectorData(const float *data, int dim, const char *context)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("vector contains invalid floating-point value "
 							"(NaN or Infinity) at position %d in %s",
-							i, context)));
+							i + 1, context)));
 	}
 }

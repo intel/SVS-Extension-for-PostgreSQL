@@ -61,7 +61,8 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	 * See also vamanascan.c (query vector detoast).
 	 */
 	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
-	VamanaValidateVectorData(vec->x, vec->dim, "build");
+	if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
+		VamanaValidateVectorData(vec->x, vec->dim, "build");
 	dimensions = vec->dim;
 
 	if (buildstate->numVectors >= buildstate->bufferCapacity)

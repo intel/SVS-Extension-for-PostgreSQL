@@ -520,7 +520,7 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
 
--- SDL425: NaN/Inf input validation (halfvec type)
+-- NaN/Inf input validation (halfvec type)
 CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
 CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
 INSERT INTO t (val) VALUES ('[1,NaN,3]');
