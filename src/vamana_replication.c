@@ -15,6 +15,7 @@
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamana_subxact_guard.h"
+#include "vamana_subxid_pending_array.h"
 #include "vamanaworker.h"
 
 #include "access/heapam_xlog.h"
@@ -116,20 +117,94 @@ VamanaNodeIsPrimary(void)
 	return VamanaGetReplayRole()->processes_write_ipc;
 }
 
-static void
-DropSlotIfInactive(const char *slotName)
+/*
+ * TryDropSlot
+ *
+ * Drop the named slot without blocking and without throwing.
+ *
+ * ReplicationSlotDrop(nowait=true) raises ERRCODE_OBJECT_IN_USE when another
+ * process holds the slot and ERRCODE_UNDEFINED_OBJECT when it is already gone.
+ * Both are ordinary outcomes rather than decoding failures, so they are caught
+ * and reported in the return value -- the same treatment
+ * VamanaTryAcquireSlotNoWait gives them.
+ *
+ * Waiting is not offered.  The holder may be the worker inside
+ * VamanaReplicationBuildSnapshot, which waits on the dropping transaction's own
+ * XID -- a cycle the deadlock detector cannot see, because this side waits on a
+ * condition variable rather than a lock.  It is also uninterruptible, since the
+ * commit callback runs inside CommitTransaction's HOLD_INTERRUPTS, and it would
+ * sleep holding AccessExclusiveLock on the index and its table.  A third party
+ * holding the slot may never release it at all.
+ *
+ * A busy slot is handed to the worker instead; see VamanaWorkerRequestSlotDrop.
+ *
+ * Every other error is demoted to a WARNING for the same reason the caller
+ * cannot wait: it runs after its transaction is durable, where an ERROR would
+ * report an already-committed DROP INDEX as having failed.  The message itself
+ * is preserved by re-reporting the caught ErrorData at WARNING level.
+ */
+static VamanaSlotDropResult
+TryDropSlot(const char *slotName)
 {
-	ReplicationSlot *existing;
+	VamanaSlotDropResult result = VAMANA_SLOT_DROP_DONE;
+	MemoryContext callerContext = CurrentMemoryContext;
+	uint32		savedInterruptHoldoffCount = InterruptHoldoffCount;
+	uint32		savedQueryCancelHoldoffCount = QueryCancelHoldoffCount;
+	uint32		savedCritSectionCount = CritSectionCount;
 
-	/* need_lock=true holds ReplicationSlotControlLock while we read active_pid */
-	existing = SearchNamedReplicationSlot(slotName, true);
-	if (existing == NULL)
-		return;
+	/* need_lock=true holds ReplicationSlotControlLock for the lookup */
+	if (SearchNamedReplicationSlot(slotName, true) == NULL)
+		return VAMANA_SLOT_DROP_DONE;
 
-	if (existing->active_pid != 0)
-		return;
+	PG_TRY();
+	{
+		ReplicationSlotDrop(slotName, /*nowait=*/ true);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
 
-	ReplicationSlotDrop(slotName, /*nowait=*/ false);
+		/*
+		 * errfinish() zeroes the interrupt-holdoff counters on its way to the
+		 * longjmp, and states that a handler which is itself inside a holdoff
+		 * section has to save and restore them for itself.  This one is: the
+		 * commit callback runs inside CommitTransaction's HOLD_INTERRUPTS, and
+		 * its matching RESUME_INTERRUPTS would underflow the count to UINT32_MAX.
+		 * A backend in that state never services an interrupt again -- no
+		 * cancel, no terminate, and no ProcSignalBarrier absorption, so the next
+		 * DROP DATABASE anywhere in the cluster waits on it forever.
+		 */
+		InterruptHoldoffCount = savedInterruptHoldoffCount;
+		QueryCancelHoldoffCount = savedQueryCancelHoldoffCount;
+		CritSectionCount = savedCritSectionCount;
+
+		MemoryContextSwitchTo(callerContext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		switch (edata->sqlerrcode)
+		{
+			case ERRCODE_OBJECT_IN_USE:
+				result = VAMANA_SLOT_DROP_BUSY;
+				break;
+
+			case ERRCODE_UNDEFINED_OBJECT:
+				/* Someone else dropped it between the lookup and here. */
+				result = VAMANA_SLOT_DROP_DONE;
+				break;
+
+			default:
+				result = VAMANA_SLOT_DROP_FAILED;
+				edata->elevel = WARNING;
+				ThrowErrorData(edata);
+				break;
+		}
+
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	return result;
 }
 
 /*
@@ -909,6 +984,9 @@ VamanaReplicationDrainSlot(Oid indexRelid)
 /*
  * Create a persistent logical replication slot for the given index.
  * Drops any existing inactive slot first (handles failed CREATE INDEX cleanup).
+ * This worker is the only process that ever holds one of these slots, so the
+ * drop cannot come back busy; if it somehow does, ReplicationSlotCreate below
+ * reports the leftover slot itself.
  */
 void
 VamanaReplicationCreate(Oid dboid, Oid indexRelid)
@@ -918,7 +996,7 @@ VamanaReplicationCreate(Oid dboid, Oid indexRelid)
 
 	SlotName(dboid, indexRelid, slotName);
 
-	DropSlotIfInactive(slotName);
+	(void) TryDropSlot(slotName);
 
 	ReplicationSlotCreate(slotName,
 						  /*db_specific=*/ true,
@@ -1163,11 +1241,169 @@ VamanaReplicationClose(VamanaReplicationSlot *slot)
 	pfree(slot);
 }
 
-void
+VamanaSlotDropResult
 VamanaReplicationDropIfExists(Oid dboid, Oid indexRelid)
 {
 	char slotName[NAMEDATALEN];
 
 	SlotName(dboid, indexRelid, slotName);
-	DropSlotIfInactive(slotName);
+	return TryDropSlot(slotName);
+}
+
+/* -----------------------------------------------------------------------
+ * Slot drop on DROP INDEX (commit-deferred)
+ *
+ * The object-access hook that notices a vamana index being dropped runs before
+ * commit, so it cannot drop the slot itself: dropping a slot is irreversible,
+ * and ROLLBACK would leave a catalogued index whose slot is gone.  The hook
+ * queues the index here instead and the slot is dropped at COMMIT, never on
+ * abort -- the same reasoning, and the same VamanaSubxidPendingArray plumbing,
+ * as the live-index counter in vamanaworkershmem.c.
+ *
+ * By then the transaction is durable, so the drop must not fail the command:
+ * TryDropSlot never throws, and a slot the worker still holds is handed to the
+ * worker rather than abandoned.
+ * ----------------------------------------------------------------------- */
+
+#define VAMANA_SLOT_DROP_QUEUE_INITIAL_CAPACITY	16
+
+typedef struct PendingSlotDrop
+{
+	Oid			dbOid;
+	Oid			indexRelid;
+	SubTransactionId subxid;
+}			PendingSlotDrop;
+
+/* Per-backend (per-transaction) list; reset to NULL at transaction end. */
+static VamanaSubxidPendingArray * CurrentSlotDrops = NULL;
+
+static bool slotDropCallbacksRegistered = false;
+
+static void VamanaSlotDropXactCallback(XactEvent event, void *arg);
+static void VamanaSlotDropSubXactCallback(SubXactEvent event,
+										  SubTransactionId mySubid,
+										  SubTransactionId parentSubid,
+										  void *arg);
+
+static VamanaSubxidPendingArray *
+GetOrCreateSlotDrops(void)
+{
+	if (CurrentSlotDrops == NULL)
+		CurrentSlotDrops =
+			VamanaSubxidPendingArrayCreate(TopTransactionContext,
+										   sizeof(PendingSlotDrop),
+										   offsetof(PendingSlotDrop, subxid),
+										   VAMANA_SLOT_DROP_QUEUE_INITIAL_CAPACITY);
+	return CurrentSlotDrops;
+}
+
+static void
+EnsureSlotDropCallbacksRegistered(void)
+{
+	if (!slotDropCallbacksRegistered)
+	{
+		RegisterXactCallback(VamanaSlotDropXactCallback, NULL);
+		RegisterSubXactCallback(VamanaSlotDropSubXactCallback, NULL);
+		slotDropCallbacksRegistered = true;
+	}
+}
+
+void
+VamanaReplicationQueueDropAtCommit(Oid dboid, Oid indexRelid)
+{
+	PendingSlotDrop *entry;
+
+	EnsureSlotDropCallbacksRegistered();
+	entry = VamanaSubxidPendingArrayAppend(GetOrCreateSlotDrops());
+	entry->dbOid = dboid;
+	entry->indexRelid = indexRelid;
+}
+
+/*
+ * Drop every slot queued by this transaction.  Runs after the commit record is
+ * written, so nothing here may throw.
+ *
+ * A slot the worker still holds is handed to the worker, which drops it on its
+ * next cycle from a point where it holds no slot of its own.  Only a database
+ * with no shmem entry has no worker to hand it to, and no worker means nobody
+ * could have been holding the slot, so BUSY there is a genuine anomaly.
+ */
+static void
+ApplyPendingSlotDrops(void)
+{
+	VamanaSubxidPendingArray *list = CurrentSlotDrops;
+
+	if (list == NULL)
+		return;
+
+	for (int i = 0; i < list->count; i++)
+	{
+		PendingSlotDrop *entry = VamanaSubxidPendingArrayEntryAt(list, i);
+		char		slotName[NAMEDATALEN];
+
+		/* Queued by a subtransaction that rolled back. */
+		if (entry->subxid == InvalidSubTransactionId)
+			continue;
+
+		if (VamanaReplicationDropIfExists(entry->dbOid,
+										  entry->indexRelid) != VAMANA_SLOT_DROP_BUSY)
+			continue;
+
+		if (VamanaWorkerRequestSlotDrop(entry->indexRelid))
+			continue;
+
+		SlotName(entry->dbOid, entry->indexRelid, slotName);
+		ereport(WARNING,
+				(errmsg("vamana: could not drop replication slot \"%s\" for dropped index %u",
+						slotName, entry->indexRelid),
+				 errdetail("Another process holds the slot, and the drop could not be handed to this database's vamana worker; the slot now has no index and will retain WAL."),
+				 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+	}
+}
+
+static void
+VamanaSlotDropXactCallback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			ApplyPendingSlotDrops();
+			CurrentSlotDrops = NULL;
+			break;
+
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			CurrentSlotDrops = NULL;
+			break;
+
+		case XACT_EVENT_PREPARE:
+			if (CurrentSlotDrops != NULL && CurrentSlotDrops->count > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		default:
+			break;
+	}
+}
+
+/*
+ * A ROLLBACK TO SAVEPOINT around a DROP INDEX must keep that index's slot:
+ * mark the subtransaction's entries discarded rather than compacting the array
+ * mid-transaction.
+ */
+static void
+VamanaSlotDropSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
+							  SubTransactionId parentSubid, void *arg)
+{
+	if (CurrentSlotDrops == NULL)
+		return;
+
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		VamanaSubxidPendingArrayPruneAbortedSubxact(CurrentSlotDrops, mySubid);
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		VamanaSubxidPendingArrayReparentSubxact(CurrentSlotDrops, mySubid,
+											   parentSubid);
 }

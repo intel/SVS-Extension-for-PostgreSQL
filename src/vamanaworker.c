@@ -234,6 +234,52 @@ VamanaWorkerProcessRequests(void)
 }
 
 /*
+ * VamanaWorkerProcessSlotDrops
+ *
+ * Drop the replication slots of indexes that were dropped while this worker was
+ * holding their slot.  The backend committing the DROP must not wait for the
+ * release, so it left the OID here (see VamanaWorkerRequestSlotDrop).
+ *
+ * Called from the top of the main loop, where this worker holds no slot of its
+ * own: acquisitions are scoped to a single replay, snapshot-build, activation, or
+ * checkpoint-confirm pass, so the drop cannot lose the race it was handed.  The
+ * cache entry goes first because it owns a handle naming the slot.
+ */
+static void
+VamanaWorkerProcessSlotDrops(void)
+{
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+	{
+		uint32		relid_u32;
+		Oid			relid;
+
+		relid_u32 = pg_atomic_read_u32(
+									   &VamanaWorkerShmemPtr->pendingSlotDrops[i].relid);
+		if (relid_u32 == 0)
+			continue;
+
+		relid = (Oid) relid_u32;
+
+		/* Clear before acting, so a fresh request cannot be swallowed. */
+		pg_atomic_write_u32(
+							&VamanaWorkerShmemPtr->pendingSlotDrops[i].relid, 0);
+
+		VamanaEvictCacheEntry(relid);
+
+		if (VamanaReplicationDropIfExists(VamanaWorkerShmemPtr->dbOid,
+										  relid) == VAMANA_SLOT_DROP_DONE)
+			ereport(LOG,
+					(errmsg("vamana worker: dropped replication slot of removed index %u",
+							relid)));
+		else
+			ereport(WARNING,
+					(errmsg("vamana worker: could not drop replication slot of removed index %u",
+							relid),
+					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+	}
+}
+
+/*
  * VamanaWorkerProcessReloads
  *
  * Check the reload queue for OIDs that backends have signaled need
@@ -770,6 +816,8 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 			worker_got_sighup = false;
 		}
 
+		VamanaWorkerProcessSlotDrops();
+
 		VamanaWorkerProcessReloads();
 
 		/*
@@ -1186,6 +1234,45 @@ VamanaWorkerSignalReload(Oid indexRelid)
 					"worker will evict all cached indexes on next cycle",
 					indexRelid)));
 	SetLatch(&entry->workerLatch);
+}
+
+/*
+ * VamanaWorkerRequestSlotDrop
+ *
+ * Ask the worker to drop the replication slot of an index this backend has
+ * finished dropping.  Used only when the backend's own attempt found the slot
+ * held: the worker acquires a slot for the length of one replay, snapshot-build,
+ * activation, or checkpoint-confirm pass, and a backend must not wait for it to
+ * finish (see TryDropSlot), so the work goes to the holder instead.
+ *
+ * Unlike a lost reload there is no cheap catch-all fallback: evicting caches
+ * would not remove a slot, and the OID is the only way to name it.  So a full
+ * queue is reported to the caller rather than absorbed.
+ */
+bool
+VamanaWorkerRequestSlotDrop(Oid indexRelid)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
+
+	Assert(OidIsValid(indexRelid));
+
+	if (entry == NULL)
+		return false;
+
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+	{
+		uint32		expected = 0;
+
+		if (pg_atomic_compare_exchange_u32(
+										   &entry->pendingSlotDrops[i].relid,
+										   &expected, (uint32) indexRelid))
+		{
+			SetLatch(&entry->workerLatch);
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /*

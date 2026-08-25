@@ -72,6 +72,13 @@ is($still_there, '1', 'the rejected DELETE left the row in place');
 # Test 2: after teardown in the target, the launcher-database DELETE succeeds.
 $node->safe_psql($TARGET_DB, "SELECT svs_teardown_database();");
 
+# Teardown drops every index in the database back-to-back, which is the heaviest
+# user of the slot-drop path: each DROP races a worker that may be holding that
+# index's slot.  A slot left behind here would pin WAL for the whole cluster with
+# no index left to replay into, so assert none survives.
+is(wait_for_no_orphan_slots($node, $TARGET_DB, 30), 0,
+    'teardown leaves no replication slot behind');
+
 my $target_oid = $node->safe_psql($LAUNCHER_DB,
     "SELECT oid FROM pg_database WHERE datname = '$TARGET_DB';");
 chomp $target_oid;

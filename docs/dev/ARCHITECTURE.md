@@ -487,7 +487,7 @@ The BGW loads from the filesystem save directory (`$PGDATA/vamana_indexes/<relid
 | During steps 1–4 (before slot creation) | Transaction uncommitted. PG rolls back catalog entry. Orphaned save directory cleaned by object-access hook or next startup. |
 | During steps 5–7 (after slot, before IPC) | Slot exists, save directory complete, WAL-logged pages present. The worker loads the index on first access (demand-driven). No data loss. |
 | During steps 8–12 (IPC in flight) | Same as above: slot + save directory complete. Backend's transaction is uncommitted. PG rolls back. The worker loads cleanly from disk on first access. |
-| After step 13, before PG COMMIT | PG rolls back catalog entry. Orphaned save directory + replication slot persist. Cleaned on next DROP attempt or by startup reconciliation. |
+| After step 13, before PG COMMIT | PG rolls back catalog entry. Orphaned save directory + replication slot persist. A later `CREATE INDEX` that is assigned the same relid drops both (`VamanaReplicationCreate` try-drops a slot of the same name before creating one). Failing that, the primary has no reconciliation pass: the slot keeps pinning WAL and `catalog_xmin` cluster-wide until dropped with `pg_drop_replication_slot()`. |
 
 #### Worker-Unavailable Handling
 
@@ -655,6 +655,22 @@ The `svs.max_slot_wal_size` GUC is the safety valve: if lag exceeds the threshol
 |---|---|---|---|
 | `restart_lsn` | PostgreSQL | All buffered transactions delivered | Yes |
 | `confirmed_flush_lsn` | SVS extension (at checkpoint) | `pg_logical_slot_advance()` call | No |
+
+#### Slot Removal on DROP INDEX
+
+Retention is cluster-wide: WAL is kept from the oldest `restart_lsn` in `pg_replication_slots`, whatever database owns it, and `catalog_xmin` holds back catalog VACUUM the same way. A slot whose index no longer exists therefore pins WAL forever with nothing left to replay into, and defeats `svs.max_slot_wal_size` for every database. Dropping the index must drop the slot.
+
+The `OAT_DROP` object-access hook fires before commit, so it only *queues* the drop (`VamanaReplicationQueueDropAtCommit`); the drop itself runs from the `XACT_EVENT_COMMIT` callback. A rolled-back `DROP INDEX` thus keeps its slot, as it must — the index is still catalogued and a slot cannot be un-dropped.
+
+The worker holds one of these slots only for the length of a single pass over it — a replay or snapshot-build WAL scan, a bounded standby activation, or, on a primary, the checkpoint `confirmed_flush` advance in `VamanaSlotAdvance`. Every one of those acquires with `nowait = true` and releases before returning, so between passes, at the top of the worker's main loop, `MyReplicationSlot == NULL`.
+
+At commit the backend makes exactly one non-blocking attempt (`ReplicationSlotDrop(nowait = true)`) rather than waiting for the holder. Waiting risks a cycle: the holder can be the worker inside `VamanaReplicationBuildSnapshot`, whose `SnapBuildWaitSnapshot` → `XactLockTableWait` waits for the dropping transaction's own XID to finish before the snapshot can reach CONSISTENT, while the backend waits for that worker to release the slot. `VamanaReplicationBuildSnapshot`'s header comment predicts it.
+
+The deadlock detector cannot break such a cycle, because only the worker's half is a lock wait — the backend's half is a condition variable. Nor can an operator: the callback runs inside `CommitTransaction`'s `HOLD_INTERRUPTS`, so a backend sleeping there ignores `pg_cancel_backend` and `pg_terminate_backend` alike, and every `DROP DATABASE` in the cluster then blocks behind the `ProcSignalBarrier` it will not accept. Independent of any cycle, waiting would sleep while holding `AccessExclusiveLock` on the index and its table — blocking every other reader of that table — and a third-party holder such as `pg_recvlogical` may never release at all.
+
+If the attempt reports the slot busy, the backend hands the relid to that database's worker (`pendingSlotDrops[]`, drained by `VamanaWorkerProcessSlotDrops` next to the reload queue, within one ~1 s heartbeat). The worker holds no slot of its own at that point in its loop, so it cannot lose the race.
+
+Nothing on this path raises an error — the transaction has already committed and the index is gone. A drop that cannot be completed (no worker entry, or a full handoff queue) is reported as a `WARNING` naming the slot, with the hint to remove it via `pg_drop_replication_slot()`.
 
 ---
 

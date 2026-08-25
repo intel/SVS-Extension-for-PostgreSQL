@@ -460,8 +460,8 @@ VamanaEvictCacheEntry(Oid indexRelid)
 /*
  * Discard cached, on-disk, and slot state so the index is rebuilt from the
  * heap on next access.  Deletes the save dir (unlike VamanaEvictCacheEntry) so
- * the stale copy is not reloaded.  The slot drop no-ops while the slot is
- * active, so the caller must release it first.
+ * the stale copy is not reloaded.  The drop cannot remove a slot held by
+ * another process, so the caller must release its own handle first.
  */
 void
 VamanaForceHeapRebuild(Oid indexRelid)
@@ -553,26 +553,28 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
 	{
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
+		Oid			vamanaAm = get_index_am_oid("vamana", true);
 
 		VamanaDeleteSaveDir(MyDatabaseId, objectId);
 		if (entry != NULL)
 			VamanaReleaseIndexLock(entry, objectId);
-		VamanaReplicationDropIfExists(MyDatabaseId, objectId);
 
 		/*
-		 * Drop of the whole relation (subId == 0), not a column.  Decrement
-		 * the per-database index counter only for vamana indexes; the hook
-		 * fires for every relation.  get_rel_relam and get_index_am_oid both
-		 * yield InvalidOid for non-index relations / a missing AM, so require
-		 * a valid, matching AM oid rather than comparing two InvalidOids.
+		 * The index counter and the replication slot both track committed
+		 * catalog truth, so both are deferred to COMMIT and neither is applied
+		 * on abort.  For the slot that is not just bookkeeping: a drop cannot
+		 * be undone, so dropping it here -- before commit -- would leave a
+		 * rolled-back DROP INDEX with a catalogued index and no slot.
+		 *
+		 * Restricted to vamana indexes; the hook fires for every relation.
+		 * get_rel_relam and get_index_am_oid both yield InvalidOid for
+		 * non-index relations / a missing AM, so require a valid, matching AM
+		 * oid rather than comparing two InvalidOids.
 		 */
-		if (subId == 0)
+		if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
 		{
-			Oid			vamanaAm = get_index_am_oid("vamana", true);
-
-			/* Applied to shmem at COMMIT by the index-count xact callback. */
-			if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
-				VamanaWorkerQueueIndexCountDelta(MyDatabaseId, -1);
+			VamanaReplicationQueueDropAtCommit(MyDatabaseId, objectId);
+			VamanaWorkerQueueIndexCountDelta(MyDatabaseId, -1);
 		}
 	}
 }

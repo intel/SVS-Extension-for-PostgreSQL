@@ -194,6 +194,15 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 		pg_atomic_write_u32(&entry->reloadRequests[i].relid, 0);
 
+	/*
+	 * Reached only on (de)reservation, never on worker restart, so a handoff
+	 * queued for a worker that then crashed still gets honoured.  A released
+	 * entry holds no indexes -- the BEFORE DELETE guard on vamana_databases
+	 * enforces that -- so nothing droppable is discarded here.
+	 */
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+		pg_atomic_write_u32(&entry->pendingSlotDrops[i].relid, 0);
+
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 		pg_atomic_write_u32(&entry->indexLocks[i].relid, 0);
 
@@ -221,6 +230,9 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 		pg_atomic_init_u32(&entry->reloadRequests[i].relid, 0);
+
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+		pg_atomic_init_u32(&entry->pendingSlotDrops[i].relid, 0);
 
 	pg_atomic_init_u32(&entry->evict_all, 0);
 	pg_atomic_init_u64(&entry->heartbeat_ts, 0);
