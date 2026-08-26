@@ -196,9 +196,11 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 
 	/*
 	 * Reached only on (de)reservation, never on worker restart, so a handoff
-	 * queued for a worker that then crashed still gets honoured.  A released
-	 * entry holds no indexes -- the BEFORE DELETE guard on vamana_databases
-	 * enforces that -- so nothing droppable is discarded here.
+	 * queued for a worker that then crashed still gets honoured.  Every entry
+	 * here names an index that is already gone, so it cannot be carried into the
+	 * next tenant -- a different dbOid would make the same relid name another
+	 * database's slot.  Whoever releases the entry must take the queue first
+	 * (VamanaWorkerTakePendingSlotDrops); this zeroing is the backstop.
 	 */
 	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
 		pg_atomic_write_u32(&entry->pendingSlotDrops[i].relid, 0);
@@ -778,8 +780,52 @@ VamanaWorkerSlotCapacity(void)
 }
 
 /*
+ * Take (read and clear) the slot drops still queued for dbOid, writing up to
+ * max relids into relids and returning how many.  Callers size the buffer with
+ * VAMANA_MAX_SLOT_DROP_QUEUE.
+ *
+ * For whoever is about to release or reuse the entry: releasing it discards the
+ * queue, and each entry is the only remaining name for a slot whose index is
+ * already gone.  Taking them under the same lock the release takes means a drop
+ * is either still queued for the worker or owned by the caller, never both and
+ * never neither.
+ */
+int
+VamanaWorkerTakePendingSlotDrops(Oid dbOid, Oid *relids, int max)
+{
+	VamanaWorkerShmem *entry;
+	int			count = 0;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE && count < max; i++)
+		{
+			uint32		relid = pg_atomic_read_u32(&entry->pendingSlotDrops[i].relid);
+
+			if (relid == 0)
+				continue;
+
+			pg_atomic_write_u32(&entry->pendingSlotDrops[i].relid, 0);
+			relids[count++] = (Oid) relid;
+		}
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return count;
+}
+
+/*
  * Release the control block for dbOid, returning it to the free pool.  The
- * caller is responsible for ensuring no worker is running against it.
+ * caller is responsible for ensuring no worker is running against it, and for
+ * taking any queued slot drops first (VamanaWorkerTakePendingSlotDrops).
  */
 void
 VamanaWorkerReleaseSlot(Oid dbOid)

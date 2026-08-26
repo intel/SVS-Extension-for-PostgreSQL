@@ -295,6 +295,15 @@ VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerClearDeadEntry(Oid dbOid);
+
+/*
+ * Read and clear the slot drops still queued for dbOid, up to max, returning
+ * the count.  Must be called before releasing the entry: the release discards
+ * the queue, and each relid is the only remaining name for a slot whose index
+ * is gone.  Size relids with VAMANA_MAX_SLOT_DROP_QUEUE.
+ */
+int		VamanaWorkerTakePendingSlotDrops(Oid dbOid, Oid *relids, int max);
+
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
 
 /*

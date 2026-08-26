@@ -299,6 +299,11 @@ ReserveSlotsForEnabledEntries(void)
 	MemoryContextSwitchTo(oldContext);
 }
 
+/*
+ * Undo this transaction's own reservations on abort.  No queued slot drop can be
+ * lost here, unlike the launcher's release: a drop is only ever handed off at
+ * commit, and these entries were reserved by the transaction now aborting.
+ */
 static void
 ReleaseSlotsReservedThisXact(void)
 {
