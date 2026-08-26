@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 08_vamana_standby_replay.pl — standby BGW replay via main-loop sweep.
+# 08_standby_replay.pl — standby BGW replay via main-loop sweep.
 #
 # Verifies that the standby BGW replays committed changes from the primary
 # via its main-loop replication sweep (gated by RecoveryInProgress()).

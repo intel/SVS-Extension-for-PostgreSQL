@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 09_vamana_standby_replay_faults.pl — standby BGW replay fault handling.
+# 09_standby_replay_faults.pl — standby BGW replay fault handling.
 #
 # The happy path lives in 08; this file covers the three failure valves.  Each
 # fix lives on the standby BGW replay path, so every test drives a primary +

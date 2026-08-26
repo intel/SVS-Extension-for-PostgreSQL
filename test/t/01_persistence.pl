@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 01_vamana_persistence.pl — on-disk persistence, save/load round-trips,
+# 01_persistence.pl — on-disk persistence, save/load round-trips,
 # search thread configuration, and LeanVec-compressed persistence.
 
 use strict;

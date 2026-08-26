@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 12_vamana_launcher.pl — the launcher and per-database worker entry point.
+# 12_launcher.pl — the launcher and per-database worker entry point.
 #
 # The launcher is the one statically-registered background worker.  It reads
 # the enabled rows from vamana_databases in svs.launcher_database and spawns

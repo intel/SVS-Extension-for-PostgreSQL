@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 13_vamana_crash_backoff.pl — the launcher's per-database crash-backoff policy.
+# 13_crash_backoff.pl — the launcher's per-database crash-backoff policy.
 #
 # The launcher owns respawn of its per-database workers (they register
 # BGW_NEVER_RESTART with bgw_notify_pid set to the launcher).  A worker that
