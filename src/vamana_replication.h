@@ -99,8 +99,32 @@ bool	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
 /* BGW: free the handle (does not drop the underlying slot). Safe with NULL. */
 void	VamanaReplicationClose(VamanaReplicationSlot *slot);
 
-/* Drop the slot if it exists and is not active. */
-void	VamanaReplicationDropIfExists(Oid dboid, Oid indexRelid);
+/*
+ * Outcome of a drop attempt.  The drop neither blocks nor throws, so BUSY is an
+ * ordinary answer the caller has to act on rather than an error it can ignore:
+ * the slot still exists, still pins WAL, and still holds back catalog_xmin.
+ */
+typedef enum VamanaSlotDropResult
+{
+	VAMANA_SLOT_DROP_DONE,		/* dropped, or already absent */
+	VAMANA_SLOT_DROP_BUSY,		/* another process holds it; nothing dropped */
+	VAMANA_SLOT_DROP_FAILED		/* unexpected failure, already logged */
+} VamanaSlotDropResult;
+
+/*
+ * Drop the index's slot now if it exists and nobody holds it.  Never waits and
+ * never throws; see the comment on TryDropSlot for why waiting is unsafe here.
+ * In-worker callers use this directly, having released their own handle first.
+ */
+VamanaSlotDropResult VamanaReplicationDropIfExists(Oid dboid, Oid indexRelid);
+
+/*
+ * Backend: ask for the index's slot to be dropped when this transaction
+ * commits.  DROP INDEX must go through here rather than dropping inline —
+ * dropping a slot cannot be undone, and the object-access hook that notices the
+ * drop runs before commit.
+ */
+void	VamanaReplicationQueueDropAtCommit(Oid dboid, Oid indexRelid);
 
 /* Output plugin entry point — required by logical decoding infrastructure. */
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);

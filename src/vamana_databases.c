@@ -237,6 +237,15 @@ VamanaDatabasesXactCallback(XactEvent event, void *arg)
 			CurrentReservationQueue = NULL;
 			break;
 
+		/*
+		 * No PRE_COMMIT fires for a prepared transaction, so nothing was
+		 * reserved; drop the queue with the TopTransactionContext it lives in,
+		 * or the next transaction in this backend appends into freed memory.
+		 */
+		case XACT_EVENT_PREPARE:
+			CurrentReservationQueue = NULL;
+			break;
+
 		default:
 			break;
 	}
@@ -299,6 +308,11 @@ ReserveSlotsForEnabledEntries(void)
 	MemoryContextSwitchTo(oldContext);
 }
 
+/*
+ * Undo this transaction's own reservations on abort.  No queued slot drop can be
+ * lost here, unlike the launcher's release: a drop is only ever handed off at
+ * commit, and these entries were reserved by the transaction now aborting.
+ */
 static void
 ReleaseSlotsReservedThisXact(void)
 {

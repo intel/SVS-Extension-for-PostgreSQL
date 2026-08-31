@@ -40,6 +40,13 @@ extern VamanaSubxidPendingArray *VamanaSubxidPendingArrayCreate(MemoryContext me
 extern void *VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array);
 
 /*
+ * True if any element is still live, i.e. was not discarded by a rolled-back
+ * subtransaction.  Not the same as count > 0: the array is never compacted, so
+ * a discarded element keeps its place.
+ */
+extern bool VamanaSubxidPendingArrayHasLiveEntries(const VamanaSubxidPendingArray *array);
+
+/*
  * Mark every element appended under mySubid as InvalidSubTransactionId, so a
  * later drain skips entries belonging to a rolled-back subtransaction.
  */

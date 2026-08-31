@@ -1049,4 +1049,372 @@ sub hold_slot_externally
     $node->stop;
 }
 
+# ===========================================================================
+# Slot removal when the worker holds the slot, and when the DROP rolls back
+#
+# Test 3 above drops an index the worker has long finished with, which is the
+# easy half.  The hard half is a DROP that lands while the worker holds the
+# slot -- on a primary that means its checkpoint confirmed_flush advance, which
+# is why the config below checkpoints as aggressively as it can and why each
+# table is dropped immediately after its index is built.  The committing backend
+# does not wait for the release: it would sleep holding AccessExclusiveLock on
+# the index and its table.  It hands the drop to the worker instead.
+#
+# The other guarantee is transactional: dropping a slot cannot be undone, so a
+# DROP INDEX that does not commit must leave the slot — and the index — intact,
+# whether it was the whole transaction that aborted or only a subtransaction.
+# ===========================================================================
+
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_slot_drop_race');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 20");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 20");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    # PGC_POSTMASTER, and 0 by default, so the two-phase cases below need it set
+    # here rather than at the point of use.
+    $node->append_conf('postgresql.conf', "max_prepared_transactions = 5");
+    # Keep the worker checkpointing, so it is holding the slot as often as
+    # possible while the DROPs land.
+    $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
+    $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    wait_for_worker($node, 30);
+
+    # Slot names are derived rather than scanned, so each case can name its own
+    # slot while other indexes exist.  Must run while the index is catalogued.
+    my $slot_of = sub {
+        my ($relname) = @_;
+        my $s = $node->safe_psql('postgres', qq{
+            SELECT 'vamana_'
+                || (SELECT oid FROM pg_database WHERE datname = current_database())
+                || '_' || (SELECT oid FROM pg_class WHERE relname = '$relname');
+        });
+        chomp $s;
+        return $s;
+    };
+
+    my $slot_count = sub {
+        my ($slot) = @_;
+        my $n = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '$slot';");
+        chomp $n;
+        return $n;
+    };
+
+    my $index_count = sub {
+        my ($relname) = @_;
+        my $n = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_class WHERE relname = '$relname';");
+        chomp $n;
+        return $n;
+    };
+
+    # Build a small index and return its slot name once the worker has created
+    # the slot.  Small on purpose: these cases are about the transaction, not
+    # about racing the build.
+    my $make_index = sub {
+        my ($tag) = @_;
+
+        $node->safe_psql('postgres', qq{
+            CREATE TABLE sp_$tag (id serial, val vector($dim));
+            INSERT INTO sp_$tag (val)
+                SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200);
+            CREATE INDEX sp_idx_$tag ON sp_$tag USING vamana (val vector_l2_ops);
+        });
+
+        my $slot = $slot_of->("sp_idx_$tag");
+        for (1 .. 20)
+        {
+            last if $slot_count->($slot) eq '1';
+            usleep(500_000);
+        }
+        return $slot;
+    };
+
+    # A committed drop may have been handed to the worker, so poll.
+    my $wait_slot_gone = sub {
+        my ($slot) = @_;
+        for (1 .. 40)
+        {
+            return 1 if $slot_count->($slot) eq '0';
+            usleep(500_000);
+        }
+        return 0;
+    };
+
+    # "The slot survived" cannot be asserted by looking once.  A drop the backend
+    # could not do itself is handed to the worker and lands a heartbeat later, so
+    # an immediate count of 1 also describes a slot that is queued to be dropped.
+    # Watch it for several heartbeats instead.
+    my $slot_persists = sub {
+        my ($slot) = @_;
+        for (1 .. 10)
+        {
+            return 0 if $slot_count->($slot) eq '0';
+            usleep(500_000);
+        }
+        return 1;
+    };
+
+    # ---------------------------------------------------------------- Rollback --
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE rb_tbl (id serial, val vector($dim));
+        INSERT INTO rb_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200);
+        CREATE INDEX rb_idx ON rb_tbl USING vamana (val vector_l2_ops);
+    });
+
+    my $rb_slot = $slot_of->('rb_idx');
+    for (1 .. 20)
+    {
+        last if $slot_count->($rb_slot) eq '1';
+        usleep(500_000);
+    }
+    is($slot_count->($rb_slot), '1', "slot created for rb_idx ($rb_slot)");
+
+    $node->safe_psql('postgres', "BEGIN; DROP INDEX rb_idx; ROLLBACK;");
+
+    ok($slot_persists->($rb_slot), 'rolled-back DROP INDEX keeps the slot');
+    is($index_count->('rb_idx'), '1', 'rolled-back DROP INDEX keeps the index');
+
+    # The index must still be usable, not merely catalogued: a slot dropped
+    # under it would leave nothing to replay its writes.
+    $node->safe_psql('postgres', qq{
+        INSERT INTO rb_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+    });
+    my $found = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT count(*) FROM (
+            SELECT id FROM rb_tbl ORDER BY val <-> ARRAY[$query_sql]::vector LIMIT 5
+        ) t;
+    });
+    chomp $found;
+    is($found, '5', 'index still searchable after the rolled-back DROP');
+
+    $node->safe_psql('postgres', "DROP TABLE rb_tbl;");
+
+    # -------------------------------------------------------------- Savepoints --
+    # The queued drop is held in a VamanaSubxidPendingArray, so a subtransaction
+    # that aborts must discard its entry and one that commits must hand the entry
+    # to its parent.  Same plumbing, and the same four cases, as the index-counter
+    # matrix in test/sql/vamana_databases.sql.
+    #
+    # Only the last of these may drop the slot.  A slot cannot be un-dropped, so
+    # every case that ends without a committed DROP INDEX has to keep it.
+
+
+    # ROLLBACK TO SAVEPOINT discards that subtransaction's queued drop.
+    my $slot_a = $make_index->('a');
+    is($slot_count->($slot_a), '1', "slot created for sp_idx_a ($slot_a)");
+    $node->safe_psql('postgres', q{
+        BEGIN;
+        SAVEPOINT sp;
+        DROP INDEX sp_idx_a;
+        ROLLBACK TO SAVEPOINT sp;
+        COMMIT;
+    });
+    ok($slot_persists->($slot_a),
+        'ROLLBACK TO SAVEPOINT keeps the slot of the DROP INDEX it discarded');
+    is($index_count->('sp_idx_a'), '1',
+        'ROLLBACK TO SAVEPOINT keeps the index');
+
+    # A subtransaction whose drop is released into its parent, where the parent
+    # then aborts: the entry was reparented, so the abort must still discard it.
+    my $slot_b = $make_index->('b');
+    is($slot_count->($slot_b), '1', "slot created for sp_idx_b ($slot_b)");
+    $node->safe_psql('postgres', q{
+        BEGIN;
+        SAVEPOINT sp;
+        DROP INDEX sp_idx_b;
+        RELEASE SAVEPOINT sp;
+        ROLLBACK;
+    });
+    ok($slot_persists->($slot_b),
+        'a released savepoint whose transaction aborts keeps the slot');
+    is($index_count->('sp_idx_b'), '1',
+        'a released savepoint whose transaction aborts keeps the index');
+
+    # A savepoint released into its parent, then discarded by rolling back to an
+    # earlier ancestor.  This is what catches reparenting to the wrong level: an
+    # entry reparented past outer_sp would survive the rollback and drop the slot
+    # of an index that still exists.
+    my $slot_c = $make_index->('c');
+    is($slot_count->($slot_c), '1', "slot created for sp_idx_c ($slot_c)");
+    $node->safe_psql('postgres', q{
+        BEGIN;
+        SAVEPOINT outer_sp;
+        SAVEPOINT inner_sp;
+        DROP INDEX sp_idx_c;
+        RELEASE SAVEPOINT inner_sp;
+        ROLLBACK TO SAVEPOINT outer_sp;
+        COMMIT;
+    });
+    ok($slot_persists->($slot_c),
+        'a released savepoint discarded by an ancestor rollback keeps the slot');
+    is($index_count->('sp_idx_c'), '1',
+        'a released savepoint discarded by an ancestor rollback keeps the index');
+
+    # The one case that must drop: released into the parent, parent commits.
+    my $slot_d = $make_index->('d');
+    is($slot_count->($slot_d), '1', "slot created for sp_idx_d ($slot_d)");
+    $node->safe_psql('postgres', q{
+        BEGIN;
+        SAVEPOINT sp;
+        DROP INDEX sp_idx_d;
+        RELEASE SAVEPOINT sp;
+        COMMIT;
+    });
+    ok($wait_slot_gone->($slot_d),
+        'a released savepoint that commits drops the slot');
+    is($index_count->('sp_idx_d'), '0',
+        'a released savepoint that commits drops the index');
+
+    # ------------------------------------------------------ Two-phase commit --
+    # Nothing pending can be carried across PREPARE TRANSACTION: the queues live
+    # in TopTransactionContext, and COMMIT PREPARED runs none of these callbacks,
+    # so a prepared DROP INDEX would drop the index and keep the slot forever.
+    # Refusing has to happen at PRE_PREPARE, before the transaction is on disk --
+    # an error at PREPARE is too late to undo it, which the "nothing left
+    # prepared" assertions below are there to catch.
+    #
+    # What must not be refused is a transaction whose pending work was discarded
+    # by a rolled-back savepoint.  Discarded entries keep their place in the
+    # array, so counting entries is not counting live ones.  All three arrays a
+    # transaction can fill are covered: the slot drops and index-count deltas of
+    # a DROP INDEX, and the undo log of an INSERT.
+
+    my $psql_err = sub {
+        my ($sql) = @_;
+        my ($rc, $out, $err) = $node->psql('postgres', $sql, on_error_stop => 0);
+        return $err;
+    };
+
+    my $prepared_count = sub {
+        my $n = $node->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts;");
+        chomp $n;
+        return $n;
+    };
+
+    my $slot_e = $make_index->('e');
+    is($slot_count->($slot_e), '1', "slot created for sp_idx_e ($slot_e)");
+    like($psql_err->("BEGIN; DROP INDEX sp_idx_e; PREPARE TRANSACTION 'vamana_pt_e';"),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while a DROP INDEX is pending');
+    is($prepared_count->(), '0',
+        'the rejected PREPARE left no prepared transaction behind');
+    ok($slot_persists->($slot_e), 'the rejected PREPARE keeps the slot');
+    is($index_count->('sp_idx_e'), '1', 'the rejected PREPARE keeps the index');
+
+    my $slot_f = $make_index->('f');
+    is($slot_count->($slot_f), '1', "slot created for sp_idx_f ($slot_f)");
+    my ($rc_f, $out_f, $err_f) = $node->psql('postgres', q{
+        BEGIN;
+        SAVEPOINT sp;
+        DROP INDEX sp_idx_f;
+        ROLLBACK TO SAVEPOINT sp;
+        PREPARE TRANSACTION 'vamana_pt_f';
+    }, on_error_stop => 0);
+    is($rc_f, 0,
+        'PREPARE is allowed once a rolled-back savepoint discarded the DROP INDEX');
+    $node->safe_psql('postgres', "COMMIT PREPARED 'vamana_pt_f';");
+    ok($slot_persists->($slot_f), 'that prepared transaction keeps the slot');
+    is($index_count->('sp_idx_f'), '1', 'that prepared transaction keeps the index');
+
+    # The undo log is a third pending array with the same rule.
+    my $slot_g = $make_index->('g');
+    is($slot_count->($slot_g), '1', "slot created for sp_idx_g ($slot_g)");
+    like($psql_err->(qq{
+            BEGIN;
+            INSERT INTO sp_g (val) VALUES (ARRAY[$array_sql]::vector);
+            PREPARE TRANSACTION 'vamana_pt_g';
+        }),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while an index write is pending');
+    is($prepared_count->(), '0',
+        'the rejected PREPARE of a write left no prepared transaction behind');
+
+    my ($rc_g, $out_g, $err_g) = $node->psql('postgres', qq{
+        BEGIN;
+        SAVEPOINT sp;
+        INSERT INTO sp_g (val) VALUES (ARRAY[$array_sql]::vector);
+        ROLLBACK TO SAVEPOINT sp;
+        PREPARE TRANSACTION 'vamana_pt_g2';
+    }, on_error_stop => 0);
+    is($rc_g, 0,
+        'PREPARE is allowed once a rolled-back savepoint discarded the write');
+    $node->safe_psql('postgres', "COMMIT PREPARED 'vamana_pt_g2';");
+    is($prepared_count->(), '0', 'no prepared transaction is left over');
+
+    $node->safe_psql('postgres',
+        "DROP TABLE sp_a, sp_b, sp_c, sp_d, sp_e, sp_f, sp_g;");
+
+    is(wait_for_no_orphan_slots($node, 'postgres', 40), 0,
+        'no slot outlives its index after the savepoint cases');
+
+    # ------------------------------------------------------------------- Race --
+    # No pause between build and drop, so the worker may still hold the slot.
+    for my $i (1 .. 5)
+    {
+        $node->safe_psql('postgres', qq{
+            CREATE TABLE race_$i (id serial, val vector($dim));
+            INSERT INTO race_$i (val)
+                SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 2000);
+            CREATE INDEX race_idx_$i ON race_$i USING vamana (val vector_l2_ops);
+            DROP TABLE race_$i;
+        });
+    }
+
+    my $left = wait_for_no_orphan_slots($node, 'postgres', 40);
+    is($left, 0,
+        'no slot outlives its index after five drops that race the worker');
+
+    ok(wait_for_worker($node, 30),
+        'worker still alive after the contended drops');
+
+    # ------------------------------------------------- Backend still healthy --
+    # Losing the race means catching ERRCODE_OBJECT_IN_USE inside the COMMIT
+    # callback, and errfinish() zeroes the interrupt-holdoff counters on its way
+    # to the longjmp.  A callback that does not restore them leaves the backend's
+    # count underflowed, after which it services no interrupt at all: it accepts
+    # no ProcSignalBarrier, so the next DROP DATABASE anywhere in the cluster
+    # waits on it forever, and no cancel or terminate can free it.
+    #
+    # Both halves must run in one session for the damaged backend to be the one
+    # dropping the database, and the timeout is what turns the hang into a
+    # failure instead of a stuck suite.
+    my $timed_out;
+    my $rc = $node->psql(
+        'postgres',
+        qq{
+            CREATE TABLE wedge_tbl (id serial, val vector($dim));
+            INSERT INTO wedge_tbl (val)
+                SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 2000);
+            CREATE INDEX wedge_idx ON wedge_tbl USING vamana (val vector_l2_ops);
+            DROP TABLE wedge_tbl;
+            CREATE DATABASE wedge_probe;
+            DROP DATABASE wedge_probe;
+        },
+        timeout => 60,
+        timed_out => \$timed_out);
+
+    ok(!$timed_out, 'DROP DATABASE still completes in a backend that lost the race');
+    is($rc, 0, 'the contended DROP INDEX leaves its backend able to run DDL');
+
+    # A healthy backend is not the whole guarantee: the drop it handed off still
+    # has to land.
+    is(wait_for_no_orphan_slots($node, 'postgres', 40), 0,
+        'the drop handed off by that backend still completed');
+
+    $node->stop;
+}
+
 done_testing();

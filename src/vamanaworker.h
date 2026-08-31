@@ -70,6 +70,15 @@ typedef void *SVSIndexHandle;
 #define VAMANA_MAX_RELOAD_QUEUE  16
 
 /*
+ * Maximum number of orphaned-slot drops that can be waiting for the worker at
+ * once.  Each entry is one index whose slot the dropping backend found held by
+ * the worker; the worker drains them within one cycle, so more than a handful
+ * in flight means a whole transaction's worth of DROP INDEXes landed during a
+ * single long replay pass.
+ */
+#define VAMANA_MAX_SLOT_DROP_QUEUE  16
+
+/*
  * Maximum number of Vamana indexes that can be live in one database.
  * Determines the size of the per-index LWLock array in shared memory.
  */
@@ -133,6 +142,17 @@ typedef struct VamanaWorkerReloadRequest
 } VamanaWorkerReloadRequest;
 
 /*
+ * Per-index orphaned-slot drop request.  Backend writes the OID of an index it
+ * has finished dropping but whose replication slot the worker was holding;
+ * worker reads and clears it the same way as a reload request.  relid == 0
+ * means empty.
+ */
+typedef struct VamanaWorkerSlotDropRequest
+{
+	pg_atomic_uint32 relid;
+} VamanaWorkerSlotDropRequest;
+
+/*
  * Per-index reader/writer lock entry.  LW_SHARED for searches; LW_EXCLUSIVE
  * for writes (INSERT, DELETE, CONSOLIDATE, COMPACT, ADOPT).  Keyed by a
  * stable slot index assigned when the BGW first loads each index.
@@ -190,6 +210,16 @@ typedef struct VamanaWorkerShmem
 	 * on demand.
 	 */
 	pg_atomic_uint32 evict_all;
+
+	/*
+	 * Orphaned-slot handoff.  A backend that has committed a DROP INDEX but
+	 * found the worker holding that index's replication slot leaves the OID
+	 * here; the worker drops the slot on its next cycle, where it holds no slot
+	 * of its own and so cannot lose the race.  Deliberately not cleared when a
+	 * worker restarts -- only when the entry is released -- so a worker crash
+	 * between the handoff and the drop does not leak the slot.
+	 */
+	VamanaWorkerSlotDropRequest pendingSlotDrops[VAMANA_MAX_SLOT_DROP_QUEUE];
 
 	/* Updated each BGW loop iteration; backends check for hung worker. */
 	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
@@ -265,6 +295,15 @@ VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerClearDeadEntry(Oid dbOid);
+
+/*
+ * Read and clear the slot drops still queued for dbOid, up to max, returning
+ * the count.  Must be called before releasing the entry: the release discards
+ * the queue, and each relid is the only remaining name for a slot whose index
+ * is gone.  Size relids with VAMANA_MAX_SLOT_DROP_QUEUE.
+ */
+int		VamanaWorkerTakePendingSlotDrops(Oid dbOid, Oid *relids, int max);
+
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
 
 /*
@@ -415,6 +454,13 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 bool	VamanaWorkerSubmitWarmup(Oid indexRelid);
 void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
+
+/*
+ * Hand a dropped index's still-held replication slot to dbOid's worker.
+ * Returns false if there is no worker entry or the handoff queue is full, in
+ * which case the slot is left for the caller to report.
+ */
+bool	VamanaWorkerRequestSlotDrop(Oid dbOid, Oid indexRelid);
 VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);
 bool	VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry);
 bool	VamanaWorkerIsAvailable(void);
