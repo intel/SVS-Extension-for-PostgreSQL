@@ -237,6 +237,15 @@ VamanaDatabasesXactCallback(XactEvent event, void *arg)
 			CurrentReservationQueue = NULL;
 			break;
 
+		/*
+		 * No PRE_COMMIT fires for a prepared transaction, so nothing was
+		 * reserved; drop the queue with the TopTransactionContext it lives in,
+		 * or the next transaction in this backend appends into freed memory.
+		 */
+		case XACT_EVENT_PREPARE:
+			CurrentReservationQueue = NULL;
+			break;
+
 		default:
 			break;
 	}

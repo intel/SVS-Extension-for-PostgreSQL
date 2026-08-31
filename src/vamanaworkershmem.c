@@ -572,12 +572,17 @@ VamanaIndexCountXactCallback(XactEvent event, void *arg)
 			CurrentIndexCountDeltas = NULL;
 			break;
 
-		case XACT_EVENT_PREPARE:
+		/* See VamanaSlotDropXactCallback: PREPARE is too late to refuse. */
+		case XACT_EVENT_PRE_PREPARE:
 			if (CurrentIndexCountDeltas != NULL &&
-				CurrentIndexCountDeltas->count > 0)
+				VamanaSubxidPendingArrayHasLiveEntries(CurrentIndexCountDeltas))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		case XACT_EVENT_PREPARE:
+			CurrentIndexCountDeltas = NULL;
 			break;
 
 		default:
@@ -777,6 +782,63 @@ VamanaWorkerSlotCapacity(void)
 	VamanaWorkerRequireShmemInitialized();
 
 	return VamanaWorkerShmemHeaderPtr->numSlots;
+}
+
+/*
+ * VamanaWorkerRequestSlotDrop
+ *
+ * Ask dbOid's worker to drop the replication slot of an index the caller has
+ * finished dropping.  Used only when the caller's own attempt found the slot
+ * held: the worker acquires a slot for the length of one replay, snapshot-build,
+ * activation, or checkpoint-confirm pass, and a backend must not wait for it to
+ * finish (see TryDropSlot), so the work goes to the holder instead.
+ *
+ * Unlike a lost reload there is no cheap catch-all fallback: evicting caches
+ * would not remove a slot, and the OID is the only way to name it.  So a full
+ * queue is reported to the caller rather than absorbed.
+ *
+ * Lives here, beside the take, because the find and the write have to happen
+ * under one hold of the header lock: an entry resolved and then written to after
+ * the lock is gone may by then belong to another database, whose worker would
+ * look for a slot named after its own dbOid and find nothing, while the slot
+ * this request names loses its last reference.  Shared is enough — every
+ * reassignment takes the lock exclusively, and two producers racing for the same
+ * ring entry are settled by the CAS.
+ */
+bool
+VamanaWorkerRequestSlotDrop(Oid dbOid, Oid indexRelid)
+{
+	VamanaWorkerShmem *entry;
+	bool		queued = false;
+
+	Assert(OidIsValid(dbOid));
+	Assert(OidIsValid(indexRelid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+		{
+			uint32		expected = 0;
+
+			if (pg_atomic_compare_exchange_u32(&entry->pendingSlotDrops[i].relid,
+											   &expected, (uint32) indexRelid))
+			{
+				/* Kicked under the lock too: past it the latch may be another tenant's. */
+				SetLatch(&entry->workerLatch);
+				queued = true;
+				break;
+			}
+		}
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return queued;
 }
 
 /*

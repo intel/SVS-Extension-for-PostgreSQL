@@ -250,11 +250,17 @@ VamanaXactCallback(XactEvent event, void *arg)
 				break;
 			}
 
-		case XACT_EVENT_PREPARE:
-			if (CurrentUndoLog != NULL && CurrentUndoLog->count > 0)
+		/* See VamanaSlotDropXactCallback: PREPARE is too late to refuse. */
+		case XACT_EVENT_PRE_PREPARE:
+			if (CurrentUndoLog != NULL &&
+				VamanaSubxidPendingArrayHasLiveEntries(CurrentUndoLog))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		case XACT_EVENT_PREPARE:
+			CurrentUndoLog = NULL;
 			break;
 
 		default:

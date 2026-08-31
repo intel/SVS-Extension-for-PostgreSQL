@@ -1073,6 +1073,9 @@ sub hold_slot_externally
     $node->append_conf('postgresql.conf', "max_replication_slots = 20");
     $node->append_conf('postgresql.conf', "max_wal_senders = 20");
     $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    # PGC_POSTMASTER, and 0 by default, so the two-phase cases below need it set
+    # here rather than at the point of use.
+    $node->append_conf('postgresql.conf', "max_prepared_transactions = 5");
     # Keep the worker checkpointing, so it is holding the slot as often as
     # possible while the DROPs land.
     $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
@@ -1275,8 +1278,84 @@ sub hold_slot_externally
     is($index_count->('sp_idx_d'), '0',
         'a released savepoint that commits drops the index');
 
+    # ------------------------------------------------------ Two-phase commit --
+    # Nothing pending can be carried across PREPARE TRANSACTION: the queues live
+    # in TopTransactionContext, and COMMIT PREPARED runs none of these callbacks,
+    # so a prepared DROP INDEX would drop the index and keep the slot forever.
+    # Refusing has to happen at PRE_PREPARE, before the transaction is on disk --
+    # an error at PREPARE is too late to undo it, which the "nothing left
+    # prepared" assertions below are there to catch.
+    #
+    # What must not be refused is a transaction whose pending work was discarded
+    # by a rolled-back savepoint.  Discarded entries keep their place in the
+    # array, so counting entries is not counting live ones.  All three arrays a
+    # transaction can fill are covered: the slot drops and index-count deltas of
+    # a DROP INDEX, and the undo log of an INSERT.
+
+    my $psql_err = sub {
+        my ($sql) = @_;
+        my ($rc, $out, $err) = $node->psql('postgres', $sql, on_error_stop => 0);
+        return $err;
+    };
+
+    my $prepared_count = sub {
+        my $n = $node->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts;");
+        chomp $n;
+        return $n;
+    };
+
+    my $slot_e = $make_index->('e');
+    is($slot_count->($slot_e), '1', "slot created for sp_idx_e ($slot_e)");
+    like($psql_err->("BEGIN; DROP INDEX sp_idx_e; PREPARE TRANSACTION 'vamana_pt_e';"),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while a DROP INDEX is pending');
+    is($prepared_count->(), '0',
+        'the rejected PREPARE left no prepared transaction behind');
+    ok($slot_persists->($slot_e), 'the rejected PREPARE keeps the slot');
+    is($index_count->('sp_idx_e'), '1', 'the rejected PREPARE keeps the index');
+
+    my $slot_f = $make_index->('f');
+    is($slot_count->($slot_f), '1', "slot created for sp_idx_f ($slot_f)");
+    my ($rc_f, $out_f, $err_f) = $node->psql('postgres', q{
+        BEGIN;
+        SAVEPOINT sp;
+        DROP INDEX sp_idx_f;
+        ROLLBACK TO SAVEPOINT sp;
+        PREPARE TRANSACTION 'vamana_pt_f';
+    }, on_error_stop => 0);
+    is($rc_f, 0,
+        'PREPARE is allowed once a rolled-back savepoint discarded the DROP INDEX');
+    $node->safe_psql('postgres', "COMMIT PREPARED 'vamana_pt_f';");
+    ok($slot_persists->($slot_f), 'that prepared transaction keeps the slot');
+    is($index_count->('sp_idx_f'), '1', 'that prepared transaction keeps the index');
+
+    # The undo log is a third pending array with the same rule.
+    my $slot_g = $make_index->('g');
+    is($slot_count->($slot_g), '1', "slot created for sp_idx_g ($slot_g)");
+    like($psql_err->(qq{
+            BEGIN;
+            INSERT INTO sp_g (val) VALUES (ARRAY[$array_sql]::vector);
+            PREPARE TRANSACTION 'vamana_pt_g';
+        }),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while an index write is pending');
+    is($prepared_count->(), '0',
+        'the rejected PREPARE of a write left no prepared transaction behind');
+
+    my ($rc_g, $out_g, $err_g) = $node->psql('postgres', qq{
+        BEGIN;
+        SAVEPOINT sp;
+        INSERT INTO sp_g (val) VALUES (ARRAY[$array_sql]::vector);
+        ROLLBACK TO SAVEPOINT sp;
+        PREPARE TRANSACTION 'vamana_pt_g2';
+    }, on_error_stop => 0);
+    is($rc_g, 0,
+        'PREPARE is allowed once a rolled-back savepoint discarded the write');
+    $node->safe_psql('postgres', "COMMIT PREPARED 'vamana_pt_g2';");
+    is($prepared_count->(), '0', 'no prepared transaction is left over');
+
     $node->safe_psql('postgres',
-        "DROP TABLE sp_a, sp_b, sp_c, sp_d;");
+        "DROP TABLE sp_a, sp_b, sp_c, sp_d, sp_e, sp_f, sp_g;");
 
     is(wait_for_no_orphan_slots($node, 'postgres', 40), 0,
         'no slot outlives its index after the savepoint cases');

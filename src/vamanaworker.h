@@ -456,11 +456,11 @@ void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);
 
 /*
- * Hand a dropped index's still-held replication slot to this database's worker.
+ * Hand a dropped index's still-held replication slot to dbOid's worker.
  * Returns false if there is no worker entry or the handoff queue is full, in
  * which case the slot is left for the caller to report.
  */
-bool	VamanaWorkerRequestSlotDrop(Oid indexRelid);
+bool	VamanaWorkerRequestSlotDrop(Oid dbOid, Oid indexRelid);
 VamanaWorkerShmem *VamanaWorkerFindActiveSlot(void);
 bool	VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry);
 bool	VamanaWorkerIsAvailable(void);

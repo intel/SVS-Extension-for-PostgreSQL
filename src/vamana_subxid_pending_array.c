@@ -65,6 +65,17 @@ VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array)
 	return entry;
 }
 
+bool
+VamanaSubxidPendingArrayHasLiveEntries(const VamanaSubxidPendingArray *array)
+{
+	for (int i = 0; i < array->count; i++)
+	{
+		if (VamanaSubxidPendingArraySubxidAt(array, i) != InvalidSubTransactionId)
+			return true;
+	}
+	return false;
+}
+
 static void
 ReplaceMatchingSubxid(VamanaSubxidPendingArray *array, SubTransactionId mySubid,
 					   SubTransactionId replacement)

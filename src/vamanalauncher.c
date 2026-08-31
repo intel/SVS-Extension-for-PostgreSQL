@@ -860,13 +860,16 @@ DropSlotsAbandonedByStoppedWorker(Oid dbOid)
 
 	for (int i = 0; i < count; i++)
 	{
-		if (VamanaReplicationDropIfExists(dbOid, relids[i]) == VAMANA_SLOT_DROP_DONE)
+		VamanaSlotDropResult result = VamanaReplicationDropIfExists(dbOid, relids[i]);
+
+		/* FAILED is not reported here: the try-drop already logged the error. */
+		if (result == VAMANA_SLOT_DROP_DONE)
 			ereport(LOG,
 					(errmsg("vamana launcher: dropped replication slot of removed index %u in database %u",
 							relids[i], dbOid)));
-		else
+		else if (result == VAMANA_SLOT_DROP_BUSY)
 			ereport(WARNING,
-					(errmsg("vamana launcher: could not drop replication slot of removed index %u in database %u",
+					(errmsg("vamana launcher: replication slot of removed index %u in database %u is still held",
 							relids[i], dbOid),
 					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
 	}

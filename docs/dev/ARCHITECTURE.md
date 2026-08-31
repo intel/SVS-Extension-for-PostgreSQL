@@ -670,6 +670,8 @@ The deadlock detector cannot break such a cycle, because only the worker's half 
 
 If the attempt reports the slot busy, the backend hands the relid to that database's worker (`pendingSlotDrops[]`, drained by `VamanaWorkerProcessSlotDrops` next to the reload queue, within one ~1 s heartbeat). The worker holds no slot of its own at that point in its loop, so it cannot lose the race.
 
+The handoff is written under the shmem header lock (`VamanaWorkerRequestSlotDrop`, beside the take below). Resolving the entry and then writing to it after the lock is gone would allow the entry to be released and re-reserved in between: the request would land in another database's queue, where the same relid names a different slot, and the slot it was meant for would lose its last reference.
+
 A queue entry is cleared only after its attempt returns, so a worker that dies partway leaves the request for its replacement, and the queue itself survives a worker restart. It cannot survive the shmem entry being released, though: a recycled entry belongs to another database, where the same relid would name a different slot. So the departing worker drains the queue once more in its shutdown sequence, and if it died before it could, the launcher finishes the drops itself as it retires the entry (`VamanaWorkerTakePendingSlotDrops`) — dropping a logical slot needs no connection to its database, only decoding from it does.
 
 Nothing on this path raises an error — the transaction has already committed and the index is gone. A drop that cannot be completed (no worker entry, or a full handoff queue) is reported as a `WARNING` naming the slot, with the hint to remove it via `pg_drop_replication_slot()`.

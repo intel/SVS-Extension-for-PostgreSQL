@@ -1349,7 +1349,7 @@ ApplyPendingSlotDrops(void)
 										  entry->indexRelid) != VAMANA_SLOT_DROP_BUSY)
 			continue;
 
-		if (VamanaWorkerRequestSlotDrop(entry->indexRelid))
+		if (VamanaWorkerRequestSlotDrop(entry->dbOid, entry->indexRelid))
 			continue;
 
 		SlotName(entry->dbOid, entry->indexRelid, slotName);
@@ -1377,11 +1377,24 @@ VamanaSlotDropXactCallback(XactEvent event, void *arg)
 			CurrentSlotDrops = NULL;
 			break;
 
-		case XACT_EVENT_PREPARE:
-			if (CurrentSlotDrops != NULL && CurrentSlotDrops->count > 0)
+		/*
+		 * Refused here, not at XACT_EVENT_PREPARE: that fires after EndPrepare,
+		 * where the transaction is already on disk and an error cannot undo it,
+		 * leaving a prepared DROP INDEX whose COMMIT PREPARED runs no callback
+		 * of ours at all.  A discarded entry still occupies its place in the
+		 * array, so live entries have to be counted rather than all of them.
+		 */
+		case XACT_EVENT_PRE_PREPARE:
+			if (CurrentSlotDrops != NULL &&
+				VamanaSubxidPendingArrayHasLiveEntries(CurrentSlotDrops))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		/* Reached only with nothing live left to apply; the array's memory goes with the transaction. */
+		case XACT_EVENT_PREPARE:
+			CurrentSlotDrops = NULL;
 			break;
 
 		default:
