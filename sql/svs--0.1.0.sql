@@ -57,9 +57,16 @@ CREATE TABLE vamana_databases (
 	-- Placeholders for a future resource-management phase; NULL means
 	-- "use the GUC default." Nullable with no default so activating them
 	-- later needs no ALTER TABLE.
-	graph_memory_mb     int CHECK (graph_memory_mb > 0),
-	total_memory_mb     int CHECK (total_memory_mb > 0),
-	search_num_threads  int CHECK (search_num_threads BETWEEN 1 AND 1024)
+	graph_memory_mb          int CHECK (graph_memory_mb > 0),
+	total_memory_mb          int CHECK (total_memory_mb > 0),
+	search_num_threads       int CHECK (search_num_threads BETWEEN 1 AND 1024),
+
+	-- NULL means "no floor" (pure best-effort against the shared pool).
+	search_threads_reserved int CHECK (search_threads_reserved BETWEEN 0 AND 1024),
+
+	-- NULL means "follow the cluster-wide build-thread default." 0 means
+	-- serial, matching core's max_parallel_maintenance_workers = 0 semantics.
+	maintenance_num_threads int CHECK (maintenance_num_threads BETWEEN 0 AND 1024)
 );
 
 SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');

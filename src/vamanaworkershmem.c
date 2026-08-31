@@ -23,6 +23,8 @@
 #include "storage/itemptr.h"
 #include "storage/lwlock.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/shmem.h"
 #include "utils/errcodes.h"
 #include "utils/injection_point.h"
@@ -190,9 +192,15 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 	pg_atomic_write_u32(&entry->evict_all, 0);
 	pg_atomic_write_u64(&entry->heartbeat_ts, 0);
 	pg_atomic_write_u32(&entry->indexCount, 0);
+	pg_atomic_write_u32(&entry->desiredSearchThreads, 0);
+	pg_atomic_write_u32(&entry->grantedSearchThreads, 0);
+	pg_atomic_write_u32(&entry->reservedSearchThreads, 0);
 
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 		pg_atomic_write_u32(&entry->reloadRequests[i].relid, 0);
+
+	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
+		pg_atomic_write_u32(&entry->buildRequests[i].pid, 0);
 
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 		pg_atomic_write_u32(&entry->indexLocks[i].relid, 0);
@@ -222,9 +230,20 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 		pg_atomic_init_u32(&entry->reloadRequests[i].relid, 0);
 
+	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
+	{
+		SvsBuildRequest *req = &entry->buildRequests[i];
+
+		pg_atomic_init_u32(&req->pid, 0);
+		pg_atomic_init_u32(&req->status, SVS_BUILD_REQUEST_PENDING);
+	}
+
 	pg_atomic_init_u32(&entry->evict_all, 0);
 	pg_atomic_init_u64(&entry->heartbeat_ts, 0);
 	pg_atomic_init_u32(&entry->indexCount, 0);
+	pg_atomic_init_u32(&entry->desiredSearchThreads, 0);
+	pg_atomic_init_u32(&entry->grantedSearchThreads, 0);
+	pg_atomic_init_u32(&entry->reservedSearchThreads, 0);
 
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 	{
@@ -409,6 +428,41 @@ VamanaWorkerReserveSlot(Oid dbOid, bool *created)
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
 
 	return entry;
+}
+
+/* -----------------------------------------------------------------------
+ * Cross-process wake
+ *
+ * A backend's own MyLatch is just &MyProc->procLatch, a struct living in the
+ * shared PGPROC array; any other backend that knows its PID can set that same
+ * latch directly via BackendPidGetProc, with no change to what the target is
+ * already waiting on.  This is how NOTIFY and worker-death wakes already
+ * reach the launcher today; it lets a build request reach it the same way
+ * without going through NOTIFY's post-commit delivery, which would never fire
+ * while the requesting backend's own transaction is still open waiting on it.
+ * ----------------------------------------------------------------------- */
+
+void
+SvsWakeBackend(pid_t pid)
+{
+	PGPROC	   *proc = BackendPidGetProc(pid);
+
+	if (proc != NULL)
+		SetLatch(&proc->procLatch);
+}
+
+void
+SvsSetLauncherPid(pid_t pid)
+{
+	VamanaWorkerRequireShmemInitialized();
+	VamanaWorkerShmemHeaderPtr->launcherPid = pid;
+}
+
+void
+SvsKickLauncher(void)
+{
+	VamanaWorkerRequireShmemInitialized();
+	SvsWakeBackend(VamanaWorkerShmemHeaderPtr->launcherPid);
 }
 
 /* -----------------------------------------------------------------------

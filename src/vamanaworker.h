@@ -55,6 +55,12 @@ typedef void *SVSIndexHandle;
 #define VAMANA_MAINTENANCE_CONSOLIDATE 0
 #define VAMANA_MAINTENANCE_COMPACT     1
 
+/* -----------------------------------------------------------------------
+ * Build-request status constants
+ * ----------------------------------------------------------------------- */
+#define SVS_BUILD_REQUEST_PENDING 0
+#define SVS_BUILD_REQUEST_GRANTED 1
+
 /*
  * Maximum number of external IDs that fit in one delete slot submission.
  * The query-vector buffer (float[2000]) is reused to carry size_t IDs:
@@ -74,6 +80,15 @@ typedef void *SVSIndexHandle;
  * Determines the size of the per-index LWLock array in shared memory.
  */
 #define VAMANA_MAX_INDEXES 64
+
+/*
+ * Maximum number of concurrent build-thread requests (one per CREATE INDEX
+ * in flight) a single database can have pending against the launcher at
+ * once.  A request that finds no free slot fails the same way a request
+ * that times out waiting for a grant does: the DDL errors out rather than
+ * proceeding uncoordinated.
+ */
+#define SVS_MAX_PENDING_BUILDS 8
 
 /* Heartbeat is written every ~1 s. Three missed beats means the worker is hung. */
 #define VAMANA_HEARTBEAT_STALE_MS  3000
@@ -131,6 +146,25 @@ typedef struct VamanaWorkerReloadRequest
 {
 	pg_atomic_uint32 relid;
 } VamanaWorkerReloadRequest;
+
+/*
+ * One pending build-thread request against this database, keyed by the
+ * requesting backend's PID.  pid == 0 marks a free entry, claimed by a
+ * backend via compare-exchange; the crash backstop reaps an entry whose pid
+ * is no longer a live backend.
+ *
+ * requested/granted are plain fields, not atomics: the writer sets them
+ * before publishing readiness through status (pg_write_barrier then
+ * pg_atomic_write_u32), and a reader pairs a pg_read_barrier with its read
+ * of status before trusting them -- the same protocol VamanaWorkerSlot uses.
+ */
+typedef struct SvsBuildRequest
+{
+	pg_atomic_uint32 pid;
+	pg_atomic_uint32 status;	/* SVS_BUILD_REQUEST_* */
+	int32			requested;	/* threads asked for */
+	int32			granted;	/* threads granted; valid once status == GRANTED */
+} SvsBuildRequest;
 
 /*
  * Per-index reader/writer lock entry.  LW_SHARED for searches; LW_EXCLUSIVE
@@ -201,6 +235,18 @@ typedef struct VamanaWorkerShmem
 	 */
 	pg_atomic_uint32 indexCount;
 
+	/*
+	 * CPU governance, published by the launcher's reconcile pass
+	 * (SvsComputeCpuGrants).  desired is this database's unconstrained
+	 * request; granted/reserved are the pool-arbitrated grant this database's
+	 * worker must hold.  The worker never computes a grant, only applies one.
+	 */
+	pg_atomic_uint32 desiredSearchThreads;
+	pg_atomic_uint32 grantedSearchThreads;
+	pg_atomic_uint32 reservedSearchThreads;
+
+	SvsBuildRequest buildRequests[SVS_MAX_PENDING_BUILDS];
+
 	int				maxSlots;
 
 	/* Launcher-owned; see VamanaLauncherBackoff. */
@@ -243,6 +289,16 @@ typedef struct VamanaWorkerShmemHeader
 	 */
 	bool			initialScanDone;
 
+	/*
+	 * The launcher's current PID, published so any backend can wake it
+	 * directly (SvsKickLauncher) without going through NOTIFY -- which only
+	 * delivers post-commit, too late for a backend that is mid-transaction
+	 * waiting on a build grant.  0 = no launcher running right now; a stale
+	 * PID from a dead launcher is indistinguishable from that to a reader,
+	 * since SvsWakeBackend no-ops on a PID that is no longer a live backend.
+	 */
+	pid_t			launcherPid;
+
 	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
 } VamanaWorkerShmemHeader;
 
@@ -266,6 +322,16 @@ VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerClearDeadEntry(Oid dbOid);
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
+
+/*
+ * vamanaworkershmem.c: cross-process wake, generalized over any target
+ * backend by PID.  SvsKickLauncher is the specialization every non-launcher
+ * caller wants; SvsWakeBackend also serves the launcher's own reply to a
+ * build request (Svs prefix: extension-wide mechanism, not vamana-specific).
+ */
+void	SvsWakeBackend(pid_t pid);
+void	SvsSetLauncherPid(pid_t pid);
+void	SvsKickLauncher(void);
 
 /*
  * Iterate every reserved control block under one LW_SHARED pass, invoking cb
