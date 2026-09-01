@@ -512,6 +512,16 @@ VamanaRelationIsVamanaIndex(Oid objectId, Oid vamanaAm)
 }
 
 /*
+ * Free the dropped index's slot in the database's index-lock table.  Runs with
+ * the header lock held, so entry is still this database's control block.
+ */
+static void
+ReleaseIndexLockCb(VamanaWorkerShmem *entry, void *ctx)
+{
+	VamanaReleaseIndexLock(entry, *((Oid *) ctx));
+}
+
+/*
  * Object-access hook: fires on every DDL object event.  We maintain the
  * per-database vamana index counter symmetrically here — +1 on OAT_POST_CREATE
  * of a vamana index, -1 on OAT_DROP — so that only genuine CREATE/DROP move it.
@@ -552,12 +562,18 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	 */
 	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
 	{
-		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
 		Oid			vamanaAm = get_index_am_oid("vamana", true);
 
 		VamanaDeleteSaveDir(MyDatabaseId, objectId);
-		if (entry != NULL)
-			VamanaReleaseIndexLock(entry, objectId);
+
+		/*
+		 * Freeing the index's lock-table slot is a write, so it goes through the
+		 * header lock rather than a bare lookup: on a recycled entry it would
+		 * free another database's reservation for the same relid while that
+		 * database's worker still holds the LWLock, and the next
+		 * VamanaGetIndexLock there would hand out a different lock for the index.
+		 */
+		(void) VamanaWorkerWithEntry(MyDatabaseId, ReleaseIndexLockCb, &objectId);
 
 		/*
 		 * The index counter and the replication slot both track committed

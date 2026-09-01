@@ -161,7 +161,6 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 	Datum		datnameDatum;
 	Name		datname;
 	Oid			dbOid;
-	VamanaWorkerShmem *entry;
 	uint32		indexCount;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
@@ -188,8 +187,13 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 	if (!OidIsValid(dbOid))
 		return PointerGetDatum(trigdata->tg_trigtuple);
 
-	entry = VamanaWorkerLookupSlot(dbOid);
-	indexCount = (entry != NULL) ? pg_atomic_read_u32(&entry->indexCount) : 0;
+	/*
+	 * Snapshot rather than a bare lookup: this read decides whether the row may
+	 * go, and a count read through an entry that has since been re-reserved would
+	 * be another database's.  Its own database's count can still change after the
+	 * read -- the second limitation above.
+	 */
+	(void) VamanaWorkerIndexCountSnapshot(dbOid, &indexCount);
 
 	if (indexCount > 0)
 		ereport(ERROR,
