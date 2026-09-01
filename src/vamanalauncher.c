@@ -646,6 +646,8 @@ AppendPendingBuildRequests(SvsBuildCpuRequest *builds, int nbuilds,
 		if (pid == 0 || pg_atomic_read_u32(&req->status) != SVS_BUILD_REQUEST_PENDING)
 			continue;
 
+		pg_read_barrier();
+
 		builds[nbuilds].dbOid = dbOid;
 		builds[nbuilds].requestPid = pid;
 		builds[nbuilds].maintenanceNumThreads = req->requested;
@@ -702,15 +704,16 @@ PublishCpuGrants(List *rows)
 	{
 		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
+		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
 
 		entries[i] = entry;
 		dbs[i].dbOid = db->dbOid;
-		dbs[i].live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
+		dbs[i].live = live;
 		dbs[i].searchNumThreads = db->cpu.searchNumThreads;
 		dbs[i].searchThreadsReserved = db->cpu.searchThreadsReserved;
 		i++;
 
-		nbuilds = AppendPendingBuildRequests(builds, nbuilds, db->dbOid, entry);
+		nbuilds = AppendPendingBuildRequests(builds, nbuilds, db->dbOid, live ? entry : NULL);
 	}
 
 	gucs.searchNumThreadsDefault = vamana_search_num_threads;
