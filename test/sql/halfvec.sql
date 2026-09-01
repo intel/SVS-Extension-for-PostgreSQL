@@ -520,7 +520,7 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
 
--- NaN/Inf input validation (halfvec type)
+-- pgvector rejects NaN/Inf at parse time on tables carrying a vamana index (halfvec type)
 CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
 CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
 INSERT INTO t (val) VALUES ('[1,NaN,3]');

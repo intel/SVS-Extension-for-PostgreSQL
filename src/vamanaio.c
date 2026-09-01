@@ -250,6 +250,11 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 	header.capacity = (uint32) count;
 	header.reserved = 0;
 
+	/*
+	 * Unreachable on 64-bit systems: int count (max ~2.1e9) * 6 bytes fits
+	 * comfortably in size_t.  Guards the multiplication as belt-and-braces and
+	 * catches a negative count, which would cast to a huge size_t.
+	 */
 	if ((size_t) count > SIZE_MAX / sizeof(ItemPointerData))
 	{
 		CloseTransientFile(fd);
@@ -285,7 +290,7 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not flush TID map for vamana index %u: %m", relid),
+				 errmsg("could not close TID map for vamana index %u: %m", relid),
 				 errdetail_log("Path: \"%s\".", tidmaptmp)));
 	}
 
@@ -344,7 +349,13 @@ VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappi
 	 * AccessShareLock — and unlinking a live writer's temp file between its
 	 * close and its rename would fail that save and cost it the whole save
 	 * directory.  A live writer's temp file is always newer than PgStartTime.
-	 * A same-lifetime orphan is left to the next save's cleanup.
+	 *
+	 * Limitation: PgStartTime is set once at postmaster start and is not reset
+	 * after crash recovery, so an orphan left by a crashed backend or worker in
+	 * the current postmaster lifetime is not swept here.  For a read-only index
+	 * that never saves again, such an orphan persists until the next save or
+	 * until the index is dropped.  The tradeoff is intentional: unlinking a
+	 * file that might be a live writer's temp is worse than leaving an orphan.
 	 *
 	 * Best effort only: this is hygiene on a read path whose contract is to
 	 * return false and let the caller rebuild, so a failure here must not turn

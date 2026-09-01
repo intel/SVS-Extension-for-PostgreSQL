@@ -457,12 +457,17 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		goto cleanup;
 	}
 
+	/*
+	 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM (2000)
+	 * above, so firing needs more than ~2.3e15 vectors on a 64-bit system.
+	 * Guards the multiplication as belt-and-braces.
+	 */
 	if ((size_t) buildstate.numVectors > 0 &&
 		(size_t) buildstate.dimensions > SIZE_MAX / sizeof(float) / (size_t) buildstate.numVectors)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("vector dataset too large to index "
-						"(%d vectors × %d dimensions exceeds memory limit)",
+						"(%d vectors x %d dimensions exceeds memory limit)",
 						buildstate.numVectors, buildstate.dimensions)));
 	dataSize = (Size) buildstate.numVectors * buildstate.dimensions * sizeof(float);
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
@@ -794,12 +799,17 @@ VamanaRebuildFromTable(Relation index)
 	}
 
 	/* Flatten vector data for SVS */
+	/*
+	 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM (2000)
+	 * above, so firing needs more than ~2.3e15 vectors on a 64-bit system.
+	 * Guards the multiplication as belt-and-braces.
+	 */
 	if ((size_t) numVectors > 0 &&
 		(size_t) dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("vector dataset too large to index "
-						"(%d vectors × %d dimensions exceeds memory limit)",
+						"(%d vectors x %d dimensions exceeds memory limit)",
 						numVectors, dimensions)));
 	dataSize = (Size) numVectors * dimensions * sizeof(float);
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
