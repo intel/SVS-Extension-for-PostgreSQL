@@ -234,6 +234,61 @@ VamanaWorkerProcessRequests(void)
 }
 
 /*
+ * VamanaWorkerProcessSlotDrops
+ *
+ * Drop the replication slots of indexes that were dropped while this worker was
+ * holding their slot.  The backend committing the DROP must not wait for the
+ * release, so it left the OID here (see VamanaWorkerRequestSlotDrop).
+ *
+ * Called from the top of the main loop and again from the shutdown sequence,
+ * both points where this worker holds no slot of its own: acquisitions are
+ * scoped to a single replay, snapshot-build, activation, or checkpoint-confirm
+ * pass, so the drop cannot lose the race it was handed.  The cache entry goes
+ * first because it owns a handle naming the slot.
+ */
+static void
+VamanaWorkerProcessSlotDrops(void)
+{
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+	{
+		uint32		relid_u32;
+		Oid			relid;
+		VamanaSlotDropResult result;
+
+		relid_u32 = pg_atomic_read_u32(
+									   &VamanaWorkerShmemPtr->pendingSlotDrops[i].relid);
+		if (relid_u32 == 0)
+			continue;
+
+		relid = (Oid) relid_u32;
+
+		VamanaEvictCacheEntry(relid);
+		result = VamanaReplicationDropIfExists(VamanaWorkerShmemPtr->dbOid, relid);
+
+		/*
+		 * Cleared once the attempt is over rather than before it, so a worker
+		 * that dies partway leaves the request for its replacement; repeating a
+		 * drop that already happened returns DONE.  A producer skips a non-zero
+		 * entry and takes another, so holding this one meanwhile swallows
+		 * nothing.
+		 */
+		pg_atomic_write_u32(
+							&VamanaWorkerShmemPtr->pendingSlotDrops[i].relid, 0);
+
+		/* FAILED is not reported here: the try-drop already logged the error. */
+		if (result == VAMANA_SLOT_DROP_DONE)
+			ereport(LOG,
+					(errmsg("vamana worker: dropped replication slot of removed index %u",
+							relid)));
+		else if (result == VAMANA_SLOT_DROP_BUSY)
+			ereport(WARNING,
+					(errmsg("vamana worker: replication slot of removed index %u is still held",
+							relid),
+					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+	}
+}
+
+/*
  * VamanaWorkerProcessReloads
  *
  * Check the reload queue for OIDs that backends have signaled need
@@ -567,6 +622,11 @@ VamanaWorkerDrainFinalCheckpoint(void)
  * A standby feeds its index by decoding WAL and never persists, so it takes a
  * final slot drain instead of a checkpoint; a primary flushes every cached
  * index to disk.
+ *
+ * Handed-off slot drops are processed here too.  This worker is stopped because
+ * its database was disabled or removed, and a removal releases the shmem entry
+ * once this process is gone -- taking the queue with it -- so the last cycle
+ * before exit is the last chance to honour them.
  */
 static pg_noreturn void
 VamanaWorkerDrainAndStop(void)
@@ -584,6 +644,8 @@ VamanaWorkerDrainAndStop(void)
 	VamanaWorkerStopAccepting();
 	VamanaWorkerShmemPtr->workerPid = 0;
 	VamanaWorkerProcessRequests();
+
+	VamanaWorkerProcessSlotDrops();
 
 	if (VamanaGetReplayRole()->persists_index)
 		VamanaWorkerDrainFinalCheckpoint();
@@ -769,6 +831,8 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 			ProcessConfigFile(PGC_SIGHUP);
 			worker_got_sighup = false;
 		}
+
+		VamanaWorkerProcessSlotDrops();
 
 		VamanaWorkerProcessReloads();
 

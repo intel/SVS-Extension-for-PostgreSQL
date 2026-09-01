@@ -92,6 +92,20 @@ is($gone, '0', 'the row is removed after teardown');
 ok(wait_for_slot_release($node, $LAUNCHER_DB, $target_oid, 30),
     'the shmem slot is released, not just the catalog row');
 
+# Teardown drops every index in the database back-to-back, which is the heaviest
+# user of the slot-drop path: each DROP races a worker that may be holding that
+# index's slot.  A slot left behind would pin WAL for the whole cluster with no
+# index left to replay into.
+#
+# Asserted here rather than right after the teardown, and with the DELETE issued
+# immediately: waiting for the drops to land first would leave nothing in the
+# handoff queue for the removal to race, which is the interleaving that has no
+# second chance.  Once the shmem entry is released the queue is gone, so a drop
+# still owed at that point has to have been finished by the departing worker or
+# by the launcher retiring the entry.
+is(wait_for_no_orphan_slots($node, $TARGET_DB, 30), 0,
+    'removing the database leaves no replication slot behind');
+
 $node->stop;
 
 done_testing();

@@ -21,6 +21,7 @@ our @EXPORT_OK = qw(
     $N @query_vecs $SYNC_SLEEP
     run_concurrent run_synchronized dir_size vamana_save_dir
     wait_for_worker wait_for_worker_db wait_for_slot_release
+    orphan_slot_count wait_for_no_orphan_slots
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 
@@ -295,6 +296,51 @@ sub wait_for_slot_release
         usleep(500_000);
     }
     return 0;
+}
+
+# ---------------------------------------------------------------------------
+# orphan_slot_count: how many vamana replication slots in $db name an index
+# that no longer exists.  Every such slot pins WAL and holds back catalog_xmin
+# for the whole cluster with nothing left to replay, so zero is an invariant
+# any test that drops an index can assert.
+#
+# Slots are database-specific and pg_class only shows the current database, so
+# the query must run in the database that owns the slots.
+# ---------------------------------------------------------------------------
+sub orphan_slot_count
+{
+    my ($node, $db) = @_;
+    my $count = $node->safe_psql($db, q{
+        SELECT count(*) FROM pg_replication_slots s
+        WHERE s.plugin = 'svs'
+          AND s.database = current_database()
+          AND s.slot_name ~ '^vamana_[0-9]+_[0-9]+$'
+          AND NOT EXISTS (SELECT 1 FROM pg_class c
+                          WHERE c.oid = split_part(s.slot_name, '_', 3)::oid);
+    });
+    chomp $count;
+    return $count;
+}
+
+# ---------------------------------------------------------------------------
+# wait_for_no_orphan_slots: poll orphan_slot_count until it reaches zero (up to
+# $attempts x 0.5s).  Polling rather than checking once because a slot the
+# worker was holding is dropped by the worker on its next cycle, not by the
+# backend that committed the DROP.  Returns the final count, so a caller can
+# report how many were left behind.
+# ---------------------------------------------------------------------------
+sub wait_for_no_orphan_slots
+{
+    my ($node, $db, $attempts) = @_;
+    $attempts //= 30;
+    my $count;
+    for my $i (1 .. $attempts)
+    {
+        $count = orphan_slot_count($node, $db);
+        return 0 if $count eq '0';
+        usleep(500_000);
+    }
+    return $count;
 }
 
 1;

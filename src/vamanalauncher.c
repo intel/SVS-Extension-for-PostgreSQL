@@ -24,6 +24,7 @@
 
 #include "svs_cpu_budget.h"
 #include "vamana.h"
+#include "vamana_replication.h"
 #include "vamanalauncher.h"
 #include "vamanaworker.h"
 
@@ -1051,6 +1052,41 @@ RespawnWorker(VamanaLauncherWorker *w, const VamanaDatabaseRow *db,
 }
 
 /*
+ * Finish the slot drops a removed database's worker was handed but never got to.
+ * Its shmem entry is about to be released, which discards the queue, and each
+ * relid there is the only remaining name for a slot whose index is already gone.
+ *
+ * A worker drains its queue on shutdown, so this only has work when it died
+ * first.  It is dead either way by the time we get here, so nothing holds these
+ * slots and the drop belongs to whoever is retiring the entry.  Dropping a
+ * logical slot does not require being connected to its database -- only decoding
+ * from it does -- so the launcher can do it from its own.
+ */
+static void
+DropSlotsAbandonedByStoppedWorker(Oid dbOid)
+{
+	Oid			relids[VAMANA_MAX_SLOT_DROP_QUEUE];
+	int			count = VamanaWorkerTakePendingSlotDrops(dbOid, relids,
+														VAMANA_MAX_SLOT_DROP_QUEUE);
+
+	for (int i = 0; i < count; i++)
+	{
+		VamanaSlotDropResult result = VamanaReplicationDropIfExists(dbOid, relids[i]);
+
+		/* FAILED is not reported here: the try-drop already logged the error. */
+		if (result == VAMANA_SLOT_DROP_DONE)
+			ereport(LOG,
+					(errmsg("vamana launcher: dropped replication slot of removed index %u in database %u",
+							relids[i], dbOid)));
+		else if (result == VAMANA_SLOT_DROP_BUSY)
+			ereport(WARNING,
+					(errmsg("vamana launcher: replication slot of removed index %u in database %u is still held",
+							relids[i], dbOid),
+					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+	}
+}
+
+/*
  * Update the ledger against the live worker set, and account for every death in
  * the shmem backoff state.  Liveness ground truth is the handle, never the
  * slot's workerPid.
@@ -1063,7 +1099,8 @@ RespawnWorker(VamanaLauncherWorker *w, const VamanaDatabaseRow *db,
  * accrual, since a deliberate disable must never read as a crash-loop, and its
  * slot stays reserved so the paused database stays configured; a removal is
  * dropped with no accrual and its slot released, since there is no row left to
- * respawn for.  A stop that is part of an in-flight restart is left untouched
+ * respawn for, after any replication-slot drops queued for that worker are
+ * finished here rather than lost with the entry.  A stop that is part of an in-flight restart is left untouched
  * here: the restart convergence pass owns that handle and respawns it in
  * place.
  */
@@ -1096,6 +1133,7 @@ ReconcileLedgerLiveness(List *rows, TimestampTz now)
 
 			case STOP_REMOVED:
 				VamanaWorkerBackoffClear(w->dbOid);
+				DropSlotsAbandonedByStoppedWorker(w->dbOid);
 				VamanaWorkerReleaseSlot(w->dbOid);
 				break;
 

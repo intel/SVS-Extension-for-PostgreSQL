@@ -202,6 +202,17 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
 		pg_atomic_write_u32(&entry->buildRequests[i].pid, 0);
 
+	/*
+	 * Reached only on (de)reservation, never on worker restart, so a handoff
+	 * queued for a worker that then crashed still gets honoured.  Every entry
+	 * here names an index that is already gone, so it cannot be carried into the
+	 * next tenant -- a different dbOid would make the same relid name another
+	 * database's slot.  Whoever releases the entry must take the queue first
+	 * (VamanaWorkerTakePendingSlotDrops); this zeroing is the backstop.
+	 */
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+		pg_atomic_write_u32(&entry->pendingSlotDrops[i].relid, 0);
+
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 		pg_atomic_write_u32(&entry->indexLocks[i].relid, 0);
 
@@ -237,6 +248,9 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 		pg_atomic_init_u32(&req->pid, 0);
 		pg_atomic_init_u32(&req->status, SVS_BUILD_REQUEST_PENDING);
 	}
+
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+		pg_atomic_init_u32(&entry->pendingSlotDrops[i].relid, 0);
 
 	pg_atomic_init_u32(&entry->evict_all, 0);
 	pg_atomic_init_u64(&entry->heartbeat_ts, 0);
@@ -612,12 +626,17 @@ VamanaIndexCountXactCallback(XactEvent event, void *arg)
 			CurrentIndexCountDeltas = NULL;
 			break;
 
-		case XACT_EVENT_PREPARE:
+		/* See VamanaSlotDropXactCallback: PREPARE is too late to refuse. */
+		case XACT_EVENT_PRE_PREPARE:
 			if (CurrentIndexCountDeltas != NULL &&
-				CurrentIndexCountDeltas->count > 0)
+				VamanaSubxidPendingArrayHasLiveEntries(CurrentIndexCountDeltas))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		case XACT_EVENT_PREPARE:
+			CurrentIndexCountDeltas = NULL;
 			break;
 
 		default:
@@ -820,8 +839,109 @@ VamanaWorkerSlotCapacity(void)
 }
 
 /*
+ * VamanaWorkerRequestSlotDrop
+ *
+ * Ask dbOid's worker to drop the replication slot of an index the caller has
+ * finished dropping.  Used only when the caller's own attempt found the slot
+ * held: the worker acquires a slot for the length of one replay, snapshot-build,
+ * activation, or checkpoint-confirm pass, and a backend must not wait for it to
+ * finish (see TryDropSlot), so the work goes to the holder instead.
+ *
+ * Unlike a lost reload there is no cheap catch-all fallback: evicting caches
+ * would not remove a slot, and the OID is the only way to name it.  So a full
+ * queue is reported to the caller rather than absorbed.
+ *
+ * Lives here, beside the take, because the find and the write have to happen
+ * under one hold of the header lock: an entry resolved and then written to after
+ * the lock is gone may by then belong to another database, whose worker would
+ * look for a slot named after its own dbOid and find nothing, while the slot
+ * this request names loses its last reference.  Shared is enough — every
+ * reassignment takes the lock exclusively, and two producers racing for the same
+ * ring entry are settled by the CAS.
+ */
+bool
+VamanaWorkerRequestSlotDrop(Oid dbOid, Oid indexRelid)
+{
+	VamanaWorkerShmem *entry;
+	bool		queued = false;
+
+	Assert(OidIsValid(dbOid));
+	Assert(OidIsValid(indexRelid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+		{
+			uint32		expected = 0;
+
+			if (pg_atomic_compare_exchange_u32(&entry->pendingSlotDrops[i].relid,
+											   &expected, (uint32) indexRelid))
+			{
+				/* Kicked under the lock too: past it the latch may be another tenant's. */
+				SetLatch(&entry->workerLatch);
+				queued = true;
+				break;
+			}
+		}
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return queued;
+}
+
+/*
+ * Take (read and clear) the slot drops still queued for dbOid, writing up to
+ * max relids into relids and returning how many.  Callers size the buffer with
+ * VAMANA_MAX_SLOT_DROP_QUEUE.
+ *
+ * For whoever is about to release or reuse the entry: releasing it discards the
+ * queue, and each entry is the only remaining name for a slot whose index is
+ * already gone.  Taking them under the same lock the release takes means a drop
+ * is either still queued for the worker or owned by the caller, never both and
+ * never neither.
+ */
+int
+VamanaWorkerTakePendingSlotDrops(Oid dbOid, Oid *relids, int max)
+{
+	VamanaWorkerShmem *entry;
+	int			count = 0;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE && count < max; i++)
+		{
+			uint32		relid = pg_atomic_read_u32(&entry->pendingSlotDrops[i].relid);
+
+			if (relid == 0)
+				continue;
+
+			pg_atomic_write_u32(&entry->pendingSlotDrops[i].relid, 0);
+			relids[count++] = (Oid) relid;
+		}
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return count;
+}
+
+/*
  * Release the control block for dbOid, returning it to the free pool.  The
- * caller is responsible for ensuring no worker is running against it.
+ * caller is responsible for ensuring no worker is running against it, and for
+ * taking any queued slot drops first (VamanaWorkerTakePendingSlotDrops).
  */
 void
 VamanaWorkerReleaseSlot(Oid dbOid)
