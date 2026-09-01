@@ -981,7 +981,6 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 (5 rows)
 
 DROP TABLE t;
-
 -- NaN/Inf input validation (halfvec type)
 CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
 CREATE INDEX ON t USING vamana (val halfvec_l2_ops);

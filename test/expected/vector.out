@@ -1003,7 +1003,6 @@ SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 (5 rows)
 
 DROP TABLE t;
-
 -- NaN/Inf input validation (vector type)
 -- NaN/Inf in INSERT must be rejected
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
