@@ -200,7 +200,14 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 		pg_atomic_write_u32(&entry->reloadRequests[i].relid, 0);
 
 	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
-		pg_atomic_write_u32(&entry->buildRequests[i].pid, 0);
+	{
+		SvsBuildRequest *req = &entry->buildRequests[i];
+
+		pg_atomic_write_u32(&req->pid, 0);
+		pg_atomic_write_u32(&req->status, SVS_BUILD_REQUEST_PENDING);
+		req->requested = 0;
+		req->granted = 0;
+	}
 
 	/*
 	 * Reached only on (de)reservation, never on worker restart, so a handoff
