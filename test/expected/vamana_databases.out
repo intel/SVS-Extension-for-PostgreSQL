@@ -2,20 +2,24 @@
 -- SPDX-License-Identifier: PostgreSQL
 -- Table shape, including both triggers' declared firing conditions
 \d vamana_databases
-                Table "public.vamana_databases"
-       Column       |  Type   | Collation | Nullable | Default 
---------------------+---------+-----------+----------+---------
- datname            | name    |           | not null | 
- enabled            | boolean |           | not null | true
- restart_generation | bigint  |           | not null | 0
- graph_memory_mb    | integer |           |          | 
- total_memory_mb    | integer |           |          | 
- search_num_threads | integer |           |          | 
+                  Table "public.vamana_databases"
+         Column          |  Type   | Collation | Nullable | Default 
+-------------------------+---------+-----------+----------+---------
+ datname                 | name    |           | not null | 
+ enabled                 | boolean |           | not null | true
+ restart_generation      | bigint  |           | not null | 0
+ graph_memory_mb         | integer |           |          | 
+ total_memory_mb         | integer |           |          | 
+ search_num_threads      | integer |           |          | 
+ search_threads_reserved | integer |           |          | 
+ maintenance_num_threads | integer |           |          | 
 Indexes:
     "vamana_databases_pkey" PRIMARY KEY, btree (datname)
 Check constraints:
     "vamana_databases_graph_memory_mb_check" CHECK (graph_memory_mb > 0)
+    "vamana_databases_maintenance_num_threads_check" CHECK (maintenance_num_threads >= 0 AND maintenance_num_threads <= 1024)
     "vamana_databases_search_num_threads_check" CHECK (search_num_threads >= 1 AND search_num_threads <= 1024)
+    "vamana_databases_search_threads_reserved_check" CHECK (search_threads_reserved >= 0 AND search_threads_reserved <= 1024)
     "vamana_databases_total_memory_mb_check" CHECK (total_memory_mb > 0)
 Triggers:
     vamana_databases_changed AFTER INSERT OR DELETE OR UPDATE ON vamana_databases FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_notify()

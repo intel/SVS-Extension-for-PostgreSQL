@@ -22,6 +22,7 @@
 
 #include "postgres.h"
 
+#include "svs_cpu_budget.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanalauncher.h"
@@ -123,6 +124,25 @@ typedef struct VamanaLauncherWorker
 } VamanaLauncherWorker;
 
 /*
+ * One database's CPU-governance catalog columns, projected out of the same
+ * scan that reads the lifecycle columns below.  Kept as its own struct, not
+ * flattened into VamanaDatabaseRow, so the CPU domain's consumer (the
+ * upcoming launcher publish path) reads only this and never the lifecycle
+ * fields, and a future domain (memory) gets an equally narrow sibling
+ * instead of widening this one.
+ *
+ * NULL search_num_threads/maintenance_num_threads become -1 ("follow the
+ * GUC default"); NULL search_threads_reserved becomes 0, which already
+ * means "no floor" whether configured explicitly or left NULL.
+ */
+typedef struct SvsDbCpuColumns
+{
+	int32		searchNumThreads;
+	int32		searchThreadsReserved;
+	int32		maintenanceNumThreads;
+} SvsDbCpuColumns;
+
+/*
  * One row of the config table, as read from the catalog.  The name is captured
  * during the SPI scan and carried alongside the OID so the spawn and
  * initial-scan paths never re-enter the catalogs: those paths run outside the
@@ -138,6 +158,7 @@ typedef struct VamanaDatabaseRow
 	char	   *datname;
 	int64		restart_generation;
 	bool		enabled;
+	SvsDbCpuColumns cpu;
 } VamanaDatabaseRow;
 
 /*
@@ -146,6 +167,8 @@ typedef struct VamanaDatabaseRow
  */
 static List *WorkerLedger = NIL;
 
+static void ClearLauncherPidOnExit(int code, Datum arg);
+static void PublishCpuGrants(List *rows);
 static long VamanaLauncherReconcileWorkers(void);
 static char *VamanaDatabasesQualifiedName(void);
 static List *ReadDatabaseRows(void);
@@ -208,6 +231,12 @@ VamanaLauncherRegister(void)
  * Main loop
  * ----------------------------------------------------------------------- */
 
+static void
+ClearLauncherPidOnExit(int code, Datum arg)
+{
+	SvsSetLauncherPid(0);
+}
+
 void
 VamanaLauncherMain(Datum main_arg)
 {
@@ -216,6 +245,16 @@ VamanaLauncherMain(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	BackgroundWorkerInitializeConnection(vamana_launcher_database, NULL, 0);
+
+	/*
+	 * before_shmem_exit, not inline cleanup before each return: the launcher's
+	 * own exits are signal-driven (SIGTERM -> die() -> proc_exit at the next
+	 * CHECK_FOR_INTERRUPTS), so there is no controlled point to clear this
+	 * inline the way a worker clears its own workerPid before its own
+	 * proc_exit call.
+	 */
+	before_shmem_exit(ClearLauncherPidOnExit, 0);
+	SvsSetLauncherPid(MyProcPid);
 
 	/*
 	 * Listen before the initial scan so an enable committed between the scan
@@ -299,6 +338,8 @@ VamanaLauncherReconcileWorkers(void)
 	TerminateDisabledWorkers(rows);
 	if (WorkerLedger != NIL)
 		ReconcileRestartConvergence(rows, now);
+
+	PublishCpuGrants(rows);
 
 	foreach(lc, EnabledRowsOf(rows))
 	{
@@ -405,7 +446,7 @@ MaterializeInitialConfig(void)
 static List *
 AppendDatabaseRow(List *list, Oid dbOid, const char *datname,
 				  int64 restart_generation, bool enabled,
-				  MemoryContext callerCtx)
+				  const SvsDbCpuColumns *cpu, MemoryContext callerCtx)
 {
 	VamanaDatabaseRow *db;
 	MemoryContext oldCtx;
@@ -421,10 +462,25 @@ AppendDatabaseRow(List *list, Oid dbOid, const char *datname,
 	db->datname = pstrdup(datname);
 	db->restart_generation = restart_generation;
 	db->enabled = enabled;
+	db->cpu = *cpu;
 	list = lappend(list, db);
 	MemoryContextSwitchTo(oldCtx);
 
 	return list;
+}
+
+/* NULL means "follow the GUC default"; the calculator's sentinel for that is -1. */
+static int32
+ResolveNullableThreadCount(bool isNull, int32 value)
+{
+	return isNull ? -1 : value;
+}
+
+/* NULL and an explicit 0 both mean "no floor," so both resolve to 0. */
+static int32
+ResolveReservedFloor(bool isNull, int32 value)
+{
+	return isNull ? 0 : value;
 }
 
 /*
@@ -485,7 +541,9 @@ ReadDatabaseRows(void)
 
 		if (qualifiedName != NULL)
 		{
-			int			ret = SPI_execute(psprintf("SELECT datname, restart_generation, enabled FROM %s",
+			int			ret = SPI_execute(psprintf("SELECT datname, restart_generation, enabled, "
+													"search_num_threads, search_threads_reserved, "
+													"maintenance_num_threads FROM %s",
 													qualifiedName),
 										  true, 0);
 
@@ -494,18 +552,21 @@ ReadDatabaseRows(void)
 
 			for (uint64 i = 0; ret == SPI_OK_SELECT && i < SPI_processed; i++)
 			{
+				HeapTuple	tuple = SPI_tuptable->vals[i];
+				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
 				bool		datnameIsNull;
 				bool		restartGenIsNull;
 				bool		enabledIsNull;
-				Name		datname = DatumGetName(SPI_getbinval(SPI_tuptable->vals[i],
-																 SPI_tuptable->tupdesc,
-																 1, &datnameIsNull));
-				int64		restart_generation = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i],
-																			   SPI_tuptable->tupdesc,
-																			   2, &restartGenIsNull));
-				bool		enabled = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[i],
-																 SPI_tuptable->tupdesc,
-																 3, &enabledIsNull));
+				bool		searchNumThreadsIsNull;
+				bool		searchThreadsReservedIsNull;
+				bool		maintenanceNumThreadsIsNull;
+				Name		datname = DatumGetName(SPI_getbinval(tuple, tupdesc, 1, &datnameIsNull));
+				int64		restart_generation = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 2, &restartGenIsNull));
+				bool		enabled = DatumGetBool(SPI_getbinval(tuple, tupdesc, 3, &enabledIsNull));
+				int32		searchNumThreads = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 4, &searchNumThreadsIsNull));
+				int32		searchThreadsReserved = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &searchThreadsReservedIsNull));
+				int32		maintenanceNumThreads = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 6, &maintenanceNumThreadsIsNull));
+				SvsDbCpuColumns cpu;
 				Oid			dbOid;
 
 				if (datnameIsNull || restartGenIsNull || enabledIsNull)
@@ -520,8 +581,12 @@ ReadDatabaseRows(void)
 					continue;
 				}
 
+				cpu.searchNumThreads = ResolveNullableThreadCount(searchNumThreadsIsNull, searchNumThreads);
+				cpu.searchThreadsReserved = ResolveReservedFloor(searchThreadsReservedIsNull, searchThreadsReserved);
+				cpu.maintenanceNumThreads = ResolveNullableThreadCount(maintenanceNumThreadsIsNull, maintenanceNumThreads);
+
 				result = AppendDatabaseRow(result, dbOid, NameStr(*datname),
-										   restart_generation, enabled, callerCtx);
+										   restart_generation, enabled, &cpu, callerCtx);
 			}
 		}
 	}
@@ -551,6 +616,155 @@ EnabledRowsOf(List *rows)
 			result = lappend(result, db);
 	}
 	return result;
+}
+
+/* -----------------------------------------------------------------------
+ * CPU governance
+ *
+ * The launcher is the sole caller of SvsComputeCpuGrants and the sole writer
+ * of the grant fields it publishes; a worker or build backend only ever
+ * applies a grant it already finds published, never computes one itself.
+ * ----------------------------------------------------------------------- */
+
+/*
+ * Gather every enabled database's pending build requests into claims,
+ * appending them to builds[nbuilds..] and returning the new count.  entry is
+ * NULL for a database with no shmem control block yet (nothing to scan).
+ */
+static int
+AppendPendingBuildRequests(SvsBuildCpuRequest *builds, int nbuilds,
+						   Oid dbOid, VamanaWorkerShmem *entry)
+{
+	if (entry == NULL)
+		return nbuilds;
+
+	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
+	{
+		SvsBuildRequest *req = &entry->buildRequests[i];
+		pid_t		pid = (pid_t) pg_atomic_read_u32(&req->pid);
+
+		if (pid == 0 || pg_atomic_read_u32(&req->status) != SVS_BUILD_REQUEST_PENDING)
+			continue;
+
+		pg_read_barrier();
+
+		builds[nbuilds].dbOid = dbOid;
+		builds[nbuilds].requestPid = pid;
+		builds[nbuilds].maintenanceNumThreads = req->requested;
+		nbuilds++;
+	}
+
+	return nbuilds;
+}
+
+/*
+ * Hand a build's grant back to the requester: publish requested/granted
+ * before flipping status, mirroring VamanaWorkerSlot's write-then-publish
+ * protocol, then wake the backend waiting on it.
+ */
+static void
+PublishBuildGrant(VamanaWorkerShmem *entry, const SvsBuildCpuGrant *grant)
+{
+	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
+	{
+		SvsBuildRequest *req = &entry->buildRequests[i];
+
+		if ((pid_t) pg_atomic_read_u32(&req->pid) != grant->requestPid)
+			continue;
+
+		req->granted = grant->grantedThreads;
+		pg_write_barrier();
+		pg_atomic_write_u32(&req->status, SVS_BUILD_REQUEST_GRANTED);
+		SvsWakeBackend(grant->requestPid);
+		return;
+	}
+}
+
+/*
+ * Publish this reconcile's CPU grants: gather the projected catalog columns,
+ * the GUC snapshot, and every live database's pending build requests; call
+ * the calculator once; write back only what changed.
+ */
+static void
+PublishCpuGrants(List *rows)
+{
+	List	   *enabledRows = EnabledRowsOf(rows);
+	int			ndbs = list_length(enabledRows);
+	SvsDbCpuRequest *dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
+	VamanaWorkerShmem **entries = palloc(sizeof(VamanaWorkerShmem *) * ndbs);
+	SvsBuildCpuRequest *builds = palloc(sizeof(SvsBuildCpuRequest) * ndbs * SVS_MAX_PENDING_BUILDS);
+	int			nbuilds = 0;
+	int			i = 0;
+	ListCell   *lc;
+	SvsCpuGucs	gucs;
+	SvsCpuBudgetInput input;
+	SvsCpuBudget *budget;
+
+	foreach(lc, enabledRows)
+	{
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
+		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
+		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
+
+		entries[i] = entry;
+		dbs[i].dbOid = db->dbOid;
+		dbs[i].live = live;
+		dbs[i].searchNumThreads = db->cpu.searchNumThreads;
+		dbs[i].searchThreadsReserved = db->cpu.searchThreadsReserved;
+		i++;
+
+		nbuilds = AppendPendingBuildRequests(builds, nbuilds, db->dbOid, live ? entry : NULL);
+	}
+
+	gucs.searchNumThreadsDefault = vamana_search_num_threads;
+	gucs.maxSearchThreadsPerDb = svs_max_search_threads_per_db;
+	gucs.maxTotalSearchThreads = svs_max_total_search_threads;
+	gucs.maxParallelWorkers = max_parallel_workers;
+	gucs.maxParallelMaintenanceWorkers = max_parallel_maintenance_workers;
+
+	input.gucs = &gucs;
+	input.dbs = dbs;
+	input.ndbs = ndbs;
+	input.builds = builds;
+	input.nbuilds = nbuilds;
+
+	budget = SvsComputeCpuGrants(&input, CurrentMemoryContext);
+
+	for (i = 0; i < budget->ndbGrants; i++)
+	{
+		VamanaWorkerShmem *entry = entries[i];
+		const SvsDbCpuGrant *grant = &budget->dbGrants[i];
+		uint32		previousGranted;
+
+		if (entry == NULL)
+			continue;
+
+		previousGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
+
+		pg_atomic_write_u32(&entry->desiredSearchThreads, (uint32) grant->desiredSearchThreads);
+		pg_atomic_write_u32(&entry->reservedSearchThreads, (uint32) grant->reservedSearchThreads);
+
+		if ((uint32) grant->grantedSearchThreads != previousGranted)
+		{
+			pg_atomic_write_u32(&entry->grantedSearchThreads, (uint32) grant->grantedSearchThreads);
+			SetLatch(&entry->workerLatch);
+		}
+	}
+
+	for (i = 0; i < budget->nbuildGrants; i++)
+	{
+		const SvsBuildCpuGrant *grant = &budget->buildGrants[i];
+		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(grant->dbOid);
+
+		if (entry != NULL)
+			PublishBuildGrant(entry, grant);
+	}
+
+	if (budget->reservedFloorsExceedPool)
+		ereport(LOG,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("vamana launcher: configured search_threads_reserved values sum to more "
+						"than the pool; floors were clamped")));
 }
 
 /* -----------------------------------------------------------------------

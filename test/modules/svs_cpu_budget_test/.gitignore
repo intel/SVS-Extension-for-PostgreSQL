@@ -1,0 +1,8 @@
+# Local binaries
+*.o
+*.so
+
+# Generated subdirectories
+/log/
+/results/
+/tmp_check/

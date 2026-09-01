@@ -26,6 +26,7 @@
 
 - [ ] If this PR introduces no new behavior: existing regression tests (`make installcheck`) and TAP tests (`test/t/`) pass with no failures
 - [ ] If this PR introduces new behavior: test cases covering it were added to `test/sql/` and/or `test/t/`
+- [ ] If this PR adds a standalone unit-test module under `test/modules/`: it builds and passes (`make -C test/modules/<module> installcheck`)
 
 ### Documentation
 

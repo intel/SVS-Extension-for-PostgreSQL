@@ -43,6 +43,9 @@ int			vamana_search_window_size = VAMANA_DEFAULT_SEARCH_WINDOW;
 int			vamana_search_num_threads = 0;
 int			vamana_compact_threshold_pct = 10;
 
+int			svs_max_search_threads_per_db = 0;
+int			svs_max_total_search_threads = 0;
+
 int			max_vamana_databases = 8;
 int			vamana_worker_timeout_ms = 5000;
 int			vamana_worker_startup_timeout_ms = 60000;
@@ -112,6 +115,34 @@ VamanaInit(void)
 							&vamana_search_num_threads,
 							0,	/* default: auto (resolves to nproc-1) */
 							0,	/* min: 0 = auto */
+							1024,	/* max */
+							PGC_SUSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("svs.max_search_threads_per_db",
+							"Ceiling on one database's total search-thread grant",
+							"0 = follow max_parallel_workers. Bounds a single worker's share of "
+							"the shared pool independently of how many threads it requests.",
+							&svs_max_search_threads_per_db,
+							0,	/* default: follow max_parallel_workers */
+							0,	/* min: 0 = follow max_parallel_workers */
+							1024,	/* max */
+							PGC_SUSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("svs.max_total_search_threads",
+							"Cluster-wide ceiling on SVS search threads summed across all workers",
+							"0 = follow max_parallel_workers. Never exceeds max_parallel_workers "
+							"regardless of this setting; only ever narrows the pool search draws from.",
+							&svs_max_total_search_threads,
+							0,	/* default: follow max_parallel_workers */
+							0,	/* min: 0 = follow max_parallel_workers */
 							1024,	/* max */
 							PGC_SUSET,
 							0,

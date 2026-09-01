@@ -95,6 +95,8 @@
 extern int	vamana_search_window_size;
 extern int	vamana_search_num_threads;
 extern int	vamana_compact_threshold_pct;
+extern int	svs_max_search_threads_per_db;
+extern int	svs_max_total_search_threads;
 
 /* Checkpoint and replication slot GUCs */
 extern int	vamana_checkpoint_debounce_window;
