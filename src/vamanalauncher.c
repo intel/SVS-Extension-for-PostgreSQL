@@ -24,6 +24,7 @@
 
 #include "svs_cpu_budget.h"
 #include "vamana.h"
+#include "vamana_databases.h"
 #include "vamana_replication.h"
 #include "vamanalauncher.h"
 #include "vamanaworker.h"
@@ -38,8 +39,10 @@
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -170,7 +173,6 @@ static List *WorkerLedger = NIL;
 static void ClearLauncherPidOnExit(int code, Datum arg);
 static void PublishCpuGrants(List *rows);
 static long VamanaLauncherReconcileWorkers(void);
-static char *VamanaDatabasesQualifiedName(void);
 static List *ReadDatabaseRows(void);
 static List *EnabledRowsOf(List *rows);
 static void MaterializeInitialConfig(void);
@@ -469,42 +471,11 @@ AppendDatabaseRow(List *list, Oid dbOid, const char *datname,
 	return list;
 }
 
-/* NULL means "follow the GUC default"; the calculator's sentinel for that is -1. */
-static int32
-ResolveNullableThreadCount(bool isNull, int32 value)
-{
-	return isNull ? -1 : value;
-}
-
 /* NULL and an explicit 0 both mean "no floor," so both resolve to 0. */
 static int32
 ResolveReservedFloor(bool isNull, int32 value)
 {
 	return isNull ? 0 : value;
-}
-
-/*
- * Schema-qualified "vamana_databases", resolved via the svs extension's own
- * namespace rather than search_path, so a same-named table planted earlier on
- * the path can never be read instead of the real one.  NULL if the extension
- * (and therefore the table) doesn't exist yet in this database; not an error,
- * since a later NOTIFY or the fallback timeout retries.
- */
-static char *
-VamanaDatabasesQualifiedName(void)
-{
-	Oid			extOid = get_extension_oid("svs", true);
-	Oid			nspOid;
-
-	if (!OidIsValid(extOid))
-		return NULL;
-
-	nspOid = get_extension_schema(extOid);
-	if (!OidIsValid(get_relname_relid("vamana_databases", nspOid)))
-		return NULL;
-
-	return psprintf("%s.%s", quote_identifier(get_namespace_name(nspOid)),
-					quote_identifier("vamana_databases"));
 }
 
 /*
@@ -537,7 +508,7 @@ ReadDatabaseRows(void)
 	}
 
 	{
-		char	   *qualifiedName = VamanaDatabasesQualifiedName();
+		char	   *qualifiedName = SvsDatabasesQualifiedName();
 
 		if (qualifiedName != NULL)
 		{
@@ -581,9 +552,9 @@ ReadDatabaseRows(void)
 					continue;
 				}
 
-				cpu.searchNumThreads = ResolveNullableThreadCount(searchNumThreadsIsNull, searchNumThreads);
+				cpu.searchNumThreads = SvsResolveNullableThreadCount(searchNumThreadsIsNull, searchNumThreads);
 				cpu.searchThreadsReserved = ResolveReservedFloor(searchThreadsReservedIsNull, searchThreadsReserved);
-				cpu.maintenanceNumThreads = ResolveNullableThreadCount(maintenanceNumThreadsIsNull, maintenanceNumThreads);
+				cpu.maintenanceNumThreads = SvsResolveNullableThreadCount(maintenanceNumThreadsIsNull, maintenanceNumThreads);
 
 				result = AppendDatabaseRow(result, dbOid, NameStr(*datname),
 										   restart_generation, enabled, &cpu, callerCtx);
@@ -643,7 +614,28 @@ AppendPendingBuildRequests(SvsBuildCpuRequest *builds, int nbuilds,
 		SvsBuildRequest *req = &entry->buildRequests[i];
 		pid_t		pid = (pid_t) pg_atomic_read_u32(&req->pid);
 
-		if (pid == 0 || pg_atomic_read_u32(&req->status) != SVS_BUILD_REQUEST_PENDING)
+		if (pid == 0)
+			continue;
+
+		/*
+		 * Structural backstop, not a crash handler: every exit path a build
+		 * backend can take today (success, error, timeout, SIGTERM mid-wait)
+		 * already releases its own slot via SvsRunGovernedBuild/
+		 * SvsWaitForBuildGrant, and a true crash forces PostgreSQL to
+		 * reinitialize shared memory before this code would ever run.  Kept
+		 * anyway, matching the same defense-in-depth the design gives
+		 * search's fiction-worker orphans: SVS_MAX_PENDING_BUILDS is a
+		 * small, shared pool, and a future change to the primary cleanup
+		 * path silently leaking one slot would otherwise degrade capacity
+		 * until the next restart, with nothing to point at why.
+		 */
+		if (BackendPidGetProc(pid) == NULL)
+		{
+			SvsReleaseBuildRequestSlot(req);
+			continue;
+		}
+
+		if (pg_atomic_read_u32(&req->status) != SVS_BUILD_REQUEST_PENDING)
 			continue;
 
 		pg_read_barrier();
@@ -688,7 +680,11 @@ PublishBuildGrant(VamanaWorkerShmem *entry, const SvsBuildCpuGrant *grant)
 static void
 PublishCpuGrants(List *rows)
 {
-	List	   *enabledRows = EnabledRowsOf(rows);
+	List	   *enabledRows;
+
+	INJECTION_POINT("svs-build-thread-grant-publish", NULL);
+
+	enabledRows = EnabledRowsOf(rows);
 	int			ndbs = list_length(enabledRows);
 	SvsDbCpuRequest *dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
 	VamanaWorkerShmem **entries = palloc(sizeof(VamanaWorkerShmem *) * ndbs);
@@ -713,7 +709,14 @@ PublishCpuGrants(List *rows)
 		dbs[i].searchThreadsReserved = db->cpu.searchThreadsReserved;
 		i++;
 
-		nbuilds = AppendPendingBuildRequests(builds, nbuilds, db->dbOid, live ? entry : NULL);
+		/*
+		 * Not gated on live: a build-thread request is meaningful as soon as
+		 * the database has a reserved entry, independent of whether a
+		 * worker is currently, healthily serving it (the worker's own
+		 * startup path requests build threads for itself before publishing
+		 * its own liveness).
+		 */
+		nbuilds = AppendPendingBuildRequests(builds, nbuilds, db->dbOid, entry);
 	}
 
 	gucs.searchNumThreadsDefault = vamana_search_num_threads;

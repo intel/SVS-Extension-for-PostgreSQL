@@ -28,8 +28,9 @@ OnlineCpusMinus1(void)
 
 /*
  * Use max_parallel_maintenance_workers for build thread count.
- * Zero (default) falls back to nproc-1.  Non-zero is honored as-is;
- * DBAs may intentionally oversubscribe.
+ * Zero or negative means serial (1 thread), matching core's own meaning of
+ * max_parallel_maintenance_workers = 0.  Non-zero is honored as-is; DBAs
+ * may intentionally oversubscribe.
  */
 int
 SVSDefaultBuildThreads(void)
@@ -37,7 +38,7 @@ SVSDefaultBuildThreads(void)
 	int			workers = max_parallel_maintenance_workers;
 
 	if (workers <= 0)
-		return OnlineCpusMinus1();
+		return 1;
 
 	return workers;
 }
