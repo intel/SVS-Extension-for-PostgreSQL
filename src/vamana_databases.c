@@ -27,8 +27,11 @@
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "commands/dbcommands.h"
+#include "commands/extension.h"
 #include "commands/trigger.h"
+#include "executor/spi.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -320,4 +323,61 @@ ReleaseSlotsReservedThisXact(void)
 		VamanaWorkerReleaseSlot(dbOid);
 
 	ReservedThisXactDbOids = NIL;
+}
+
+/* -----------------------------------------------------------------------
+ * Table reads (SPI)
+ * ----------------------------------------------------------------------- */
+
+char *
+SvsDatabasesQualifiedName(void)
+{
+	Oid			extOid = get_extension_oid("svs", true);
+	Oid			nspOid;
+
+	if (!OidIsValid(extOid))
+		return NULL;
+
+	nspOid = get_extension_schema(extOid);
+	if (!OidIsValid(get_relname_relid("vamana_databases", nspOid)))
+		return NULL;
+
+	return psprintf("%s.%s", quote_identifier(get_namespace_name(nspOid)),
+					quote_identifier("vamana_databases"));
+}
+
+int32
+SvsResolveNullableThreadCount(bool isNull, int32 value)
+{
+	return isNull ? -1 : value;
+}
+
+int32
+SvsDatabasesGetMyMaintenanceNumThreads(void)
+{
+	char	   *qualifiedName = SvsDatabasesQualifiedName();
+	int32		result = -1;
+
+	if (qualifiedName == NULL)
+		return -1;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SvsDatabasesGetMyMaintenanceNumThreads: SPI_connect failed");
+
+	if (SPI_execute(psprintf("SELECT maintenance_num_threads FROM %s "
+							 "WHERE datname = current_database()",
+							 qualifiedName),
+					 true, 0) == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		bool		isNull;
+		int32		value = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+														SPI_tuptable->tupdesc,
+														1, &isNull));
+
+		result = SvsResolveNullableThreadCount(isNull, value);
+	}
+
+	SPI_finish();
+
+	return result;
 }

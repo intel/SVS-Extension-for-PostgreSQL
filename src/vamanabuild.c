@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "vamana.h"
+#include "svs_build_thread_grant.h"
 #include "svs_wrapper.h"
 #include "vamanaworker.h"
 
@@ -282,6 +283,36 @@ FreeBuildState(VamanaBuildState * buildstate)
 }
 
 /*
+ * Closure for SvsRunGovernedBuild: the actual SVS graph build, run once the
+ * thread count is known.  ids is generated here, not passed in, since its
+ * only use is this call and its size depends on numVectors either way.
+ */
+typedef struct VamanaSVSBuildContext
+{
+	SVSBuilderHandle builder;
+	const float *flatData;
+	int			numVectors;
+
+	SVSIndexHandle result;
+	int			errorCode;
+} VamanaSVSBuildContext;
+
+static void
+VamanaRunSVSBuild(int grantedThreads, void *context)
+{
+	VamanaSVSBuildContext *ctx = (VamanaSVSBuildContext *) context;
+	size_t	   *ids = palloc((size_t) ctx->numVectors * sizeof(size_t));
+
+	for (int i = 0; i < ctx->numVectors; i++)
+		ids[i] = (size_t) i;
+
+	SVSBuilderSetThreadpool(ctx->builder, grantedThreads);
+	ctx->result = SVSBuildDynamicIndex(ctx->builder, ctx->flatData, ids,
+										ctx->numVectors, &ctx->errorCode);
+	pfree(ids);
+}
+
+/*
  * Build the index
  */
 IndexBuildResult *
@@ -386,20 +417,21 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	builder = SVSCreateBuilder(buildstate.distance_type, buildstate.dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
-	SVSBuilderSetThreadpool(builder, SVSDefaultBuildThreads());
 
 	ereport(NOTICE,
 			(errmsg("building SVS index with %d vectors of dimension %d",
 					buildstate.numVectors, buildstate.dimensions)));
 
 	{
-		size_t	   *ids = palloc((size_t) buildstate.numVectors * sizeof(size_t));
+		VamanaSVSBuildContext buildCtx = {
+			.builder = builder,
+			.flatData = flatData,
+			.numVectors = buildstate.numVectors,
+		};
 
-		for (int i = 0; i < buildstate.numVectors; i++)
-			ids[i] = (size_t) i;
-
-		svsIndex = SVSBuildDynamicIndex(builder, flatData, ids, buildstate.numVectors, &error_code);
-		pfree(ids);
+		SvsRunGovernedBuild(VamanaRunSVSBuild, &buildCtx);
+		svsIndex = buildCtx.result;
+		error_code = buildCtx.errorCode;
 	}
 
 	if (svsIndex == NULL)
@@ -729,17 +761,17 @@ VamanaRebuildFromTable(Relation index)
 
 	builder = SVSCreateBuilder(distanceType, dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
-	SVSBuilderSetThreadpool(builder, SVSDefaultBuildThreads());
 
-	/* Generate sequential external IDs: ids[i] = i */
 	{
-		size_t	   *ids = palloc((size_t) numVectors * sizeof(size_t));
+		VamanaSVSBuildContext buildCtx = {
+			.builder = builder,
+			.flatData = flatData,
+			.numVectors = numVectors,
+		};
 
-		for (int i = 0; i < numVectors; i++)
-			ids[i] = (size_t) i;
-
-		svsIndex = SVSBuildDynamicIndex(builder, flatData, ids, numVectors, &errorCode);
-		pfree(ids);
+		SvsRunGovernedBuild(VamanaRunSVSBuild, &buildCtx);
+		svsIndex = buildCtx.result;
+		errorCode = buildCtx.errorCode;
 	}
 
 	if (svsIndex == NULL || errorCode != 0)

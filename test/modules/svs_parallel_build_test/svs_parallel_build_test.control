@@ -1,0 +1,5 @@
+# svs_parallel_build_test extension
+comment = 'Standalone test harness for the ParallelContext park wrapper'
+default_version = '1.0'
+module_pathname = '$libdir/svs_parallel_build_test'
+relocatable = true

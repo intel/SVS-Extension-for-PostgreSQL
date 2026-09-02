@@ -17,6 +17,8 @@ OBJS = src/svs.o \
        src/vamana_subxid_pending_array.o \
        src/vamana_subxact_guard.o \
        src/vamanabuild.o \
+       src/svs_parallel_build.o \
+       src/svs_build_thread_grant.o \
        src/vamanacache.o \
        src/vamanaio.o \
        src/vamanainsert.o \
