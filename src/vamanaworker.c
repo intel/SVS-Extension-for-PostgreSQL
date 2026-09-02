@@ -65,10 +65,19 @@ volatile sig_atomic_t worker_got_sigterm = false;
 volatile sig_atomic_t worker_got_sighup = false;
 
 /*
- * Set while an index load or slot drain is in progress.  VamanaRelcacheCallback
- * checks this flag to avoid evicting entries the load path is populating.
+ * Two eviction-suppression guards, checked together by VamanaRelcacheCallback:
+ *
+ * vamana_eviction_suppressed -- set by drain/checkpoint/standby paths to
+ *   suppress ALL evictions (e.g. during graceful shutdown drain, where every
+ *   live entry must survive until it is checkpointed).
+ *
+ * vamana_eviction_suppressed_for_relid -- set by write/warmup/reload paths
+ *   to protect only the single relid being written.  Other relids are not
+ *   suppressed, so DROP TABLE invalidations for stale cache entries can still
+ *   fire and free their slots.
  */
 bool		vamana_eviction_suppressed = false;
+Oid			vamana_eviction_suppressed_for_relid = InvalidOid;
 
 /*
  * Set by VamanaRelcacheCallback when a relid outside the cache is invalidated;
@@ -350,9 +359,9 @@ VamanaWorkerProcessReloads(void)
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_eviction_suppressed = true;
+		vamana_eviction_suppressed_for_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
-		vamana_eviction_suppressed = false;
+		vamana_eviction_suppressed_for_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -378,7 +387,13 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 	if (relid == InvalidOid || VamanaGetCache(relid) == NULL)
 		standbyRediscoverPending = true;
 
+	/* Drain/checkpoint: suppress all evictions. */
 	if (vamana_eviction_suppressed)
+		return;
+
+	/* Write/warmup/reload: suppress only the relid being actively operated on. */
+	if (vamana_eviction_suppressed_for_relid != InvalidOid &&
+		(relid == InvalidOid || relid == vamana_eviction_suppressed_for_relid))
 		return;
 
 	if (relid == InvalidOid)

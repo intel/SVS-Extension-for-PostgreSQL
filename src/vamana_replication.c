@@ -1345,6 +1345,17 @@ ApplyPendingSlotDrops(void)
 		if (entry->subxid == InvalidSubTransactionId)
 			continue;
 
+		/*
+		 * Signal the BGW to evict its in-memory cache entry for the dropped
+		 * index.  The RELOAD request causes VamanaWorkerProcessReloads to
+		 * evict the slot; the subsequent reload attempt fails cleanly because
+		 * the save directory and the catalog entry are both gone.  This call
+		 * runs after commit so the BGW does not race the still-in-progress
+		 * DROP when it opens the transaction for the reload.
+		 */
+		if (!AmBackgroundWorkerProcess() && VamanaWorkerIsAvailable())
+			VamanaWorkerSignalReload(entry->indexRelid);
+
 		if (VamanaReplicationDropIfExists(entry->dbOid,
 										  entry->indexRelid) != VAMANA_SLOT_DROP_BUSY)
 			continue;
