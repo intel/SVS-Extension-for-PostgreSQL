@@ -800,9 +800,10 @@ VamanaRebuildFromTable(Relation index)
 
 	/* Flatten vector data for SVS */
 	/*
-	 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM (2000)
-	 * above, so firing needs more than ~2.3e15 vectors on a 64-bit system.
-	 * Guards the multiplication as belt-and-braces.
+	 * Unreachable in practice: the index could not have been created unless its
+	 * dimensions passed the VAMANA_MAX_DIM (2000) cap in vamanabuild(), so
+	 * firing needs more than ~2.3e15 vectors on a 64-bit system.  Guards the
+	 * multiplication as belt-and-braces.
 	 */
 	if ((size_t) numVectors > 0 &&
 		(size_t) dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)

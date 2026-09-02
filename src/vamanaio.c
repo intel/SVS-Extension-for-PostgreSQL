@@ -130,8 +130,12 @@ VamanaGetTidMapTmpPath(const char *indexdir, char *buf, size_t bufsz)
 
 /*
  * write() the whole buffer, looping over short writes.  Returns false with
- * errno set on failure; a short write that leaves errno clear means the
- * filesystem is full.
+ * errno set on failure.
+ *
+ * A write() of a non-zero count that returns 0 is not an error POSIX assigns a
+ * cause to, and it can leave errno clear.  ENOSPC is substituted in that case
+ * so the caller's %m reports a plausible cause rather than "Success" — a best
+ * guess, not a determination that the filesystem is full.
  *
  * Deliberately contains no CHECK_FOR_INTERRUPTS: throwing from here would leak
  * the caller's transient fd and leave the temp file behind.  The loop is
