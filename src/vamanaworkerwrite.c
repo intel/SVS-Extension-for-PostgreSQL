@@ -461,7 +461,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 	 * freeing the SVSIndexHandle we already retrieved and causing a
 	 * use-after-free or stale-index write.
 	 */
-	vamana_eviction_suppressed = true;
+	vamana_eviction_suppressed_for_relid = slot->indexRelid;
 
 	PG_TRY();
 	{
@@ -493,12 +493,12 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 							 VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
 
-		vamana_eviction_suppressed = false;
+		vamana_eviction_suppressed_for_relid = InvalidOid;
 		return;
 	}
 	PG_END_TRY();
 
-	vamana_eviction_suppressed = false;
+	vamana_eviction_suppressed_for_relid = InvalidOid;
 }
 
 /* -----------------------------------------------------------------------
@@ -566,15 +566,19 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		}
 
 		/*
-		 * Set the reload guard before populating the cache so any relcache
-		 * invalidation that fires inside VamanaCacheIndex (e.g. from a
-		 * concurrent DROP) does not evict the entry mid-populate.
+		 * Protect this relid from eviction while populating its cache entry.
+		 * Any relcache invalidation that fires inside VamanaCacheIndex (e.g.
+		 * from a concurrent DROP) must not free the handle mid-populate.
+		 * Invalidations for other relids are not suppressed: DROP TABLE events
+		 * from earlier rounds may be pending, and allowing them to fire here
+		 * lets VamanaRelcacheCallback mark stale slots invalid so Branch 3 of
+		 * VamanaAllocCacheSlot can reclaim them.
 		 *
 		 * The guard is cleared only after DONE is written.  The next write
-		 * slot will set its own guard on entry, which covers the window where
-		 * the CREATE INDEX commit's relcache invalidation arrives.
+		 * slot sets its own guard on entry, covering the window where the
+		 * CREATE INDEX commit's relcache invalidation arrives.
 		 */
-		vamana_eviction_suppressed = true;
+		vamana_eviction_suppressed_for_relid = relid;
 		VamanaCacheIndex(relid, svsIndex,
 						 params->dimensions,
 						 params->graph_degree,
@@ -612,14 +616,14 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		slot->numResults = params->numVectors;
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-		vamana_eviction_suppressed = false;
+		vamana_eviction_suppressed_for_relid = InvalidOid;
 		loadSucceeded = true;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata;
 
-		vamana_eviction_suppressed = false;
+		vamana_eviction_suppressed_for_relid = InvalidOid;
 
 		/* Leave ErrorContext before allocating anything; errfinish() left us in it. */
 		MemoryContextSwitchTo(oldcontext);
@@ -700,9 +704,9 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_eviction_suppressed = true;
+		vamana_eviction_suppressed_for_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
-		vamana_eviction_suppressed = false;
+		vamana_eviction_suppressed_for_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -714,7 +718,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 	{
 		ErrorData  *edata;
 
-		vamana_eviction_suppressed = false;
+		vamana_eviction_suppressed_for_relid = InvalidOid;
 
 		if (IsTransactionState())
 			AbortCurrentTransaction();

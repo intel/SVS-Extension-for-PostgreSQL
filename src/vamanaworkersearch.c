@@ -48,13 +48,81 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	/*
 	 * Get or load the index.  Avoid the transaction and catch-up drain if the
 	 * index is already warm in process memory.
+	 *
+	 * VamanaWorkerEnsureIndexCurrent calls VamanaWorkerGetOrLoadIndex, which
+	 * propagates ERRCODE_CONFIGURATION_LIMIT_EXCEEDED (cache full) rather than
+	 * returning NULL.  Catch that here so a full-cache denial on the search path
+	 * fails the queued slots cleanly instead of escaping to the BGW top-level
+	 * handler and killing the worker.
 	 */
 	{
 		bool		needsRebuild;
+		bool		loadFailed = false;
+		char		loadErrMsg[512];	/* same size as VamanaWorkerSlot.errorMessage */
 
 		index = VamanaGetCachedIndex(relid, &needsRebuild);
 		if (needsRebuild)
-			index = VamanaWorkerEnsureIndexCurrent(relid);
+		{
+			MemoryContext oldcontext = CurrentMemoryContext;
+
+			PG_TRY();
+			{
+				index = VamanaWorkerEnsureIndexCurrent(relid);
+			}
+			PG_CATCH();
+			{
+				ErrorData  *edata;
+
+				MemoryContextSwitchTo(oldcontext);
+				edata = CopyErrorData();
+				FlushErrorState();
+
+				/*
+				 * VamanaWorkerEnsureIndexCurrent opens a transaction and pushes a
+				 * snapshot before calling into the load path.  Those are skipped
+				 * when the error propagates, so clean them up here before the
+				 * worker continues.  AbortCurrentTransaction must come after
+				 * FlushErrorState so the error state is clear when the abort runs.
+				 */
+				if (ActiveSnapshotSet())
+					PopActiveSnapshot();
+				if (IsTransactionState())
+					AbortCurrentTransaction();
+
+				/*
+				 * Only forward the cache-full message verbatim: it is a sanitized
+				 * compile-time constant.  Any other load error (SVS library failure,
+				 * I/O error) may contain internal detail, so substitute a generic
+				 * string and keep the detail in the server log only.
+				 */
+				if (edata->sqlerrcode == ERRCODE_CONFIGURATION_LIMIT_EXCEEDED &&
+					edata->message != NULL)
+					snprintf(loadErrMsg, sizeof(loadErrMsg), "%s", edata->message);
+				else
+					snprintf(loadErrMsg, sizeof(loadErrMsg),
+							 "error loading vamana index; see server log for detail");
+				FreeErrorData(edata);
+				loadFailed = true;
+				index = NULL;
+			}
+			PG_END_TRY();
+		}
+
+		if (loadFailed)
+		{
+			for (int i = 0; i < n; i++)
+			{
+				VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+
+				slot->numResults = 0;
+				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+						 "%s", loadErrMsg);
+				slot->errorCategory = VAMANA_ERR_INTERNAL;
+				pg_write_barrier();
+				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+			}
+			return;
+		}
 	}
 
 	/*
