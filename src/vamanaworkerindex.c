@@ -175,9 +175,25 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  * the on-disk checkpoint (not a heap rebuild): such a handle predates any
  * post-checkpoint commit still pending in the replication slot.
  *
+ * Propagates ERRCODE_CONFIGURATION_LIMIT_EXCEEDED (cache full) so the caller
+ * sees an explicit error rather than a silent NULL return.  All other errors
+ * are caught, logged as WARNING, and result in a NULL return.
+ *
  * Must be called from within an active transaction (or the caller must open
  * one).
  */
+
+/*
+ * Propagation predicate for VamanaRunInSubXact: return true when the cache is
+ * full so the hard-deny reaches the caller rather than being swallowed here.
+ * The predicate style follows VamanaShutdownCancelPending in vamanaworker.c.
+ */
+static bool
+VamanaCacheFullError(void)
+{
+	return geterrcode() == ERRCODE_CONFIGURATION_LIMIT_EXCEEDED;
+}
+
 typedef struct GetOrLoadIndexArgs
 {
 	Oid			relid;
@@ -233,7 +249,7 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 	args.loadedFromDisk = loadedFromDisk;
 	args.index = NULL;
 
-	result = VamanaRunInSubXact(GetOrLoadIndexBody, &args, NULL);
+	result = VamanaRunInSubXact(GetOrLoadIndexBody, &args, VamanaCacheFullError);
 	if (result.succeeded)
 		return args.index;
 
