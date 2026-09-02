@@ -197,6 +197,35 @@ sub check_build_slot_appnames
 		"SELECT injection_points_detach('svs-build-thread-grant-acquired');");
 }
 
+# ---------------------------------------------------------------------------
+# If the launcher never gets to publish a grant, the waiting backend must
+# time out rather than hang.  Stalling PublishCpuGrants itself -- the
+# launcher's one and only path to a grant -- makes that deterministic instead
+# of racing a real launcher hang.
+# ---------------------------------------------------------------------------
+{
+	$node->safe_psql('postgres', "ALTER SYSTEM SET svs.worker_timeout_ms = 100;");
+	$node->safe_psql('postgres', "SELECT pg_reload_conf();");
+	$node->safe_psql('postgres',
+		"SELECT injection_points_attach('svs-build-thread-grant-publish', 'wait');"
+	);
+
+	my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
+		CREATE TABLE btg_timeout_tbl (id serial PRIMARY KEY, val vector(3));
+		INSERT INTO btg_timeout_tbl (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+		CREATE INDEX ON btg_timeout_tbl USING vamana (val vector_l2_ops);
+	));
+	like($stderr, qr/no build-thread grant from the launcher within \d+ ms/,
+		'CREATE INDEX times out when the launcher never publishes a grant');
+
+	$node->safe_psql('postgres',
+		"SELECT injection_points_wakeup('svs-build-thread-grant-publish');");
+	$node->safe_psql('postgres',
+		"SELECT injection_points_detach('svs-build-thread-grant-publish');");
+	$node->safe_psql('postgres', "ALTER SYSTEM RESET svs.worker_timeout_ms;");
+	$node->safe_psql('postgres', "SELECT pg_reload_conf();");
+}
+
 $node->stop;
 
 done_testing();

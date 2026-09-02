@@ -313,6 +313,83 @@ VamanaRunSVSBuild(int grantedThreads, void *context)
 }
 
 /*
+ * Index-shape parameters needed to construct an SVS algorithm/storage/
+ * builder triple.  Deliberately narrower than VamanaBuildState: the only
+ * callers building fresh (vamanabuild, VamanaRebuildFromTable) source these
+ * from different places (reloptions vs. a live scan), and this keeps the
+ * builder lifecycle below decoupled from either caller's own state.
+ */
+typedef struct VamanaSVSIndexParams
+{
+	int				dimensions;
+	int				graph_degree;
+	int				alpha;
+	int				build_window_size;
+	int				search_window_size;
+	bool			use_search_history;
+	int				compression_type;
+	int				compression_primary;
+	int				compression_secondary;
+	int				leanvec_dims;
+	SVSDistanceType	distance_type;
+} VamanaSVSIndexParams;
+
+/*
+ * Builds an SVS index under a launcher-granted thread count.  Owns the
+ * builder/storage/algorithm handles it creates and frees them on every exit
+ * path, including an ERROR raised while waiting for or running under the
+ * grant -- those handles are native SVS objects that PostgreSQL's own
+ * memory-context cleanup does not know how to reclaim.
+ */
+static SVSIndexHandle
+VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
+							 const float *flatData, int numVectors,
+							 int *errorCodeOut)
+{
+	SVSAlgorithmHandle algorithm;
+	SVSStorageHandle storage;
+	SVSBuilderHandle builder;
+	VamanaSVSBuildContext buildCtx;
+	int			buildWindow = params->build_window_size > 0 ?
+		params->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(params->graph_degree);
+
+	algorithm = SVSCreateAlgorithm(params->graph_degree, buildWindow,
+									params->search_window_size, params->alpha,
+									params->use_search_history);
+
+	if (params->compression_type == VAMANA_COMPRESSION_LEANVEC)
+		storage = SVSCreateLeanVecStorage(params->dimensions, params->leanvec_dims,
+										   params->compression_primary,
+										   params->compression_secondary);
+	else
+		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
+
+	builder = SVSCreateBuilder(params->distance_type, params->dimensions, algorithm);
+	SVSBuilderSetStorage(builder, storage);
+
+	buildCtx = (VamanaSVSBuildContext) {
+		.builder = builder,
+		.flatData = flatData,
+		.numVectors = numVectors,
+	};
+
+	PG_TRY();
+	{
+		SvsRunGovernedBuild(VamanaRunSVSBuild, &buildCtx);
+	}
+	PG_FINALLY();
+	{
+		SVSFreeBuilder(builder);
+		SVSFreeStorage(storage);
+		SVSFreeAlgorithm(algorithm);
+	}
+	PG_END_TRY();
+
+	*errorCodeOut = buildCtx.errorCode;
+	return buildCtx.result;
+}
+
+/*
  * Build the index
  */
 IndexBuildResult *
@@ -320,9 +397,6 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	IndexBuildResult *result;
 	VamanaBuildState buildstate;
-	SVSAlgorithmHandle algorithm = NULL;
-	SVSStorageHandle storage = NULL;
-	SVSBuilderHandle builder = NULL;
 	SVSIndexHandle svsIndex = NULL;
 	float	   *flatData = NULL;
 	Size		dataSize;
@@ -390,48 +464,27 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			   buildstate.dimensions * sizeof(float));
 	}
 
-	{
-		int			build_window = buildstate.build_window_size > 0 ?
-			buildstate.build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(buildstate.graph_degree);
-		int			search_window = buildstate.search_window_size;
-
-		algorithm = SVSCreateAlgorithm(
-									   buildstate.graph_degree,
-									   build_window,
-									   search_window,
-									   buildstate.alpha,
-									   buildstate.use_search_history);
-	}
-
-	if (buildstate.compression_type == VAMANA_COMPRESSION_LEANVEC)
-	{
-		storage = SVSCreateLeanVecStorage(buildstate.dimensions,
-										  buildstate.leanvec_dims,
-										  buildstate.compression_primary,
-										  buildstate.compression_secondary);
-	}
-	else
-	{
-		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
-	}
-
-	builder = SVSCreateBuilder(buildstate.distance_type, buildstate.dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
-
 	ereport(NOTICE,
 			(errmsg("building SVS index with %d vectors of dimension %d",
 					buildstate.numVectors, buildstate.dimensions)));
 
 	{
-		VamanaSVSBuildContext buildCtx = {
-			.builder = builder,
-			.flatData = flatData,
-			.numVectors = buildstate.numVectors,
+		VamanaSVSIndexParams params = {
+			.dimensions = buildstate.dimensions,
+			.graph_degree = buildstate.graph_degree,
+			.alpha = buildstate.alpha,
+			.build_window_size = buildstate.build_window_size,
+			.search_window_size = buildstate.search_window_size,
+			.use_search_history = buildstate.use_search_history,
+			.compression_type = buildstate.compression_type,
+			.compression_primary = buildstate.compression_primary,
+			.compression_secondary = buildstate.compression_secondary,
+			.leanvec_dims = buildstate.leanvec_dims,
+			.distance_type = buildstate.distance_type,
 		};
 
-		SvsRunGovernedBuild(VamanaRunSVSBuild, &buildCtx);
-		svsIndex = buildCtx.result;
-		error_code = buildCtx.errorCode;
+		svsIndex = VamanaBuildSVSIndexGoverned(&params, flatData,
+											   buildstate.numVectors, &error_code);
 	}
 
 	if (svsIndex == NULL)
@@ -505,12 +558,6 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 cleanup:
 	if (svsIndex)
 		SVSFreeIndex(svsIndex);
-	if (builder)
-		SVSFreeBuilder(builder);
-	if (storage)
-		SVSFreeStorage(storage);
-	if (algorithm)
-		SVSFreeAlgorithm(algorithm);
 	if (flatData)
 		pfree(flatData);
 
@@ -566,9 +613,6 @@ VamanaRebuildFromTable(Relation index)
 	HeapTuple	tuple;
 	TupleDesc	tupdesc;
 	SVSIndexHandle svsIndex;
-	SVSAlgorithmHandle algorithm;
-	SVSBuilderHandle builder;
-	SVSStorageHandle storage;
 	VamanaOptions *opts;
 	int			dimensions;
 	int			graph_degree;
@@ -751,35 +795,26 @@ VamanaRebuildFromTable(Relation index)
 			   dimensions * sizeof(float));
 	}
 
-	algorithm = SVSCreateAlgorithm(graph_degree, buildWindow, searchWindow, alpha, useSearchHistory);
-
-	if (compression_type == VAMANA_COMPRESSION_LEANVEC)
-		storage = SVSCreateLeanVecStorage(dimensions, leanvec_dims,
-										  compression_primary, compression_secondary);
-	else
-		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
-
-	builder = SVSCreateBuilder(distanceType, dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
-
 	{
-		VamanaSVSBuildContext buildCtx = {
-			.builder = builder,
-			.flatData = flatData,
-			.numVectors = numVectors,
+		VamanaSVSIndexParams params = {
+			.dimensions = dimensions,
+			.graph_degree = graph_degree,
+			.alpha = alpha,
+			.build_window_size = buildWindow,
+			.search_window_size = searchWindow,
+			.use_search_history = useSearchHistory,
+			.compression_type = compression_type,
+			.compression_primary = compression_primary,
+			.compression_secondary = compression_secondary,
+			.leanvec_dims = leanvec_dims,
+			.distance_type = distanceType,
 		};
 
-		SvsRunGovernedBuild(VamanaRunSVSBuild, &buildCtx);
-		svsIndex = buildCtx.result;
-		errorCode = buildCtx.errorCode;
+		svsIndex = VamanaBuildSVSIndexGoverned(&params, flatData, numVectors, &errorCode);
 	}
 
 	if (svsIndex == NULL || errorCode != 0)
 	{
-		SVSFreeBuilder(builder);
-		SVSFreeStorage(storage);
-		SVSFreeAlgorithm(algorithm);
-
 		for (int i = 0; i < numVectors; i++)
 			pfree(vectorBuffer[i]);
 		pfree(vectorBuffer);
@@ -793,11 +828,7 @@ VamanaRebuildFromTable(Relation index)
 
 	SVSSetIndexSearchThreads(svsIndex, SVSDefaultSearchThreads());
 
-	/* Cleanup vector buffers and flatData (but keep tidMapping for cache) */
-	SVSFreeBuilder(builder);
-	SVSFreeStorage(storage);
-	SVSFreeAlgorithm(algorithm);
-
+	/* tidMapping is still needed below, by VamanaCacheIndex. */
 	for (int i = 0; i < numVectors; i++)
 		pfree(vectorBuffer[i]);
 	pfree(vectorBuffer);

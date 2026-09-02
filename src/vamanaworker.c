@@ -1847,8 +1847,9 @@ SvsWaitForBuildGrant(SvsBuildRequest *req, int timeout_ms, int32 *grantedOut)
 void
 SvsReleaseBuildRequestSlot(SvsBuildRequest *req)
 {
-	pg_atomic_write_u32(&req->status, SVS_BUILD_REQUEST_PENDING);
 	req->requested = 0;
 	req->granted = 0;
+	pg_write_barrier();
+	pg_atomic_write_u32(&req->status, SVS_BUILD_REQUEST_PENDING);
 	pg_atomic_write_u32(&req->pid, 0);
 }

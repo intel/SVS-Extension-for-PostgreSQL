@@ -119,7 +119,7 @@ SVS provides a high-level batch build API with internal parallelism management.
 **Implementation characteristics:**
 - **SVS manages parallelism internally** via threads
 - **No manual shared memory management** required for build
-- **PostgreSQL passes thread count** via `max_parallel_maintenance_workers` for build operations and `svs.search_num_threads` for search operations
+- **Build thread count is launcher-governed:** the backend requests a thread count (`maintenance_num_threads` from `vamana_databases`, falling back to `max_parallel_maintenance_workers` when unset) and blocks until the launcher grants it from the database's CPU budget; search still passes `svs.search_num_threads` straight through
 - **Dynamic index:** Uses `svs_index_build_dynamic` to produce a mutable index; INSERT calls `SVSAddPoints` for incremental updates, DELETE + VACUUM calls `SVSDeletePoints` with consolidation and compaction
 - **Must buffer vectors:** All vectors loaded into memory before build
 

@@ -42,6 +42,7 @@
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -679,7 +680,11 @@ PublishBuildGrant(VamanaWorkerShmem *entry, const SvsBuildCpuGrant *grant)
 static void
 PublishCpuGrants(List *rows)
 {
-	List	   *enabledRows = EnabledRowsOf(rows);
+	List	   *enabledRows;
+
+	INJECTION_POINT("svs-build-thread-grant-publish", NULL);
+
+	enabledRows = EnabledRowsOf(rows);
 	int			ndbs = list_length(enabledRows);
 	SvsDbCpuRequest *dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
 	VamanaWorkerShmem **entries = palloc(sizeof(VamanaWorkerShmem *) * ndbs);
