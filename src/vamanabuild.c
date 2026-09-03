@@ -743,6 +743,8 @@ VamanaRebuildFromTable(Relation index)
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("vector dimension mismatch: expected %d, got %d", dimensions, vec->dim)));
 			}
+			if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
+				VamanaValidateVectorData(vec->x, vec->dim, "rebuild");
 			vectorBuffer[numVectors] = palloc(dimensions * sizeof(float));
 			memcpy(vectorBuffer[numVectors], vec->x, dimensions * sizeof(float));
 			pfree(vec);			/* free the _COPY allocation */

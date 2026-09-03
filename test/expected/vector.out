@@ -1041,7 +1041,7 @@ DROP TABLE t;
 -- VamanaValidateVectorData direct coverage: bypass pgvector's input functions
 -- via a bytea cast so a NaN datum reaches the extension's AM boundary.
 -- Requires superuser (CREATE CAST is privileged DDL).
--- 16-byte vector body: int16 dim=3, int16 unused=0, then three little-endian
+-- 16-byte bytea payload: int16 dim=3, int16 unused=0, then three little-endian
 -- float4s where the first is 0x7FC00000 (quiet NaN).
 CREATE CAST (bytea AS vector) WITHOUT FUNCTION;
 -- insert path: index exists, NaN reaches vamanainsert

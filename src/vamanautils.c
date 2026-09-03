@@ -340,7 +340,7 @@ VamanaGetDistanceMetric(Relation index)
  * library. SVS performs no input validation; non-finite values propagate
  * silently through distance computations (IEEE 754), corrupting k-NN
  * ranking without error. context is a short label used in the error
- * message ("insert", "build").
+ * message ("insert", "build", "rebuild").
  */
 void
 VamanaValidateVectorData(const float *data, int dim, const char *context)
