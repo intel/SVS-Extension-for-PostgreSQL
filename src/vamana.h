@@ -311,6 +311,7 @@ void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber 
 bool		VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
 void		VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count);
 void		VamanaInstallObjectAccessHook(void);
+void		VamanaValidateVectorData(const float *data, int dim, const char *context);
 
 /* Dynamic index support */
 void		VamanaWriteMetaPageDynamic(Relation index, uint64 nextExternalId,

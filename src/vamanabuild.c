@@ -61,6 +61,8 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	 * See also vamanascan.c (query vector detoast).
 	 */
 	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
+	if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
+		VamanaValidateVectorData(vec->x, vec->dim, "build");
 	dimensions = vec->dim;
 
 	if (buildstate->numVectors >= buildstate->bufferCapacity)
@@ -455,6 +457,18 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		goto cleanup;
 	}
 
+	/*
+	 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM (2000)
+	 * above, so firing needs more than ~2.3e15 vectors on a 64-bit system.
+	 * Guards the multiplication as belt-and-braces.
+	 */
+	if ((size_t) buildstate.numVectors > 0 &&
+		(size_t) buildstate.dimensions > SIZE_MAX / sizeof(float) / (size_t) buildstate.numVectors)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("vector dataset too large to index "
+						"(%d vectors x %d dimensions exceeds memory limit)",
+						buildstate.numVectors, buildstate.dimensions)));
 	dataSize = (Size) buildstate.numVectors * buildstate.dimensions * sizeof(float);
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
 	for (int i = 0; i < buildstate.numVectors; i++)
@@ -729,6 +743,8 @@ VamanaRebuildFromTable(Relation index)
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("vector dimension mismatch: expected %d, got %d", dimensions, vec->dim)));
 			}
+			if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
+				VamanaValidateVectorData(vec->x, vec->dim, "rebuild");
 			vectorBuffer[numVectors] = palloc(dimensions * sizeof(float));
 			memcpy(vectorBuffer[numVectors], vec->x, dimensions * sizeof(float));
 			pfree(vec);			/* free the _COPY allocation */
@@ -785,6 +801,19 @@ VamanaRebuildFromTable(Relation index)
 	}
 
 	/* Flatten vector data for SVS */
+	/*
+	 * Unreachable in practice: the index could not have been created unless its
+	 * dimensions passed the VAMANA_MAX_DIM (2000) cap in vamanabuild(), so
+	 * firing needs more than ~2.3e15 vectors on a 64-bit system.  Guards the
+	 * multiplication as belt-and-braces.
+	 */
+	if ((size_t) numVectors > 0 &&
+		(size_t) dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("vector dataset too large to index "
+						"(%d vectors x %d dimensions exceeds memory limit)",
+						numVectors, dimensions)));
 	dataSize = (Size) numVectors * dimensions * sizeof(float);
 	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
 
