@@ -347,10 +347,49 @@ void	VamanaWorkerShmemStartup(void);		/* shmem_startup_hook */
 void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_init */
 
 /* vamanaworkershmem.c: per-database control-block lookup and reservation */
+
+/*
+ * Resolve dbOid's control block, or NULL if the database has no slot reserved.
+ *
+ * Read-only, and stale by the time it returns: the header lock is released
+ * before the pointer is handed back.  The pointer stays valid — the array is
+ * never reallocated — but it stops being a promise about *which* database the
+ * entry serves, because a release and re-reserve can hand that array position to
+ * another database.  So this answers "is a slot reserved, and roughly what does
+ * it say", for callers whose worst case is one stale answer that the next pass
+ * corrects.
+ *
+ * Never write through this pointer: the write can land on another database's
+ * entry, which no atomic prevents.  Use VamanaWorkerWithEntry, which keeps the
+ * lock held across the mutation, or a snapshot accessor for a read whose result
+ * decides something irreversible (VamanaWorkerIndexCountSnapshot,
+ * VamanaWorkerBackoffSnapshot).
+ *
+ * Two callers legitimately keep using the pointer: the worker's own
+ * VamanaWorkerShmemPtr, whose entry is only released once the launcher has
+ * confirmed the worker stopped, and the backend IPC claim path, whose request
+ * spans a wake-up and a wait that no lock can be held across.
+ */
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerClearDeadEntry(Oid dbOid);
+
+/*
+ * Mutate dbOid's control block with the header lock held for the whole
+ * callback, so the entry cannot be recycled between being found and being
+ * written to.  Returns false if no slot is reserved for dbOid.
+ *
+ * The callback must write only through the entry's atomics, must not take the
+ * header lock again (it is not recursive) or any other LWLock — in particular
+ * nothing reaching VamanaWorkerEntryIsLive, which takes ProcArrayLock — must do
+ * no unbounded work, and must not ereport above DEBUG.  Report a condition by
+ * handing it back through ctx and raising it after this returns.
+ *
+ * Distinct from VamanaReservedEntryCb below, whose contract is read-only.
+ */
+typedef void (*VamanaEntryMutatorCb) (VamanaWorkerShmem *entry, void *ctx);
+bool	VamanaWorkerWithEntry(Oid dbOid, VamanaEntryMutatorCb cb, void *ctx);
 
 /*
  * Read and clear the slot drops still queued for dbOid, up to max, returning
@@ -361,6 +400,16 @@ void	VamanaWorkerClearDeadEntry(Oid dbOid);
 int		VamanaWorkerTakePendingSlotDrops(Oid dbOid, Oid *relids, int max);
 
 void	VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta);
+
+/*
+ * Copy dbOid's live-index count into *count; false (and *count = 0) when no slot
+ * is reserved.  Read under the header lock, so the number belongs to dbOid and
+ * not to whichever database may since have taken that array position — the
+ * BEFORE DELETE guard on vamana_databases reads a zero as permission to remove
+ * the row.  The value itself is a snapshot and may be out of date by the time the
+ * caller acts on it.
+ */
+bool	VamanaWorkerIndexCountSnapshot(Oid dbOid, uint32 *count);
 
 /*
  * vamanaworkershmem.c: cross-process wake, generalized over any target

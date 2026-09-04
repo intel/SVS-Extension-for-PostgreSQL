@@ -324,4 +324,105 @@ SKIP: {
     $node->stop;
 }
 
+# ---------------------------------------------------------------------------
+# A write into a control block cannot be recycled out from under it.  Every
+# mutation runs with the header lock held in shared mode, so the entry it found
+# cannot be released and re-reserved for another database before the write lands
+# — otherwise a CREATE INDEX would move a stranger's index counter, and that
+# counter is what guards removing a database's row.  The injection point pauses
+# a CREATE INDEX inside its counter update, still holding the lock, and a
+# concurrent reservation must wait for it.
+# ---------------------------------------------------------------------------
+SKIP: {
+    skip 'server not built with --enable-injection-points', 4
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = start_node('vamana_entry_mutation_locked');
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 40);
+    $node->safe_psql('postgres', "CREATE DATABASE mutation_db;");
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE mut_t (v vector(3));
+        INSERT INTO mut_t VALUES ('[1,0,0]'), ('[0,1,0]'), ('[0,0,1]');
+    });
+
+    my $ctl = $node->background_psql('postgres');
+    $ctl->query_safe(
+        "SELECT injection_points_attach('vamana-entry-mutation-midpoint', 'wait');");
+
+    # The index build finishes before commit; the parked mutation is the +1 the
+    # commit applies to this database's counter.
+    my $creator = $node->background_psql('postgres');
+    my $creator_pid = $creator->query('SELECT pg_backend_pid();');
+    chomp $creator_pid;
+    $creator->query_until(qr//,
+        "CREATE INDEX mut_idx ON mut_t USING vamana (v vector_l2_ops);\n");
+
+    my $parked = '';
+    for (1 .. 300) {
+        usleep(100_000);
+        $parked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE pid = $creator_pid AND wait_event = 'vamana-entry-mutation-midpoint';");
+        last if $parked ne '';
+    }
+    isnt($parked, '', 'a control-block mutation parks with the header lock held');
+
+    # Reserver: fire-and-forget.  Reserving takes the header lock exclusively, so
+    # it cannot proceed until the mutation above releases it.
+    my $reserver = $node->background_psql('postgres');
+    my $reserver_pid = $reserver->query('SELECT pg_backend_pid();');
+    chomp $reserver_pid;
+    $reserver->query_until(qr//,
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('mutation_db', true);\n");
+
+    my $blocked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $blocked = $ctl->query(
+            "SELECT pid FROM pg_stat_activity WHERE pid = $reserver_pid "
+          . "AND wait_event = 'vamana_worker_header' AND wait_event_type = 'LWLock';");
+        last if $blocked ne '';
+    }
+    isnt($blocked, '',
+        'a concurrent reservation waits on the header lock until the mutation finishes');
+
+    # Detach before waking: the commit reaches further mutations (the slot-drop
+    # ring, the index-lock table) and would park again on an attachment left in
+    # place.
+    $ctl->query_safe(
+        "SELECT injection_points_detach('vamana-entry-mutation-midpoint');");
+    $ctl->query_safe(
+        "SELECT injection_points_wakeup('vamana-entry-mutation-midpoint');");
+
+    my $reserved = '';
+    for (1 .. 300) {
+        usleep(100_000);
+        $reserved = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_vamana_worker w JOIN pg_database d "
+          . "ON d.oid = w.db_oid WHERE d.datname = 'mutation_db';");
+        chomp $reserved;
+        last if $reserved eq '1';
+    }
+    is($reserved, '1', 'the waiting reservation completes once the lock is released');
+
+    # The counter moved on the database that ran the CREATE INDEX, and the
+    # database that took a slot during it starts at zero.
+    my $counts = $node->safe_psql('postgres', qq{
+        SELECT string_agg(d.datname || '=' || w.index_count, ',' ORDER BY d.datname)
+        FROM pg_stat_vamana_worker w JOIN pg_database d ON d.oid = w.db_oid
+        WHERE d.datname IN ('postgres', 'mutation_db');
+    });
+    chomp $counts;
+    is($counts, 'mutation_db=0,postgres=1',
+        'the index count lands on the database that created the index');
+
+    $creator->quit;
+    $reserver->quit;
+    $ctl->quit;
+    $node->stop;
+}
+
 done_testing();

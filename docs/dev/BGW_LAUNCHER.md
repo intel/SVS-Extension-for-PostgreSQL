@@ -91,7 +91,7 @@ A single control entry is written by two different processes, so ownership is ma
 
 Grouping the backoff state into its own named sub-structure, rather than scattering flat fields next to the worker-owned IPC fields, makes the "one struct, two owners, two locking disciplines" boundary visible in the type itself instead of only in prose a future reader has to reconstruct.
 
-An array-wide lock guards slot identity (finding a slot by OID, reserving a new slot) and the launcher's backoff fields. Incrementing or decrementing the index counter does not take that lock; it is a plain atomic operation, because that counter is touched on every `CREATE INDEX` and `DROP INDEX` across every database and must not serialize on a single administrative lock.
+An array-wide lock guards slot identity (finding a slot by OID, reserving a new slot) and the launcher's backoff fields. Because it guards identity, every write into an entry is made while still holding it. The fields are atomics, so each write is untorn on its own, but only the lock keeps a write aimed at the database it was meant for: an entry that is found and then written to after the lock is released may by then have been freed and re-reserved for another database, and the write lands on that database's control block instead. Writes take the lock in *shared* mode — identity changes only under exclusive, and two writers of the same field are already ordered by its atomic — so incrementing the index counter still does not serialize `CREATE INDEX` in one database against another. It serializes only against reservation and release, which are rare and administrative.
 
 ---
 

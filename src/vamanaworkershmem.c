@@ -358,6 +358,11 @@ VamanaWorkerFindSlot(Oid dbOid)
  * Return the control block serving dbOid, or NULL if none is reserved.
  * The "not found" result is the state the CREATE INDEX check treats as
  * "this database is not enabled for vamana."
+ *
+ * The lock is dropped before the pointer is returned, so the answer is a
+ * read-only snapshot: the entry may have been released and re-reserved for
+ * another database by the time the caller uses it.  Mutators take
+ * VamanaWorkerWithEntry instead; the contract is spelled out in vamanaworker.h.
  */
 VamanaWorkerShmem *
 VamanaWorkerLookupSlot(Oid dbOid)
@@ -400,6 +405,57 @@ VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx)
 			cb(entry, ctx);
 	}
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
+/*
+ * Invoke cb on dbOid's control block with the header lock held across the whole
+ * callback, so the entry cannot be recycled between being found and being
+ * written to.  Returns false when no slot is reserved for dbOid.
+ *
+ * This is the mutating counterpart to VamanaWorkerLookupSlot.  What the lock
+ * protects is not the memory — the array is never reallocated — but the entry's
+ * identity: dbOid is written only under LW_EXCLUSIVE (reserve and release), so
+ * once the lock is gone "this entry serves the database you asked for" no longer
+ * holds, and a write can land on another tenant's block.  Making each field
+ * atomic keeps a write untorn; it does not keep it addressed to the right
+ * database.
+ *
+ * Shared is the right mode: identity changes only under exclusive, and two
+ * mutators racing on the same field are already settled by its atomic.  So a
+ * CREATE INDEX in one database still does not serialize against another — it
+ * serializes only against reservation and release.  Same discipline the backoff
+ * accessors below already follow for their own fields.
+ *
+ * The callback runs under the lock; see vamanaworker.h for what that forbids.
+ */
+bool
+VamanaWorkerWithEntry(Oid dbOid, VamanaEntryMutatorCb cb, void *ctx)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		cb(entry, ctx);
+
+		/*
+		 * The mutation is done and the lock is still held, which is the whole
+		 * invariant: this point lets a test park here and prove that a
+		 * concurrent reserve or release — both exclusive — cannot recycle the
+		 * entry out from under a mutation.
+		 */
+		INJECTION_POINT("vamana-entry-mutation-midpoint", NULL);
+	}
+
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return entry != NULL;
 }
 
 /*
@@ -554,27 +610,62 @@ VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta)
 }
 
 /*
- * Apply a net delta to dbOid's counter.  Looking up the slot takes the
- * array-wide lock in shared mode; the increment/decrement itself is a plain
- * atomic, deliberately outside that lock.  No-op if no
- * slot is reserved for the database.
+ * Copy dbOid's live-index count into *count, returning false and zeroing *count
+ * when no slot is reserved.  Read under the header lock so the number belongs to
+ * dbOid: the DELETE guard on vamana_databases treats a zero as permission to
+ * remove the row, and an unlocked read through a recycled entry could report a
+ * different database's count.  Value staleness remains — a CREATE INDEX in the
+ * target database can commit before the caller acts — and is documented where
+ * the guard makes its decision.
  */
-static void
-ApplyIndexCountDelta(Oid dbOid, int delta)
+bool
+VamanaWorkerIndexCountSnapshot(Oid dbOid, uint32 *count)
 {
 	VamanaWorkerShmem *entry;
 
-	if (delta == 0)
-		return;
+	Assert(OidIsValid(dbOid));
 
-	entry = VamanaWorkerLookupSlot(dbOid);
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+		*count = pg_atomic_read_u32(&entry->indexCount);
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
 	if (entry == NULL)
-		return;
+	{
+		*count = 0;
+		return false;
+	}
+	return true;
+}
+
+static void
+ApplyIndexCountDeltaCb(VamanaWorkerShmem *entry, void *ctx)
+{
+	int			delta = *((int *) ctx);
 
 	if (delta > 0)
 		pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) delta);
 	else
 		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));
+}
+
+/*
+ * Apply a net delta to dbOid's counter, or nothing if the database has no slot.
+ * The find and the write share one hold of the header lock: the atomic keeps the
+ * write untorn, but only the lock keeps it aimed at this database, and a delta
+ * landing on another tenant's counter would move the gate on removing that
+ * database's row.
+ */
+static void
+ApplyIndexCountDelta(Oid dbOid, int delta)
+{
+	if (delta == 0)
+		return;
+
+	(void) VamanaWorkerWithEntry(dbOid, ApplyIndexCountDeltaCb, &delta);
 }
 
 /*
@@ -858,48 +949,51 @@ VamanaWorkerSlotCapacity(void)
  * would not remove a slot, and the OID is the only way to name it.  So a full
  * queue is reported to the caller rather than absorbed.
  *
- * Lives here, beside the take, because the find and the write have to happen
- * under one hold of the header lock: an entry resolved and then written to after
- * the lock is gone may by then belong to another database, whose worker would
- * look for a slot named after its own dbOid and find nothing, while the slot
- * this request names loses its last reference.  Shared is enough — every
- * reassignment takes the lock exclusively, and two producers racing for the same
- * ring entry are settled by the CAS.
+ * Lives here, beside the take, because the enqueue is a mutation and so runs
+ * under the header lock (VamanaWorkerWithEntry): a request written to a recycled
+ * entry would reach a worker that looks for a slot named after its own dbOid and
+ * finds nothing, while the slot this request names loses its last reference.
  */
+typedef struct SlotDropRequest
+{
+	Oid			indexRelid;
+	bool		queued;
+}			SlotDropRequest;
+
+static void
+RequestSlotDropCb(VamanaWorkerShmem *entry, void *ctx)
+{
+	SlotDropRequest *req = (SlotDropRequest *) ctx;
+
+	for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
+	{
+		uint32		expected = 0;
+
+		if (pg_atomic_compare_exchange_u32(&entry->pendingSlotDrops[i].relid,
+										   &expected, (uint32) req->indexRelid))
+		{
+			/* Kicked under the lock too: past it the latch may be another tenant's. */
+			SetLatch(&entry->workerLatch);
+			req->queued = true;
+			return;
+		}
+	}
+}
+
 bool
 VamanaWorkerRequestSlotDrop(Oid dbOid, Oid indexRelid)
 {
-	VamanaWorkerShmem *entry;
-	bool		queued = false;
+	SlotDropRequest req;
 
 	Assert(OidIsValid(dbOid));
 	Assert(OidIsValid(indexRelid));
 
-	VamanaWorkerRequireShmemInitialized();
+	req.indexRelid = indexRelid;
+	req.queued = false;
 
-	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	(void) VamanaWorkerWithEntry(dbOid, RequestSlotDropCb, &req);
 
-	entry = VamanaWorkerFindSlot(dbOid);
-	if (entry != NULL)
-	{
-		for (int i = 0; i < VAMANA_MAX_SLOT_DROP_QUEUE; i++)
-		{
-			uint32		expected = 0;
-
-			if (pg_atomic_compare_exchange_u32(&entry->pendingSlotDrops[i].relid,
-											   &expected, (uint32) indexRelid))
-			{
-				/* Kicked under the lock too: past it the latch may be another tenant's. */
-				SetLatch(&entry->workerLatch);
-				queued = true;
-				break;
-			}
-		}
-	}
-
-	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
-
-	return queued;
+	return req.queued;
 }
 
 /*

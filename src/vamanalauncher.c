@@ -352,7 +352,12 @@ VamanaLauncherReconcileWorkers(void)
 		if (FindLedgerEntry(db->dbOid) != NULL)
 			continue;
 
-		/* A restarted launcher's ledger is empty; don't spawn into an already-live worker's slot. */
+		/*
+		 * A restarted launcher's ledger is empty; don't spawn into an
+		 * already-live worker's slot.  Read-only and stale-tolerant: the worst a
+		 * recycled entry costs is one skipped spawn, which the next reconcile
+		 * makes good.
+		 */
 		{
 			VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
 

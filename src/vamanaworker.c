@@ -1041,6 +1041,11 @@ VamanaWorkerEntryIsLive(VamanaWorkerShmem *entry)
  * serving this backend's database, else NULL.  NULL distinguishes only
  * "no ready worker" from "ready"; callers that must tell "database not enabled"
  * apart from "worker still starting" use VamanaWorkerLookupSlot directly.
+ *
+ * The liveness test runs outside the header lock by necessity:
+ * VamanaWorkerEntryIsLive reaches BackendPidGetProc, which takes ProcArrayLock,
+ * and that must not nest inside the header lock.  A stale yes/no costs one
+ * retry, so the readers here tolerate it; a mutation would not.
  */
 VamanaWorkerShmem *
 VamanaWorkerFindActiveSlot(void)
@@ -1080,6 +1085,7 @@ VamanaWorkerIsAvailable(void)
 void
 VamanaWorkerAssertDatabase(void)
 {
+	/* Existence only; the pointer is not kept or written through. */
 	if (VamanaWorkerLookupSlot(MyDatabaseId) != NULL)
 		return;
 
@@ -1141,7 +1147,9 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 
 	/*
 	 * A non-zero heartbeat with no live pid means the worker ran, then hung or
-	 * died — fail immediately rather than spinning for startup_timeout_ms.
+	 * died — fail immediately rather than spinning for startup_timeout_ms.  A
+	 * stale-tolerant read: it only decides between erroring now and waiting, and
+	 * this backend is about to wait anyway.
 	 */
 	entry = VamanaWorkerLookupSlot(MyDatabaseId);
 	if (entry != NULL && pg_atomic_read_u64(&entry->heartbeat_ts) != 0)
@@ -1210,22 +1218,16 @@ VamanaWorkerPublishPending(VamanaWorkerShmem *entry, VamanaWorkerSlot *slot)
 	return true;
 }
 
-/*
- * VamanaWorkerSignalReload
- *
- * Ask the worker to reload the given index (e.g., after an INSERT/REINDEX).
- * Writes the OID into the reload queue and kicks the worker latch.
- * Must NOT use SIGUSR1: that is owned by PostgreSQL's ProcSignal layer.
- */
-void
-VamanaWorkerSignalReload(Oid indexRelid)
+typedef struct ReloadRequest
 {
-	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(MyDatabaseId);
+	Oid			indexRelid;
+	bool		queueFull;
+}			ReloadRequest;
 
-	Assert(OidIsValid(indexRelid));
-
-	if (entry == NULL)
-		return;
+static void
+SignalReloadCb(VamanaWorkerShmem *entry, void *ctx)
+{
+	ReloadRequest *req = (ReloadRequest *) ctx;
 
 	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 	{
@@ -1233,7 +1235,7 @@ VamanaWorkerSignalReload(Oid indexRelid)
 
 		if (pg_atomic_compare_exchange_u32(
 										   &entry->reloadRequests[i].relid,
-										   &expected, (uint32) indexRelid))
+										   &expected, (uint32) req->indexRelid))
 		{
 			SetLatch(&entry->workerLatch);
 			return;
@@ -1242,14 +1244,44 @@ VamanaWorkerSignalReload(Oid indexRelid)
 
 	/*
 	 * Queue full: the dropped OID is unknown, so tell the worker to evict its
-	 * whole cache.  Each index then reloads on its next request.
+	 * whole cache.  Each index then reloads on its next request.  The caller
+	 * warns about it once the lock is released.
 	 */
 	pg_atomic_write_u32(&entry->evict_all, 1);
-	ereport(WARNING,
-			(errmsg("vamana worker reload queue full for index %u; "
-					"worker will evict all cached indexes on next cycle",
-					indexRelid)));
 	SetLatch(&entry->workerLatch);
+	req->queueFull = true;
+}
+
+/*
+ * VamanaWorkerSignalReload
+ *
+ * Ask the worker to reload the given index (e.g., after an INSERT/REINDEX).
+ * Writes the OID into the reload queue and kicks the worker latch.
+ * Must NOT use SIGUSR1: that is owned by PostgreSQL's ProcSignal layer.
+ *
+ * The queue write happens under the header lock (VamanaWorkerWithEntry) so it
+ * cannot reach an entry that has since been recycled for another database, which
+ * would make that database reload an index it does not have and leave this one
+ * serving a stale graph.
+ */
+void
+VamanaWorkerSignalReload(Oid indexRelid)
+{
+	ReloadRequest req;
+
+	Assert(OidIsValid(indexRelid));
+
+	req.indexRelid = indexRelid;
+	req.queueFull = false;
+
+	if (!VamanaWorkerWithEntry(MyDatabaseId, SignalReloadCb, &req))
+		return;
+
+	if (req.queueFull)
+		ereport(WARNING,
+				(errmsg("vamana worker reload queue full for index %u; "
+						"worker will evict all cached indexes on next cycle",
+						indexRelid)));
 }
 
 /*
