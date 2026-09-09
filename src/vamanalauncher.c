@@ -23,6 +23,7 @@
 #include "postgres.h"
 
 #include "svs_cpu_budget.h"
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_databases.h"
 #include "vamana_replication.h"
@@ -146,6 +147,23 @@ typedef struct SvsDbCpuColumns
 } SvsDbCpuColumns;
 
 /*
+ * One database's memory-governance catalog columns, the equally narrow
+ * sibling SvsDbCpuColumns's own comment calls for: the memory domain's
+ * consumer (PublishMemoryOverrides) reads only this, never the CPU fields.
+ *
+ * NULL residency_memory/search_work_mem become 0, matching the shmem
+ * override fields' own "0 means unset, resolve to the default GUC" idiom
+ * (memory-management-design.md Section 5.3/5.3b); unlike CPU's threads,
+ * 0 is never a valid override value here, so it doubles cleanly as the
+ * NULL sentinel with no separate -1 encoding needed.
+ */
+typedef struct SvsDbMemoryColumns
+{
+	int32		residencyMemoryMbOverride;
+	int32		searchWorkMemMbOverride;
+} SvsDbMemoryColumns;
+
+/*
  * One row of the config table, as read from the catalog.  The name is captured
  * during the SPI scan and carried alongside the OID so the spawn and
  * initial-scan paths never re-enter the catalogs: those paths run outside the
@@ -162,6 +180,7 @@ typedef struct VamanaDatabaseRow
 	int64		restart_generation;
 	bool		enabled;
 	SvsDbCpuColumns cpu;
+	SvsDbMemoryColumns memory;
 } VamanaDatabaseRow;
 
 /*
@@ -172,6 +191,7 @@ static List *WorkerLedger = NIL;
 
 static void ClearLauncherPidOnExit(int code, Datum arg);
 static void PublishCpuGrants(List *rows);
+static void PublishMemoryOverrides(List *rows);
 static long VamanaLauncherReconcileWorkers(void);
 static List *ReadDatabaseRows(void);
 static List *EnabledRowsOf(List *rows);
@@ -270,6 +290,9 @@ VamanaLauncherMain(Datum main_arg)
 
 	MaterializeInitialConfig();
 
+	/* Reap anything left dead while no launcher was running to reap it. */
+	SvsMemoryReapDeadReservations();
+
 	ereport(LOG, (errmsg("vamana launcher started")));
 
 	for (;;)
@@ -299,6 +322,8 @@ VamanaLauncherMain(Datum main_arg)
 		 * need.
 		 */
 		ProcessNotifyInterrupt(false);
+
+		SvsMemoryReapDeadReservations();
 
 		naptime = VamanaLauncherReconcileWorkers();
 
@@ -342,6 +367,7 @@ VamanaLauncherReconcileWorkers(void)
 		ReconcileRestartConvergence(rows, now);
 
 	PublishCpuGrants(rows);
+	PublishMemoryOverrides(rows);
 
 	foreach(lc, EnabledRowsOf(rows))
 	{
@@ -448,7 +474,8 @@ MaterializeInitialConfig(void)
 static List *
 AppendDatabaseRow(List *list, Oid dbOid, const char *datname,
 				  int64 restart_generation, bool enabled,
-				  const SvsDbCpuColumns *cpu, MemoryContext callerCtx)
+				  const SvsDbCpuColumns *cpu, const SvsDbMemoryColumns *memory,
+				  MemoryContext callerCtx)
 {
 	VamanaDatabaseRow *db;
 	MemoryContext oldCtx;
@@ -465,6 +492,7 @@ AppendDatabaseRow(List *list, Oid dbOid, const char *datname,
 	db->restart_generation = restart_generation;
 	db->enabled = enabled;
 	db->cpu = *cpu;
+	db->memory = *memory;
 	list = lappend(list, db);
 	MemoryContextSwitchTo(oldCtx);
 
@@ -512,9 +540,18 @@ ReadDatabaseRows(void)
 
 		if (qualifiedName != NULL)
 		{
+			/*
+			 * Column order is positional (SPI_getbinval below reads by
+			 * index): datname, restart_generation, enabled,
+			 * search_num_threads, search_threads_reserved,
+			 * maintenance_num_threads, residency_memory, search_work_mem.
+			 * A future column belongs at the end, with a matching new
+			 * index -- never inserted between existing ones.
+			 */
 			int			ret = SPI_execute(psprintf("SELECT datname, restart_generation, enabled, "
 													"search_num_threads, search_threads_reserved, "
-													"maintenance_num_threads FROM %s",
+													"maintenance_num_threads, residency_memory, "
+													"search_work_mem FROM %s",
 													qualifiedName),
 										  true, 0);
 
@@ -531,13 +568,18 @@ ReadDatabaseRows(void)
 				bool		searchNumThreadsIsNull;
 				bool		searchThreadsReservedIsNull;
 				bool		maintenanceNumThreadsIsNull;
+				bool		residencyMemoryIsNull;
+				bool		searchWorkMemIsNull;
 				Name		datname = DatumGetName(SPI_getbinval(tuple, tupdesc, 1, &datnameIsNull));
 				int64		restart_generation = DatumGetInt64(SPI_getbinval(tuple, tupdesc, 2, &restartGenIsNull));
 				bool		enabled = DatumGetBool(SPI_getbinval(tuple, tupdesc, 3, &enabledIsNull));
 				int32		searchNumThreads = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 4, &searchNumThreadsIsNull));
 				int32		searchThreadsReserved = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 5, &searchThreadsReservedIsNull));
 				int32		maintenanceNumThreads = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 6, &maintenanceNumThreadsIsNull));
+				int32		residencyMemoryMb = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 7, &residencyMemoryIsNull));
+				int32		searchWorkMemMb = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 8, &searchWorkMemIsNull));
 				SvsDbCpuColumns cpu;
+				SvsDbMemoryColumns memory;
 				Oid			dbOid;
 
 				if (datnameIsNull || restartGenIsNull || enabledIsNull)
@@ -556,8 +598,11 @@ ReadDatabaseRows(void)
 				cpu.searchThreadsReserved = ResolveReservedFloor(searchThreadsReservedIsNull, searchThreadsReserved);
 				cpu.maintenanceNumThreads = SvsResolveNullableThreadCount(maintenanceNumThreadsIsNull, maintenanceNumThreads);
 
+				memory.residencyMemoryMbOverride = residencyMemoryIsNull ? 0 : residencyMemoryMb;
+				memory.searchWorkMemMbOverride = searchWorkMemIsNull ? 0 : searchWorkMemMb;
+
 				result = AppendDatabaseRow(result, dbOid, NameStr(*datname),
-										   restart_generation, enabled, &cpu, callerCtx);
+										   restart_generation, enabled, &cpu, &memory, callerCtx);
 			}
 		}
 	}
@@ -681,20 +726,24 @@ static void
 PublishCpuGrants(List *rows)
 {
 	List	   *enabledRows;
-
-	INJECTION_POINT("svs-build-thread-grant-publish", NULL);
-
-	enabledRows = EnabledRowsOf(rows);
-	int			ndbs = list_length(enabledRows);
-	SvsDbCpuRequest *dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
-	VamanaWorkerShmem **entries = palloc(sizeof(VamanaWorkerShmem *) * ndbs);
-	SvsBuildCpuRequest *builds = palloc(sizeof(SvsBuildCpuRequest) * ndbs * SVS_MAX_PENDING_BUILDS);
+	int			ndbs;
+	SvsDbCpuRequest *dbs;
+	VamanaWorkerShmem **entries;
+	SvsBuildCpuRequest *builds;
 	int			nbuilds = 0;
 	int			i = 0;
 	ListCell   *lc;
 	SvsCpuGucs	gucs;
 	SvsCpuBudgetInput input;
 	SvsCpuBudget *budget;
+
+	INJECTION_POINT("svs-build-thread-grant-publish", NULL);
+
+	enabledRows = EnabledRowsOf(rows);
+	ndbs = list_length(enabledRows);
+	dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
+	entries = palloc(sizeof(VamanaWorkerShmem *) * ndbs);
+	builds = palloc(sizeof(SvsBuildCpuRequest) * ndbs * SVS_MAX_PENDING_BUILDS);
 
 	foreach(lc, enabledRows)
 	{
@@ -768,6 +817,29 @@ PublishCpuGrants(List *rows)
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("vamana launcher: configured search_threads_reserved values sum to more "
 						"than the pool; floors were clamped")));
+}
+
+/*
+ * Materialize every enabled row's memory-governance overrides into its
+ * reserved shmem entry, same "reserves or refreshes the slot" cadence as
+ * PublishCpuGrants: an override set after enrollment (an UPDATE, not just
+ * the original INSERT) reaches shmem on the next reconcile, not only at
+ * first reservation. A row with no reserved entry yet is skipped; the next
+ * reconcile after it spawns picks it up.
+ */
+static void
+PublishMemoryOverrides(List *rows)
+{
+	ListCell   *lc;
+
+	foreach(lc, EnabledRowsOf(rows))
+	{
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
+
+		VamanaWorkerSetMemoryOverrides(db->dbOid,
+										db->memory.residencyMemoryMbOverride,
+										db->memory.searchWorkMemMbOverride);
+	}
 }
 
 /* -----------------------------------------------------------------------

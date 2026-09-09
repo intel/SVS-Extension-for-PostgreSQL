@@ -9,6 +9,7 @@ DATA = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/svs.o \
        src/vamana.o \
        src/svs_cpu_budget.o \
+       src/svs_memory.o \
        src/svs_slot_naming.o \
        src/vamanalauncher.o \
        src/vamana_replication.o \
@@ -35,7 +36,7 @@ OBJS = src/svs.o \
        src/vamana_databases.o \
        src/vamana_teardown.o \
        src/vamana_warmup.o
-HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h src/svs_cpu_budget.h src/svs_slot_naming.h
+HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h src/svs_cpu_budget.h src/svs_memory.h src/svs_slot_naming.h
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))

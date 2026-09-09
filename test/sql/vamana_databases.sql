@@ -4,6 +4,7 @@
 -- Table shape, including both triggers' declared firing conditions
 
 \d vamana_databases
+\d svs_index_residency
 
 -- The row-level trigger resolves datname against pg_database, so every row
 -- here must name a database that actually exists.
@@ -26,16 +27,27 @@ DELETE FROM vamana_databases WHERE datname = 'template1';
 -- Placeholder columns accept NULL and non-NULL values
 
 INSERT INTO vamana_databases (datname) VALUES ('vamana_databases_test_dbd');
-INSERT INTO vamana_databases (datname, graph_memory_mb, total_memory_mb, search_num_threads)
-	VALUES ('vamana_databases_test_dbe', 512, 4096, 8);
+INSERT INTO vamana_databases (datname, graph_memory_mb, residency_memory, search_work_mem, search_num_threads)
+	VALUES ('vamana_databases_test_dbe', 512, 4096, 2048, 8);
 -- Scoped to the rows this test created: other regression files may have
 -- already self-enrolled their own database (e.g. contrib_regression) by the
 -- time this file runs, and this assertion must not depend on run order.
-SELECT datname, graph_memory_mb, total_memory_mb, search_num_threads
+SELECT datname, graph_memory_mb, residency_memory, search_work_mem, search_num_threads
 	FROM vamana_databases
 	WHERE datname IN ('postgres', 'vamana_databases_test_dbc',
 					   'vamana_databases_test_dbd', 'vamana_databases_test_dbe')
 	ORDER BY datname;
+
+-- residency_memory and search_work_mem each reject zero and negative values,
+-- symmetric with every other placeholder column's CHECK (> 0).
+INSERT INTO vamana_databases (datname, residency_memory) VALUES ('vamana_databases_test_dbd', 0);
+INSERT INTO vamana_databases (datname, residency_memory) VALUES ('vamana_databases_test_dbd', -1);
+INSERT INTO vamana_databases (datname, search_work_mem) VALUES ('vamana_databases_test_dbd', 0);
+INSERT INTO vamana_databases (datname, search_work_mem) VALUES ('vamana_databases_test_dbd', -1);
+
+-- total_memory_mb no longer exists: the residency/build axis split (design
+-- doc Section 5.3) dissolved the combined cap.
+SELECT total_memory_mb FROM vamana_databases LIMIT 0;
 
 -- INSERT/UPDATE/DELETE/TRUNCATE are all revoked from PUBLIC; the table owner
 -- retains them

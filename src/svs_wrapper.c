@@ -556,6 +556,36 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 	return total;
 }
 
+uint64
+SVSGetIndexMemoryUsage(SVSIndexHandle index)
+{
+	svs_error_h error = svs_error_create();
+	size_t		bytes = 0;
+
+	svs_index_get_memory_usage((svs_index_h) index, &bytes, error);
+
+	CheckSVSError(error, "get index memory usage");
+	svs_error_free(error);
+
+	return bytes;
+}
+
+void
+SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out)
+{
+	svs_error_h error = svs_error_create();
+	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+
+	svs_index_get_memory_breakdown((svs_index_h) index, &breakdown, error);
+
+	CheckSVSError(error, "get index memory breakdown");
+	svs_error_free(error);
+
+	out->graphBytes = breakdown.graph_bytes;
+	out->dataBytes = breakdown.data_bytes;
+	out->metadataBytes = breakdown.metadata_bytes;
+}
+
 int
 SVSSaveIndex(SVSIndexHandle index, const char *path)
 {

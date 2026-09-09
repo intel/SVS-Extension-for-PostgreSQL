@@ -58,8 +58,14 @@ CREATE TABLE vamana_databases (
 	-- "use the GUC default." Nullable with no default so activating them
 	-- later needs no ALTER TABLE.
 	graph_memory_mb          int CHECK (graph_memory_mb > 0),
-	total_memory_mb          int CHECK (total_memory_mb > 0),
 	search_num_threads       int CHECK (search_num_threads BETWEEN 1 AND 1024),
+
+	-- NULL means "use svs.default_residency_memory" / "use
+	-- svs.default_search_work_mem" (memory-management-design.md Section 5.3,
+	-- 5.3b). A positive override is this database's own total ceiling, not
+	-- a per-query or per-batch number.
+	residency_memory   int CHECK (residency_memory > 0),
+	search_work_mem     int CHECK (search_work_mem > 0),
 
 	-- NULL means "no floor" (pure best-effort against the shared pool).
 	search_threads_reserved int CHECK (search_threads_reserved BETWEEN 0 AND 1024),
@@ -70,6 +76,18 @@ CREATE TABLE vamana_databases (
 );
 
 SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');
+
+-- Durable fallback for the residency override's decrease-validation trigger
+-- when the owning worker isn't live to answer against shmem (design doc
+-- Section 5.3a). Written by build confirm and by the worker's load/unload
+-- reconcile; not yet read or written by any Phase 0 code path.
+CREATE TABLE svs_index_residency (
+	index_relid     oid PRIMARY KEY,
+	db_oid          oid NOT NULL,
+	resident_bytes  bigint NOT NULL
+);
+
+SELECT pg_catalog.pg_extension_config_dump('svs_index_residency', '');
 
 CREATE FUNCTION vamana_databases_notify() RETURNS trigger
 	LANGUAGE plpgsql AS
@@ -100,6 +118,11 @@ REVOKE TRUNCATE ON vamana_databases FROM PUBLIC;
 -- future default-privileges change and is grep-able here.
 REVOKE INSERT, UPDATE, DELETE ON vamana_databases FROM PUBLIC;
 
+-- svs_index_residency is written only by the build-confirm and worker
+-- load/unload paths (design doc Section 5.3a); same explicit-revoke posture
+-- as vamana_databases above, for the same reason.
+REVOKE TRUNCATE, INSERT, UPDATE, DELETE ON svs_index_residency FROM PUBLIC;
+
 -- Observability
 --
 -- Two grains, mirroring pg_stat_replication / pg_replication_slots in core:
@@ -117,27 +140,52 @@ REVOKE INSERT, UPDATE, DELETE ON vamana_databases FROM PUBLIC;
 
 CREATE FUNCTION pg_stat_vamana_worker()
 	RETURNS TABLE (
-		db_oid              oid,
-		worker_pid          int,
-		worker_state        text,
-		index_count         int,
-		evict_all           bool,
-		heartbeat_ts        timestamptz
+		db_oid                          oid,
+		worker_pid                      int,
+		worker_state                    text,
+		index_count                     int,
+		evict_all                       bool,
+		heartbeat_ts                    timestamptz,
+		residency_bytes_committed       bigint,
+		build_bytes_committed           bigint,
+		residency_memory_limit          bigint,
+		search_work_mem_limit           bigint,
+		search_scratch_bytes_in_flight  bigint
 	)
 	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker'
 	LANGUAGE C;
 
+-- residency_drift is computed here, not in the C function above: it needs
+-- svs_index_residency, a catalog table the C function never touches.
 CREATE VIEW pg_stat_vamana_worker AS
-	SELECT * FROM pg_stat_vamana_worker();
+	SELECT w.db_oid,
+		   w.worker_pid,
+		   w.worker_state,
+		   w.index_count,
+		   w.evict_all,
+		   w.heartbeat_ts,
+		   w.residency_bytes_committed,
+		   w.build_bytes_committed,
+		   w.residency_memory_limit,
+		   w.residency_bytes_committed - COALESCE(r.resident_bytes, 0) AS residency_drift,
+		   w.search_work_mem_limit,
+		   w.search_scratch_bytes_in_flight
+	  FROM pg_stat_vamana_worker() w
+	  LEFT JOIN (
+			SELECT db_oid, sum(resident_bytes) AS resident_bytes
+			  FROM svs_index_residency
+			 GROUP BY db_oid
+	  ) r ON r.db_oid = w.db_oid;
 
 CREATE FUNCTION pg_stat_vamana_worker_slot()
 	RETURNS TABLE (
-		db_oid              oid,
-		slot_index          int,
-		slot_status         text,
-		slot_kind           text,
-		index_relid         oid,
-		error_message       text
+		db_oid                          oid,
+		slot_index                      int,
+		slot_status                     text,
+		slot_kind                       text,
+		index_relid                     oid,
+		error_message                   text,
+		search_scratch_bytes_per_query  bigint
 	)
 	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker_slot'
 	LANGUAGE C;

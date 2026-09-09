@@ -80,6 +80,16 @@ int			SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 						   ItemPointer results, float *distances,
 						   int *numResultsPerQuery);
 
+typedef struct SVSMemoryBreakdown
+{
+	uint64		graphBytes;
+	uint64		dataBytes;
+	uint64		metadataBytes;
+}			SVSMemoryBreakdown;
+
+uint64		SVSGetIndexMemoryUsage(SVSIndexHandle index);
+void		SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out);
+
 int			SVSSaveIndex(SVSIndexHandle index, const char *path);
 
 SVSIndexHandle SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,

@@ -15,6 +15,8 @@
 #include "storage/lwlock.h"
 #include "storage/itemptr.h"
 
+#include "svs_memory.h"
+
 /* Forward declaration so we can use SVSIndexHandle without pulling all of svs_wrapper.h */
 #ifndef SVS_WRAPPER_H
 typedef void *SVSIndexHandle;
@@ -98,6 +100,14 @@ typedef void *SVSIndexHandle;
  * proceeding uncoordinated.
  */
 #define SVS_MAX_PENDING_BUILDS 8
+
+/*
+ * Bound on concurrently pending insert-batch reservations per database:
+ * one batch in flight at a time per backend, worst case every backend
+ * writing at once. Mirrors SVS_MAX_PENDING_BUILDS's fixed-array idiom for
+ * "concurrent per-backend requests against one database".
+ */
+#define SVS_MAX_PENDING_INSERT_RESERVATIONS 64
 
 /* Heartbeat is written every ~1 s. Three missed beats means the worker is hung. */
 #define VAMANA_HEARTBEAT_STALE_MS  3000
@@ -290,6 +300,49 @@ typedef struct VamanaWorkerShmem
 	 */
 	VamanaIndexLockSlot indexLocks[VAMANA_MAX_INDEXES];
 
+	/*
+	 * SVS memory governance (svs_memory.c owns every read and write of the
+	 * fields below; see that module's header for the accounting contract).
+	 */
+
+	/* Admitted residency budget in bytes; 0 = not yet admitted. */
+	uint64		residencyBudget;
+
+	/* Exact resident bytes plus every live residency-affecting reservation. */
+	uint64		residencyBytesCommitted;
+
+	/* In-progress build peaks, this database's contribution to the build axis. */
+	uint64		buildBytesCommitted;
+
+	/*
+	 * Live sum of this database's currently-dispatched search batches'
+	 * scratch cost. Its own atomic, never memLock: it must not contend with
+	 * a build gate or a load reconcile (Section 5.8 of the design doc).
+	 */
+	pg_atomic_uint64 searchScratchBytesInFlight;
+
+	/* Guards residencyBudget, residencyBytesCommitted, buildBytesCommitted,
+	 * reservations, and insertReservations as one check-then-add unit. */
+	LWLock			memLock;
+
+	/*
+	 * Build/residency reservations, keyed by relid. Bounded by
+	 * VAMANA_MAX_INDEXES, the same ceiling indexLocks already enforces on
+	 * concurrent live indexes per database.
+	 */
+	SvsMemReservation reservations[VAMANA_MAX_INDEXES];
+
+	/* Pending insert-batch reservations; several can share a relid. */
+	SvsMemInsertReservation insertReservations[SVS_MAX_PENDING_INSERT_RESERVATIONS];
+
+	/*
+	 * Per-database override materialized by the launcher at slot
+	 * reservation, from vamana_databases.residency_memory /
+	 * .search_work_mem. 0 = unset, resolve to the default GUC instead.
+	 */
+	int				residencyMemoryMbOverride;
+	int				searchWorkMemMbOverride;
+
 	VamanaWorkerSlot *slots;		/* array of maxSlots entries; see above */
 } VamanaWorkerShmem;
 
@@ -329,6 +382,17 @@ typedef struct VamanaWorkerShmemHeader
 	 */
 	pid_t			launcherPid;
 
+	/*
+	 * Cluster-wide roll-up of every admitted database's residency budget
+	 * (not live usage -- residency is admitted at config time against this
+	 * sum, see SvsMemoryAdmitDatabase) and every database's in-progress
+	 * build peaks. Guarded by lock; each per-database delta is folded in
+	 * only after that database's own memLock section has already committed
+	 * it, memLock always acquired first (Section 5.5 of the design doc).
+	 */
+	uint64			totalResidencyCommittedGlobal;
+	uint64			totalBuildCommittedGlobal;
+
 	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
 } VamanaWorkerShmemHeader;
 
@@ -351,6 +415,14 @@ VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerClearDeadEntry(Oid dbOid);
+
+/*
+ * The header control block itself, exposed so svs_memory.c can take its
+ * lock to roll a per-database delta into totalResidencyCommittedGlobal /
+ * totalBuildCommittedGlobal -- the same raw-struct-plus-caller-managed-lock
+ * idiom every other VamanaWorkerShmem consumer already uses.
+ */
+VamanaWorkerShmemHeader *VamanaWorkerHeader(void);
 
 /*
  * Read and clear the slot drops still queued for dbOid, up to max, returning
@@ -384,6 +456,14 @@ void	SvsKickLauncher(void);
  */
 typedef void (*VamanaReservedEntryCb) (VamanaWorkerShmem *entry, void *ctx);
 void	VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx);
+
+/*
+ * vamanaworkershmem.c: launcher-owned memory-governance override
+ * materialization (header lock). No-op if dbOid has no reserved entry yet;
+ * the next reconcile after it reserves one retries.
+ */
+void	VamanaWorkerSetMemoryOverrides(Oid dbOid, int residencyMemoryMbOverride,
+									   int searchWorkMemMbOverride);
 
 /* vamanaworkershmem.c: launcher-owned crash-backoff state (header lock) */
 bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);

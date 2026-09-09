@@ -12,6 +12,7 @@
 
 #include "postgres.h"
 
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamana_subxact_guard.h"
@@ -190,12 +191,24 @@ GetOrLoadIndexBody(void *arg)
 {
 	GetOrLoadIndexArgs *a = (GetOrLoadIndexArgs *) arg;
 	Relation	indexRel = index_open(a->relid, NoLock);
+	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
 
 	/* Test hook: TAP forces a failure while indexRel/lock are held. */
 	INJECTION_POINT("vamana-get-or-load-index-error", NULL);
 
 	a->index = LoadIndexFromDiskOrRebuild(indexRel, a->relid, a->loadedFromDisk);
 	FinalizeIndexCacheEntry(indexRel, a->relid);
+
+	/*
+	 * Reaching here means the cache was just evicted or never loaded, the
+	 * same relcache invalidation that would fire from ALTER INDEX SET. This
+	 * is the earliest safe place to compare against a possible
+	 * search_window_size/use_search_history change.
+	 */
+	SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, a->relid,
+										  opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW,
+										  opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+
 	index_close(indexRel, AccessShareLock);
 }
 

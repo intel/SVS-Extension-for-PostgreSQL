@@ -15,6 +15,7 @@
 #include "vamana.h"
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
+#include "svs_memory.h"
 
 #include "access/xact.h"
 #include "miscadmin.h"
@@ -225,6 +226,16 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 
 	for (int i = 0; i < entry->maxSlots; i++)
 		pg_atomic_write_u32(&entry->slots[i].status, VAMANA_SLOT_EMPTY);
+
+	entry->residencyMemoryMbOverride = 0;
+	entry->searchWorkMemMbOverride = 0;
+
+	/*
+	 * Unwinds this entry's contribution to the header roll-ups and clears
+	 * its counters and reservations, so a recycled slot never inherits the
+	 * previous tenant's committed memory.
+	 */
+	SvsMemoryResetDatabaseAccounting(entry);
 }
 
 static void
@@ -273,6 +284,9 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 		pg_atomic_init_u32(&ls->relid, 0);
 		LWLockInitialize(&ls->lock, VamanaIndexLockTranche);
 	}
+
+	pg_atomic_init_u64(&entry->searchScratchBytesInFlight, 0);
+	LWLockInitialize(&entry->memLock, VamanaIndexLockTranche);
 
 	/* Atomics are now constructed; set their logical baseline values. */
 	VamanaWorkerResetEntryState(entry);
@@ -373,6 +387,18 @@ VamanaWorkerLookupSlot(Oid dbOid)
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
 
 	return entry;
+}
+
+/*
+ * The header control block, for callers (svs_memory.c) that manage its
+ * lock themselves rather than going through a per-field accessor.
+ */
+VamanaWorkerShmemHeader *
+VamanaWorkerHeader(void)
+{
+	VamanaWorkerRequireShmemInitialized();
+
+	return VamanaWorkerShmemHeaderPtr;
 }
 
 /*
@@ -679,6 +705,32 @@ VamanaIndexCountSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
  * policy (when a death counts as recovery, how the interval grows) lives in the
  * launcher, which passes its decision in as the `recovered` flag.
  * ----------------------------------------------------------------------- */
+
+/*
+ * Materialize dbOid's memory-governance overrides into its reserved entry,
+ * same locking as the backoff accessors below. A no-op if dbOid has no
+ * reserved entry (not yet enrolled, or awaiting its first spawn); the
+ * caller's next reconcile pass calls again once one exists.
+ */
+void
+VamanaWorkerSetMemoryOverrides(Oid dbOid, int residencyMemoryMbOverride,
+							   int searchWorkMemMbOverride)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+	{
+		entry->residencyMemoryMbOverride = residencyMemoryMbOverride;
+		entry->searchWorkMemMbOverride = searchWorkMemMbOverride;
+	}
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
 
 /*
  * Copy dbOid's backoff counters into *out.  Returns false and zeroes *out when

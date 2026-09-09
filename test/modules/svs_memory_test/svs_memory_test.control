@@ -1,0 +1,4 @@
+comment = 'Unit-test driver for svs_memory; not for production use'
+default_version = '1.0'
+module_pathname = '$libdir/svs_memory_test'
+relocatable = true

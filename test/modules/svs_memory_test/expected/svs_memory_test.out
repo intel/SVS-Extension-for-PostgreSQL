@@ -1,0 +1,265 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+CREATE EXTENSION svs_memory_test;
+SELECT svs_memory_test_build_ceiling_bytes() AS build_ceiling \gset
+SELECT svs_memory_test_residency_ceiling_bytes() AS residency_ceiling \gset
+-- Admission: budget in, stats out; re-admitting updates the budget in place.
+SELECT svs_memory_admit_database(100, (40 * 1024 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                         0 |                     0
+(1 row)
+
+SELECT svs_memory_admit_database(100, (30 * 1024 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         31457280 |                         0 |                     0
+(1 row)
+
+SELECT svs_memory_admit_database(100, (40 * 1024 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+-- Build reserve, then a handoff whose measured bytes fit: build peak
+-- releases, residency reconciles from estimate to measured.
+SELECT svs_memory_reserve_build(100, 1, (10 * 1024 * 1024)::bigint, (10 * 1024 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  10485760 |              10485760
+(1 row)
+
+SELECT svs_memory_handoff_build(100, 1, (10 * 1024 * 1024)::bigint, (9 * 1024 * 1024)::bigint);
+ svs_memory_handoff_build 
+--------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                   9437184 |                     0
+(1 row)
+
+-- A handoff whose measured bytes do not fit drops the reservation entirely.
+SELECT svs_memory_reserve_build(100, 2, (5 * 1024 * 1024)::bigint, (5 * 1024 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_handoff_build(100, 2, (5 * 1024 * 1024)::bigint, (35 * 1024 * 1024)::bigint);
+ svs_memory_handoff_build 
+--------------------------
+ f
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                   9437184 |                     0
+(1 row)
+
+-- Abort releases both the build peak and the residency estimate.
+SELECT svs_memory_reserve_build(100, 3, (3 * 1024 * 1024)::bigint, (3 * 1024 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_abort_build(100, 3, (3 * 1024 * 1024)::bigint);
+ svs_memory_abort_build 
+------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                   9437184 |                     0
+(1 row)
+
+-- Reconcile load on a fresh handoff (index 1) is a re-verification: no change.
+SELECT svs_memory_reconcile_load(100, 1, (9 * 1024 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                   9437184 |                     0
+(1 row)
+
+-- Reconcile load with no pending reservation (reload or restart adopt),
+-- fitting the budget.
+SELECT svs_memory_reconcile_load(100, 4, (10 * 1024 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  19922944 |                     0
+(1 row)
+
+-- Same, but the measured bytes overflow the budget: nothing is committed.
+SELECT svs_memory_reconcile_load(100, 5, (100 * 1024 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ f
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  19922944 |                     0
+(1 row)
+
+-- Unload releases index 4's exact committed bytes.
+SELECT svs_memory_account_unload(100, 4);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                   9437184 |                     0
+(1 row)
+
+-- Insert growth: a fitting reservation commits; an overflowing one does not.
+SELECT svs_memory_reserve_insert(100, 1, (2 * 1024 * 1024)::bigint);
+ svs_memory_reserve_insert 
+---------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  11534336 |                     0
+(1 row)
+
+SELECT svs_memory_reserve_insert(100, 1, (50 * 1024 * 1024)::bigint);
+ svs_memory_reserve_insert 
+---------------------------
+ f
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  11534336 |                     0
+(1 row)
+
+-- Reanchoring folds index 1's prior measured size and its one pending
+-- insert delta into the worker's single fresh exact measurement.
+SELECT svs_memory_reanchor_insert(100, 1, (12 * 1024 * 1024)::bigint);
+ svs_memory_reanchor_insert 
+----------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  12582912 |                     0
+(1 row)
+
+-- Reaping while every reservation's owner is this live session is a no-op.
+-- A dead-owner reap needs a second, crashed backend to be real, which this
+-- single-session driver cannot produce; that case is a TAP test instead.
+SELECT svs_memory_reserve_build(100, 6, (1 * 1024 * 1024)::bigint, (1 * 1024 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reap_dead_reservations();
+ svs_memory_reap_dead_reservations 
+-----------------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                  13631488 |               1048576
+(1 row)
+
+SELECT svs_memory_abort_build(100, 6, (1 * 1024 * 1024)::bigint);
+ svs_memory_abort_build 
+------------------------
+ 
+(1 row)
+
+SELECT svs_memory_account_unload(100, 1);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(100);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+         41943040 |                         0 |                     0
+(1 row)
+
+-- Global build ceiling: one big reservation, then a second that would push
+-- the cluster-wide total over svs.max_build_memory.
+SELECT svs_memory_admit_database(200, (40 * 1024 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reserve_build(100, 7, :build_ceiling - (10 * 1024 * 1024)::bigint, (1 * 1024 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reserve_build(200, 8, (20 * 1024 * 1024)::bigint, (1 * 1024 * 1024)::bigint);
+ERROR:  build of index 8 would exceed svs.max_build_memory
+DETAIL:  Requested 20971520 bytes against the 104857600 byte ceiling.
+SELECT svs_memory_abort_build(100, 7, :build_ceiling - (10 * 1024 * 1024)::bigint);
+ svs_memory_abort_build 
+------------------------
+ 
+(1 row)
+
+-- Global residency ceiling: admitted budgets already sum to 80MB
+-- (databases 100 and 200 at 40MB each); a third database's budget pushes
+-- the cluster-wide sum over svs.max_residency_memory.
+SELECT svs_memory_admit_database(300, (30 * 1024 * 1024)::bigint);
+ERROR:  admitting database 300 at 31457280 bytes would exceed svs.max_residency_memory
+DETAIL:  Every admitted database's residency budget would sum to 115343360 bytes, over the 104857600 byte ceiling.
+-- Per-database residency budget, independent of the global ceiling: a
+-- single build's residency estimate exceeding this database's own budget.
+SELECT svs_memory_reserve_build(200, 9, (1 * 1024 * 1024)::bigint, (41 * 1024 * 1024)::bigint);
+ERROR:  build of index 9 would exceed database 200's residency budget
+DETAIL:  Requested 42991616 bytes, 0 already committed, 41943040 byte budget.

@@ -436,6 +436,79 @@ SELECT pg_reload_conf();
  t
 (1 row)
 
+-- svs.max_build_memory / svs.max_residency_memory / svs.default_residency_memory /
+-- svs.max_search_work_mem / svs.default_search_work_mem: all [1, INT_MAX] MB,
+-- default 100MB, PGC_SIGHUP. Always finite: no "0 means unlimited" path.
+SHOW svs.max_build_memory;
+ svs.max_build_memory 
+----------------------
+ 100MB
+(1 row)
+
+SHOW svs.max_residency_memory;
+ svs.max_residency_memory 
+--------------------------
+ 100MB
+(1 row)
+
+SHOW svs.default_residency_memory;
+ svs.default_residency_memory 
+------------------------------
+ 100MB
+(1 row)
+
+SHOW svs.max_search_work_mem;
+ svs.max_search_work_mem 
+-------------------------
+ 100MB
+(1 row)
+
+SHOW svs.default_search_work_mem;
+ svs.default_search_work_mem 
+-----------------------------
+ 100MB
+(1 row)
+
+-- Out-of-range (below min): rejected at ALTER SYSTEM time
+ALTER SYSTEM SET svs.max_build_memory = 0;
+ERROR:  0 MB is outside the valid range for parameter "svs.max_build_memory" (1 MB .. 2147483647 MB)
+ALTER SYSTEM SET svs.max_residency_memory = 0;
+ERROR:  0 MB is outside the valid range for parameter "svs.max_residency_memory" (1 MB .. 2147483647 MB)
+ALTER SYSTEM SET svs.default_residency_memory = 0;
+ERROR:  0 MB is outside the valid range for parameter "svs.default_residency_memory" (1 MB .. 2147483647 MB)
+ALTER SYSTEM SET svs.max_search_work_mem = 0;
+ERROR:  0 MB is outside the valid range for parameter "svs.max_search_work_mem" (1 MB .. 2147483647 MB)
+ALTER SYSTEM SET svs.default_search_work_mem = 0;
+ERROR:  0 MB is outside the valid range for parameter "svs.default_search_work_mem" (1 MB .. 2147483647 MB)
+ALTER SYSTEM SET svs.max_build_memory = -1;
+ERROR:  -1 MB is outside the valid range for parameter "svs.max_build_memory" (1 MB .. 2147483647 MB)
+-- Valid lower boundary
+ALTER SYSTEM SET svs.max_build_memory = 1;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+SHOW svs.max_build_memory;
+ svs.max_build_memory 
+----------------------
+ 1MB
+(1 row)
+
+ALTER SYSTEM RESET svs.max_build_memory;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
 -- svs.checkpoint_interval: [-1, 86400] s
 -- Out-of-range
 ALTER SYSTEM SET svs.checkpoint_interval = -2;

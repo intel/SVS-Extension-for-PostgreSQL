@@ -331,6 +331,57 @@ VamanaInit(void)
 							GUC_UNIT_MS,
 							NULL, NULL, NULL);
 
+	DefineCustomIntVariable("svs.max_build_memory",
+							"Cluster-wide ceiling on concurrent SVS build peak",
+							"Sum of every in-progress CREATE INDEX / REINDEX build's peak memory. "
+							"Always finite: there is no \"0 means unlimited\" path.",
+							&vamana_max_build_memory_mb,
+							100, 1, INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.max_residency_memory",
+							"Cluster-wide ceiling on the sum of every database's resolved residency budget",
+							"Checked at config-time admission (vamana_databases enrollment), not at "
+							"query time: an admitted working set is guaranteed to fit.",
+							&vamana_max_residency_memory_mb,
+							100, 1, INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.default_residency_memory",
+							"Residency budget for a database whose vamana_databases.residency_memory is NULL",
+							"Independent of svs.max_residency_memory by design: collapsing the two into "
+							"one number lets a single unconfigured database's default consume the whole "
+							"cluster ceiling, starving every other unconfigured database at admission.",
+							&vamana_default_residency_memory_mb,
+							100, 1, INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.max_search_work_mem",
+							"Cluster-wide ceiling on the sum of every database's resolved search-scratch budget",
+							"Checked as a plain catalog aggregate at vamana_databases insert/update time, "
+							"not against live worker state.",
+							&vamana_max_search_work_mem_mb,
+							100, 1, INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("svs.default_search_work_mem",
+							"Search-scratch budget for a database whose vamana_databases.search_work_mem is NULL",
+							"Independent of svs.max_search_work_mem, mirroring why svs.default_residency_memory "
+							"is independent of svs.max_residency_memory.",
+							&vamana_default_search_work_mem_mb,
+							100, 1, INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("svs");
 
 	/*
