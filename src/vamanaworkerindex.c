@@ -175,9 +175,12 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  * the on-disk checkpoint (not a heap rebuild): such a handle predates any
  * post-checkpoint commit still pending in the replication slot.
  *
- * Propagates ERRCODE_CONFIGURATION_LIMIT_EXCEEDED (cache full) so the caller
- * sees an explicit error rather than a silent NULL return.  All other errors
- * are caught, logged as WARNING, and result in a NULL return.
+ * When propagateCacheFull is true, ERRCODE_CONFIGURATION_LIMIT_EXCEEDED
+ * (cache full) is re-thrown to the caller rather than swallowed. The
+ * AccessShareLock taken below is released either way; a caller that opts in
+ * still owns its own transaction, snapshot, and any suppression guard it set
+ * around this call. All other errors are always caught, logged as WARNING,
+ * and result in a NULL return.
  *
  * Must be called from within an active transaction (or the caller must open
  * one).
@@ -216,7 +219,7 @@ GetOrLoadIndexBody(void *arg)
 }
 
 SVSIndexHandle
-VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
+VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheFull)
 {
 	bool		needsRebuild;
 	SVSIndexHandle index;
@@ -249,7 +252,24 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
 	args.loadedFromDisk = loadedFromDisk;
 	args.index = NULL;
 
-	result = VamanaRunInSubXact(GetOrLoadIndexBody, &args, VamanaCacheFullError);
+	/*
+	 * When propagateCacheFull is true, VamanaRunInSubXact re-throws instead of
+	 * returning, so the UnlockRelationOid below is never reached on that path.
+	 * Catch here just to release the lock before re-throwing further up to
+	 * the caller that opted in.
+	 */
+	PG_TRY();
+	{
+		result = VamanaRunInSubXact(GetOrLoadIndexBody, &args,
+									 propagateCacheFull ? VamanaCacheFullError : NULL);
+	}
+	PG_CATCH();
+	{
+		UnlockRelationOid(relid, AccessShareLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
 	if (result.succeeded)
 		return args.index;
 
@@ -270,10 +290,13 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk)
  * rebuild already reflects every committed row, so it is not drained: doing so
  * would re-apply post-checkpoint commits the rebuild already contains.
  *
- * Owns its transaction; the caller must not open one.  Returns NULL on failure.
+ * Owns its transaction; the caller must not open one.  Returns NULL on
+ * failure.  propagateCacheFull is forwarded to VamanaWorkerGetOrLoadIndex
+ * unchanged; see its header comment for what opting in obligates the caller
+ * to clean up.
  */
 SVSIndexHandle
-VamanaWorkerEnsureIndexCurrent(Oid relid)
+VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull)
 {
 	bool		loadedFromDisk;
 	bool		needsRebuild;
@@ -282,7 +305,7 @@ VamanaWorkerEnsureIndexCurrent(Oid relid)
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk);
+	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk, propagateCacheFull);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
@@ -391,7 +414,7 @@ VamanaStandbyLoadIndex(Oid relid)
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
+	(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
 
 	PopActiveSnapshot();
 	CommitTransactionCommand();

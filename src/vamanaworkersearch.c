@@ -73,7 +73,7 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 
 			PG_TRY();
 			{
-				index = VamanaWorkerEnsureIndexCurrent(relid);
+				index = VamanaWorkerEnsureIndexCurrent(relid, true);
 			}
 			PG_CATCH();
 			{

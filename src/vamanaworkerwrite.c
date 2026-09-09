@@ -243,15 +243,20 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	/* Load and catch up the index if it is not already warm. */
 	index = VamanaGetCachedIndex(relid, &needsRebuild);
 	if (needsRebuild)
-		index = VamanaWorkerEnsureIndexCurrent(relid);
+		index = VamanaWorkerEnsureIndexCurrent(relid, false);
 
 	/*
 	 * Retry once: handles the race where CREATE INDEX committed and sent a
 	 * LOAD slot, but that slot was processed after this write slot was already
 	 * collected as PENDING.  A second attempt will find the fresh entry.
+	 *
+	 * propagateCacheFull is false at both calls above: a cache-full denial
+	 * here must not skip this retry or the empty-table fallback below, since
+	 * neither exists to handle cache-full specifically and both are equally
+	 * valid when the index simply is not resident right now.
 	 */
 	if (index == NULL)
-		index = VamanaWorkerEnsureIndexCurrent(relid);
+		index = VamanaWorkerEnsureIndexCurrent(relid, false);
 
 	if (index == NULL)
 	{
@@ -705,7 +710,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 		PushActiveSnapshot(GetTransactionSnapshot());
 
 		vamana_eviction_suppressed_for_relid = relid;
-		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, true);
 		vamana_eviction_suppressed_for_relid = InvalidOid;
 
 		PopActiveSnapshot();

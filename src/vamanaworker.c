@@ -360,7 +360,7 @@ VamanaWorkerProcessReloads(void)
 		PushActiveSnapshot(GetTransactionSnapshot());
 
 		vamana_eviction_suppressed_for_relid = relid;
-		(void) VamanaWorkerGetOrLoadIndex(relid, NULL);
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
 		vamana_eviction_suppressed_for_relid = InvalidOid;
 
 		PopActiveSnapshot();
