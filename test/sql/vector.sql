@@ -515,3 +515,39 @@ INSERT INTO t (val) VALUES ('[2,2,2]');
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id;
 
 DROP TABLE t;
+
+-- pgvector rejects NaN/Inf at parse time on tables carrying a vamana index (vector type)
+
+-- pgvector rejects NaN/Inf on INSERT
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+INSERT INTO t (val) VALUES ('[1,NaN,3]');
+INSERT INTO t (val) VALUES ('[1,Infinity,3]');
+INSERT INTO t (val) VALUES ('[1,-Infinity,3]');
+DROP TABLE t;
+
+-- pgvector rejects NaN/Inf in query vector
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+SELECT * FROM t ORDER BY val <-> '[1,NaN,3]' LIMIT 1;
+SELECT * FROM t ORDER BY val <-> '[1,Infinity,3]' LIMIT 1;
+DROP TABLE t;
+
+-- VamanaValidateVectorData direct coverage: bypass pgvector's input functions
+-- via a bytea cast so a NaN datum reaches the extension's AM boundary.
+-- Requires superuser (CREATE CAST is privileged DDL).
+-- 16-byte bytea payload: int16 dim=3, int16 unused=0, then three little-endian
+-- float4s where the first is 0x7FC00000 (quiet NaN).
+CREATE CAST (bytea AS vector) WITHOUT FUNCTION;
+-- insert path: index exists, NaN reaches vamanainsert
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+INSERT INTO t (val) VALUES ('\x030000000000c07f0000803f0000803f'::bytea::vector);
+DROP TABLE t;
+-- build path: NaN in heap before CREATE INDEX, reaches BuildCallback
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+INSERT INTO t (val) VALUES ('\x030000000000c07f0000803f0000803f'::bytea::vector);
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+DROP TABLE t;
+DROP CAST (bytea AS vector);

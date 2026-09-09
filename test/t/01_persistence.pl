@@ -1073,4 +1073,141 @@ use VamanaTestUtils qw(:all);
     $node->stop;
 }
 
+# ===========================================================================
+# Rebuild input validation — a non-finite value that reached the heap must be
+# rejected when the worker rebuilds the index from table data.
+# Covers: the "rebuild" guard in VamanaRebuildFromTable (src/vamanabuild.c)
+#
+# This is the only coverage for that guard.  It cannot be reached from
+# test/sql/: BuildCallback rejects any CREATE INDEX over a non-finite value,
+# and vamanainsert rejects any such value added to an already-indexed table,
+# so no SQL route leaves NaN in the heap beside a valid index.  Two things are
+# needed to construct that state:
+#
+#   - A raw datum.  pgvector's vector_in rejects NaN before the extension is
+#     reached, so the value arrives through a bytea -> vector cast declared
+#     WITHOUT FUNCTION, which reinterprets the bytes with no validation.
+#
+#   - A write that skips the index.  Clearing pg_index.indisready stops
+#     PostgreSQL maintaining the index on DML, so the INSERT never calls
+#     vamanainsert and the value lands in the heap only.  It is restored
+#     immediately afterwards, leaving a valid index over a heap the other two
+#     guards would never have permitted.
+#
+# The guard's own message cannot be asserted on: VamanaWorkerGetOrLoadIndex
+# runs the rebuild under VamanaRunInSubXact and frees the ErrorData, discarding
+# the text.  The observable consequence is checked instead, and the recovery
+# step at the end is what attributes the failure to the planted value rather
+# than to the forced-rebuild procedure itself.
+#
+# log_min_messages must stay below WARNING: in that GUC LOG outranks WARNING,
+# so the default would suppress the warning matched below.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_rebuild_nan');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker($node, 30);
+
+    # The payload used below encodes three dimensions, so this block uses
+    # vector(3) rather than the shared $dim.
+    $node->safe_psql('postgres',
+        "CREATE CAST (bytea AS vector) WITHOUT FUNCTION;");
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE rbnan_tbl (id serial PRIMARY KEY, val vector(3));
+        INSERT INTO rbnan_tbl (val) VALUES ('[1,1,1]'), ('[2,2,2]');
+        CREATE INDEX rbnan_idx ON rbnan_tbl USING vamana (val vector_l2_ops);
+    });
+
+    my $ioid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'rbnan_idx';");
+    chomp $ioid;
+    my $save_dir = vamana_save_dir($node, 'postgres', $ioid);
+
+    my $query = "SET enable_seqscan = off; "
+              . "SELECT id FROM rbnan_tbl ORDER BY val <-> '[1,1,1]' LIMIT 2;";
+
+    # 16-byte bytea payload read as a vector body: int16 dim=3, int16 unused=0,
+    # then three little-endian float4s of which the first is 0x7FC00000, a
+    # quiet NaN.  q{} keeps Perl from interpreting the \x.
+    my $nan_datum = q{'\x030000000000c07f0000803f0000803f'::bytea::vector};
+
+    # Inserting the value directly is not possible: vamanainsert rejects it
+    # while the index exists, and BuildCallback rejects it on any subsequent
+    # CREATE INDEX, so neither ordering leaves it in the heap.  Both of those
+    # refusals are already covered by the bytea-cast cases in
+    # test/sql/vector.sql, which is why the detour below is needed here.
+    #
+    # Take the index out of the write path for one statement.  Each safe_psql
+    # is its own session, so the INSERT connects after the catalog change and
+    # reads the updated indisready.
+    $node->safe_psql('postgres',
+        "UPDATE pg_index SET indisready = false "
+      . "WHERE indexrelid = 'rbnan_idx'::regclass;");
+    $node->safe_psql('postgres',
+        "INSERT INTO rbnan_tbl (val) VALUES ($nan_datum);");
+    $node->safe_psql('postgres',
+        "UPDATE pg_index SET indisready = true "
+      . "WHERE indexrelid = 'rbnan_idx'::regclass;");
+
+    is($node->safe_psql('postgres',
+            "SELECT count(*) FROM rbnan_tbl WHERE val::text LIKE '%NaN%';"),
+        '1', 'non-finite value reached the heap');
+    is($node->safe_psql('postgres',
+            "SELECT indisvalid FROM pg_index "
+          . "WHERE indexrelid = 'rbnan_idx'::regclass;"),
+        't', 'index is still valid after the detour');
+
+    # Drop the on-disk copy so the next request has to rebuild from the heap.
+    # It must go while the cluster is down: a running worker checkpoints the
+    # index on shutdown and would write a fresh copy straight back.
+    $node->stop;
+    remove_tree($save_dir) if -d $save_dir;
+    ok(!-d $save_dir, 'save directory removed while cluster is down');
+
+    my $log_pos = length($node->log_content());
+    $node->start;
+    wait_for_worker($node, 30);
+
+    my ($out, $err) = ('', '');
+    my $rc = $node->psql('postgres', $query,
+        stdout => \$out, stderr => \$err);
+    isnt($rc, 0, 'query fails while the heap holds a non-finite value');
+    like($err, qr/not loaded/,
+        'backend reports the index could not be loaded');
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/rebuilding vamana index from table data/,
+        'rebuild from table data was attempted');
+    like($log, qr/failed to load index/,
+        'worker reports the rebuild failed');
+
+    # Recovery: the same index rebuilds cleanly once the row is gone.
+    $node->safe_psql('postgres',
+        "DELETE FROM rbnan_tbl WHERE val::text LIKE '%NaN%';");
+
+    $node->stop;
+    remove_tree($save_dir) if -d $save_dir;
+    $node->start;
+    wait_for_worker($node, 30);
+
+    # The save directory was removed again, so answering this query requires a
+    # second rebuild from the heap: succeeding here means the guard passed the
+    # same data once the offending row was gone.
+    isnt($node->safe_psql('postgres', $query), '',
+        'rebuild succeeds once the non-finite value is removed');
+
+    $node->stop;
+}
+
 done_testing();
