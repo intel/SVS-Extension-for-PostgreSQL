@@ -136,6 +136,55 @@ for my $i (1 .. 8)
 }
 
 # ---------------------------------------------------------------------------
+# Case 6: search-path denial
+#
+# Cases 1, 2 and 5 all reach the deny through svs_warmup_index(), which loads
+# via VamanaWorkerProcessWarmupSlot.  A plain index scan against a cold index
+# loads via a different path: VamanaWorkerRunBatch's PG_TRY/PG_CATCH around
+# VamanaWorkerEnsureIndexCurrent (vamanaworkersearch.c).  idx9 has never been
+# warmed or queried up to this point and the cache still holds exactly
+# idx1..idx8, so this is the first thing to touch idx9 without going through
+# svs_warmup_index() — it must fail through the search-path catch block, not
+# the warmup path, and the query error (not a WARNING) must reach the client.
+# ---------------------------------------------------------------------------
+
+{
+    my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM t9 ORDER BY val <-> '[$query_sql]' LIMIT 3;
+    ));
+    isnt($ret, 0,
+        'plain query against a cold 9th index fails when all 8 cache slots are in use');
+    like($stderr, qr/all \d+ index cache slots are in use/,
+        'search-path denial message names the cache-full condition');
+
+    my $hb0 = $node->safe_psql("postgres",
+        "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
+      . "WHERE worker_pid = $wpid;");
+    my $hb_advanced = '';
+    for my $i (1 .. 40)
+    {
+        usleep(250_000);
+        my $hb = $node->safe_psql("postgres",
+            "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
+          . "WHERE worker_pid = $wpid;");
+        if ($hb ne '' && $hb0 ne '' && $hb gt $hb0)
+        {
+            $hb_advanced = 1;
+            last;
+        }
+    }
+    ok($hb_advanced, 'worker heartbeat advances after search-path denial');
+
+    my $res = $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM t1 ORDER BY val <-> '[$query_sql]' LIMIT 3;
+    ));
+    is($res, $baseline[0],
+        'idx1 (warm incumbent) still returns its baseline result after search-path denial');
+}
+
+# ---------------------------------------------------------------------------
 # Case 3: reclaim after unload
 #
 # This is the regression test for the high-water-mark trap: vamanaCacheUsed

@@ -391,7 +391,16 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 	if (vamana_eviction_suppressed)
 		return;
 
-	/* Write/warmup/reload: suppress only the relid being actively operated on. */
+	/*
+	 * Write/warmup/reload: suppress only the relid being actively operated on.
+	 * A global invalidation (relid == InvalidOid, meaning the SI queue
+	 * overflowed and any relation may have changed) is treated as a match
+	 * here too, so it is suppressed along with the protected relid rather
+	 * than evicting every other cached entry.  This mirrors the older
+	 * vamana_eviction_suppressed blanket flag's behavior for the same case,
+	 * so it is not a new gap; the standbyRediscoverPending flag set above
+	 * still catches a suppressed global invalidation on reconciliation.
+	 */
 	if (vamana_eviction_suppressed_for_relid != InvalidOid &&
 		(relid == InvalidOid || relid == vamana_eviction_suppressed_for_relid))
 		return;

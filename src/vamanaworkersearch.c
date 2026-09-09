@@ -57,7 +57,13 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	 */
 	{
 		bool		needsRebuild;
-		bool		loadFailed = false;
+
+		/*
+		 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(),
+		 * so it must survive the longjmp back to the PG_TRY() setjmp point
+		 * (-Wclobbered).
+		 */
+		volatile bool loadFailed = false;
 		char		loadErrMsg[512];	/* same size as VamanaWorkerSlot.errorMessage */
 
 		index = VamanaGetCachedIndex(relid, &needsRebuild);
