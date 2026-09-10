@@ -8,6 +8,12 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION svs_memory_test_residency_ceiling_bytes() RETURNS bigint
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_test_global_build_committed_bytes() RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_global_residency_committed_bytes() RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_admit_database(db_oid oid, residency_budget bigint)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
@@ -20,7 +26,7 @@ CREATE FUNCTION svs_memory_handoff_build(db_oid oid, relid oid, build_peak bigin
 RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION svs_memory_abort_build(db_oid oid, relid oid, build_peak bigint)
+CREATE FUNCTION svs_memory_abort_build(db_oid oid, relid oid)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 

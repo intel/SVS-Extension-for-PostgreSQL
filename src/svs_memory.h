@@ -142,10 +142,15 @@ extern bool SvsMemoryHandoffBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 measuredResidencyBytes);
 
 /*
- * Backend, on any build error before handoff. Releases buildPeak and drops
- * the residency reservation for relid.
+ * Backend, on any build error, whether before or after a successful
+ * handoff. Releases whatever relid's reservation still holds -- its build
+ * peak if HandoffBuild hasn't already released it, and its estimate or its
+ * measured bytes, whichever the reservation's own state says is currently
+ * committed -- then drops the reservation. Safe to call more than once or
+ * after HandoffBuild already ran; there is nothing left to release once
+ * relid has no reservation.
  */
-extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid, uint64 buildPeak);
+extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
 
 /*
  * Worker, at load. Reconciles a pending handoff to measuredBytes in place,

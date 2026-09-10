@@ -137,6 +137,12 @@ VamanaStatEntryVisible(const VamanaStatVisibility *vis, Oid dbOid)
 	return vis->seeAll || dbOid == vis->selfDbOid;
 }
 
+static inline int64
+VamanaStatBytesDatum(uint64 bytes)
+{
+	return (int64) Min(bytes, (uint64) PG_INT64_MAX);
+}
+
 static VamanaStatVisibility
 VamanaStatVisibilityForCaller(void)
 {
@@ -287,9 +293,9 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 
 		if (snap->residencyAdmitted)
 		{
-			values[6] = Int64GetDatum((int64) snap->residencyBytesCommitted);
-			values[7] = Int64GetDatum((int64) snap->buildBytesCommitted);
-			values[8] = Int64GetDatum((int64) snap->residencyBudgetBytes);
+			values[6] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBytesCommitted));
+			values[7] = Int64GetDatum(VamanaStatBytesDatum(snap->buildBytesCommitted));
+			values[8] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBudgetBytes));
 		}
 		else
 		{
@@ -298,8 +304,8 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 			nulls[8] = true;
 		}
 
-		values[9] = Int64GetDatum((int64) snap->searchWorkMemLimitBytes);
-		values[10] = Int64GetDatum((int64) snap->searchScratchBytesInFlight);
+		values[9] = Int64GetDatum(VamanaStatBytesDatum(snap->searchWorkMemLimitBytes));
+		values[10] = Int64GetDatum(VamanaStatBytesDatum(snap->searchScratchBytesInFlight));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -501,7 +507,7 @@ pg_stat_vamana_worker_slot(PG_FUNCTION_ARGS)
 				SvsMemorySearchScratchBytesPerQuery(row->dbOid, snap->indexRelid);
 
 			if (bytesPerQuery != 0)
-				values[6] = Int64GetDatum((int64) bytesPerQuery);
+				values[6] = Int64GetDatum(VamanaStatBytesDatum(bytesPerQuery));
 			else
 				nulls[6] = true;
 		}

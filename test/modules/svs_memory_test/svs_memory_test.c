@@ -17,8 +17,22 @@
 #include "utils/builtins.h"
 
 #include "svs_memory.h"
+#include "vamanaworker.h"
 
 PG_MODULE_MAGIC;
+
+static uint64
+GetNonNegativeArgAsUint64(PG_FUNCTION_ARGS, int argnum)
+{
+	int64		value = PG_GETARG_INT64(argnum);
+
+	if (value < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("byte argument %d must not be negative", argnum)));
+
+	return (uint64) value;
+}
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_build_ceiling_bytes);
 Datum
@@ -34,11 +48,25 @@ svs_memory_test_residency_ceiling_bytes(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) vamana_max_residency_memory_mb * 1024 * 1024);
 }
 
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_global_build_committed_bytes);
+Datum
+svs_memory_test_global_build_committed_bytes(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) VamanaWorkerHeader()->totalBuildCommittedGlobal);
+}
+
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_global_residency_committed_bytes);
+Datum
+svs_memory_test_global_residency_committed_bytes(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) VamanaWorkerHeader()->totalResidencyCommittedGlobal);
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_admit_database);
 Datum
 svs_memory_admit_database(PG_FUNCTION_ARGS)
 {
-	SvsMemoryAdmitDatabase(PG_GETARG_OID(0), (uint64) PG_GETARG_INT64(1));
+	SvsMemoryAdmitDatabase(PG_GETARG_OID(0), GetNonNegativeArgAsUint64(fcinfo, 1));
 	PG_RETURN_VOID();
 }
 
@@ -47,7 +75,8 @@ Datum
 svs_memory_reserve_build(PG_FUNCTION_ARGS)
 {
 	SvsMemoryReserveBuild(PG_GETARG_OID(0), PG_GETARG_OID(1),
-						   (uint64) PG_GETARG_INT64(2), (uint64) PG_GETARG_INT64(3));
+						   GetNonNegativeArgAsUint64(fcinfo, 2),
+						   GetNonNegativeArgAsUint64(fcinfo, 3));
 	PG_RETURN_VOID();
 }
 
@@ -56,8 +85,8 @@ Datum
 svs_memory_handoff_build(PG_FUNCTION_ARGS)
 {
 	bool		confirmed = SvsMemoryHandoffBuild(PG_GETARG_OID(0), PG_GETARG_OID(1),
-												   (uint64) PG_GETARG_INT64(2),
-												   (uint64) PG_GETARG_INT64(3));
+												   GetNonNegativeArgAsUint64(fcinfo, 2),
+												   GetNonNegativeArgAsUint64(fcinfo, 3));
 
 	PG_RETURN_BOOL(confirmed);
 }
@@ -66,7 +95,7 @@ PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_abort_build);
 Datum
 svs_memory_abort_build(PG_FUNCTION_ARGS)
 {
-	SvsMemoryAbortBuild(PG_GETARG_OID(0), PG_GETARG_OID(1), (uint64) PG_GETARG_INT64(2));
+	SvsMemoryAbortBuild(PG_GETARG_OID(0), PG_GETARG_OID(1));
 	PG_RETURN_VOID();
 }
 
@@ -75,7 +104,7 @@ Datum
 svs_memory_reconcile_load(PG_FUNCTION_ARGS)
 {
 	bool		fits = SvsMemoryReconcileLoad(PG_GETARG_OID(0), PG_GETARG_OID(1),
-											  (uint64) PG_GETARG_INT64(2));
+											  GetNonNegativeArgAsUint64(fcinfo, 2));
 
 	PG_RETURN_BOOL(fits);
 }
@@ -93,7 +122,7 @@ Datum
 svs_memory_reserve_insert(PG_FUNCTION_ARGS)
 {
 	bool		fits = SvsMemoryReserveInsert(PG_GETARG_OID(0), PG_GETARG_OID(1),
-											  (uint64) PG_GETARG_INT64(2));
+											  GetNonNegativeArgAsUint64(fcinfo, 2));
 
 	PG_RETURN_BOOL(fits);
 }
@@ -102,7 +131,8 @@ PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_reanchor_insert);
 Datum
 svs_memory_reanchor_insert(PG_FUNCTION_ARGS)
 {
-	SvsMemoryReanchorInsert(PG_GETARG_OID(0), PG_GETARG_OID(1), (uint64) PG_GETARG_INT64(2));
+	SvsMemoryReanchorInsert(PG_GETARG_OID(0), PG_GETARG_OID(1),
+							 GetNonNegativeArgAsUint64(fcinfo, 2));
 	PG_RETURN_VOID();
 }
 

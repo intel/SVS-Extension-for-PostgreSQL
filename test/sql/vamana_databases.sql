@@ -91,6 +91,35 @@ DROP DATABASE vamana_databases_test_leak;
 -- waits for it via VamanaWorkerWaitUntilAvailable.
 INSERT INTO vamana_databases (datname, enabled) VALUES ('contrib_regression', true);
 
+-- New memory-accounting stats columns: shape, NULL-safety, and visibility.
+-- Nothing has admitted this database into the accounting module yet, so
+-- residency_bytes_committed/build_bytes_committed are NULL -- and
+-- residency_drift, the one column computed in SQL rather than C, must
+-- propagate that NULL through its join and subtraction rather than
+-- coalescing it into a false zero.
+SELECT residency_bytes_committed IS NULL AS committed_is_null,
+       build_bytes_committed IS NULL AS build_is_null,
+       residency_drift IS NULL AS drift_is_null,
+       search_scratch_bytes_in_flight
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- The slot-grain column exists and reads NULL until something computes it.
+SELECT DISTINCT search_scratch_bytes_per_query IS NULL AS unset_before_any_search
+  FROM pg_stat_vamana_worker_slot
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- An unprivileged role reads these columns for its own row only, the same
+-- visibility rule as every other pg_stat_vamana_worker column.
+CREATE ROLE vamana_databases_test_stats_reader NOLOGIN;
+SET ROLE vamana_databases_test_stats_reader;
+SELECT residency_bytes_committed, build_bytes_committed, residency_drift,
+       search_scratch_bytes_in_flight
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+RESET ROLE;
+DROP ROLE vamana_databases_test_stats_reader;
+
 -- Live-index counter is commit-accurate.  The BEFORE DELETE guard reads
 -- indexCount as a hard gate, so it must equal committed catalog truth and
 -- must not reflect a rolled-back CREATE/DROP INDEX.  pg_stat_vamana_worker is

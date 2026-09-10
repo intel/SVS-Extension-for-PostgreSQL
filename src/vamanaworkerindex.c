@@ -191,7 +191,7 @@ GetOrLoadIndexBody(void *arg)
 {
 	GetOrLoadIndexArgs *a = (GetOrLoadIndexArgs *) arg;
 	Relation	indexRel = index_open(a->relid, NoLock);
-	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+	VamanaOptions *opts;
 
 	/* Test hook: TAP forces a failure while indexRel/lock are held. */
 	INJECTION_POINT("vamana-get-or-load-index-error", NULL);
@@ -203,8 +203,11 @@ GetOrLoadIndexBody(void *arg)
 	 * Reaching here means the cache was just evicted or never loaded, the
 	 * same relcache invalidation that would fire from ALTER INDEX SET. This
 	 * is the earliest safe place to compare against a possible
-	 * search_window_size/use_search_history change.
+	 * search_window_size/use_search_history change. rd_options is read here,
+	 * not before the two calls above, since either can process that
+	 * invalidation and free the relcache entry's prior rd_options.
 	 */
+	opts = (VamanaOptions *) indexRel->rd_options;
 	SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, a->relid,
 										  opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW,
 										  opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
