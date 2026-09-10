@@ -23,6 +23,7 @@
 
 #include "postgres.h"
 
+#include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
 
@@ -75,6 +76,9 @@ typedef struct VamanaWorkerSnapshot
 	bool		evictAll;
 	uint64		heartbeatRaw;
 	uint32		indexCount;
+	uint32		searchThreadsDesired;
+	uint32		searchThreadsGranted;
+	uint32		searchThreadsReserved;
 } VamanaWorkerSnapshot;
 
 /*
@@ -141,16 +145,28 @@ VamanaStatVisibilityForCaller(void)
 /* -----------------------------------------------------------------------
  * pg_stat_vamana_worker(): one row per reserved database (worker grain).
  *
- * Column layout (6 columns):
- *   0  db_oid        oid
- *   1  worker_pid    int4         (0 -> NULL)
- *   2  worker_state  text         (see VamanaWorkerStateName)
- *   3  index_count   int4         (NULL on a standby — counter not maintained)
- *   4  evict_all     bool
- *   5  heartbeat_ts  timestamptz  (0 -> NULL)
+ * Column layout (10 columns):
+ *   0  db_oid                     oid
+ *   1  worker_pid                 int4         (0 -> NULL)
+ *   2  worker_state               text         (see VamanaWorkerStateName)
+ *   3  index_count                int4         (NULL on a standby — counter not maintained)
+ *   4  evict_all                  bool
+ *   5  heartbeat_ts               timestamptz  (0 -> NULL)
+ *   6  search_threads_desired     int4         (resolved, clamped ask; 0 when not live)
+ *   7  search_threads_granted     int4         (pool-arbitrated grant; 0 when not live)
+ *   8  search_threads_reserved    int4         (floor actually honored; 0 when not live)
+ *   9  max_search_threads_per_db  int4         (resolved ceiling; not per-entry, no lock needed)
+ *
+ * Unlike index_count, columns 6-8 are populated on a standby: PublishCpuGrants
+ * runs unconditionally on every launcher reconcile, primary or standby, and
+ * ReadDatabaseRows is a read-only SPI SELECT that works fine under recovery.
+ * index_count differs because VamanaIndexCountIsMaintained() is specifically
+ * about the commit-order-dependent index counter, which the standby's redo
+ * stream does not maintain; there is no analogous reason to null out a grant
+ * the launcher actually published.
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_COLS 6
+#define PG_STAT_VAMANA_WORKER_COLS 10
 
 typedef struct VamanaWorkerHydrateCtx
 {
@@ -178,6 +194,9 @@ VamanaWorkerHydrateCb(VamanaWorkerShmem *entry, void *ctxArg)
 	snap->evictAll = (pg_atomic_read_u32(&entry->evict_all) != 0);
 	snap->heartbeatRaw = pg_atomic_read_u64(&entry->heartbeat_ts);
 	snap->indexCount = pg_atomic_read_u32(&entry->indexCount);
+	snap->searchThreadsDesired = pg_atomic_read_u32(&entry->desiredSearchThreads);
+	snap->searchThreadsGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
+	snap->searchThreadsReserved = pg_atomic_read_u32(&entry->reservedSearchThreads);
 	ctx->count++;
 }
 
@@ -189,6 +208,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	VamanaWorkerHydrateCtx ctx;
 	TimestampTz now;
 	bool		isPrimary;
+	int32		maxSearchThreadsPerDb;
 
 	InitMaterializedSRF(fcinfo, 0);
 	Assert(rsinfo->setDesc->natts == PG_STAT_VAMANA_WORKER_COLS);
@@ -207,6 +227,17 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	/* Node role and clock are call-wide facts; sample each once, classify pure. */
 	isPrimary = VamanaNodeIsPrimary();
 	now = GetCurrentTimestamp();
+
+	/*
+	 * A GUC, not per-entry shmem: one cluster-wide value for every row, so it
+	 * is read once here rather than under the header lock in the callback.
+	 * Mirrors ComputePerDatabaseCeiling() in svs_cpu_budget.c, which resolves
+	 * the same GUC against the same fallback when computing grants; reported
+	 * here as the resolved ceiling (not the raw 0-means-follow GUC value) so a
+	 * DBA can compare a grant directly against what it was capped by.
+	 */
+	maxSearchThreadsPerDb = (svs_max_search_threads_per_db == 0) ?
+		max_parallel_workers : svs_max_search_threads_per_db;
 
 	for (int i = 0; i < ctx.count; i++)
 	{
@@ -237,6 +268,11 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 			values[5] = TimestampTzGetDatum((TimestampTz) snap->heartbeatRaw);
 		else
 			nulls[5] = true;
+
+		values[6] = Int32GetDatum((int32) snap->searchThreadsDesired);
+		values[7] = Int32GetDatum((int32) snap->searchThreadsGranted);
+		values[8] = Int32GetDatum((int32) snap->searchThreadsReserved);
+		values[9] = Int32GetDatum(maxSearchThreadsPerDb);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

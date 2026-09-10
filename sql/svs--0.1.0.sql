@@ -117,12 +117,16 @@ REVOKE INSERT, UPDATE, DELETE ON vamana_databases FROM PUBLIC;
 
 CREATE FUNCTION pg_stat_vamana_worker()
 	RETURNS TABLE (
-		db_oid              oid,
-		worker_pid          int,
-		worker_state        text,
-		index_count         int,
-		evict_all           bool,
-		heartbeat_ts        timestamptz
+		db_oid                      oid,
+		worker_pid                  int,
+		worker_state                text,
+		index_count                 int,
+		evict_all                   bool,
+		heartbeat_ts                timestamptz,
+		search_threads_desired      int,
+		search_threads_granted      int,
+		search_threads_reserved     int,
+		max_search_threads_per_db   int
 	)
 	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker'
 	LANGUAGE C;
