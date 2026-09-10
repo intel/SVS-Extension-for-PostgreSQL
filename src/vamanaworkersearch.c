@@ -181,20 +181,21 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 		{
 			/*
 			 * Apply this database's current search-thread grant to the handle
-			 * about to run.  It is one number per database, not per index:
-			 * dispatch is strictly serial (VamanaWorkerDispatchBatch runs one
-			 * index's batch to completion before starting the next), so every
-			 * cached index takes its turn on the same number and there is
-			 * nothing to sub-allocate.  Applied fresh on every dispatch, not
-			 * cached at load time, because the launcher can revise the grant
-			 * at any reconcile.
+			 * about to run, one number per database (dispatch is strictly
+			 * serial, so there is nothing to sub-allocate per index), applied
+			 * fresh on every dispatch since the launcher can revise it at any
+			 * reconcile.  Skipped when unchanged: SVSSetIndexSearchThreads
+			 * tears down and rebuilds the whole SVS thread pool on every call
+			 * (spawns a fresh set of OS threads, joins the old ones), so
+			 * paying that cost on every dispatch regardless of whether the
+			 * grant moved would make this the dominant cost of a search.
 			 *
-			 * SVSSetIndexSearchThreads swaps the SVS thread pool with no
-			 * internal locking, so it races any concurrent search on the same
-			 * handle.  It is safe only from the single-threaded worker main
-			 * loop, immediately before a batch runs under the index's rwlock.
-			 * Never move this into a signal handler, a GUC assign hook, or
-			 * anything that can run concurrently with the dispatch loop.
+			 * SVSSetIndexSearchThreads has no internal locking, so it races
+			 * any concurrent search on the same handle.  Safe only from the
+			 * single-threaded worker main loop, immediately before a batch
+			 * runs under the index's rwlock.  Never move it into a signal
+			 * handler, a GUC assign hook, or anything that can run
+			 * concurrently with the dispatch loop.
 			 *
 			 * Can ereport(ERROR) (CheckSVSError on a failed SVS call), so it
 			 * must run inside this PG_TRY: the PG_CATCH below releases the
@@ -202,12 +203,17 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 			 * instead of the error escaping to the BGW top-level handler.
 			 */
 			{
+				VamanaIndexCache *cache = VamanaGetCache(relid);
 				int			searchThreads = SvsCurrentSearchGrant();
 
-				SVSSetIndexSearchThreads(index, searchThreads);
-				ereport(DEBUG1,
-						(errmsg("vamana worker: dispatching batch on index %u with "
-								"%d search threads", relid, searchThreads)));
+				if (cache != NULL && cache->searchThreadsApplied != searchThreads)
+				{
+					SVSSetIndexSearchThreads(index, searchThreads);
+					cache->searchThreadsApplied = searchThreads;
+					ereport(DEBUG1,
+							(errmsg("vamana worker: dispatching batch on index %u with "
+									"%d search threads", relid, searchThreads)));
+				}
 			}
 
 			/* Test hook: TAP forces a search failure while the rwlock is held. */

@@ -410,22 +410,7 @@ bool	VamanaWorkerSlotsExhausted(void);
 /* vamanaworkershmem.c: number of per-database control-block slots. */
 int		VamanaWorkerSlotCapacity(void);
 
-/*
- * This database's current search-thread grant, as published by the launcher's
- * reconcile pass.  The worker never computes a grant, only applies one.
- *
- * A zero reads as 1, which covers real cases rather than papering over a bug: a
- * control block reset on (de)reservation, a worker that is up but not yet live to
- * the launcher, and any database whose first reconcile has not run.  One is the
- * design's auto fallback and matches the grant calculator's own
- * (ResolveOrFallback(searchNumThreadsDefault, 1)): a thread request with nothing
- * configured must not silently claim near-all cores.
- *
- * Clamped, not trusted.  The value crosses into the SVS C++ library as a thread
- * pool size, so an unexpected shmem value must not become an allocation request.
- * The clamp is defense in depth, not policy: the pool ceiling is the launcher's
- * job and duplicating it here is the drift the design warns against.
- */
+/* vamanaworkershmem.c: this database's published search-thread grant. Worker-only. */
 int		SvsCurrentSearchGrant(void);
 
 /* vamanaworkershmem.c */

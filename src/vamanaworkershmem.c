@@ -378,28 +378,30 @@ VamanaWorkerLookupSlot(Oid dbOid)
 /*
  * SvsCurrentSearchGrant
  *
- * Fast path: the worker's own control block, already resolved into
- * VamanaWorkerShmemPtr.  Backends have no such pointer and resolve their
- * database's entry by lookup instead.  A database with no reserved entry at
- * all (not yet enabled for vamana) also falls back to the auto default.
+ * This database's current search-thread grant, as published by the
+ * launcher's reconcile pass.  Worker-only: every caller today runs in the
+ * worker's own process, so VamanaWorkerShmemPtr is always this database's
+ * control block.  Add a VamanaWorkerLookupSlot(MyDatabaseId) fallback if a
+ * backend caller is ever added; do not add it speculatively.
+ *
+ * A zero reads as 1 rather than 0: a control block reset on
+ * (de)reservation, a worker up but not yet live to the launcher, and any
+ * database whose first reconcile has not run are all real states, and a
+ * thread request with nothing configured must not silently claim 0 threads.
+ * Not clamped beyond that: the launcher's own ceiling (max_parallel_workers,
+ * hard-capped at 1024 by core's MAX_PARALLEL_WORKER_LIMIT) already bounds
+ * every grant it publishes, so there is nothing here to defend against.
  */
 int
 SvsCurrentSearchGrant(void)
 {
-	VamanaWorkerShmem *entry = VamanaWorkerShmemPtr;
 	uint32		grant;
 
-	if (entry == NULL)
-		entry = VamanaWorkerLookupSlot(MyDatabaseId);
+	Assert(VamanaWorkerShmemPtr != NULL);
 
-	if (entry == NULL)
-		return 1;
+	grant = pg_atomic_read_u32(&VamanaWorkerShmemPtr->grantedSearchThreads);
 
-	grant = pg_atomic_read_u32(&entry->grantedSearchThreads);
-	if (grant == 0)
-		grant = 1;
-
-	return (int) Min(grant, 1024);
+	return (grant == 0) ? 1 : (int) grant;
 }
 
 /*
