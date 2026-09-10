@@ -1,0 +1,21 @@
+\echo Use "CREATE EXTENSION svs_cpu_slots_test" to load this file. \quit
+
+CREATE FUNCTION svs_slot_resize(target int4)
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_slot_count()
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_slot_release_all()
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_slot_bgw_type()
+RETURNS text
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;

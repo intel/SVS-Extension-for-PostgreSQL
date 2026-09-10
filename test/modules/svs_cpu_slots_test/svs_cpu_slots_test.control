@@ -1,0 +1,5 @@
+# svs_cpu_slots_test extension
+comment = 'Standalone test harness for the parked BGWORKER_CLASS_PARALLEL slot pool'
+default_version = '1.0'
+module_pathname = '$libdir/svs_cpu_slots_test'
+relocatable = true
