@@ -376,6 +376,35 @@ VamanaWorkerLookupSlot(Oid dbOid)
 }
 
 /*
+ * SvsCurrentSearchGrant
+ *
+ * This database's current search-thread grant, as published by the
+ * launcher's reconcile pass.  Worker-only: every caller today runs in the
+ * worker's own process, so VamanaWorkerShmemPtr is always this database's
+ * control block.  Add a VamanaWorkerLookupSlot(MyDatabaseId) fallback if a
+ * backend caller is ever added; do not add it speculatively.
+ *
+ * A zero reads as 1 rather than 0: a control block reset on
+ * (de)reservation, a worker up but not yet live to the launcher, and any
+ * database whose first reconcile has not run are all real states, and a
+ * thread request with nothing configured must not silently claim 0 threads.
+ * Not clamped beyond that: the launcher's own ceiling (max_parallel_workers,
+ * hard-capped at 1024 by core's MAX_PARALLEL_WORKER_LIMIT) already bounds
+ * every grant it publishes, so there is nothing here to defend against.
+ */
+int
+SvsCurrentSearchGrant(void)
+{
+	uint32		grant;
+
+	Assert(VamanaWorkerShmemPtr != NULL);
+
+	grant = pg_atomic_read_u32(&VamanaWorkerShmemPtr->grantedSearchThreads);
+
+	return (grant == 0) ? 1 : (int) grant;
+}
+
+/*
  * Invoke cb on every reserved (dbOid != InvalidOid) control block under a
  * single LW_SHARED pass, with the header lock held across all invocations.
  *

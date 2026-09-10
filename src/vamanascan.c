@@ -95,6 +95,7 @@ LoadIndexFromPages(Relation index)
 	config.data_type = SVS_DTYPE_FLOAT32;
 	config.dimensions = (int) meta.dimensions;
 	config.leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
+	config.search_num_threads = SvsCurrentSearchGrant();
 
 	ereport(LOG,
 			(errmsg("loading vamana index %u", relid),
