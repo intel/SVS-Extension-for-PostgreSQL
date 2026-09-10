@@ -102,6 +102,38 @@ $standby->start;
 $primary->wait_for_replay_catchup($standby);
 
 # ===========================================================================
+# Test 0: CPU grant columns are populated on a standby; index_count is not
+#
+# PublishCpuGrants runs unconditionally on every launcher reconcile, primary
+# or standby, and ReadDatabaseRows is a read-only SPI SELECT that works fine
+# under recovery, so search_threads_desired/granted/reserved are populated
+# here.  index_count differs because VamanaIndexCountIsMaintained() is
+# specifically about the commit-order-dependent index counter, which the
+# standby's redo stream does not maintain.
+# ===========================================================================
+
+my $grant_columns_ok = '';
+for (1 .. 30)
+{
+    usleep(500_000);
+    eval {
+        $grant_columns_ok = $standby->safe_psql('postgres', qq{
+            SELECT search_threads_desired IS NOT NULL
+                AND search_threads_granted IS NOT NULL
+                AND search_threads_reserved IS NOT NULL
+                AND index_count IS NULL
+            FROM pg_stat_vamana_worker
+            WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+        });
+    };
+    chomp $grant_columns_ok if defined $grant_columns_ok;
+    last if defined $grant_columns_ok && $grant_columns_ok eq 't';
+}
+
+is($grant_columns_ok, 't',
+    "standby replay: search_threads_desired/granted/reserved are populated on a standby, index_count is not");
+
+# ===========================================================================
 # Test 1: Rows inserted on primary are searchable on standby
 #
 # enable_seqscan = off forces the vamana index so the query is answered from
