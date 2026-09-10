@@ -77,12 +77,21 @@ struct SvsSlotSet
 {
 	MemoryContext ctx;
 	char		libraryName[MAXPGPATH];
-	SvsSlotKind kind;
 	char		datname[NAMEDATALEN];
 
 	SvsSlotEntry *entries;		/* array in ctx, capacity slots */
 	int			capacity;
 	int			count;			/* slots believed live right now */
+
+	/*
+	 * Highest slotIndex ever handed out, so a regrow after a slot dies out
+	 * of turn (pg_terminate_backend, OOM kill) cannot reuse the label of a
+	 * still-live survivor.  ReapDeadSlots() shifts the entries array down
+	 * when a slot dies, but it cannot rewrite that slot's own already-
+	 * running app-name string, so slotIndex must never be recomputed from
+	 * set->count: two live workers would then show the same "X/Y" label.
+	 */
+	int			nextSlotIndex;
 
 	/*
 	 * Set once a resize leaves count < target, cleared once a later resize
@@ -105,14 +114,13 @@ static void LogShortfallTransition(SvsSlotSet *set, int target);
 
 SvsSlotSet *
 SvsSlotSetCreate(MemoryContext ctx, const char *libraryName,
-				  SvsSlotKind kind, const char *datname)
+				  const char *datname)
 {
 	MemoryContext oldCtx = MemoryContextSwitchTo(ctx);
 	SvsSlotSet *set = palloc0(sizeof(SvsSlotSet));
 
 	set->ctx = ctx;
 	strlcpy(set->libraryName, libraryName, sizeof(set->libraryName));
-	set->kind = kind;
 	strlcpy(set->datname, datname, sizeof(set->datname));
 	set->entries = NULL;
 	set->capacity = 0;
@@ -145,7 +153,7 @@ SvsSlotSetResize(SvsSlotSet *set, int target)
 		if (!WaitForSlotShutdownBounded(entry->handle, SVS_SLOT_SHUTDOWN_TIMEOUT_MS))
 			ereport(WARNING,
 					(errmsg("svs cpu slots: timed out waiting for a %s slot to shut down after termination",
-							SvsSlotKindBgwType(set->kind))));
+							SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH))));
 
 		pfree(entry->handle);
 		set->count--;
@@ -162,8 +170,8 @@ SvsSlotSetResize(SvsSlotSet *set, int target)
 		EnsureCapacity(set, set->count + 1);
 
 		memset(&bgw, 0, sizeof(bgw));
-		snprintf(bgw.bgw_name, BGW_MAXLEN, "%s", SvsSlotKindBgwType(set->kind));
-		snprintf(bgw.bgw_type, BGW_MAXLEN, "%s", SvsSlotKindBgwType(set->kind));
+		snprintf(bgw.bgw_name, BGW_MAXLEN, "%s", SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH));
+		snprintf(bgw.bgw_type, BGW_MAXLEN, "%s", SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH));
 		snprintf(bgw.bgw_library_name, BGW_MAXLEN, "%s", set->libraryName);
 		snprintf(bgw.bgw_function_name, BGW_MAXLEN, "SvsParkedSlotMain");
 
@@ -187,7 +195,7 @@ SvsSlotSetResize(SvsSlotSet *set, int target)
 		bgw.bgw_notify_pid = MyProcPid;
 
 		memset(&arg, 0, sizeof(arg));
-		arg.slotIndex = set->count + 1;
+		arg.slotIndex = ++set->nextSlotIndex;
 		arg.slotTotal = target;
 		arg.reserved = target;
 		strlcpy(arg.datname, set->datname, sizeof(arg.datname));
@@ -345,13 +353,11 @@ WaitForSlotShutdownBounded(BackgroundWorkerHandle *handle, long timeoutMs)
  * a disk-fill vector.
  *
  * RegisterDynamicBackgroundWorker() gives no reason code for its failure, so
- * which limit is actually binding is inferred here, not read from core: if
- * this set already holds at least max_parallel_workers slots, the parallel
- * pool clamp is the more likely explanation than the background worker slot
- * table (max_worker_processes), because the pool check runs first and short-
- * circuits before the slot table is even scanned.  Other backends' parallel
- * workers can still confound this heuristic; say so plainly rather than
- * asserting a cause the caller cannot independently verify.
+ * this deliberately reports only what is known for certain (how many slots
+ * are held versus requested), not a guess at which limit is binding: the
+ * held count alone already makes a max_parallel_workers shortfall and a
+ * max_worker_processes shortfall distinguishable in the log, without risking
+ * a wrong causal claim the caller cannot independently verify.
  */
 static void
 LogShortfallTransition(SvsSlotSet *set, int target)
@@ -360,24 +366,15 @@ LogShortfallTransition(SvsSlotSet *set, int target)
 
 	if (nowShort && !set->inShortfall)
 	{
-		if (set->count >= max_parallel_workers)
-			ereport(LOG,
-					(errmsg("svs cpu slots: holding %d of %d requested %s slots for database \"%s\"",
-							set->count, target, SvsSlotKindBgwType(set->kind), set->datname),
-					 errdetail("%d slots held is at or above max_parallel_workers (%d); this looks like the parallel-worker pool limit, not the background worker slot table.",
-							   set->count, max_parallel_workers)));
-		else
-			ereport(LOG,
-					(errmsg("svs cpu slots: holding %d of %d requested %s slots for database \"%s\"",
-							set->count, target, SvsSlotKindBgwType(set->kind), set->datname),
-					 errdetail("%d slots held is below max_parallel_workers (%d); this looks like the background worker slot table (max_worker_processes) instead of the parallel-worker pool.",
-							   set->count, max_parallel_workers)));
+		ereport(LOG,
+				(errmsg("svs cpu slots: holding %d of %d requested %s slots for database \"%s\"",
+						set->count, target, SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH), set->datname)));
 	}
 	else if (!nowShort && set->inShortfall)
 	{
 		ereport(LOG,
 				(errmsg("svs cpu slots: shortfall cleared, holding %d of %d requested %s slots for database \"%s\"",
-						set->count, target, SvsSlotKindBgwType(set->kind), set->datname)));
+						set->count, target, SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH), set->datname)));
 	}
 
 	set->inShortfall = nowShort;
@@ -413,8 +410,6 @@ SvsParkedSlotMain(Datum main_arg)
 	char		appName[NAMEDATALEN + 64];
 
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(arg));
-	/* Defend against a corrupt or truncated copy; never trust it blindly. */
-	arg.datname[NAMEDATALEN - 1] = '\0';
 
 	pqsignal(SIGTERM, SvsParkedSlotSigterm);
 	BackgroundWorkerUnblockSignals();
@@ -426,24 +421,35 @@ SvsParkedSlotMain(Datum main_arg)
 	 * would require.
 	 *
 	 * That also means InitPostgres never runs, and pgstat_beinit()/
-	 * pgstat_bestart_*() are normally only called from there (or from
+	 * pgstat_bestart*() are normally only called from there (or from
 	 * AuxiliaryProcessMainCommon() for built-in auxiliary processes).
 	 * Without them this worker would be invisible in pg_stat_activity and
 	 * pgstat_report_appname() below would silently do nothing, which defeats
 	 * the whole point of a fiction worker that exists to be counted and
-	 * observed.  Call the same three functions AuxiliaryProcessMainCommon()
-	 * uses to get an aux process into pg_stat_activity without a database
-	 * connection.  pgstat_bestart_final() calls GetSessionUserId() for any
+	 * observed.  Establish backend status the same way
+	 * AuxiliaryProcessMainCommon() does for an aux process with no database
+	 * connection.  The final bestart step calls GetSessionUserId() for any
 	 * B_BG_WORKER, which asserts a valid SessionUserId that InitPostgres
 	 * would normally have set; InitializeSessionUserIdStandalone() is the
 	 * documented way for a background worker to establish that identity
 	 * without a database connection or catalog access (it is the same call
 	 * autovacuum workers use for the same reason).
+	 *
+	 * PostgreSQL 18 split the single pgstat_bestart() call into
+	 * pgstat_bestart_initial() (report before SessionUserId exists) and
+	 * pgstat_bestart_final() (report once it does); pgstat_bestart_initial
+	 * and pgstat_bestart_final do not exist before 18, where a single
+	 * pgstat_bestart() call does both steps after SessionUserId is set.
 	 */
 	pgstat_beinit();
+#if PG_VERSION_NUM >= 180000
 	pgstat_bestart_initial();
 	InitializeSessionUserIdStandalone();
 	pgstat_bestart_final();
+#else
+	InitializeSessionUserIdStandalone();
+	pgstat_bestart();
+#endif
 
 	SvsFormatSearchSlotAppName(appName, sizeof(appName), arg.datname,
 							   arg.slotIndex, arg.slotTotal, arg.reserved);

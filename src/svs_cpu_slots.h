@@ -30,9 +30,16 @@ typedef struct SvsSlotSet SvsSlotSet;
 /*
  * ctx must outlive the set.  libraryName names the .so holding
  * SvsParkedSlotMain, since that differs between the extension and a test module.
+ *
+ * Search-only for now: every slot this module registers reports itself with
+ * SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH) and SvsFormatSearchSlotAppName.
+ * SvsSlotKind has a BUILD member, but nothing here builds or tests a
+ * BUILD-kind set, so there is deliberately no parameter to request one; a
+ * caller that needs build-slot self-description should extend
+ * SvsParkedSlotMain to branch on kind when that caller exists, not before.
  */
 extern SvsSlotSet *SvsSlotSetCreate(MemoryContext ctx, const char *libraryName,
-									 SvsSlotKind kind, const char *datname);
+									 const char *datname);
 
 /*
  * Converge on `target` live slots.  Returns the count actually held, which may be
