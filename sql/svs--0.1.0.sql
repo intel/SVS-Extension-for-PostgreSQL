@@ -150,7 +150,11 @@ CREATE FUNCTION pg_stat_vamana_worker()
 		build_bytes_committed           bigint,
 		residency_memory_limit          bigint,
 		search_work_mem_limit           bigint,
-		search_scratch_bytes_in_flight  bigint
+		search_scratch_bytes_in_flight  bigint,
+		search_threads_desired          int,
+		search_threads_granted          int,
+		search_threads_reserved         int,
+		max_search_threads_per_db       int
 	)
 	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker'
 	LANGUAGE C;
@@ -169,7 +173,11 @@ CREATE VIEW pg_stat_vamana_worker AS
 		   w.residency_memory_limit,
 		   w.residency_bytes_committed - COALESCE(r.resident_bytes, 0) AS residency_drift,
 		   w.search_work_mem_limit,
-		   w.search_scratch_bytes_in_flight
+		   w.search_scratch_bytes_in_flight,
+		   w.search_threads_desired,
+		   w.search_threads_granted,
+		   w.search_threads_reserved,
+		   w.max_search_threads_per_db
 	  FROM pg_stat_vamana_worker() w
 	  LEFT JOIN (
 			SELECT db_oid, sum(resident_bytes) AS resident_bytes

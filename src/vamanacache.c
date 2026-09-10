@@ -36,14 +36,15 @@
  * Per-process cache: up to VAMANA_MAX_CACHED_INDEXES SVS index handles
  * (background worker only).
  *
- * Eviction policy: FIFO by insertion order.  When all slots are full and a
- * new index arrives, the oldest slot (vamanaCacheNext % max) is evicted.
+ * Eviction policy: hard-deny.  When all slots hold live indexes, a new load
+ * is refused with an explicit error.  The operator unloads one index first.
+ * vamanaCacheUsed is a high-water mark and never shrinks; VamanaAllocCacheSlot
+ * reclaims invalidated slots so evictions can free capacity.
  */
 
 /* Array of per-process cache entries */
 static VamanaIndexCache *vamanaCacheSlots[VAMANA_MAX_CACHED_INDEXES];
-static int	vamanaCacheUsed = 0;	/* how many slots are allocated */
-static int	vamanaCacheNext = 0;	/* next slot to evict (FIFO) */
+static int	vamanaCacheUsed = 0;	/* high-water mark of allocated slots */
 
 /*
  * Free resources held by a cache entry and mark it invalid.
@@ -97,8 +98,9 @@ VamanaFindCacheSlot(Oid indexRelid)
 }
 
 /*
- * Allocate or evict a cache slot.  Returns a pointer to an empty (or
- * freshly cleared) VamanaIndexCache that the caller should fill.
+ * Allocate a cache slot for indexRelid.  Returns a pointer to an empty (or
+ * freshly cleared) VamanaIndexCache that the caller should fill.  Throws
+ * ERRCODE_CONFIGURATION_LIMIT_EXCEEDED when all slots hold live indexes.
  */
 static VamanaIndexCache *
 VamanaAllocCacheSlot(Oid indexRelid)
@@ -107,7 +109,7 @@ VamanaAllocCacheSlot(Oid indexRelid)
 	VamanaIndexCache *entry;
 	MemoryContext oldCtx;
 
-	/* Fast path: existing slot for this relid */
+	/* Branch 1: existing slot for this relid, valid or not. */
 	for (int i = 0; i < vamanaCacheUsed; i++)
 	{
 		if (vamanaCacheSlots[i] != NULL &&
@@ -119,6 +121,7 @@ VamanaAllocCacheSlot(Oid indexRelid)
 		}
 	}
 
+	/* Branch 2: grow into a never-used slot. */
 	if (vamanaCacheUsed < VAMANA_MAX_CACHED_INDEXES)
 	{
 		slot = vamanaCacheUsed;
@@ -133,17 +136,46 @@ VamanaAllocCacheSlot(Oid indexRelid)
 		return entry;
 	}
 
-	/* Evict the oldest slot (FIFO) */
-	slot = vamanaCacheNext % VAMANA_MAX_CACHED_INDEXES;
-	vamanaCacheNext++;
-	entry = vamanaCacheSlots[slot];
+	/*
+	 * Branch 3: reclaim an invalidated slot.  vamanaCacheUsed is a high-water
+	 * mark and never shrinks, so an array that has held 8 distinct indexes
+	 * stays "full" even after every entry is invalidated.  Without this branch
+	 * the hard-deny below would be permanent rather than a live-capacity signal,
+	 * and unloading an index could never make room for another.
+	 */
+	for (int i = 0; i < vamanaCacheUsed; i++)
+	{
+		entry = vamanaCacheSlots[i];
+		if (entry != NULL && !entry->isValid)
+		{
+			VamanaClearCacheEntry(entry);	/* idempotent; drops any residue */
+			/*
+			 * Clear the stale relid before returning.  The caller assigns
+			 * entry->indexRelid a few lines later, so the stale value is
+			 * normally overwritten.  Clearing it guards the narrow window
+			 * where an error between here and that assignment would otherwise
+			 * leave a slot matchable by Branch 1 under the wrong OID.
+			 */
+			entry->indexRelid = InvalidOid;
+			return entry;
+		}
+	}
 
-	if (entry->isValid && entry->svsIndex)
-		ereport(DEBUG1,
-				(errmsg("vamana cache: evicting index %u to make room for %u",
-						entry->indexRelid, indexRelid)));
-	VamanaClearCacheEntry(entry);
-	return entry;
+	/*
+	 * Hard deny.  Every slot holds a live index.  Refuse rather than evict:
+	 * FIFO eviction was activity-blind and could knock a busy index out of
+	 * cache purely because it loaded first.  The operator unloads one
+	 * explicitly instead.
+	 *
+	 * Only the compile-time slot count is mentioned: a caller who cannot see
+	 * another database's pg_class must not learn which indexes are resident.
+	 */
+	ereport(ERROR,
+			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+			 errmsg("cannot load vamana index: all %d index cache slots are in use",
+					VAMANA_MAX_CACHED_INDEXES),
+			 errhint("Unload a cached vamana index in this database before loading another.")));
+	pg_unreachable();
 }
 
 /*

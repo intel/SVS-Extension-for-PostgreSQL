@@ -498,6 +498,7 @@ void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 cat
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
+extern Oid	vamana_eviction_suppressed_for_relid;
 
 /*
  * True when the error currently being handled is the query-cancel raised by the
@@ -553,8 +554,20 @@ List   *VamanaWorkerEnumerateIndexes(void);
 /* VamanaWorkerEnumerateIndexes wrapped in its own transaction. */
 List   *VamanaWorkerEnumerateAllIndexes(void);
 
-SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk);
-SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid);
+/*
+ * propagateCacheFull: when true, a cache-full denial (ERRCODE_CONFIGURATION_
+ * LIMIT_EXCEEDED) is re-thrown to the caller instead of being swallowed into a
+ * NULL return.  The relation lock taken internally is released either way. A
+ * caller that opts in still owns its own transaction, active snapshot, and
+ * any eviction-suppression guard it set around the call: those are outside
+ * this function and are not unwound by the throw.  Pass false unless the
+ * caller specifically needs the denial to reach its client (search dispatch,
+ * explicit warmup); every other caller wants the pre-existing "NULL means try
+ * again later" contract.
+ */
+SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk,
+										  bool propagateCacheFull);
+SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull);
 void	VamanaWorkerResetStaleSlots(void);
 
 /* Converges a standby's cache onto targetRelids; returns true once every relid has a live slot. */

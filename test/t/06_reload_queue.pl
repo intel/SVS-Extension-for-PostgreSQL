@@ -22,6 +22,15 @@ use VamanaTestUtils qw(:all);
 
 my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
 
+# Querying a table loads its index into the worker's cache, and the cache
+# hard-deny (VAMANA_MAX_CACHED_INDEXES == 8) refuses a 9th resident index
+# instead of evicting one. The reload-queue overflow this test exercises
+# does not need residency: VamanaInvalidateCache signals a reload for any
+# invalidated OID whether or not it currently has a cache entry. So only
+# the query loops (not table creation or TRUNCATE) are capped to cache
+# capacity, keeping $N_TABLES at 17 for the actual queue overflow.
+my $N_QUERY_TABLES = 8;
+
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_reload_queue');
     $node->init;
@@ -53,7 +62,7 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
 
     sleep(2);
 
-    for my $i (0 .. $N_TABLES - 1)
+    for my $i (0 .. $N_QUERY_TABLES - 1)
     {
         $node->safe_psql('postgres', qq{
             SET enable_seqscan = off;
@@ -96,8 +105,43 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
     }
     ok($cleared, 'evict_all cleared after worker resumes');
 
+    # The evict_all handler returns before draining the per-OID reload queue
+    # (vamanaworker.c VamanaWorkerProcessReloads), so the 16 relids already
+    # queued when the 17th signal tripped evict_all are still sitting there.
+    # The worker's very next cycle drains all 16 through the per-OID loop
+    # against the 8-slot cache: exactly the more-than-8-distinct-indexes-in-
+    # one-pass workload that used to throw a cache-full error out of that
+    # loop and kill the worker. Confirm it now survives.
+    my $pid_after_overflow = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity "
+      . "WHERE backend_type = 'vamana worker' LIMIT 1;");
+    chomp $pid_after_overflow;
+    is($pid_after_overflow, $worker_pid,
+        'worker survived the queue-overflow drain (same pid, no crash-restart)');
+
+    my $hb1 = $node->safe_psql('postgres',
+        "SELECT extract(epoch from heartbeat_ts) FROM pg_stat_vamana_worker LIMIT 1;");
+    chomp $hb1;
+    sleep(2);
+    my $hb2 = $node->safe_psql('postgres',
+        "SELECT extract(epoch from heartbeat_ts) FROM pg_stat_vamana_worker LIMIT 1;");
+    chomp $hb2;
+    ok($hb2 > $hb1, 'worker heartbeat advances after the overflow drain');
+
+    # Restrict the crash check to the per-database worker itself: a normal
+    # $node->stop() later in this test logs unrelated "vamana launcher" and
+    # "logical replication launcher" background-worker exits at shutdown,
+    # which also read "exited with exit code 1" and are not a crash.
+    my $log = slurp_file($node->logfile);
+    unlike($log, qr/background worker "vamana worker[^"]*".*exited with exit code 1/,
+        'no worker crash-exit in the server log');
+    unlike($log, qr/Segmentation fault/,
+        'no segfault in the server log');
+    like($log, qr/vamana worker: failed to load index \d+/,
+        'cache-full denials during the drain surfaced as WARNING, not a crash');
+
     my $nonempty = 0;
-    for my $i (0 .. $N_TABLES - 1)
+    for my $i (0 .. $N_QUERY_TABLES - 1)
     {
         my $cnt = $node->safe_psql('postgres', qq{
             SET enable_seqscan = off;
@@ -110,7 +154,7 @@ my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
         $nonempty++ if $cnt ne '0';
     }
     ok($nonempty == 0,
-        'all 17 indexes return 0 results after TRUNCATE and reload');
+        'queried indexes return 0 results after TRUNCATE and reload');
 
     $node->stop;
 }
