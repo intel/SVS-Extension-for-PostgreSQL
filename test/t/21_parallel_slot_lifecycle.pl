@@ -101,11 +101,10 @@ my $crashed_during_cycles = $node->log_contains(
 ok(!$crashed_during_cycles,
 	'case 4: server log has no crashed-worker or segfault line across the cycles');
 
-# AllocateSlotIndex() must keep every live slot's self-reported "X/Y" label
-# within 1..slotTotal even after many grow/shrink cycles; an earlier fix that
-# assigned indices from a counter that only ever increased passed every
-# check above (they never look at application_name) while still producing
-# labels like "124/6" once the counter had climbed past the six-slot total.
+# Nothing above this point looks at application_name, only resize() return
+# values, backend pid, and slot_count(), so this is the only check in case 4
+# that would catch a live slot's "X/Y" label drifting outside 1..slotTotal
+# after many grow/shrink cycles.
 my $held_final = $owner->query_safe('SELECT svs_slot_resize(6);');
 chomp $held_final;
 is($held_final, '6', 'case 4: resize(6) after the cycles converges exactly, for the label check below');

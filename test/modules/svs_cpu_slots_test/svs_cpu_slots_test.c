@@ -44,8 +44,7 @@ static SvsSlotSet *TestSlotSet = NULL;
  * strand its slots the way an unclean crash necessarily does.  Without this,
  * every psql -c invocation that resized and disconnected without an explicit
  * svs_slot_release_all() call would leak its parked slots for the life of
- * the cluster; that leak was, in fact, first found in exactly that way while
- * manually driving this module before this hook was added.
+ * the cluster.
  */
 static void
 ReleaseTestSlotSetOnExit(int code, Datum arg)

@@ -299,13 +299,11 @@ ReapDeadSlots(SvsSlotSet *set)
 }
 
 /*
- * The smallest positive index not already held by a live entry, so a new
- * slot's "X/Y" label can never collide with a still-live survivor's (the
- * original bug: recomputing from set->count reused a just-freed number
- * while its old holder was still running) and never drifts past slotTotal
- * either (the regression from a first fix that used an ever-increasing
- * counter: labels like "124/6" after enough grow/shrink cycles, because a
- * counter that only goes up eventually exceeds any fixed target).  Callers
+ * The smallest positive index not already held by a live entry.  Every live
+ * slot's self-reported "X/Y" label must be unique among current holders and
+ * stay within 1..slotTotal, so the index a new slot gets can be neither a
+ * number already in use by a still-running survivor nor a value drawn from
+ * an ever-increasing source that would eventually exceed the total.  Callers
  * always run ReapDeadSlots() first, so set->entries here holds only slots
  * actually believed live right now.
  *
