@@ -213,6 +213,29 @@ sub run_search
 		"the freshly loaded handle's thread count matches the grant (5), not nproc-1");
 }
 
+# ---------------------------------------------------------------------------
+# 6. Skipped when unchanged: SVSSetIndexSearchThreads runs (and logs) on the
+# first dispatch that applies a given thread count, then is skipped on a
+# later dispatch for the same index as long as the grant has not moved.
+# ---------------------------------------------------------------------------
+{
+	my $log_pos = length($node->log_content());
+	isnt(run_search(), '', 'first search after the reload returns results');
+
+	my $log = substr($node->log_content(), $log_pos);
+	like($log,
+		qr/vamana worker: dispatching batch on index $relid with 5 search threads/,
+		'first dispatch after the reload logs the applied thread count');
+
+	$log_pos = length($node->log_content());
+	isnt(run_search(), '', 'second search with the same grant returns results');
+
+	$log = substr($node->log_content(), $log_pos);
+	unlike($log,
+		qr/vamana worker: dispatching batch on index $relid with \d+ search threads/,
+		'second dispatch with an unchanged grant does not repeat the apply');
+}
+
 $node->stop;
 
 done_testing();
