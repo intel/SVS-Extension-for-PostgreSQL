@@ -483,7 +483,21 @@ use VamanaTestUtils qw(:all);
 }
 
 # ===========================================================================
-# Search threads — SVSLoadIndex uses SVSDefaultSearchThreads(), not build threads
+# Search threads — SVSLoadIndex applies this database's published search
+# grant (SvsCurrentSearchGrant()), falling back to SVSDefaultSearchThreads()
+# only when no grant is available.  The database here is registered in
+# vamana_databases, so the catalog-driven grant is always in play, and
+# unconfigured (search_num_threads NULL, svs.search_num_threads unset)
+# resolves to 1, not nproc-1: SVSDefaultSearchThreads() itself still defaults
+# to nproc-1, and that divergence is intentional (see the CPU search
+# management design note in svs_wrapper.c/vamanaworkersearch.c).
+#
+# A restart leaves the freshly restarted worker not yet "live" on the
+# launcher's very first post-restart reconcile pass, which floors this
+# database's grant at 0 until a second pass runs.  A no-op catalog write
+# (re-asserting enabled=true) fires the vamana_databases_changed NOTIFY and
+# forces that second pass promptly instead of waiting on the launcher's
+# multi-minute naptime.
 # ===========================================================================
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_search_threads');
@@ -511,6 +525,9 @@ use VamanaTestUtils qw(:all);
 
     my $log_pos_before_restart = length($node->log_content());
     $node->restart;
+    wait_for_worker($node);
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';");
 
     my $after_restart = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
@@ -523,28 +540,19 @@ use VamanaTestUtils qw(:all);
 
     like($new_log,
         qr/loading SVS index with \d+ search threads \(svs\.search_num_threads=\d+, max_parallel_maintenance_workers=2\)/,
-        'DEBUG1 log confirms SVSLoadIndex used SVSDefaultSearchThreads()');
+        'DEBUG1 log confirms SVSLoadIndex logged its resolved search thread count');
 
-    my $nproc_raw = `nproc 2>/dev/null`;
-    chomp $nproc_raw;
-    my $nproc = ($nproc_raw =~ /^(\d+)$/) ? int($1) : 0;
-    my $expected_search_threads = $nproc > 1 ? $nproc - 1 : 1;
-
-    if ($nproc >= 4)
-    {
-        like($new_log,
-            qr/loading SVS index with $expected_search_threads search threads/,
-            "search threads ($expected_search_threads = nproc-1) exceed max_parallel_maintenance_workers (2)");
-    }
-    else
-    {
-        pass("skipped: nproc=$nproc, nproc-1 may equal max_parallel_maintenance_workers");
-    }
+    like($new_log,
+        qr/loading SVS index with 1 search threads/,
+        'unconfigured search_num_threads resolves to 1 via the published grant, not nproc-1');
 
     $node->safe_psql("postgres",
         "ALTER SYSTEM SET svs.search_num_threads = 3;");
     my $log_pos_before_test4 = length($node->log_content());
     $node->restart;
+    wait_for_worker($node);
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';");
 
     # Demand-driven load: query so SVSLoadIndex runs and logs its thread count.
     $node->safe_psql("postgres", qq(
@@ -562,7 +570,7 @@ use VamanaTestUtils qw(:all);
 
     like($log_test4,
         qr/loading SVS index with 3 search threads \(svs\.search_num_threads=3/,
-        'svs.search_num_threads=3 overrides auto default');
+        'svs.search_num_threads=3 becomes the cluster-wide default the published grant resolves to');
 
     $node->safe_psql("postgres",
         "ALTER SYSTEM RESET svs.search_num_threads;");

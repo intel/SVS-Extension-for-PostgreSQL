@@ -45,6 +45,7 @@ typedef struct SVSBuildConfig
 	int			dimensions;				/* Vector dimensionality (needed for LeanVec load) */
 	int			leanvec_dims;			/* LeanVec reduced dims (-1 = dimensions/2) */
 	int			build_window_size;		/* Build window size from reloptions (0 = use default) */
+	int			search_num_threads;		/* 0 = use SVSDefaultSearchThreads() */
 }			SVSBuildConfig;
 
 SVSAlgorithmHandle SVSCreateAlgorithm(int graph_degree, int build_window, int search_window, int alpha,

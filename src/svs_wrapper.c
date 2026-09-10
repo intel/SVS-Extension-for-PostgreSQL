@@ -645,7 +645,8 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 
 		SVSBuilderSetStorage(builder, storage);
 		{
-			int			search_threads = SVSDefaultSearchThreads();
+			int			search_threads = (config->search_num_threads > 0) ?
+				config->search_num_threads : SVSDefaultSearchThreads();
 
 			SVSBuilderSetThreadpool(builder, search_threads);
 			ereport(DEBUG1,

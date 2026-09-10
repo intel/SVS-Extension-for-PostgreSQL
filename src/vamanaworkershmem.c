@@ -376,6 +376,33 @@ VamanaWorkerLookupSlot(Oid dbOid)
 }
 
 /*
+ * SvsCurrentSearchGrant
+ *
+ * Fast path: the worker's own control block, already resolved into
+ * VamanaWorkerShmemPtr.  Backends have no such pointer and resolve their
+ * database's entry by lookup instead.  A database with no reserved entry at
+ * all (not yet enabled for vamana) also falls back to the auto default.
+ */
+int
+SvsCurrentSearchGrant(void)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerShmemPtr;
+	uint32		grant;
+
+	if (entry == NULL)
+		entry = VamanaWorkerLookupSlot(MyDatabaseId);
+
+	if (entry == NULL)
+		return 1;
+
+	grant = pg_atomic_read_u32(&entry->grantedSearchThreads);
+	if (grant == 0)
+		grant = 1;
+
+	return (int) Min(grant, 1024);
+}
+
+/*
  * Invoke cb on every reserved (dbOid != InvalidOid) control block under a
  * single LW_SHARED pass, with the header lock held across all invocations.
  *
