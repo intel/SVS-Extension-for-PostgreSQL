@@ -71,6 +71,8 @@ typedef struct SvsParkedSlotArg
 typedef struct SvsSlotEntry
 {
 	BackgroundWorkerHandle *handle;
+	int32		slotIndex;		/* label this entry's worker was given at
+								 * registration; see AllocateSlotIndex() */
 } SvsSlotEntry;
 
 struct SvsSlotSet
@@ -82,16 +84,6 @@ struct SvsSlotSet
 	SvsSlotEntry *entries;		/* array in ctx, capacity slots */
 	int			capacity;
 	int			count;			/* slots believed live right now */
-
-	/*
-	 * Highest slotIndex ever handed out, so a regrow after a slot dies out
-	 * of turn (pg_terminate_backend, OOM kill) cannot reuse the label of a
-	 * still-live survivor.  ReapDeadSlots() shifts the entries array down
-	 * when a slot dies, but it cannot rewrite that slot's own already-
-	 * running app-name string, so slotIndex must never be recomputed from
-	 * set->count: two live workers would then show the same "X/Y" label.
-	 */
-	int			nextSlotIndex;
 
 	/*
 	 * Set once a resize leaves count < target, cleared once a later resize
@@ -111,6 +103,7 @@ static void EnsureCapacity(SvsSlotSet *set, int needed);
 static void ReapDeadSlots(SvsSlotSet *set);
 static bool WaitForSlotShutdownBounded(BackgroundWorkerHandle *handle, long timeoutMs);
 static void LogShortfallTransition(SvsSlotSet *set, int target);
+static int32 AllocateSlotIndex(SvsSlotSet *set);
 
 SvsSlotSet *
 SvsSlotSetCreate(MemoryContext ctx, const char *libraryName,
@@ -195,7 +188,7 @@ SvsSlotSetResize(SvsSlotSet *set, int target)
 		bgw.bgw_notify_pid = MyProcPid;
 
 		memset(&arg, 0, sizeof(arg));
-		arg.slotIndex = ++set->nextSlotIndex;
+		arg.slotIndex = AllocateSlotIndex(set);
 		arg.slotTotal = target;
 		arg.reserved = target;
 		strlcpy(arg.datname, set->datname, sizeof(arg.datname));
@@ -232,6 +225,7 @@ SvsSlotSetResize(SvsSlotSet *set, int target)
 		}
 
 		set->entries[set->count].handle = handle;
+		set->entries[set->count].slotIndex = arg.slotIndex;
 		set->count++;
 	}
 
@@ -302,6 +296,46 @@ ReapDeadSlots(SvsSlotSet *set)
 			i++;
 		}
 	}
+}
+
+/*
+ * The smallest positive index not already held by a live entry, so a new
+ * slot's "X/Y" label can never collide with a still-live survivor's (the
+ * original bug: recomputing from set->count reused a just-freed number
+ * while its old holder was still running) and never drifts past slotTotal
+ * either (the regression from a first fix that used an ever-increasing
+ * counter: labels like "124/6" after enough grow/shrink cycles, because a
+ * counter that only goes up eventually exceeds any fixed target).  Callers
+ * always run ReapDeadSlots() first, so set->entries here holds only slots
+ * actually believed live right now.
+ *
+ * O(count^2) across a full resize, which is fine: count is bounded by
+ * max_parallel_workers, at most a few hundred even in an extreme
+ * configuration.
+ */
+static int32
+AllocateSlotIndex(SvsSlotSet *set)
+{
+	int32		candidate;
+
+	for (candidate = 1; candidate <= set->count + 1; candidate++)
+	{
+		bool		inUse = false;
+		int			i;
+
+		for (i = 0; i < set->count; i++)
+		{
+			if (set->entries[i].slotIndex == candidate)
+			{
+				inUse = true;
+				break;
+			}
+		}
+		if (!inUse)
+			return candidate;
+	}
+
+	pg_unreachable();
 }
 
 /*

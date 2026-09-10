@@ -101,6 +101,24 @@ my $crashed_during_cycles = $node->log_contains(
 ok(!$crashed_during_cycles,
 	'case 4: server log has no crashed-worker or segfault line across the cycles');
 
+# AllocateSlotIndex() must keep every live slot's self-reported "X/Y" label
+# within 1..slotTotal even after many grow/shrink cycles; an earlier fix that
+# assigned indices from a counter that only ever increased passed every
+# check above (they never look at application_name) while still producing
+# labels like "124/6" once the counter had climbed past the six-slot total.
+my $held_final = $owner->query_safe('SELECT svs_slot_resize(6);');
+chomp $held_final;
+is($held_final, '6', 'case 4: resize(6) after the cycles converges exactly, for the label check below');
+
+my $bad_labels = $node->safe_psql('postgres',
+	"SELECT count(*) FROM pg_stat_activity " .
+	"WHERE backend_type = '$SLOT_BGW_TYPE' " .
+	"AND application_name !~ 'slot [1-6]/6'");
+chomp $bad_labels;
+is($bad_labels, '0', 'case 4: slot labels stay within total after repeated cycles');
+
+$owner->query_safe('SELECT svs_slot_resize(0);');
+
 # ---------------------------------------------------------------------------
 # Case 5: owner death, both kinds.  A crash and a clean exit have genuinely
 # different mechanics -- SIGKILL takes the whole cluster down with it and
@@ -195,11 +213,16 @@ chomp $held_when_exhausted;
 ok($held_when_exhausted =~ /^\d+$/ && $held_when_exhausted < 8,
 	"case 6: max_worker_processes exhaustion holds fewer than requested (held $held_when_exhausted)");
 
+# LogShortfallTransition() no longer guesses which limit is binding (see
+# svs_cpu_slots.c); it reports only the held/requested counts, which is
+# already enough to tell this case apart from case 2's: case 2 holds
+# max_parallel_workers (4) of 8 requested, this case holds fewer than that
+# because the background worker slot table ran out first.
 my $shortfall_line = $node->log_contains(
-	qr/svs cpu slots: holding \d+ of 8 requested.*below max_parallel_workers.*background worker slot table/s,
+	qr/svs cpu slots: holding $held_when_exhausted of 8 requested/,
 	$pre_exhaust_offset);
 ok($shortfall_line,
-	'case 6: shortfall is logged as the background worker slot table, distinguishable from case 2\'s pool-limit line');
+	"case 6: shortfall is logged holding $held_when_exhausted of 8, fewer than case 2's max_parallel_workers-of-8 shortfall");
 
 $node->safe_psql('postgres', 'SELECT svs_slot_release_all();');
 
