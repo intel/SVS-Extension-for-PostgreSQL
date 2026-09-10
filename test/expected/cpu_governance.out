@@ -1,0 +1,184 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+-- CPU grant observability: pg_stat_vamana_worker's search_threads_desired,
+-- search_threads_granted, search_threads_reserved, and
+-- max_search_threads_per_db columns.  These only read values PublishCpuGrants
+-- (src/vamanalauncher.c) already computes and writes on every reconcile;
+-- nothing here changes how a grant is computed, published, or applied.
+-- Enable this database and wait for its worker before any index work, so
+-- this file runs standalone.  Idempotent and a no-op in the full suite,
+-- where vamana_databases.sql (ordered first) has already warmed it.
+INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true)
+	ON CONFLICT (datname) DO NOTHING;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+-- Unconfigured default: search_num_threads NULL and svs.search_num_threads at
+-- its compiled default (0 = auto) must resolve desired to 1, not
+-- nproc-1/max_parallel_workers.  The regression config pins
+-- svs.search_num_threads away from its compiled default for other tests, so
+-- force it back to 0 here rather than trust whatever the harness configured,
+-- then restore it once this assertion is taken.
+ALTER SYSTEM SET svs.search_num_threads = 0;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+UPDATE vamana_databases SET search_num_threads = NULL, search_threads_reserved = 0
+	WHERE datname = current_database();
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND search_threads_desired = 1;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+-- ResolveOrFallback(searchNumThreadsDefault, 1) is the calculator's fallback
+-- (src/svs_cpu_budget.c); this pins that behavior rather than nproc-1, which
+-- is what an uninitialized or copy-pasted-from-elsewhere ceiling would look
+-- like.
+SELECT search_threads_desired, search_threads_reserved FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+ search_threads_desired | search_threads_reserved 
+------------------------+-------------------------
+                      1 |                       0
+(1 row)
+
+-- Restore the cluster default the regression config expects for every other
+-- test file in this suite.
+ALTER SYSTEM SET svs.search_num_threads = 8;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
+-- Columns reflect configuration: a per-database UPDATE, driven through
+-- catalog DML so the vamana_databases_changed NOTIFY wakes the launcher
+-- promptly rather than waiting out its three-minute naptime.
+UPDATE vamana_databases SET search_num_threads = 6, search_threads_reserved = 2
+	WHERE datname = current_database();
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND search_threads_desired = 6;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+-- desired and reserved are written unconditionally every reconcile, so they
+-- are asserted exactly once desired has caught up to the new catalog value.
+-- granted is only rewritten when it changes and is otherwise contention-
+-- dependent, so it is asserted by shape, not by a racy literal: it can never
+-- exceed the ask and, uncontended, can never fall below the honored floor.
+SELECT search_threads_desired = 6 AS desired_ok,
+	   search_threads_reserved = 2 AS reserved_ok,
+	   search_threads_granted <= search_threads_desired AS granted_le_desired,
+	   search_threads_granted >= search_threads_reserved AS granted_ge_reserved
+	FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+ desired_ok | reserved_ok | granted_le_desired | granted_ge_reserved 
+------------+-------------+--------------------+---------------------
+ t          | t           | t                  | t
+(1 row)
+
+-- max_search_threads_per_db reports the resolved ceiling (it follows
+-- max_parallel_workers when svs.max_search_threads_per_db is left at its
+-- 0 = "follow" default), not the raw GUC value, since 0 the raw value would
+-- tell a DBA nothing to compare a grant against.
+SELECT (SELECT max_search_threads_per_db FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database()))
+	   = (SELECT setting::int FROM pg_settings WHERE name = 'max_parallel_workers') AS ceiling_follows_max_parallel_workers;
+ ceiling_follows_max_parallel_workers 
+--------------------------------------
+ t
+(1 row)
+
+-- Visibility gate: an unprivileged caller sees only its own database's row;
+-- a pg_read_all_stats member sees every reserved database.  Reuses the
+-- permanent 'postgres' database as the second live row instead of creating
+-- and tearing down a throwaway database, since disabling a database's worker
+-- releases its shmem slot asynchronously (a launcher reconcile, not this
+-- UPDATE's commit) and this test has no need to wait on that.
+INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true)
+	ON CONFLICT (datname) DO UPDATE SET enabled = true;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+-- Two distinct databases now have a reserved row.
+SELECT count(DISTINCT db_oid) >= 2 AS at_least_two_rows_exist FROM pg_stat_vamana_worker;
+ at_least_two_rows_exist 
+-------------------------
+ t
+(1 row)
+
+CREATE ROLE cpu_governance_unpriv NOLOGIN;
+CREATE ROLE cpu_governance_privileged NOLOGIN;
+GRANT pg_read_all_stats TO cpu_governance_privileged;
+-- Unprivileged: sees exactly its own database's row, never the other one.
+SET ROLE cpu_governance_unpriv;
+SELECT count(DISTINCT db_oid) AS visible_rows,
+	   bool_and(db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())) AS only_self
+	FROM pg_stat_vamana_worker;
+ visible_rows | only_self 
+--------------+-----------
+            1 | t
+(1 row)
+
+RESET ROLE;
+-- pg_read_all_stats member: sees both.
+SET ROLE cpu_governance_privileged;
+SELECT count(DISTINCT db_oid) >= 2 AS sees_all_rows FROM pg_stat_vamana_worker;
+ sees_all_rows 
+---------------
+ t
+(1 row)
+
+RESET ROLE;
+DROP ROLE cpu_governance_unpriv;
+DROP ROLE cpu_governance_privileged;
+-- Remove the 'postgres' row entirely: this file may run before
+-- vamana_databases.sql (regression file order is alphabetical, not
+-- suite-defined), and that file inserts its own fresh 'postgres' row,
+-- which would collide with one left behind here.  The BEFORE DELETE guard
+-- only rejects a database with live vamana indexes (none exist in
+-- 'postgres'), so this succeeds regardless of whether the launcher has
+-- released the shmem slot yet.
+DELETE FROM vamana_databases WHERE datname = 'postgres';
+-- Restore this database's own row to its pre-test configuration, so later
+-- regression files that share contrib_regression don't inherit this file's
+-- thread governance settings.
+UPDATE vamana_databases SET search_num_threads = NULL, search_threads_reserved = 0
+	WHERE datname = current_database();
