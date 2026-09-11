@@ -369,6 +369,17 @@ void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_i
  * VamanaWorkerShmemPtr, whose entry is only released once the launcher has
  * confirmed the worker stopped, and the backend IPC claim path, whose request
  * spans a wake-up and a wait that no lock can be held across.
+ *
+ * One caller still writes through it and is not meant to: the launcher's
+ * CPU-grant pass (PublishCpuGrants), which caches entries across
+ * SvsComputeCpuGrants and writes the grants afterwards.  Nothing can recycle an
+ * entry underneath it today, but only because the launcher is the sole releaser
+ * of a reserved one — a fact about the callers, not something this API
+ * guarantees.  Its build-grant half cannot simply move under the callback
+ * either: publishing a grant calls SvsWakeBackend, which reaches ProcArrayLock,
+ * and the callback contract below forbids that.  Retiring it wants a generation
+ * stamp owned by reserve and release, or a wake deferred until after the lock is
+ * dropped, so it is left to its own change rather than patched here.
  */
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
