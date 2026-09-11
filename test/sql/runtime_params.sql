@@ -219,6 +219,96 @@ SHOW svs.checkpoint_operations;
 ALTER SYSTEM RESET svs.checkpoint_operations;
 SELECT pg_reload_conf();
 
+-- svs.max_build_memory / svs.max_residency_memory / svs.default_residency_memory /
+-- svs.max_search_work_mem / svs.default_search_work_mem: all [1, INT_MAX] MB,
+-- default 100MB, PGC_SIGHUP. Always finite: no "0 means unlimited" path.
+
+SHOW svs.max_build_memory;
+SHOW svs.max_residency_memory;
+SHOW svs.default_residency_memory;
+SHOW svs.max_search_work_mem;
+SHOW svs.default_search_work_mem;
+
+-- Out-of-range (below min): rejected at ALTER SYSTEM time
+ALTER SYSTEM SET svs.max_build_memory = 0;
+ALTER SYSTEM SET svs.max_residency_memory = 0;
+ALTER SYSTEM SET svs.default_residency_memory = 0;
+ALTER SYSTEM SET svs.max_search_work_mem = 0;
+ALTER SYSTEM SET svs.default_search_work_mem = 0;
+ALTER SYSTEM SET svs.max_build_memory = -1;
+
+-- Valid lower boundary, each GUC
+ALTER SYSTEM SET svs.max_build_memory = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_build_memory;
+ALTER SYSTEM RESET svs.max_build_memory;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.max_residency_memory = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_residency_memory;
+ALTER SYSTEM RESET svs.max_residency_memory;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.default_residency_memory = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.default_residency_memory;
+ALTER SYSTEM RESET svs.default_residency_memory;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.max_search_work_mem = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_search_work_mem;
+ALTER SYSTEM RESET svs.max_search_work_mem;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.default_search_work_mem = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.default_search_work_mem;
+ALTER SYSTEM RESET svs.default_search_work_mem;
+SELECT pg_reload_conf();
+
+-- Valid upper boundary, each GUC
+ALTER SYSTEM SET svs.max_build_memory = 2147483647;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_build_memory;
+ALTER SYSTEM RESET svs.max_build_memory;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.max_residency_memory = 2147483647;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_residency_memory;
+ALTER SYSTEM RESET svs.max_residency_memory;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.default_residency_memory = 2147483647;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.default_residency_memory;
+ALTER SYSTEM RESET svs.default_residency_memory;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.max_search_work_mem = 2147483647;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.max_search_work_mem;
+ALTER SYSTEM RESET svs.max_search_work_mem;
+SELECT pg_reload_conf();
+
+ALTER SYSTEM SET svs.default_search_work_mem = 2147483647;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
+SHOW svs.default_search_work_mem;
+ALTER SYSTEM RESET svs.default_search_work_mem;
+SELECT pg_reload_conf();
+
 -- svs.checkpoint_interval: [-1, 86400] s
 
 -- Out-of-range

@@ -4,6 +4,7 @@
 -- Table shape, including both triggers' declared firing conditions
 
 \d vamana_databases
+\d svs_index_residency
 
 -- The row-level trigger resolves datname against pg_database, so every row
 -- here must name a database that actually exists.
@@ -26,16 +27,27 @@ DELETE FROM vamana_databases WHERE datname = 'template1';
 -- Placeholder columns accept NULL and non-NULL values
 
 INSERT INTO vamana_databases (datname) VALUES ('vamana_databases_test_dbd');
-INSERT INTO vamana_databases (datname, graph_memory_mb, total_memory_mb, search_num_threads)
-	VALUES ('vamana_databases_test_dbe', 512, 4096, 8);
+INSERT INTO vamana_databases (datname, graph_memory_mb, residency_memory, search_work_mem, search_num_threads)
+	VALUES ('vamana_databases_test_dbe', 512, 4096, 2048, 8);
 -- Scoped to the rows this test created: other regression files may have
 -- already self-enrolled their own database (e.g. contrib_regression) by the
 -- time this file runs, and this assertion must not depend on run order.
-SELECT datname, graph_memory_mb, total_memory_mb, search_num_threads
+SELECT datname, graph_memory_mb, residency_memory, search_work_mem, search_num_threads
 	FROM vamana_databases
 	WHERE datname IN ('postgres', 'vamana_databases_test_dbc',
 					   'vamana_databases_test_dbd', 'vamana_databases_test_dbe')
 	ORDER BY datname;
+
+-- residency_memory and search_work_mem each reject zero and negative values,
+-- symmetric with every other placeholder column's CHECK (> 0).
+INSERT INTO vamana_databases (datname, residency_memory) VALUES ('vamana_databases_test_dbd', 0);
+INSERT INTO vamana_databases (datname, residency_memory) VALUES ('vamana_databases_test_dbd', -1);
+INSERT INTO vamana_databases (datname, search_work_mem) VALUES ('vamana_databases_test_dbd', 0);
+INSERT INTO vamana_databases (datname, search_work_mem) VALUES ('vamana_databases_test_dbd', -1);
+
+-- total_memory_mb no longer exists: the residency/build axis split (design
+-- doc Section 5.3) dissolved the combined cap.
+SELECT total_memory_mb FROM vamana_databases LIMIT 0;
 
 -- INSERT/UPDATE/DELETE/TRUNCATE are all revoked from PUBLIC; the table owner
 -- retains them
@@ -78,6 +90,60 @@ DROP DATABASE vamana_databases_test_leak;
 -- reserves the slot at COMMIT and spawns the worker; the first search then
 -- waits for it via VamanaWorkerWaitUntilAvailable.
 INSERT INTO vamana_databases (datname, enabled) VALUES ('contrib_regression', true);
+
+-- New memory-accounting stats columns: shape, NULL-safety, and visibility.
+-- Nothing has admitted this database into the accounting module yet, so
+-- residency_bytes_committed/build_bytes_committed are NULL -- and
+-- residency_drift, the one column computed in SQL rather than C, must
+-- propagate that NULL through its join and subtraction rather than
+-- coalescing it into a false zero.
+SELECT residency_bytes_committed IS NULL AS committed_is_null,
+       build_bytes_committed IS NULL AS build_is_null,
+       residency_drift IS NULL AS drift_is_null,
+       search_scratch_bytes_in_flight
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- The slot-grain column exists and reads NULL until something computes it.
+SELECT DISTINCT search_scratch_bytes_per_query IS NULL AS unset_before_any_search
+  FROM pg_stat_vamana_worker_slot
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- An unprivileged role reads these columns for its own row only, the same
+-- visibility rule as every other pg_stat_vamana_worker column. Enabling a
+-- second database gives a real foreign row to check the unprivileged role
+-- cannot see, not just a NULL one indistinguishable from "nothing admitted".
+UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+-- Confirm the foreign row actually exists as superuser first, so the
+-- unprivileged role's zero-row result below proves visibility is denied
+-- rather than proving the row never showed up.
+SELECT count(*) = 1 AS foreign_row_exists_for_superuser
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+
+CREATE ROLE vamana_databases_test_stats_reader NOLOGIN;
+SET ROLE vamana_databases_test_stats_reader;
+SELECT residency_bytes_committed, build_bytes_committed, residency_drift,
+       search_scratch_bytes_in_flight
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+SELECT count(*) = 0 AS foreign_row_not_visible
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+RESET ROLE;
+DROP ROLE vamana_databases_test_stats_reader;
+
+UPDATE vamana_databases SET enabled = false WHERE datname = 'postgres';
 
 -- Live-index counter is commit-accurate.  The BEFORE DELETE guard reads
 -- indexCount as a hard gate, so it must equal committed catalog truth and

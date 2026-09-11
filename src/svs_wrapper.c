@@ -556,6 +556,95 @@ SVSBatchSearch(Oid indexRelid, SVSIndexHandle index,
 	return total;
 }
 
+uint64
+SVSGetIndexMemoryUsage(SVSIndexHandle index)
+{
+	svs_error_h error = svs_error_create();
+	size_t		bytes = 0;
+
+	svs_index_get_memory_usage((svs_index_h) index, &bytes, error);
+
+	CheckSVSError(error, "get index memory usage");
+	svs_error_free(error);
+
+	return bytes;
+}
+
+void
+SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out)
+{
+	svs_error_h error = svs_error_create();
+	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+
+	svs_index_get_memory_breakdown((svs_index_h) index, &breakdown, error);
+
+	CheckSVSError(error, "get index memory breakdown");
+	svs_error_free(error);
+
+	out->graphBytes = breakdown.graph_bytes;
+	out->dataBytes = breakdown.data_bytes;
+	out->metadataBytes = breakdown.metadata_bytes;
+}
+
+void
+SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out)
+{
+	svs_error_h error = svs_error_create();
+	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+
+	svs_index_builder_estimate_memory_dynamic((svs_index_builder_h) builder,
+											   (size_t) numVectors,
+											   0, /* blocksize_bytes: use builder default */
+											   &breakdown,
+											   error);
+
+	CheckSVSError(error, "estimate build memory");
+	svs_error_free(error);
+
+	out->graphBytes = breakdown.graph_bytes;
+	out->dataBytes = breakdown.data_bytes;
+	out->metadataBytes = breakdown.metadata_bytes;
+}
+
+uint64
+SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors)
+{
+	svs_error_h error = svs_error_create();
+	svs_search_params_h search_params;
+	size_t		bytes = 0;
+
+	search_params = svs_search_params_create_vamana((size_t) searchWindowSize, error);
+
+	if (!svs_error_ok(error) || search_params == NULL)
+	{
+		CheckSVSError(error, "create search params for search memory estimate");
+		svs_error_free(error);
+		return 0;
+	}
+
+	PG_TRY();
+	{
+		svs_index_builder_estimate_search_memory_dynamic((svs_index_builder_h) builder,
+														   (size_t) numQueries,
+														   (size_t) numNeighbors,
+														   search_params,
+														   NULL, /* id_filter: no qual pushdown */
+														   0,	 /* blocksize_bytes: use builder default */
+														   &bytes,
+														   error);
+	}
+	PG_FINALLY();
+	{
+		svs_search_params_free(search_params);
+	}
+	PG_END_TRY();
+
+	CheckSVSError(error, "estimate search memory");
+	svs_error_free(error);
+
+	return bytes;
+}
+
 int
 SVSSaveIndex(SVSIndexHandle index, const char *path)
 {

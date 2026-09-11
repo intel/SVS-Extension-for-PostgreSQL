@@ -23,6 +23,7 @@
 
 #include "postgres.h"
 
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
@@ -76,9 +77,17 @@ typedef struct VamanaWorkerSnapshot
 	bool		evictAll;
 	uint64		heartbeatRaw;
 	uint32		indexCount;
+	uint64		searchWorkMemLimitBytes;
+	uint64		searchScratchBytesInFlight;
 	uint32		searchThreadsDesired;
 	uint32		searchThreadsGranted;
 	uint32		searchThreadsReserved;
+
+	/* Filled by a second, memLock-guarded pass; see pg_stat_vamana_worker(). */
+	bool		residencyAdmitted;
+	uint64		residencyBudgetBytes;
+	uint64		residencyBytesCommitted;
+	uint64		buildBytesCommitted;
 } VamanaWorkerSnapshot;
 
 /*
@@ -132,6 +141,12 @@ VamanaStatEntryVisible(const VamanaStatVisibility *vis, Oid dbOid)
 	return vis->seeAll || dbOid == vis->selfDbOid;
 }
 
+static inline int64
+VamanaStatBytesDatum(uint64 bytes)
+{
+	return (int64) Min(bytes, (uint64) PG_INT64_MAX);
+}
+
 static VamanaStatVisibility
 VamanaStatVisibilityForCaller(void)
 {
@@ -145,19 +160,28 @@ VamanaStatVisibilityForCaller(void)
 /* -----------------------------------------------------------------------
  * pg_stat_vamana_worker(): one row per reserved database (worker grain).
  *
- * Column layout (10 columns):
- *   0  db_oid                     oid
- *   1  worker_pid                 int4         (0 -> NULL)
- *   2  worker_state               text         (see VamanaWorkerStateName)
- *   3  index_count                int4         (NULL on a standby — counter not maintained)
- *   4  evict_all                  bool
- *   5  heartbeat_ts               timestamptz  (0 -> NULL)
- *   6  search_threads_desired     int4         (resolved, clamped ask; 0 when not live)
- *   7  search_threads_granted     int4         (pool-arbitrated grant; 0 when not live)
- *   8  search_threads_reserved    int4         (floor actually honored; 0 when not live)
- *   9  max_search_threads_per_db  int4         (resolved ceiling; not per-entry, no lock needed)
+ * Column layout (15 columns):
+ *   0  db_oid                         oid
+ *   1  worker_pid                     int4         (0 -> NULL)
+ *   2  worker_state                   text         (see VamanaWorkerStateName)
+ *   3  index_count                    int4         (NULL on a standby — counter not maintained)
+ *   4  evict_all                      bool
+ *   5  heartbeat_ts                   timestamptz  (0 -> NULL)
+ *   6  residency_bytes_committed      int8         (NULL if never admitted)
+ *   7  build_bytes_committed          int8         (NULL if never admitted)
+ *   8  residency_memory_limit         int8         (NULL if never admitted)
+ *   9  search_work_mem_limit          int8
+ *  10  search_scratch_bytes_in_flight int8
+ *  11  search_threads_desired         int4         (resolved, clamped ask; 0 when not live)
+ *  12  search_threads_granted         int4         (pool-arbitrated grant; 0 when not live)
+ *  13  search_threads_reserved        int4         (floor actually honored; 0 when not live)
+ *  14  max_search_threads_per_db      int4         (resolved ceiling; not per-entry, no lock needed)
  *
- * Unlike index_count, columns 6-8 are populated on a standby: PublishCpuGrants
+ * residency_drift is not a column here: it needs svs_index_residency, a
+ * catalog table, which this function never touches. The CREATE VIEW joins
+ * it in instead -- see sql/svs--0.1.0.sql.
+ *
+ * Unlike index_count, columns 11-13 are populated on a standby: PublishCpuGrants
  * runs unconditionally on every launcher reconcile, primary or standby, and
  * ReadDatabaseRows is a read-only SPI SELECT that works fine under recovery.
  * index_count differs because VamanaIndexCountIsMaintained() is specifically
@@ -166,7 +190,7 @@ VamanaStatVisibilityForCaller(void)
  * the launcher actually published.
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_COLS 10
+#define PG_STAT_VAMANA_WORKER_COLS 15
 
 typedef struct VamanaWorkerHydrateCtx
 {
@@ -194,9 +218,19 @@ VamanaWorkerHydrateCb(VamanaWorkerShmem *entry, void *ctxArg)
 	snap->evictAll = (pg_atomic_read_u32(&entry->evict_all) != 0);
 	snap->heartbeatRaw = pg_atomic_read_u64(&entry->heartbeat_ts);
 	snap->indexCount = pg_atomic_read_u32(&entry->indexCount);
+
+	/*
+	 * Safe under the header lock: searchWorkMemMbOverride is guarded by
+	 * that same lock (set by the launcher at slot reservation), and
+	 * searchScratchBytesInFlight is its own atomic, never memLock.
+	 */
+	snap->searchWorkMemLimitBytes = SvsMemoryResolveSearchWorkMem(entry);
+	snap->searchScratchBytesInFlight = pg_atomic_read_u64(&entry->searchScratchBytesInFlight);
+
 	snap->searchThreadsDesired = pg_atomic_read_u32(&entry->desiredSearchThreads);
 	snap->searchThreadsGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
 	snap->searchThreadsReserved = pg_atomic_read_u32(&entry->reservedSearchThreads);
+
 	ctx->count++;
 }
 
@@ -223,6 +257,26 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	ctx.snapshots = palloc(sizeof(VamanaWorkerSnapshot) * ctx.capacity);
 
 	VamanaWorkerForEachReserved(VamanaWorkerHydrateCb, &ctx);
+
+	/*
+	 * A second pass, header lock released: residencyBudget/residencyBytes-
+	 * Committed/buildBytesCommitted are memLock-guarded, and memLock must be
+	 * acquired before the header lock, never after (Section 5.5), so they
+	 * cannot be read from inside VamanaWorkerHydrateCb.
+	 */
+	for (int i = 0; i < ctx.count; i++)
+	{
+		VamanaWorkerSnapshot *snap = &ctx.snapshots[i];
+		SvsMemoryStats stats;
+
+		snap->residencyAdmitted = SvsMemoryReadStats(snap->dbOid, &stats);
+		if (snap->residencyAdmitted)
+		{
+			snap->residencyBudgetBytes = stats.residencyBudget;
+			snap->residencyBytesCommitted = stats.residencyBytesCommitted;
+			snap->buildBytesCommitted = stats.buildBytesCommitted;
+		}
+	}
 
 	/* Node role and clock are call-wide facts; sample each once, classify pure. */
 	isPrimary = VamanaNodeIsPrimary();
@@ -269,10 +323,26 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 		else
 			nulls[5] = true;
 
-		values[6] = Int32GetDatum((int32) snap->searchThreadsDesired);
-		values[7] = Int32GetDatum((int32) snap->searchThreadsGranted);
-		values[8] = Int32GetDatum((int32) snap->searchThreadsReserved);
-		values[9] = Int32GetDatum(maxSearchThreadsPerDb);
+		if (snap->residencyAdmitted)
+		{
+			values[6] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBytesCommitted));
+			values[7] = Int64GetDatum(VamanaStatBytesDatum(snap->buildBytesCommitted));
+			values[8] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBudgetBytes));
+		}
+		else
+		{
+			nulls[6] = true;
+			nulls[7] = true;
+			nulls[8] = true;
+		}
+
+		values[9] = Int64GetDatum(VamanaStatBytesDatum(snap->searchWorkMemLimitBytes));
+		values[10] = Int64GetDatum(VamanaStatBytesDatum(snap->searchScratchBytesInFlight));
+
+		values[11] = Int32GetDatum((int32) snap->searchThreadsDesired);
+		values[12] = Int32GetDatum((int32) snap->searchThreadsGranted);
+		values[13] = Int32GetDatum((int32) snap->searchThreadsReserved);
+		values[14] = Int32GetDatum(maxSearchThreadsPerDb);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -284,16 +354,21 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
  * pg_stat_vamana_worker_slot(): one row per work-slot across all reserved
  * databases (slot grain).
  *
- * Column layout (6 columns):
- *   0  db_oid         oid
- *   1  slot_index     int4
- *   2  slot_status    text   ("empty"/"pending"/"processing"/"done"/"error")
- *   3  slot_kind      text   ("search"/"insert"/"delete"/"maintenance"/"load"/"warmup"/NULL)
- *   4  index_relid    oid    (NULL when empty or InvalidOid)
- *   5  error_message  text   (NULL unless status == error)
+ * Column layout (7 columns):
+ *   0  db_oid                         oid
+ *   1  slot_index                     int4
+ *   2  slot_status                    text   ("empty"/"pending"/"processing"/"done"/"error")
+ *   3  slot_kind                      text   ("search"/"insert"/"delete"/"maintenance"/"load"/"warmup"/NULL)
+ *   4  index_relid                    oid    (NULL when empty or InvalidOid)
+ *   5  error_message                  text   (NULL unless status == error)
+ *   6  search_scratch_bytes_per_query int8   (NULL when index_relid is NULL, or not yet computed)
+ *
+ * search_scratch_bytes_per_query lives here, not on pg_stat_vamana_worker:
+ * it is memoized per index, keyed by index_relid, and this is the only view
+ * already keyed that way.
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_SLOT_COLS 6
+#define PG_STAT_VAMANA_WORKER_SLOT_COLS 7
 
 /*
  * One work-slot's presentation snapshot, read with the acquire barrier that
@@ -458,6 +533,23 @@ pg_stat_vamana_worker_slot(PG_FUNCTION_ARGS)
 			values[5] = CStringGetTextDatum(snap->errorMessage);
 		else
 			nulls[5] = true;
+
+		/*
+		 * Header lock already released here (VamanaWorkerForEachReserved
+		 * returned above); safe to take memLock via this call.
+		 */
+		if (snap->status != VAMANA_SLOT_EMPTY && OidIsValid(snap->indexRelid))
+		{
+			uint64		bytesPerQuery =
+				SvsMemorySearchScratchBytesPerQuery(row->dbOid, snap->indexRelid);
+
+			if (bytesPerQuery != 0)
+				values[6] = Int64GetDatum(VamanaStatBytesDatum(bytesPerQuery));
+			else
+				nulls[6] = true;
+		}
+		else
+			nulls[6] = true;
 
 		/* Test hook: TAP proves this runs outside the header LW_SHARED hold. */
 		INJECTION_POINT("vamana-slot-stat-emit-row", NULL);

@@ -136,6 +136,85 @@ sub wait_for_worker_count
 }
 
 # ---------------------------------------------------------------------------
+# Memory-governance override materialization does not crash the launcher,
+# and its resolved values surface correctly through pg_stat_vamana_worker.
+#
+# Two databases enrolled with distinct residency_memory/search_work_mem
+# overrides, then one updated, exercise PublishMemoryOverrides at both slot
+# reservation and reconcile-refresh time, and this test confirms the
+# launcher's positional SPI read (residency_memory/search_work_mem at
+# columns 7/8) lands each value in the right shmem field, not shifted.
+#
+# search_work_mem_limit is asserted against its exact resolved value:
+# SvsMemoryResolveSearchWorkMem has no admission gate. residency_memory_limit
+# is asserted NULL: SvsMemoryAdmitDatabase is not called from any production
+# path yet (that lands with Track A, after this gate), so residencyBudget is
+# genuinely never set at this stage -- this is not a placeholder, it is the
+# correct current behavior.
+# ---------------------------------------------------------------------------
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_launcher_memory_overrides');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE DATABASE mem_ovr_a;");
+    $node->safe_psql('postgres', "CREATE DATABASE mem_ovr_b;");
+
+    $node->safe_psql('postgres', qq{
+        INSERT INTO vamana_databases (datname, enabled, residency_memory, search_work_mem) VALUES
+            ('mem_ovr_a', true, 512, 128),
+            ('mem_ovr_b', true, 256, 64);
+    });
+
+    is(wait_for_worker_count($node, 2, 40), '2',
+        'launcher spawns workers for both databases with distinct memory overrides');
+
+    is($node->safe_psql('postgres', qq{
+        SELECT search_work_mem_limit
+          FROM pg_stat_vamana_worker
+         WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'mem_ovr_a');
+    }), 134217728, 'mem_ovr_a search_work_mem override (128MB) resolves via the stats view');
+
+    is($node->safe_psql('postgres', qq{
+        SELECT search_work_mem_limit
+          FROM pg_stat_vamana_worker
+         WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'mem_ovr_b');
+    }), 67108864, 'mem_ovr_b search_work_mem override (64MB) resolves via the stats view');
+
+    is($node->safe_psql('postgres', qq{
+        SELECT residency_memory_limit IS NULL
+          FROM pg_stat_vamana_worker
+         WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'mem_ovr_a');
+    }), 't', 'residency_memory_limit is NULL before SvsMemoryAdmitDatabase is ever called');
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET residency_memory = 1024 WHERE datname = 'mem_ovr_a';");
+
+    # No restart, no crash: the next reconcile pass re-materializes the
+    # changed override without disturbing either worker.
+    usleep(2_000_000);
+    is(worker_count($node, 'mem_ovr_a'), '1',
+        'worker for mem_ovr_a survives its residency_memory override changing');
+    is(worker_count($node, 'mem_ovr_b'), '1',
+        'worker for mem_ovr_b is unaffected by mem_ovr_a\'s override change');
+
+    is($node->safe_psql('postgres', qq{
+        SELECT search_work_mem_limit
+          FROM pg_stat_vamana_worker
+         WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'mem_ovr_a');
+    }), 134217728, 'mem_ovr_a search_work_mem override is unaffected by its residency_memory override changing');
+
+    $node->stop;
+}
+
+# ---------------------------------------------------------------------------
 # A launcher restart must not disturb an already-running worker.
 #
 # The restarted launcher's ledger starts empty, even though the per-database
@@ -262,6 +341,15 @@ sub wait_for_worker_count
     chomp $seen_a;
     is($seen_a, $iso_a_oid,
         'unprivileged backend in iso_a sees only its own row (no cross-db leakage)');
+
+    # Group 4/Task 7's new columns are visible through the same GRANT, for
+    # the same unprivileged role, on its own row.
+    my $seen_a_search_limit = $node->safe_psql('iso_a',
+        "SELECT search_work_mem_limit FROM pg_stat_vamana_worker;",
+        extra_params => [ '-U', 'unpriv' ]);
+    chomp $seen_a_search_limit;
+    ok($seen_a_search_limit =~ /^\d+$/,
+        'unprivileged backend in iso_a can read search_work_mem_limit on its own row');
 
     # A backend in iso_a, forced to search, is served by iso_a's own
     # worker.  A successful worker-mode search proves the backend resolved its
