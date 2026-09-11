@@ -191,6 +191,40 @@ SELECT svs_memory_reconcile_load(533, 7, (1 * 1024 * 1024 + 1)::bigint);
 SELECT * FROM svs_memory_read_stats(533);
 SELECT * FROM svs_memory_test_check_invariants();
 
+-- ReconcileLoad's existing-reservation fits check, and which field it folds
+-- out of the running total for a RESERVED record: the estimate, not a
+-- measured value it has never taken. A measured load landing exactly on
+-- budget fits, and the reservation reconciles to RESIDENT with no owner.
+SELECT svs_memory_admit_database(535, (10 * 1024 * 1024)::bigint);
+SELECT svs_memory_reserve_build(535, 1, 0::bigint, (4 * 1024 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(535, 1, (10 * 1024 * 1024)::bigint) AS fits;
+SELECT residency_bytes_committed = (10 * 1024 * 1024) AS committed_equals_measured
+  FROM svs_memory_read_stats(535);
+SELECT relid, state, owner_pid FROM svs_memory_test_reservations(535);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Free 535's budget back to the shared global ceiling; later boundary
+-- tests in this section need the headroom, same as db 520 below.
+SELECT svs_memory_account_unload(535, 1);
+SELECT svs_memory_admit_database(535, 1::bigint);
+
+-- ReanchorInsert's over-budget warning: a reanchor landing exactly on the
+-- budget stays silent; one byte more warns.
+SELECT svs_memory_admit_database(536, (1 * 1024 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(536, 1, (900 * 1024)::bigint);
+SELECT svs_memory_reanchor_insert(536, 1, (1 * 1024 * 1024)::bigint);
+SELECT residency_bytes_committed = (1 * 1024 * 1024) AS exactly_at_budget_no_warning
+  FROM svs_memory_read_stats(536);
+SELECT svs_memory_reanchor_insert(536, 1, (1 * 1024 * 1024 + 1)::bigint);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Unwind 536's deliberate overage: both the invariant violation and its
+-- budget must not leak into the rest of the file, the same as db 542
+-- later in this file.
+SELECT svs_memory_account_unload(536, 1);
+SELECT svs_memory_admit_database(536, 1::bigint);
+SELECT * FROM svs_memory_test_check_invariants();
+
 -- ReserveInsert's fits check: a delta that exactly fills the budget
 -- succeeds; one byte more fails and reserves nothing.
 SELECT svs_memory_admit_database(534, (1 * 1024 * 1024)::bigint);
@@ -198,6 +232,21 @@ SELECT svs_memory_reserve_insert(534, 8, (1 * 1024 * 1024)::bigint);
 SELECT * FROM svs_memory_read_stats(534);
 SELECT svs_memory_reserve_insert(534, 9, 1::bigint);
 SELECT * FROM svs_memory_read_stats(534);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- With two pending inserts on the same relid, reanchoring folds out only
+-- the older one's delta and leaves the newer one still pending. Its delta
+-- differs from the older one's, so folding the wrong one would land the
+-- committed total on a different number than the one asserted below.
+SELECT svs_memory_admit_database(560, (20 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(560, 1, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_insert(560, 1, (1 * 1024)::bigint);
+SELECT svs_memory_reserve_insert(560, 1, (3 * 1024)::bigint);
+SELECT svs_memory_reanchor_insert(560, 1, (11 * 1024)::bigint);
+SELECT residency_bytes_committed = (14 * 1024) AS older_deltas_folded_newer_still_pending
+  FROM svs_memory_read_stats(560);
+SELECT delta_bytes = (3 * 1024) AS newer_pending_insert_survives
+  FROM svs_memory_test_insert_reservations(560);
 SELECT * FROM svs_memory_test_check_invariants();
 
 -- Abort on a RESIDENT record releases its measured bytes, the amount the
@@ -237,6 +286,11 @@ SELECT residency_bytes_committed > residency_budget AS over_budget_after_reancho
 SELECT svs_memory_reconcile_load(542, 2, (100 * 1024)::bigint) AS fits;
 SELECT residency_bytes_committed = (1200 * 1024) AS committed_unchanged_by_failed_load
   FROM svs_memory_read_stats(542);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Unload the deliberate overage above so it does not leak into every
+-- check_invariants() call for the rest of this file.
+SELECT svs_memory_account_unload(542, 1);
 SELECT * FROM svs_memory_test_check_invariants();
 
 -- Guard: a database cannot have two live reservations for the same relid.
@@ -354,4 +408,23 @@ SELECT svs_memory_reserve_build(612, 1, 1024::bigint, 1::bigint);
 SELECT relid, state, owner_pid = pg_backend_pid() AS owned_by_this_backend,
        estimate_bytes, measured_bytes, build_peak_bytes
   FROM svs_memory_test_reservations(612);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- SvsMemoryResetDatabaseAccounting, run on a slot release: rolling one
+-- database's contribution out of the global totals must not touch another
+-- database's. It also erases the reset database's own reservations, so a
+-- reload starts clean rather than inheriting a recycled slot's tenant.
+SELECT svs_memory_admit_database(620, (5 * 1024)::bigint);
+SELECT svs_memory_reserve_build(620, 1, (1 * 1024)::bigint, (1 * 1024)::bigint);
+SELECT svs_memory_admit_database(621, (5 * 1024)::bigint);
+SELECT svs_memory_reserve_build(621, 1, (2 * 1024)::bigint, (2 * 1024)::bigint);
+SELECT * FROM svs_memory_read_stats(621) \gset before_621_
+SELECT svs_memory_test_reset_database_accounting(620);
+SELECT count(*) = 0 AS reset_database_no_longer_admitted
+  FROM svs_memory_read_stats(620);
+SELECT count(*) = 0 AS reset_database_lost_its_reservations
+  FROM svs_memory_test_reservations(620);
+SELECT residency_bytes_committed = :before_621_residency_bytes_committed
+   AND build_bytes_committed = :before_621_build_bytes_committed AS other_database_untouched
+  FROM svs_memory_read_stats(621);
 SELECT * FROM svs_memory_test_check_invariants();

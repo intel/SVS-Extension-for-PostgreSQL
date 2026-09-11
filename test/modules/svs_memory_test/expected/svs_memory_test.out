@@ -667,6 +667,121 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
+-- ReconcileLoad's existing-reservation fits check, and which field it folds
+-- out of the running total for a RESERVED record: the estimate, not a
+-- measured value it has never taken. A measured load landing exactly on
+-- budget fits, and the reservation reconciles to RESIDENT with no owner.
+SELECT svs_memory_admit_database(535, (10 * 1024 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reserve_build(535, 1, 0::bigint, (4 * 1024 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reconcile_load(535, 1, (10 * 1024 * 1024)::bigint) AS fits;
+ fits 
+------
+ t
+(1 row)
+
+SELECT residency_bytes_committed = (10 * 1024 * 1024) AS committed_equals_measured
+  FROM svs_memory_read_stats(535);
+ committed_equals_measured 
+---------------------------
+ t
+(1 row)
+
+SELECT relid, state, owner_pid FROM svs_memory_test_reservations(535);
+ relid |  state   | owner_pid 
+-------+----------+-----------
+     1 | RESIDENT |         0
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+-- Free 535's budget back to the shared global ceiling; later boundary
+-- tests in this section need the headroom, same as db 520 below.
+SELECT svs_memory_account_unload(535, 1);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_admit_database(535, 1::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+-- ReanchorInsert's over-budget warning: a reanchor landing exactly on the
+-- budget stays silent; one byte more warns.
+SELECT svs_memory_admit_database(536, (1 * 1024 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reconcile_load(536, 1, (900 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reanchor_insert(536, 1, (1 * 1024 * 1024)::bigint);
+ svs_memory_reanchor_insert 
+----------------------------
+ 
+(1 row)
+
+SELECT residency_bytes_committed = (1 * 1024 * 1024) AS exactly_at_budget_no_warning
+  FROM svs_memory_read_stats(536);
+ exactly_at_budget_no_warning 
+------------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reanchor_insert(536, 1, (1 * 1024 * 1024 + 1)::bigint);
+WARNING:  database 536's residency budget is now exceeded after an insert into index 1
+DETAIL:  1048577 bytes committed, 1048576 byte budget.
+ svs_memory_reanchor_insert 
+----------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid |                            violation                            
+--------+-----------------------------------------------------------------
+    536 | residencyBytesCommitted 1048577 exceeds residencyBudget 1048576
+(1 row)
+
+-- Unwind 536's deliberate overage: both the invariant violation and its
+-- budget must not leak into the rest of the file, the same as db 542
+-- later in this file.
+SELECT svs_memory_account_unload(536, 1);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_admit_database(536, 1::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
 -- ReserveInsert's fits check: a delta that exactly fills the budget
 -- succeeds; one byte more fails and reserves nothing.
 SELECT svs_memory_admit_database(534, (1 * 1024 * 1024)::bigint);
@@ -697,6 +812,59 @@ SELECT * FROM svs_memory_read_stats(534);
  residency_budget | residency_bytes_committed | build_bytes_committed 
 ------------------+---------------------------+-----------------------
           1048576 |                   1048576 |                     0
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+-- With two pending inserts on the same relid, reanchoring folds out only
+-- the older one's delta and leaves the newer one still pending. Its delta
+-- differs from the older one's, so folding the wrong one would land the
+-- committed total on a different number than the one asserted below.
+SELECT svs_memory_admit_database(560, (20 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reconcile_load(560, 1, (10 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reserve_insert(560, 1, (1 * 1024)::bigint);
+ svs_memory_reserve_insert 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reserve_insert(560, 1, (3 * 1024)::bigint);
+ svs_memory_reserve_insert 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reanchor_insert(560, 1, (11 * 1024)::bigint);
+ svs_memory_reanchor_insert 
+----------------------------
+ 
+(1 row)
+
+SELECT residency_bytes_committed = (14 * 1024) AS older_deltas_folded_newer_still_pending
+  FROM svs_memory_read_stats(560);
+ older_deltas_folded_newer_still_pending 
+-----------------------------------------
+ t
+(1 row)
+
+SELECT delta_bytes = (3 * 1024) AS newer_pending_insert_survives
+  FROM svs_memory_test_insert_reservations(560);
+ newer_pending_insert_survives 
+-------------------------------
+ t
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
@@ -845,6 +1013,19 @@ SELECT * FROM svs_memory_test_check_invariants();
     542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
 (1 row)
 
+-- Unload the deliberate overage above so it does not leak into every
+-- check_invariants() call for the rest of this file.
+SELECT svs_memory_account_unload(542, 1);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
 -- Guard: a database cannot have two live reservations for the same relid.
 SELECT svs_memory_admit_database(600, (1 * 1024)::bigint);
  svs_memory_admit_database 
@@ -867,10 +1048,9 @@ SELECT count(*) = 1 AS exactly_one_reservation_survives FROM svs_memory_test_res
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- Guard: a database cannot be admitted at a zero residency budget.
 SELECT svs_memory_admit_database(601, 0::bigint);
@@ -887,10 +1067,9 @@ SELECT svs_memory_admit_database(602, (1 * 1024)::bigint);
 SELECT svs_memory_handoff_build(602, 1, 0::bigint, 100::bigint);
 ERROR:  no pending build reservation for index 1 in database 602
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- HandoffBuild zeros buildPeakBytes once released, so nothing later
 -- re-releases it; a later abort on the same (now-confirmed) reservation
@@ -935,10 +1114,9 @@ SELECT :build_committed_before_603 = :build_committed_after_603 AS build_peak_no
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- The reaper reclaims only RESERVED reservations; a dead owner on a
 -- CONFIRMED record is never treated as an abandoned build.
@@ -991,10 +1169,9 @@ SELECT relid, state FROM svs_memory_test_reservations(604) ORDER BY relid;
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- RequireAdmitted's error: any accounting call on a database that was
 -- never admitted refuses cleanly.
@@ -1025,10 +1202,9 @@ SELECT count(*) = 64 AS all_64_slots_still_tracked FROM svs_memory_test_reservat
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- Unloading an index with no reservation warns instead of erroring.
 SELECT svs_memory_admit_database(607, (1 * 1024)::bigint);
@@ -1045,10 +1221,9 @@ WARNING:  SVS memory accounting: unload of index 1 in database 607 has no reserv
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- The pending-insert table is finite too: a 65th distinct pending batch
 -- for one database is refused, and the 64 already queued stay queued.
@@ -1075,10 +1250,9 @@ SELECT count(*) = 64 AS all_64_pending_inserts_still_queued
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- Reanchor refuses when relid has no resident reservation to fold into.
 SELECT svs_memory_admit_database(609, (1 * 1024)::bigint);
@@ -1090,10 +1264,9 @@ SELECT svs_memory_admit_database(609, (1 * 1024)::bigint);
 SELECT svs_memory_reanchor_insert(609, 1, 100::bigint);
 ERROR:  no resident reservation for index 1 in database 609 to reanchor
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- Abort on a relid with no reservation at all is a safe no-op, not an
 -- error: the "safe to call more than once" promise extends to a relid
@@ -1125,10 +1298,9 @@ SELECT residency_bytes_committed = 0 AND build_bytes_committed = 0 AS unchanged_
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- Reanchor with no pending insert waiting still folds cleanly: the
 -- steady-state re-measure case, with nothing pending to fold in.
@@ -1158,10 +1330,9 @@ SELECT residency_bytes_committed = 150 AS reanchored_to_new_measurement_exactly
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
-(1 row)
+ db_oid | violation 
+--------+-----------
+(0 rows)
 
 -- ReserveBuild's rollback on a global-ceiling failure leaves every counter
 -- untouched and the relid reusable, not consumed by the failed attempt.
@@ -1203,8 +1374,69 @@ SELECT relid, state, owner_pid = pg_backend_pid() AS owned_by_this_backend,
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
- db_oid |                            violation                            
---------+-----------------------------------------------------------------
-    542 | residencyBytesCommitted 1228800 exceeds residencyBudget 1048576
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+-- SvsMemoryResetDatabaseAccounting, run on a slot release: rolling one
+-- database's contribution out of the global totals must not touch another
+-- database's. It also erases the reset database's own reservations, so a
+-- reload starts clean rather than inheriting a recycled slot's tenant.
+SELECT svs_memory_admit_database(620, (5 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
 (1 row)
+
+SELECT svs_memory_reserve_build(620, 1, (1 * 1024)::bigint, (1 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_admit_database(621, (5 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reserve_build(621, 1, (2 * 1024)::bigint, (2 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(621) \gset before_621_
+SELECT svs_memory_test_reset_database_accounting(620);
+ svs_memory_test_reset_database_accounting 
+-------------------------------------------
+ 
+(1 row)
+
+SELECT count(*) = 0 AS reset_database_no_longer_admitted
+  FROM svs_memory_read_stats(620);
+ reset_database_no_longer_admitted 
+-----------------------------------
+ t
+(1 row)
+
+SELECT count(*) = 0 AS reset_database_lost_its_reservations
+  FROM svs_memory_test_reservations(620);
+ reset_database_lost_its_reservations 
+--------------------------------------
+ t
+(1 row)
+
+SELECT residency_bytes_committed = :before_621_residency_bytes_committed
+   AND build_bytes_committed = :before_621_build_bytes_committed AS other_database_untouched
+  FROM svs_memory_read_stats(621);
+ other_database_untouched 
+--------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
 

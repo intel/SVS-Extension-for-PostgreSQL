@@ -124,6 +124,13 @@ BEGIN
 	END LOOP;
 END $$;
 
+-- Confirm the foreign row actually exists as superuser first, so the
+-- unprivileged role's zero-row result below proves visibility is denied
+-- rather than proving the row never showed up.
+SELECT count(*) = 1 AS foreign_row_exists_for_superuser
+  FROM pg_stat_vamana_worker
+ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+
 CREATE ROLE vamana_databases_test_stats_reader NOLOGIN;
 SET ROLE vamana_databases_test_stats_reader;
 SELECT residency_bytes_committed, build_bytes_committed, residency_drift,
