@@ -383,6 +383,33 @@ VamanaCacheGetNeedsSave(Oid indexRelid)
 }
 
 /*
+ * Notify the launcher when this database's last cached index unloads, so the
+ * grant it was holding is reclaimed at the next reconcile rather than after a
+ * full naptime.
+ *
+ * Conditional on reaching zero: every index cached under a worker shares one
+ * per-database grant, so unloading one of several frees no capacity.  Only the
+ * transition to zero releases anything.
+ *
+ * Worker-only.  Backends use this same per-process cache and hold no grant, so a
+ * backend's local eviction must not wake the launcher.  The worker check also
+ * establishes that shared memory is initialized, which SvsKickLauncher requires.
+ */
+static void
+VamanaCacheMaybeKickLauncher(void)
+{
+	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
+
+	if (VamanaWorkerShmemPtr == NULL ||
+		VamanaWorkerShmemPtr->workerPid != MyProcPid)
+		return;
+	if (VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES) > 0)
+		return;
+
+	SvsKickLauncher();
+}
+
+/*
  * Invalidate cached index (called on data modifications).
  */
 void
@@ -418,6 +445,8 @@ VamanaInvalidateCache(Oid indexRelid)
 	 * relation.  The flag will be corrected on the next LoadIndexFromPages
 	 * call that discovers the directory is absent.
 	 */
+
+	VamanaCacheMaybeKickLauncher();
 }
 
 /*
@@ -443,6 +472,8 @@ VamanaEvictAllCacheEntries(void)
 
 		VamanaClearCacheEntry(entry);
 	}
+
+	VamanaCacheMaybeKickLauncher();
 }
 
 /*
@@ -489,6 +520,8 @@ VamanaEvictCacheEntry(Oid indexRelid)
 			(errmsg("evicting vamana cache entry for relation %u", indexRelid)));
 
 	VamanaClearCacheEntry(entry);
+
+	VamanaCacheMaybeKickLauncher();
 }
 
 /*

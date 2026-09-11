@@ -1,0 +1,5 @@
+# svs_cache_kick_test extension
+comment = 'Standalone test harness for vamanacache.c cache-eviction arithmetic'
+default_version = '1.0'
+module_pathname = '$libdir/svs_cache_kick_test'
+relocatable = true
