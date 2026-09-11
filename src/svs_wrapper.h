@@ -90,6 +90,8 @@ typedef struct SVSMemoryBreakdown
 
 uint64		SVSGetIndexMemoryUsage(SVSIndexHandle index);
 void		SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out);
+void		SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out);
+uint64		SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors);
 
 int			SVSSaveIndex(SVSIndexHandle index, const char *path);
 
