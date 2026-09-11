@@ -24,7 +24,7 @@
 
 #include "vamanaworker.h"
 
-#define SVS_MEMORY_TEST_MAX_DATABASES 16
+#define SVS_MEMORY_TEST_MAX_DATABASES 40
 
 static VamanaWorkerShmemHeader *fakeHeader = NULL;
 static LWLock fakeHeaderLock;

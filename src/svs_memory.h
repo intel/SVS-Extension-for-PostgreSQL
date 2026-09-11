@@ -84,9 +84,10 @@ typedef struct SvsMemReservation
 
 	/*
 	 * The build peak reserved for this index, still outstanding. Zeroed by
-	 * SvsMemoryHandoffBuild/SvsMemoryAbortBuild once released through their
-	 * own caller-supplied buildPeak argument; read by the reaper, which has
-	 * no other way to learn a dead backend's build peak.
+	 * SvsMemoryHandoffBuild once released; SvsMemoryAbortBuild releases it
+	 * too but drops the whole reservation via FreeReservation rather than
+	 * zeroing this field in place. Read by the reaper, which has no other
+	 * way to learn a dead backend's build peak.
 	 */
 	uint64		buildPeakBytes;
 } SvsMemReservation;
@@ -182,8 +183,8 @@ extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
 
 /*
  * Reaps every reservation -- build or pending insert -- whose owning
- * backend is no longer alive. Called from the worker's latch cycle and its
- * startup scan.
+ * backend is no longer alive. Called from the launcher's latch cycle and
+ * its startup scan.
  */
 extern void SvsMemoryReapDeadReservations(void);
 

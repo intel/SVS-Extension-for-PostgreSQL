@@ -14,6 +14,56 @@ AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 CREATE FUNCTION svs_memory_test_global_residency_committed_bytes() RETURNS bigint
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_test_reservations(
+    db_oid oid,
+    OUT relid oid,
+    OUT state text,
+    OUT owner_pid int,
+    OUT estimate_bytes bigint,
+    OUT measured_bytes bigint,
+    OUT build_peak_bytes bigint,
+    OUT search_scratch_bytes_per_query bigint
+) RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_insert_reservations(
+    db_oid oid,
+    OUT relid oid,
+    OUT owner_pid int,
+    OUT delta_bytes bigint
+) RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_check_invariants(OUT db_oid oid, OUT violation text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_set_owner_pid(db_oid oid, relid oid, owner_pid int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_reset_database_accounting(db_oid oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_resolve_residency_budget(db_oid oid) RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_resolve_search_work_mem(db_oid oid) RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_residency_budget(db_oid oid) RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_search_scratch_bytes_per_query(db_oid oid, relid oid)
+RETURNS bigint
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_recheck_search_scratch_options(
+    db_oid oid, relid oid, search_window_size int, use_search_history boolean
+) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_admit_database(db_oid oid, residency_budget bigint)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

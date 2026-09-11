@@ -791,7 +791,7 @@ If `hot_standby_feedback = off`, the primary may remove WAL segments that the st
 
 INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker. Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly — this is not a privilege escalation: the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
 
-The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `total_memory_mb > 0`, and `search_num_threads BETWEEN 1 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
+The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `residency_memory > 0`, `search_work_mem > 0`, and `search_num_threads BETWEEN 1 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
 
 ---
 

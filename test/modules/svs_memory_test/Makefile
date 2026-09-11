@@ -12,6 +12,8 @@ DATA = svs_memory_test--1.0.sql
 
 REGRESS = svs_memory_test
 
+EXTRA_CLEAN = $(wildcard *.gcda) $(wildcard *.gcno)
+
 PG_CPPFLAGS = -I../../../src
 vpath %.c ../../../src
 

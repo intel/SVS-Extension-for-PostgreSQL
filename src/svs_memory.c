@@ -379,8 +379,8 @@ SvsMemoryAbortBuild(Oid dbOid, Oid relid)
 	reservation = FindReservation(entry, relid);
 	if (reservation != NULL)
 	{
-		uint64		residencyHeld = (reservation->state == SVS_MEM_CONFIRMED) ?
-			reservation->measuredBytes : reservation->estimateBytes;
+		uint64		residencyHeld = (reservation->state == SVS_MEM_RESERVED) ?
+			reservation->estimateBytes : reservation->measuredBytes;
 
 		if (reservation->buildPeakBytes > 0)
 		{

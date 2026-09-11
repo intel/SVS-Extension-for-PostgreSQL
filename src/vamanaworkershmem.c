@@ -69,6 +69,12 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 static int	VamanaIndexLockTranche = -1;
 static const char *const VamanaIndexLockTrancheName = "vamana_index_rwlock";
 
+/* LWLock tranche for each database's memory-accounting lock (memLock), kept
+ * separate from the index-lock tranche above so memory-accounting wait time
+ * is not misreported as index-lock wait time in pg_stat_activity. */
+static int	VamanaMemLockTranche = -1;
+static const char *const VamanaMemLockTrancheName = "vamana_mem_lock";
+
 /* -----------------------------------------------------------------------
  * Shared memory accessors
  *
@@ -286,7 +292,7 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 	}
 
 	pg_atomic_init_u64(&entry->searchScratchBytesInFlight, 0);
-	LWLockInitialize(&entry->memLock, VamanaIndexLockTranche);
+	LWLockInitialize(&entry->memLock, VamanaMemLockTranche);
 
 	/* Atomics are now constructed; set their logical baseline values. */
 	VamanaWorkerResetEntryState(entry);
@@ -306,12 +312,15 @@ VamanaWorkerShmemStartup(void)
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 
 	/*
-	 * The per-index r/w lock tranche is process-local state (a tranche id
-	 * plus a registered name), so it must be (re)established in every
-	 * process that attaches, whether or not it created the segment.
+	 * Both tranches are process-local state (a tranche id plus a registered
+	 * name), so each must be (re)established in every process that attaches,
+	 * whether or not it created the segment.
 	 */
 	VamanaIndexLockTranche = LWLockNewTrancheId();
 	LWLockRegisterTranche(VamanaIndexLockTranche, VamanaIndexLockTrancheName);
+
+	VamanaMemLockTranche = LWLockNewTrancheId();
+	LWLockRegisterTranche(VamanaMemLockTranche, VamanaMemLockTrancheName);
 
 	VamanaWorkerShmemHeaderPtr = ShmemInitStruct("VamanaWorkerShmemHeader",
 												 VamanaWorkerHeaderSize(), &found);
