@@ -490,6 +490,9 @@ bool	VamanaWorkerSlotsExhausted(void);
 /* vamanaworkershmem.c: number of per-database control-block slots. */
 int		VamanaWorkerSlotCapacity(void);
 
+/* vamanaworkershmem.c: this database's published search-thread grant. Worker-only. */
+int		SvsCurrentSearchGrant(void);
+
 /* vamanaworkershmem.c */
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);

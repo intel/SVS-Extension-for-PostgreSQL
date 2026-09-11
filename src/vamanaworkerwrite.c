@@ -550,6 +550,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		config.leanvec_dims			= params->leanvec_dims;
 		config.distance_type		= (SVSDistanceType) params->distance_type;
 		config.data_type			= SVS_DTYPE_FLOAT32;
+		config.search_num_threads	= SvsCurrentSearchGrant();
 
 		svsIndex = SVSLoadDynamicIndex(savepath, &config);
 		if (svsIndex == NULL)

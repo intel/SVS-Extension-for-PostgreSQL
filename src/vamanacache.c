@@ -79,6 +79,7 @@ VamanaClearCacheEntry(VamanaIndexCache *entry)
 	entry->lastWriteTime = 0;
 	entry->lastCheckpointTime = 0;
 	entry->checkpointInProgress = false;
+	entry->searchThreadsApplied = 0;
 }
 
 /*
@@ -291,6 +292,7 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	entry->lastWriteTime = 0;
 	entry->lastCheckpointTime = GetCurrentTimestamp();
 	entry->checkpointInProgress = false;
+	entry->searchThreadsApplied = 0;
 
 	ereport(DEBUG1,
 			(errmsg("cached vamana index for relation %u (%d dimensions, degree %d)",

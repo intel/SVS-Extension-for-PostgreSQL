@@ -252,6 +252,14 @@ typedef struct VamanaIndexCache
 	TimestampTz lastWriteTime;		/* updated on every write slot; 0 = no writes yet */
 	TimestampTz lastCheckpointTime;	/* 0 = treat as infinite elapsed */
 	bool		checkpointInProgress;
+
+	/*
+	 * Last search-thread count actually applied to svsIndex via
+	 * SVSSetIndexSearchThreads.  0 = never applied.  SVSSetIndexSearchThreads
+	 * tears down and rebuilds the whole SVS thread pool on every call, so
+	 * VamanaWorkerRunBatch checks this before calling it again.
+	 */
+	int			searchThreadsApplied;
 }			VamanaIndexCache;
 
 typedef struct VamanaScanOpaqueData
