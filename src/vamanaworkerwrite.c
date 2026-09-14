@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
@@ -139,6 +141,29 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 				(errmsg("vamana worker: first-insert build failed for index %u",
 						relid)));
 		return NULL;
+	}
+
+	/*
+	 * cache already holds a RESIDENT reservation at 0 bytes, from the
+	 * empty-table VamanaCacheIndex call that created this entry; reconcile
+	 * it to this build's real measured size rather than accounting it as a
+	 * fresh load.
+	 */
+	{
+		uint64		measuredBytes = SVSGetIndexMemoryUsage(svsIndex);
+
+		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes))
+		{
+			SVSFreeIndex(svsIndex);
+			ereport(WARNING,
+					(errmsg("vamana worker: first-insert build for index %u exceeds this database's residency budget",
+							relid),
+					 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes)));
+			return NULL;
+		}
+
+		cache->residentBytes = measuredBytes;
+		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
 	}
 
 	cache->svsIndex = svsIndex;

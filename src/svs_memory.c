@@ -199,7 +199,7 @@ SvsMemoryResidencyBudget(Oid dbOid)
 }
 
 void
-SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget)
+SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget, uint64 durableCommittedFloor)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
@@ -213,18 +213,20 @@ SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget)
 
 	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
 
-	if (residencyBudget < entry->residencyBytesCommitted)
 	{
-		uint64		committed = entry->residencyBytesCommitted;
+		uint64		committedFloor = Max(entry->residencyBytesCommitted, durableCommittedFloor);
 
-		LWLockRelease(&entry->memLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("database %u's residency budget cannot be lowered below its already-committed bytes",
-						dbOid),
-				 errdetail("Requested %llu byte budget, %llu bytes already committed.",
-						   (unsigned long long) residencyBudget,
-						   (unsigned long long) committed)));
+		if (residencyBudget < committedFloor)
+		{
+			LWLockRelease(&entry->memLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("database %u's residency budget cannot be lowered below its already-committed bytes",
+							dbOid),
+					 errdetail("Requested %llu byte budget, %llu bytes already committed.",
+							   (unsigned long long) residencyBudget,
+							   (unsigned long long) committedFloor)));
+		}
 	}
 
 	LWLockAcquire(header->lock, LW_EXCLUSIVE);

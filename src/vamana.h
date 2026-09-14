@@ -238,6 +238,7 @@ typedef struct VamanaIndexCache
 	int			tidMappingCapacity; /* allocated slots in tidMapping */
 	uint64		nextExternalId; /* local mirror of metapage nextExternalId */
 	int			numDeleted;		/* soft-deleted entries not yet compacted */
+	uint64		residentBytes;	/* exact bytes accounted at load; what unload must subtract */
 
 	/* Replication slot and WAL replay state */
 	struct VamanaReplicationSlot *replicationSlot;

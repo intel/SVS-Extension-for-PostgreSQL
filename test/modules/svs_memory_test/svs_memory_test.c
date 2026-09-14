@@ -226,7 +226,8 @@ PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_admit_database);
 Datum
 svs_memory_admit_database(PG_FUNCTION_ARGS)
 {
-	SvsMemoryAdmitDatabase(PG_GETARG_OID(0), GetNonNegativeArgAsUint64(fcinfo, 1));
+	SvsMemoryAdmitDatabase(PG_GETARG_OID(0), GetNonNegativeArgAsUint64(fcinfo, 1),
+							GetNonNegativeArgAsUint64(fcinfo, 2));
 	PG_RETURN_VOID();
 }
 

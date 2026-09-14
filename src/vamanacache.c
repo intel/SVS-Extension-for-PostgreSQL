@@ -12,6 +12,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
@@ -54,9 +56,12 @@ VamanaClearCacheEntry(VamanaIndexCache *entry)
 {
 	if (entry->svsIndex)
 	{
+		SvsMemoryAccountUnload(MyDatabaseId, entry->indexRelid);
+		SvsIndexResidencyRecordUnload(entry->indexRelid);
 		SVSFreeIndex(entry->svsIndex);
 		entry->svsIndex = NULL;
 	}
+	entry->residentBytes = 0;
 	if (entry->tidMapping)
 	{
 		pfree(entry->tidMapping);
@@ -194,6 +199,33 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	int			capacity = (tidMappingCapacity > numVectors) ? tidMappingCapacity : numVectors;
 
 	entry = VamanaAllocCacheSlot(indexRelid);
+
+	/*
+	 * Measure and reconcile against this database's residency budget before
+	 * entry is touched at all, so a refusal here needs nothing unwound:
+	 * VamanaAllocCacheSlot already guarantees entry arrives clean, and it
+	 * stays that way if this index never actually enters the cache.
+	 *
+	 * Does not free svsIndex on refusal. Every caller still owns it at this
+	 * point exactly as if this function had never been called -- the same
+	 * contract they already rely on for any other error during this call --
+	 * and frees it through their own existing cleanup path.
+	 */
+	{
+		uint64		measuredBytes = (svsIndex != NULL) ? SVSGetIndexMemoryUsage(svsIndex) : 0;
+
+		if (!SvsMemoryReconcileLoad(MyDatabaseId, indexRelid, measuredBytes))
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("cannot load vamana index %u: exceeds this database's residency budget",
+							indexRelid),
+					 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes),
+					 errhint("Raise svs.max_residency_memory, this database's residency_memory override, "
+							 "or unload another index in this database.")));
+
+		entry->residentBytes = measuredBytes;
+		SvsIndexResidencyRecordLoad(indexRelid, MyDatabaseId, measuredBytes);
+	}
 
 	if (tidMapping != NULL && capacity > 0)
 	{
