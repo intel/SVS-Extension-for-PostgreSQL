@@ -114,12 +114,24 @@ extern uint64 SvsMemoryResidencyBudget(Oid dbOid);
 
 /*
  * Config-time admission. Admits dbOid at residencyBudget bytes, or updates
- * an already-admitted database to a new budget, only if the cluster-wide
- * sum of every admitted database's budget still fits svs.max_residency_memory.
- * Errors on rejection; on success, dbOid's admitted budget governs every
- * later build, load, and insert check for that database.
+ * an already-admitted database to a new budget, only if that budget is not
+ * below what dbOid already has committed, and the cluster-wide sum of every
+ * admitted database's budget still fits svs.max_residency_memory. Errors on
+ * rejection; on success, dbOid's admitted budget governs every later build,
+ * load, and insert check for that database.
+ *
+ * durableCommittedFloor is the caller's answer to "what does dbOid hold
+ * that this module's own live counter might not currently reflect" -- 0
+ * when the live counter (entry->residencyBytesCommitted) is already known
+ * to be the truth, or a durable figure (see svs_index_residency.h) when it
+ * might not be, e.g. a worker mid-restart briefly reporting zero. This
+ * module never resolves that question itself: it has no notion of a
+ * worker's liveness or a durable catalog record, only bytes given to it.
+ * The guard compares residencyBudget against whichever of the two
+ * (live counter or durableCommittedFloor) is larger.
  */
-extern void SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget);
+extern void SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget,
+									uint64 durableCommittedFloor);
 
 /*
  * Backend build gate, at CREATE INDEX. Reserves buildPeak against the
