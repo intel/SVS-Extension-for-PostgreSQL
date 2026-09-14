@@ -23,6 +23,7 @@
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
+#include "svs_cpu_slots.h"
 #include "svs_wrapper.h"
 
 #include "access/xact.h"
@@ -86,6 +87,14 @@ Oid			vamana_eviction_suppressed_for_relid = InvalidOid;
  */
 bool		standbyRediscoverPending = false;
 
+/*
+ * The parked search-slot set this worker converges to its own published
+ * search-thread grant.  One set per worker process, created once in
+ * VamanaWorkerMain and released on every exit path via the before_shmem_exit
+ * callback below, never on a single code path alone.
+ */
+static SvsSlotSet *VamanaWorkerSearchSlots = NULL;
+
 /* -----------------------------------------------------------------------
  * Signal handlers (worker process only)
  * ----------------------------------------------------------------------- */
@@ -127,6 +136,21 @@ bool
 VamanaShutdownCancelPending(void)
 {
 	return worker_got_sigterm && geterrcode() == ERRCODE_QUERY_CANCELED;
+}
+
+/*
+ * Release every held search slot on the way out, on any exit path: a
+ * controlled ereport(FATAL) unwinds through proc_exit without running the
+ * clean-shutdown code in VamanaWorkerDrainAndStop, so a callback registered
+ * once at slot-set creation is the only place guaranteed to run before this
+ * process's slots stop counting against max_parallel_workers. A true signal
+ * death takes the whole instance down and restarts everything, so there is
+ * no orphan for this callback to clean up in that case.
+ */
+static void
+VamanaWorkerReleaseSearchSlotsOnExit(int code, Datum arg)
+{
+	SvsSlotSetReleaseAll(VamanaWorkerSearchSlots);
 }
 
 /* -----------------------------------------------------------------------
@@ -717,19 +741,19 @@ VamanaStandbyActivateSlotBounded(Oid relid)
 }
 
 /*
- * VamanaWorkerRunStartupTransaction: capture the database name for the
- * txn-less heartbeat loop, log readiness, and seed indexCount from the live
- * catalog (primary-only — a standby neither maintains the counter nor can
- * run the enumerating SPI).  Catalog access and SPI both require a live
+ * VamanaWorkerRunStartupTransaction: record the already-captured database
+ * name for the txn-less heartbeat loop, log readiness, and seed indexCount
+ * from the live catalog (primary-only — a standby neither maintains the
+ * counter nor can run the enumerating SPI).  SPI requires a live
  * transaction and snapshot, which only this call provides.
  */
 static void
-VamanaWorkerRunStartupTransaction(VamanaZeroIndexState *zeroIndexState)
+VamanaWorkerRunStartupTransaction(VamanaZeroIndexState *zeroIndexState, char *datname)
 {
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	zeroIndexState->dbname = VamanaWorkerCaptureDatabaseName();
+	zeroIndexState->dbname = datname;
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
 						 zeroIndexState->dbname)));
 	if (VamanaIndexCountIsMaintained())
@@ -796,7 +820,7 @@ VamanaWorkerCheckpointDueIndexes(void)
  * handled here.
  */
 static void
-VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
+VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 {
 	/* Tracks the role era so VamanaWorkerHandlePromotion can detect a flip. */
 	bool		wasReplayingWal;
@@ -817,7 +841,20 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 1);
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
 
-	VamanaWorkerRunStartupTransaction(zeroIndexState);
+	/*
+	 * The reconcile that spawned this worker published its grant before the
+	 * spawn loop ran, and the postmaster's SIGUSR1 on worker start fires
+	 * before workerPid above is set, so neither event wakes the launcher on
+	 * this worker's 0-to-nonzero liveness transition. Nothing else shortens
+	 * naptime, so without this kick a freshly enabled database would serve
+	 * at its zero-clamped-to-one grant for up to VAMANA_LAUNCHER_NAPTIME_MS.
+	 * Safe here: VamanaWorkerEntryIsLive only needs a non-zero workerPid and
+	 * a non-stale heartbeat, and VamanaHeartbeatIsStale treats a never-beaten
+	 * worker as live.
+	 */
+	SvsKickLauncher();
+
+	VamanaWorkerRunStartupTransaction(zeroIndexState, datname);
 
 	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
 
@@ -859,6 +896,23 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState)
 		VamanaWorkerProcessSlotDrops();
 
 		VamanaWorkerProcessReloads();
+
+		/*
+		 * Converge held search slots on the published grant every heartbeat,
+		 * not only when kicked. The launcher sets the worker latch only when
+		 * grantedSearchThreads changes, and a control block survives a
+		 * worker restart without a (de)reservation, so VamanaWorkerResetEntryState
+		 * never re-arms that change notification across a restart into an
+		 * already-settled grant. A kick-driven-only implementation would
+		 * then hold zero slots indefinitely after such a restart. Do not
+		 * remove this poll in favor of relying on the kick alone.
+		 *
+		 * Resize to exactly what SvsCurrentSearchGrant() returns, with no
+		 * clamp of our own. The launcher owns the ceiling; a grant can never
+		 * exceed MAX_PARALLEL_WORKER_LIMIT (1024) in the first place, so
+		 * there is nothing here for a second clamp to guard against.
+		 */
+		(void) SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
 
 		/*
 		 * Process pending search requests on every iteration, not only when
@@ -912,6 +966,7 @@ VamanaWorkerMain(Datum main_arg)
 {
 	/* Zero-index log-once state; dbname captured in the startup transaction. */
 	VamanaZeroIndexState zeroIndexState = {0};
+	char	   *datname;
 
 	/*
 	 * Set up signal handlers.  Do NOT override SIGUSR1: it is owned by
@@ -961,6 +1016,37 @@ VamanaWorkerMain(Datum main_arg)
 	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
 
 	/*
+	 * Own a slot set for the worker's lifetime, converged onto this
+	 * database's published search-thread grant every heartbeat (see
+	 * VamanaWorkerServe). A short transaction of its own: the name is needed
+	 * here, before the serve loop, and the heartbeat loop that follows runs
+	 * without a transaction, so it cannot re-enter the catalog to fetch it.
+	 * The captured name is passed down to VamanaWorkerServe and on into
+	 * VamanaWorkerRunStartupTransaction rather than fetched again there.
+	 */
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	datname = VamanaWorkerCaptureDatabaseName();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	VamanaWorkerSearchSlots = SvsSlotSetCreate(TopMemoryContext, "svs", datname);
+	before_shmem_exit(VamanaWorkerReleaseSearchSlotsOnExit, 0);
+
+	/*
+	 * Converge once here, before workerPid is published and before the
+	 * kick in VamanaWorkerServe can trigger a reconcile of its own: the
+	 * reconcile that decided to (re)spawn this worker publishes its
+	 * grant before the spawn loop runs, so a reader could
+	 * otherwise observe that published grant with this worker holding
+	 * zero slots for as long as it takes this process to reach its own
+	 * first heartbeat. Doing the same convergence read here as the
+	 * per-heartbeat block below closes that gap; nothing here changes
+	 * the target the worker converges to.
+	 */
+	(void) SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
+
+	/*
 	 * A standby's logical slot reads catalog rows the primary must not VACUUM
 	 * away.  That protection depends on hot_standby_feedback pinning the
 	 * primary's catalog_xmin; without it the slot is silently invalidated and
@@ -983,7 +1069,7 @@ VamanaWorkerMain(Datum main_arg)
 	 */
 	PG_TRY();
 	{
-		VamanaWorkerServe(&zeroIndexState);
+		VamanaWorkerServe(&zeroIndexState, datname);
 	}
 	PG_CATCH();
 	{
