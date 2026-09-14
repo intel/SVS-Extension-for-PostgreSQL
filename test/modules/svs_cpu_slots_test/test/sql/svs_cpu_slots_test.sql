@@ -42,6 +42,20 @@ SELECT bool_and(wait_event_type IS NULL AND wait_event IS NULL) AS wait_event_un
 FROM pg_stat_activity
 WHERE backend_type = svs_slot_bgw_type();
 
+-- Case 1b: resizing to the already-held count is a no-op -- it must not
+-- terminate and re-register the whole set just to land on the same total.
+CREATE TEMP TABLE svs_slot_pids_before AS
+SELECT pid FROM pg_stat_activity WHERE backend_type = svs_slot_bgw_type();
+
+SELECT svs_slot_resize(4) AS held_at_same_target;
+
+SELECT (SELECT array_agg(pid ORDER BY pid) FROM svs_slot_pids_before)
+     = (SELECT array_agg(pid ORDER BY pid) FROM pg_stat_activity
+        WHERE backend_type = svs_slot_bgw_type())
+  AS pids_unchanged_on_noop_resize;
+
+DROP TABLE svs_slot_pids_before;
+
 -- Case 2: pool enforcement.  max_parallel_workers is PGC_USERSET, so this
 -- session can clamp the pool without a restart.
 SET max_parallel_workers = 4;

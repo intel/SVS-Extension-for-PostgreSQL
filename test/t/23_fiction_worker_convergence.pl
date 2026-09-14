@@ -1,20 +1,11 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 23_fiction_worker_convergence.pl -- pins the observable behavior a
-# per-database worker must show once it holds one parked parallel slot per
-# granted search thread (Task A4).  Written ahead of the implementation: its
-# two dependencies (a slot-set primitive and grant application) are still in
-# review, so every assertion here is built only on what already exists on
-# main today -- the grant math in svs_cpu_budget.c / PublishCpuGrants, and
-# core PostgreSQL views.
+# 23_fiction_worker_convergence.pl -- pins the observable behavior of a
+# per-database worker that holds one parked parallel slot per granted
+# search thread.
 #
-# This file is expected to fail. That is the point: it fails on its
-# assertions, pinning the target behavior, so the implementation has
-# something external to converge against instead of being graded by tests
-# shaped after the fact.
-#
-# Stable observables only (see the design note this was written from):
+# Stable observables only:
 #   - backend_type = 'vamana search slot'  (SvsSlotKindBgwType; not under review)
 #   - pg_stat_vamana_worker.search_threads_desired / _granted / _reserved
 #   - pg_stat_vamana_worker.worker_pid / heartbeat_ts
@@ -24,25 +15,17 @@
 # active review and will change shape without changing meaning.
 #
 # ---------------------------------------------------------------------------
-# OPEN DESIGN QUESTION -- static hold vs. per-dispatch acquisition
+# STATIC-HOLD ASSUMPTION
 #
-# Whether a granted search thread's parked slot is held for the grant's
-# whole lifetime (static hold) or acquired only while a search is actually
-# dispatched is not yet decided. Every assertion in this file that compares
-# a "vamana search slot" row count against a *granted* value while no
-# search is in flight assumes static hold -- that is, the worker owns a
-# slot set and converges the held slot count on the launcher's published
-# grant, and it is also the model nearly
-# every case below tests, because none of them keep a search actively
-# running at the moment they sample. If the policy flips to per-dispatch,
-# every such assertion in this file needs rewriting; the grant-math checks
-# (search_threads_desired/granted/reserved converge correctly) and the
-# crash/pid-stability checks do not, since they say nothing about *when* a
-# slot is held. That whole class of assertion is marked with a
-# STATIC-HOLD ASSUMPTION comment at each site below rather than gathered
-# into one lexical block, because it is not a handful of cases -- it is most
-# of the file. See the final task report for the reviewer-facing version of
-# this note.
+# A granted search thread's parked slot is held for the grant's whole
+# lifetime, not acquired only while a search is actually dispatched
+# (static hold, not per-dispatch acquisition). Every assertion in this file
+# that compares a "vamana search slot" row count against a *granted* value
+# while no search is in flight assumes this: the worker owns a slot set and
+# converges the held slot count on the launcher's published grant. That
+# class of assertion is marked with a STATIC-HOLD ASSUMPTION comment at each
+# site below rather than gathered into one lexical block, because it is not
+# a handful of cases -- it is most of the file.
 # ---------------------------------------------------------------------------
 
 use strict;
@@ -285,10 +268,8 @@ $node->safe_psql('postgres', qq(
 # ---------------------------------------------------------------------------
 # Case 1: converge up.
 #
-# The grant math (SvsComputeCpuGrants / PublishCpuGrants) already exists on
-# main; only slot-holding does not. So this splits into a real assertion
-# (the published grant reaches 4) and a pinning assertion (the held slot
-# count matches it), which is expected to fail until A4 lands.
+# Splits into a grant-math assertion (the published grant reaches 4) and a
+# slot-hold assertion (the held slot count converges to match it).
 # ---------------------------------------------------------------------------
 {
     $node->safe_psql('postgres',
@@ -301,8 +282,7 @@ $node->safe_psql('postgres', qq(
     # worker to hold 4 parked search slots simply because it was granted 4.
     my $held = wait_for_search_slot_count($node, 'postgres', 4, 20);
     is($held, '4',
-        "case 1: exactly 4 'vamana search slot' rows exist for the database "
-      . "(pins the not-yet-implemented slot hold)");
+        "case 1: exactly 4 'vamana search slot' rows exist for the database");
 }
 
 # ---------------------------------------------------------------------------
@@ -310,12 +290,11 @@ $node->safe_psql('postgres', qq(
 # the shared pool (not a private counter) by observing a plain core
 # parallel query regain workers.
 #
-# max_parallel_workers is lowered to 4 for this block only, so that if
-# search slots really consumed the shared pool, granting 4 to search would
-# starve a concurrent core query down to 0 workers, and dropping the grant
-# to 2 would free 2 back for it. Today nothing consumes the pool for
-# search, so this is a real, meaningful failure (not a vacuous one): the
-# "starved-then-recovers" shape never appears.
+# max_parallel_workers is lowered to 4 for this block only, so that granting
+# 4 to search starves a concurrent core query down to 0 workers, and
+# dropping the grant to 2 frees 2 back for it: the "starved-then-recovers"
+# shape proves the released slots returned to the shared pool rather than
+# a private counter.
 # ---------------------------------------------------------------------------
 {
     $node->safe_psql('postgres', "ALTER SYSTEM SET max_parallel_workers = 4;");
@@ -338,8 +317,7 @@ $node->safe_psql('postgres', qq(
 
     my $held = wait_for_search_slot_count($node, 'postgres', 2, 20);
     is($held, '2',
-        "case 2: exactly 2 'vamana search slot' rows remain "
-      . "(pins the not-yet-implemented slot release)");
+        "case 2: exactly 2 'vamana search slot' rows remain");
 
     my $after = workers_launched($node, 'postgres', 'core_probe');
     ok($before == 0 && $after > $before,
@@ -367,15 +345,15 @@ is($pid_after_12, $pg_worker_pid,
 # ---------------------------------------------------------------------------
 # Cases 3 and 5: a freshly enabled database.
 #
-# Section 3.1: PublishCpuGrants publishes 0 for a not-yet-live database, but
-# the accessor is supposed to clamp that up to 1 so a starting worker never
-# runs 0 slots while SVS runs a search thread. Section 3.3: the reconcile
-# that spawns the worker has already published its grant as 0 (spawn loop
-# runs after PublishCpuGrants), and nothing wakes the launcher on the
-# workerPid 0-to-nonzero transition, so without a fix this can stay at 0 for
-# up to VAMANA_LAUNCHER_NAPTIME_MS (180s). The poll bounds below are well
-# under that, so a naptime-only regression fails this test instead of
-# hanging it.
+# PublishCpuGrants publishes 0 for a not-yet-live database, but the accessor
+# clamps that up to 1 so a starting worker never runs 0 slots while SVS runs
+# a search thread. The reconcile that spawns the worker has already
+# published its grant as 0 (spawn loop runs after PublishCpuGrants), and
+# nothing wakes the launcher on the workerPid 0-to-nonzero transition except
+# the worker's own kick (SvsKickLauncher in VamanaWorkerServe), so a
+# regression there can stay at 0 for up to VAMANA_LAUNCHER_NAPTIME_MS
+# (180s). The poll bounds below are well under that, so such a regression
+# fails this test instead of hanging it.
 # ---------------------------------------------------------------------------
 {
     $node->safe_psql('postgres', "CREATE DATABASE fresh_db;");
@@ -522,27 +500,13 @@ assert_no_crash_since($node, $run_log_pos, 'cases 3 and 5');
 # written -- and the worker's latch kicked -- only when the value *changes*.
 # VamanaWorkerResetEntryState explicitly does not run on a plain worker
 # restart. So a worker that restarts while the grant is already settled at
-# its current value is never kicked about it: a kick-only convergence
-# implementation passes every other case in this file and fails only this
-# one, by leaving the restarted worker holding zero slots forever. Do not
-# simplify this case away; it is the regression test for exactly that trap.
-# Convergence must be driven by polling every heartbeat, with the kick only
-# making it prompt.
-#
-# Confirmed by hand against a scratch cluster: on main today the published
-# grant does not merely stay "unchanged and un-acted-on" across a restart --
-# it drops to 0 (the old worker's exit is noticed by a reconcile that
-# correctly sees "not live" and publishes 0) and then stays at 0
-# indefinitely, because nothing re-notifies the launcher once the new
-# worker becomes live (the same zero-grant gap cases 3 and 5 pin, triggered
-# here by a restart instead of an initial enable). So the "post_granted"
-# assertion below fails today for that reason, not because the grant was
-# literally frozen at its old value. Both symptoms share the same root
-# cause and the same fix (SvsKickLauncher on the worker publishing its own
-# workerPid), so the assertion is left as specified -- once fixed, the
-# grant should settle back to its pre-restart value quickly, which is what
-# "unchanged" means here: the same steady-state value, not a value that
-# never moved in between.
+# its current value is never kicked about it by that mechanism alone: a
+# kick-only convergence implementation passes every other case in this file
+# and fails only this one, by leaving the restarted worker holding zero
+# slots forever. Do not simplify this case away; it is the regression test
+# for exactly that trap. Convergence must be driven by polling every
+# heartbeat, with the restarted worker's own SvsKickLauncher call (on
+# publishing its workerPid) only making it prompt.
 # ---------------------------------------------------------------------------
 {
     my $pre_granted = granted_for_db($node, $pg_dboid);
@@ -607,13 +571,13 @@ assert_no_crash_since($node, $run_log_pos, 'case 4');
     chomp $alive;
     is($alive, '0', "case 6: worker for 'postgres' has stopped after disable");
 
-    # STATIC-HOLD ASSUMPTION, but a vacuous one today: nothing has ever held
-    # a slot for 'postgres' in this run, so this is expected to already be
-    # 0 regardless of whether release-on-exit is implemented.
+    # STATIC-HOLD ASSUMPTION: the worker held 2 search slots (from the
+    # setup above) right up to the disable; this pins that
+    # VamanaWorkerReleaseSearchSlotsOnExit actually runs on that exit path
+    # and releases them, rather than leaving them orphaned.
     my $held_after_stop = search_slot_count($node, 'postgres');
     is($held_after_stop, '0',
-        "case 6: no 'vamana search slot' rows remain after the worker stops "
-      . "(vacuous today: none were ever held)");
+        "case 6: no 'vamana search slot' rows remain after the worker stops");
 
     $node->safe_psql('postgres',
         "UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';");
@@ -638,8 +602,9 @@ assert_no_crash_since($node, $run_log_pos, 'case 6');
 # ---------------------------------------------------------------------------
 # Case 7: reduced pool. Constrain max_parallel_workers below what 'postgres'
 # desires, so granted < desired, and pin that the held count tracks
-# granted, not desired. No log-text assertion (section 2 item 2): the
-# shortfall is observed purely through the numeric gap in the view.
+# granted, not desired. No log-text assertion: shortfall log wording is
+# under active review, so the shortfall is observed purely through the
+# numeric gap in the view instead.
 #
 # svs.max_search_threads_per_db must be raised explicitly here. It defaults
 # to 0, which means "follow max_parallel_workers" (see
@@ -693,6 +658,182 @@ assert_no_crash_since($node, $run_log_pos, 'case 6');
 
 assert_rollup_matches($node, 'after case 7');
 assert_no_crash_since($node, $run_log_pos, 'case 7 (reduced pool)');
+
+# ---------------------------------------------------------------------------
+# Case 10: two databases live at once -- changing one's grant must not
+# touch the other's held slots.
+#
+# 'postgres' and 'fresh_db' up to this point were only ever changed one at
+# a time, never compared against each other while both are live. fresh_db
+# is left holding 5 slots since cases 3/5; 'postgres' is left holding 1
+# since case 7's cleanup.
+# ---------------------------------------------------------------------------
+{
+    my $fresh_oid = db_oid($node, 'fresh_db');
+
+    my $fresh_before = wait_for_search_slot_count($node, 'fresh_db', 5, 10);
+    is($fresh_before, '5', "case 10 setup: fresh_db still holds 5 slots untouched");
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 3 WHERE datname = 'postgres';");
+    my $pg_granted = wait_for_granted($node, $pg_dboid, 3, 30);
+    is($pg_granted, '3', "case 10: postgres grant reaches 3");
+    my $pg_held = wait_for_search_slot_count($node, 'postgres', 3, 20);
+    is($pg_held, '3', "case 10: postgres held slots reach 3");
+
+    my $fresh_after_pg_change = search_slot_count($node, 'fresh_db');
+    is($fresh_after_pg_change, '5',
+        "case 10: fresh_db's held slots are untouched by postgres's grant change");
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 2 WHERE datname = 'fresh_db';");
+    my $fresh_granted = wait_for_granted($node, $fresh_oid, 2, 30);
+    is($fresh_granted, '2', "case 10: fresh_db grant reaches 2");
+    my $fresh_held = wait_for_search_slot_count($node, 'fresh_db', 2, 20);
+    is($fresh_held, '2', "case 10: fresh_db held slots reach 2");
+
+    my $pg_after_fresh_change = search_slot_count($node, 'postgres');
+    is($pg_after_fresh_change, '3',
+        "case 10: postgres's held slots are untouched by fresh_db's grant change");
+}
+
+assert_rollup_matches($node, 'after case 10');
+assert_no_crash_since($node, $run_log_pos, 'case 10');
+
+# ---------------------------------------------------------------------------
+# Case 11: near the grant ceiling.
+#
+# Every prior case drives small grants (1-5); none approach the pool this
+# node actually has (max_parallel_workers = 8). Disable fresh_db first so
+# the whole pool is free for 'postgres' alone, then ask for exactly
+# max_parallel_workers: the clamp math must land exactly on the boundary
+# (granted = desired = max_parallel_workers), not one short of it.
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = false WHERE datname = 'fresh_db';");
+    for (1 .. 60)    # up to 30s for the graceful drain to finish
+    {
+        usleep(500_000);
+        my $alive = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' AND datname = 'fresh_db';");
+        chomp $alive;
+        last if $alive eq '0';
+    }
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 8 WHERE datname = 'postgres';");
+
+    my $desired = '';
+    my $granted = '';
+    for (1 .. 30)
+    {
+        usleep(500_000);
+        $desired = desired_for_db($node, $pg_dboid);
+        $granted = granted_for_db($node, $pg_dboid);
+        last if defined($desired) && $desired eq '8'
+             && defined($granted) && $granted eq '8';
+    }
+    is($desired, '8', "case 11: desired reaches max_parallel_workers (8)");
+    is($granted, '8',
+        "case 11: granted reaches max_parallel_workers (8) with no pool contention");
+
+    my $held = wait_for_search_slot_count($node, 'postgres', 8, 20);
+    is($held, '8', "case 11: held slot count reaches 8, right at the pool boundary");
+
+    my $launched = workers_launched($node, 'postgres', 'core_probe');
+    is($launched, 0,
+        "case 11: a concurrent core query gets 0 workers with the pool exactly saturated");
+
+    # Restore fresh_db and a small grant on postgres for the rest of the suite.
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true WHERE datname = 'fresh_db';");
+    wait_for_worker_db($node, 'fresh_db', 30);
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 1 WHERE datname = 'postgres';");
+    wait_for_granted($node, $pg_dboid, 1, 30);
+}
+
+assert_rollup_matches($node, 'after case 11');
+assert_no_crash_since($node, $run_log_pos, 'case 11');
+
+# ---------------------------------------------------------------------------
+# Case 12: crash-triggered slot release.
+#
+# VamanaWorkerReleaseSearchSlotsOnExit exists specifically for the exit path
+# a clean shutdown never takes: an uncaught ERROR that unwinds through
+# proc_exit without running VamanaWorkerDrainAndStop. Driven via the
+# in-tree injection-point framework (the same mechanism
+# 13_crash_backoff.pl uses). If release-on-exit did not run, the
+# replacement worker's own convergence would add a second full set on top
+# of the crashed worker's leaked slots, and the held count would settle at
+# double the grant instead of matching it -- that is what this case would
+# catch. Placed last: the crash it injects is intentional and would trip
+# assert_no_crash_since for every later case, so nothing follows it.
+#
+# fresh_db is disabled first: 'vamana-worker-tick-crash' fires for every
+# vamana worker's heartbeat, not just 'postgres', so a second live worker
+# would race to trip it too and confuse which pid this case is tracking.
+# ---------------------------------------------------------------------------
+if (($ENV{enable_injection_points} // 'no') eq 'yes')
+{
+    $node->safe_psql('postgres', "CREATE EXTENSION IF NOT EXISTS injection_points;");
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = false WHERE datname = 'fresh_db';");
+    for (1 .. 60)    # up to 30s for the graceful drain to finish
+    {
+        usleep(500_000);
+        my $alive = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker' AND datname = 'fresh_db';");
+        chomp $alive;
+        last if $alive eq '0';
+    }
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 3 WHERE datname = 'postgres';");
+    my $pre_crash_granted = wait_for_granted($node, $pg_dboid, 3, 30);
+    is($pre_crash_granted, '3', "case 12 setup: grant settles at 3 before the crash");
+    my $pre_crash_held = wait_for_search_slot_count($node, 'postgres', 3, 20);
+    is($pre_crash_held, '3', "case 12 setup: 3 search slots held before the crash");
+
+    my $log_pos = length($node->log_content());
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-worker-tick-crash', 'error');");
+    $node->wait_for_log(qr/error triggered for injection point vamana-worker-tick-crash/,
+        $log_pos);
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-worker-tick-crash');");
+
+    my $new_pid = wait_for_new_worker_pid_db($node, 'postgres', $pg_worker_pid, 60);
+    ok($new_pid =~ /^\d+$/ && $new_pid ne $pg_worker_pid,
+        "case 12: worker restarted after the injected crash (pid=$new_pid)");
+
+    # STATIC-HOLD ASSUMPTION: the replacement worker converges to the same
+    # grant (3), not the old worker's leaked 3 plus its own 3.
+    my $post_crash_held = wait_for_search_slot_count($node, 'postgres', 3, 30);
+    is($post_crash_held, '3',
+        "case 12: exactly 3 'vamana search slot' rows remain after the crash "
+      . "(no orphans survive from the crashed worker)");
+
+    # Re-enable fresh_db: a disabled database's row keeps its last-known
+    # granted value in pg_stat_vamana_worker even though its worker holds no
+    # slots, which would otherwise make the rollup invariant below spurious.
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true WHERE datname = 'fresh_db';");
+    wait_for_worker_db($node, 'fresh_db', 30);
+    wait_for_search_slot_count($node, 'fresh_db', 2, 20);
+
+    assert_rollup_matches($node, 'after case 12');
+}
+else
+{
+    diag('skipping case 12 (crash-triggered slot release): '
+       . 'server not built with --enable-injection-points');
+}
 
 $node->stop;
 
