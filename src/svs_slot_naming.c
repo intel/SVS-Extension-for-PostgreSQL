@@ -28,19 +28,29 @@ SvsSlotKindBgwType(SvsSlotKind kind)
 	pg_unreachable();
 }
 
+const char *
+SvsSearchSlotWaitEventName(void)
+{
+	return "VamanaSearchSlot";
+}
+
 /*
- * Replace any control character (including newline) with a space, in place.
- * datname is chosen by anyone with CREATEDB and lands in application_name,
- * which is world-readable in pg_stat_activity and consumed by line-oriented
- * log parsers, so it must not carry a byte that could inject a line break.
+ * Copy datname into dst, replacing any control character (including
+ * newline) with a space.  datname is chosen by anyone with CREATEDB and
+ * lands in application_name, which is world-readable in pg_stat_activity
+ * and consumed by line-oriented log parsers, so it must not carry a byte
+ * that could inject a line break.
  */
 static void
-SanitizeForAppName(char *str)
+CopySanitizedDatname(char *dst, size_t dstsize, const char *datname)
 {
-	for (; *str != '\0'; str++)
+	char	   *p;
+
+	strlcpy(dst, datname, dstsize);
+	for (p = dst; *p != '\0'; p++)
 	{
-		if ((unsigned char) *str < 0x20 || *str == 0x7f)
-			*str = ' ';
+		if ((unsigned char) *p < 0x20 || *p == 0x7f)
+			*p = ' ';
 	}
 }
 
@@ -50,8 +60,7 @@ SvsFormatSearchSlotAppName(char *buf, size_t bufsize, const char *datname,
 {
 	char		safeDatname[NAMEDATALEN];
 
-	strlcpy(safeDatname, datname, sizeof(safeDatname));
-	SanitizeForAppName(safeDatname);
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), datname);
 
 	snprintf(buf, bufsize, "vamana: search slot %d/%d (reserved %d) db=%s",
 			 slotIndex, slotTotal, reserved, safeDatname);
@@ -64,8 +73,7 @@ SvsFormatBuildSlotAppName(char *buf, size_t bufsize, const char *datname,
 {
 	char		safeDatname[NAMEDATALEN];
 
-	strlcpy(safeDatname, datname, sizeof(safeDatname));
-	SanitizeForAppName(safeDatname);
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), datname);
 
 	snprintf(buf, bufsize, "vamana: build slot %d/%d (requested %d, granted %d) db=%s",
 			 slotIndex, slotTotal, requested, granted, safeDatname);

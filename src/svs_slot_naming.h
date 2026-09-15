@@ -18,6 +18,14 @@ typedef enum SvsSlotKind
 extern const char *SvsSlotKindBgwType(SvsSlotKind kind);
 
 /*
+ * Name of the wait event a parked search slot reports while blocked in its
+ * park loop, registered with WaitEventExtensionNew().  Search slots only:
+ * a build slot's park loop is untouched and still waits on plain
+ * PG_WAIT_EXTENSION.
+ */
+extern const char *SvsSearchSlotWaitEventName(void);
+
+/*
  * application_name for a search slot, set via pgstat_report_appname() from
  * inside the running fiction worker.  Called again whenever granted/reserved
  * change, since neither is fixed for the slot's lifetime.  Format is

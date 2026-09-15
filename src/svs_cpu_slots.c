@@ -437,45 +437,50 @@ SvsParkedSlotSigterm(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
-void
-SvsParkedSlotMain(Datum main_arg)
+/*
+ * Bring a freshly forked parked slot from "has a PGPROC" to "a real,
+ * describable process" before it ever reaches the park loop: register for
+ * SIGTERM, join the shared ProcArray, establish backend status, and
+ * publish this slot's application_name and wait event.  Returns the wait
+ * event id the park loop should report while blocked.
+ *
+ * No BackgroundWorkerInitializeConnection call anywhere in this sequence:
+ * this worker was registered without BGWORKER_BACKEND_DATABASE_CONNECTION,
+ * so it has no database to connect to and none of the transaction
+ * machinery that would require.  That also means InitPostgres never runs,
+ * so several steps InitPostgres would otherwise have taken care of are
+ * done here directly instead:
+ *
+ * - InitProcessPhase2() makes MyProc visible in the shared ProcArray.
+ *   BackendPidGetProc() finds a process by walking that array, and
+ *   pg_stat_activity's wait_event/wait_event_type columns are read from
+ *   the PGPROC that lookup returns, so without this call the wait event
+ *   registered below would never be observable.  Matches InitPostgres()'s
+ *   own ordering: before backend-status/session-identity setup.
+ * - pgstat_beinit()/pgstat_bestart*() establish backend status the same
+ *   way AuxiliaryProcessMainCommon() does for an aux process with no
+ *   database connection; without them this worker would be invisible in
+ *   pg_stat_activity and pgstat_report_appname() below would silently do
+ *   nothing.
+ * - InitializeSessionUserIdStandalone() establishes the session identity
+ *   pgstat_bestart_final()'s GetSessionUserId() call requires for any
+ *   B_BG_WORKER (autovacuum workers call it for the same reason).
+ *
+ * PostgreSQL 18 split the single pgstat_bestart() call into
+ * pgstat_bestart_initial() (report before SessionUserId exists) and
+ * pgstat_bestart_final() (report once it does); earlier versions have one
+ * pgstat_bestart() call that does both steps after SessionUserId is set.
+ */
+static uint32
+SvsParkedSlotBootstrap(const SvsParkedSlotArg *arg)
 {
-	SvsParkedSlotArg arg;
 	char		appName[NAMEDATALEN + 64];
-	uint32		waitEventSearchSlot;
-
-	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(arg));
 
 	pqsignal(SIGTERM, SvsParkedSlotSigterm);
 	BackgroundWorkerUnblockSignals();
 
-	/*
-	 * No BackgroundWorkerInitializeConnection call: this worker was
-	 * registered without BGWORKER_BACKEND_DATABASE_CONNECTION, so it has no
-	 * database to connect to and none of the transaction machinery that
-	 * would require.
-	 *
-	 * That also means InitPostgres never runs, and pgstat_beinit()/
-	 * pgstat_bestart*() are normally only called from there (or from
-	 * AuxiliaryProcessMainCommon() for built-in auxiliary processes).
-	 * Without them this worker would be invisible in pg_stat_activity and
-	 * pgstat_report_appname() below would silently do nothing, which defeats
-	 * the whole point of a fiction worker that exists to be counted and
-	 * observed.  Establish backend status the same way
-	 * AuxiliaryProcessMainCommon() does for an aux process with no database
-	 * connection.  The final bestart step calls GetSessionUserId() for any
-	 * B_BG_WORKER, which asserts a valid SessionUserId that InitPostgres
-	 * would normally have set; InitializeSessionUserIdStandalone() is the
-	 * documented way for a background worker to establish that identity
-	 * without a database connection or catalog access (it is the same call
-	 * autovacuum workers use for the same reason).
-	 *
-	 * PostgreSQL 18 split the single pgstat_bestart() call into
-	 * pgstat_bestart_initial() (report before SessionUserId exists) and
-	 * pgstat_bestart_final() (report once it does); pgstat_bestart_initial
-	 * and pgstat_bestart_final do not exist before 18, where a single
-	 * pgstat_bestart() call does both steps after SessionUserId is set.
-	 */
+	InitProcessPhase2();
+
 	pgstat_beinit();
 #if PG_VERSION_NUM >= 180000
 	pgstat_bestart_initial();
@@ -486,31 +491,27 @@ SvsParkedSlotMain(Datum main_arg)
 	pgstat_bestart();
 #endif
 
-	/*
-	 * InitProcess() (already run before this function, from
-	 * BackgroundWorkerMain()) allocates MyProc but does not make it visible
-	 * in the shared ProcArray; that step, InitProcessPhase2(), is normally
-	 * only reached via InitPostgres(), which this worker never calls.
-	 * Without it, BackendPidGetProc() cannot find this process by pid, and
-	 * pg_stat_activity's wait_event/wait_event_type columns (which are read
-	 * from the PGPROC that lookup returns) stay NULL no matter what this
-	 * worker reports through WaitLatch below.  InitProcessPhase2() needs
-	 * nothing a database connection would have provided and registers its
-	 * own ProcArray removal on exit, so it is safe to call directly here.
-	 */
-	InitProcessPhase2();
-
-	SvsFormatSearchSlotAppName(appName, sizeof(appName), arg.datname,
-							   arg.slotIndex, arg.slotTotal, arg.reserved);
+	SvsFormatSearchSlotAppName(appName, sizeof(appName), arg->datname,
+							   arg->slotIndex, arg->slotTotal, arg->reserved);
 	pgstat_report_appname(appName);
 
 	/*
-	 * WaitEventExtensionNew() dedupes by name through a shared hash, so every
-	 * parked slot across every backend registering "VamanaSearchSlot" gets
-	 * back the same id with no coordination needed; each process still only
-	 * calls it the once, here, before entering its park loop.
+	 * WaitEventExtensionNew() dedupes by name through a shared hash, so
+	 * every parked slot across every backend gets back the same id with no
+	 * coordination needed.
 	 */
-	waitEventSearchSlot = WaitEventExtensionNew("VamanaSearchSlot");
+	return WaitEventExtensionNew(SvsSearchSlotWaitEventName());
+}
+
+void
+SvsParkedSlotMain(Datum main_arg)
+{
+	SvsParkedSlotArg arg;
+	uint32		waitEventSearchSlot;
+
+	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(arg));
+
+	waitEventSearchSlot = SvsParkedSlotBootstrap(&arg);
 
 	for (;;)
 	{

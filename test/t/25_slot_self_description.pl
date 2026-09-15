@@ -116,8 +116,7 @@ my $pg_granted = wait_for_granted($node, $pg_oid, 1, 40);
 is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 
 # ---------------------------------------------------------------------------
-# Case 1: backend_type.  Already true on main; asserted anyway so a
-# regression here is caught alongside the new checks in this file.
+# Case 1: a parked slot self-describes as backend_type 'vamana search slot'.
 # ---------------------------------------------------------------------------
 {
 	my $count = $node->safe_psql('postgres',
@@ -129,8 +128,8 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 }
 
 # ---------------------------------------------------------------------------
-# Case 2: named wait event.  Must fail against unpatched main, where the
-# park loop waits on the generic PG_WAIT_EXTENSION.
+# Case 2: a parked slot's wait event is named, not the generic extension
+# wait every other unrelated extension wait would also report.
 # ---------------------------------------------------------------------------
 {
 	my $wait = $node->safe_psql('postgres',
@@ -143,8 +142,8 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 }
 
 # ---------------------------------------------------------------------------
-# Case 3: numbers survive a long database name.  Must fail against
-# unpatched main, where "db=" comes first and truncation eats the counts.
+# Case 3: the slot counts, not datname, are the part of application_name
+# that survives NAMEDATALEN truncation for a long database name.
 # ---------------------------------------------------------------------------
 {
 	my $longdb = "longname_" . ("x" x 54);    # 63 chars, NAMEDATALEN - 1
@@ -172,7 +171,6 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 
 # ---------------------------------------------------------------------------
 # Case 4: a control character in datname does not reach application_name.
-# Must fail against unpatched main, which has no sanitizing at all.
 # ---------------------------------------------------------------------------
 {
 	my $nl_raw = "nldb_before\nafter";        # real newline, for CREATE DATABASE
@@ -196,9 +194,8 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 
 # ---------------------------------------------------------------------------
 # Case 5: a literal '%' in datname is preserved, proving no format
-# confusion was introduced.  Expected to already pass against unpatched
-# main: datname is a %s argument to a literal format string, never a
-# format string itself.
+# confusion was introduced: datname is a %s argument to a literal format
+# string, never a format string itself.
 # ---------------------------------------------------------------------------
 {
 	my $pctdb = "pct100%db";
