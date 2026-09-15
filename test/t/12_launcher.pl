@@ -68,6 +68,7 @@ sub wait_for_worker_count
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
@@ -160,6 +161,7 @@ sub wait_for_worker_count
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '1500MB'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
@@ -189,10 +191,10 @@ sub wait_for_worker_count
     }), 67108864, 'mem_ovr_b search_work_mem override (64MB) resolves via the stats view');
 
     is($node->safe_psql('postgres', qq{
-        SELECT residency_memory_limit IS NULL
+        SELECT residency_memory_limit
           FROM pg_stat_vamana_worker
          WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'mem_ovr_a');
-    }), 't', 'residency_memory_limit is NULL before SvsMemoryAdmitDatabase is ever called');
+    }), 536870912, 'mem_ovr_a residency_memory override (512MB) resolves via the stats view');
 
     $node->safe_psql('postgres',
         "UPDATE vamana_databases SET residency_memory = 1024 WHERE datname = 'mem_ovr_a';");
@@ -287,6 +289,7 @@ sub wait_for_worker_count
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");

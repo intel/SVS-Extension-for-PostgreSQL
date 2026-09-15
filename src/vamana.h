@@ -21,11 +21,6 @@
 
 #define VAMANA_MAX_DIM 2000
 
-/*
- * Maximum number of SVS index handles cached per process (background worker).
- */
-#define VAMANA_MAX_CACHED_INDEXES 8
-
 /* Support functions */
 #define VAMANA_DISTANCE_PROC 1
 #define VAMANA_NORM_PROC 2
@@ -339,7 +334,7 @@ void		VamanaInvalidateCache(Oid indexRelid);
 void		VamanaEvictCacheEntry(Oid indexRelid);
 void		VamanaForceHeapRebuild(Oid indexRelid);
 void		VamanaEvictAllCacheEntries(void);
-int			VamanaGetAllCachedRelids(Oid *out, int maxout);
+List	   *VamanaGetAllCachedRelids(void);
 void		VamanaCacheSetNeedsSave(Oid indexRelid, bool flag);
 bool		VamanaCacheGetNeedsSave(Oid indexRelid);
 SVSIndexHandle VamanaRebuildFromTable(Relation index);

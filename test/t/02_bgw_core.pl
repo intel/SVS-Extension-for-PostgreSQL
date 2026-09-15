@@ -24,6 +24,7 @@ use VamanaTestUtils qw(:all);
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '300MB'");
     $node->start;
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");

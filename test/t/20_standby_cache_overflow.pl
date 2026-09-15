@@ -1,19 +1,19 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 20_standby_cache_overflow.pl — standby bootstrap survives more vamana
-# indexes than fit in the cache.
+# 20_standby_cache_overflow.pl — standby bootstrap survives indexes that
+# fail to load.
 #
 # VamanaWorkerServe bootstraps a standby's cache before it starts accepting
 # requests: it enumerates every vamana index in the database and loads each
 # one via VamanaStandbyLoadIndex, which calls VamanaWorkerGetOrLoadIndex with
-# no enclosing PG_TRY. With 9 or more vamana indexes and an 8-slot cache
-# (VAMANA_MAX_CACHED_INDEXES), the 9th load hits the cache-full denial. If
-# that denial propagates instead of returning NULL, it escapes
-# VamanaWorkerServe uncaught and takes the whole worker down; the postmaster
-# restarts it, bootstrap runs again, and it dies at the same point every
-# time. This test builds exactly that fixture and asserts the worker starts
-# once and stays up.
+# no enclosing PG_TRY. If a load failure propagates instead of returning
+# NULL, it escapes VamanaWorkerServe uncaught and takes the whole worker
+# down; the postmaster restarts it, bootstrap runs again, and it dies at the
+# same point every time. This test builds a fixture where every index's own
+# residency footprint exceeds the database's own residency budget, so every
+# load fails during bootstrap, and asserts the worker starts once and stays
+# up regardless.
 
 use strict;
 use warnings FATAL => 'all';
@@ -26,10 +26,11 @@ use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
 
-my $N_INDEXES = 9;    # one more than VAMANA_MAX_CACHED_INDEXES (8)
+my $N_INDEXES = 9;
 
 # ===========================================================================
-# Setup: primary with 9 vamana indexes, then a streaming standby.
+# Setup: primary with 9 vamana indexes, each larger than the database's own
+# 1MB residency budget, then a streaming standby.
 # Fixture pattern follows test/t/08_standby_replay.pl.
 # ===========================================================================
 
@@ -45,14 +46,15 @@ $primary->start;
 $primary->safe_psql('postgres', "CREATE EXTENSION vector;");
 $primary->safe_psql('postgres', "CREATE EXTENSION svs;");
 $primary->safe_psql('postgres',
-    "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    "INSERT INTO vamana_databases (datname, enabled, residency_memory) "
+  . "VALUES ('postgres', true, 1);");
 
 for my $i (0 .. $N_INDEXES - 1)
 {
     $primary->safe_psql('postgres', qq{
         CREATE TABLE so_tbl_$i (id serial PRIMARY KEY, val vector($dim));
         INSERT INTO so_tbl_$i (val)
-            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 10);
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000);
         CREATE INDEX so_idx_$i ON so_tbl_$i USING vamana (val vector_l2_ops);
     });
 }
@@ -77,14 +79,14 @@ $standby->start;
 $primary->wait_for_replay_catchup($standby);
 
 # ===========================================================================
-# The worker starts, and only once: no crash-loop from the cache-full denial
-# during bootstrap.
+# The worker starts, and only once: no crash-loop from bootstrap's
+# uncaught-load-failure path.
 # ===========================================================================
 
 my $worker_pid = wait_for_worker($standby, 30);
 ok($worker_pid =~ /^\d+$/, "standby worker running (pid=$worker_pid)");
 
-# Bootstrap loads all 9 relids sequentially with a blocking slot-activation
+# Bootstrap attempts all 9 relids sequentially with a blocking slot-activation
 # wait per index (VamanaWorkerServe, before workerPid is published). Each
 # wait needs a standby snapshot from the primary to reach consistency; on an
 # otherwise idle primary that only happens on its own schedule, which can
@@ -123,7 +125,8 @@ chomp $hb2;
 ok($hb2 ne '' && $hb2 > $hb1, 'standby worker heartbeat advances after bootstrap');
 
 # ===========================================================================
-# The 9th index's denial during bootstrap is a WARNING, not a crash.
+# Every one of the 9 residency-budget denials during bootstrap is a
+# WARNING, not a crash, and names the ceiling, not a slot count.
 # ===========================================================================
 
 my $log = slurp_file($standby->logfile);
@@ -131,34 +134,31 @@ unlike($log, qr/background worker "vamana worker[^"]*".*exited with exit code 1/
     'no standby worker crash-exit in the server log');
 unlike($log, qr/Segmentation fault/,
     'no segfault in the standby server log');
-like($log, qr/vamana worker: failed to load index \d+/,
-    'the bootstrap cache-full denial surfaced as WARNING, not a crash');
+like($log, qr/residency budget/,
+    'the bootstrap denials surfaced as WARNING and name the residency ceiling');
+unlike($log, qr/cache slots/,
+    'no denial during bootstrap is the old slot-count message');
 
 # ===========================================================================
-# Exactly 8 of the 9 indexes fit in the standby cache after bootstrap. Which
-# 8 depends on enumeration order, so query all 9 and count: the 8 that
-# bootstrap loaded answer directly from cache, and the one left out is
-# denied via the search-path cache-full check (vamanaworkersearch.c), which
-# surfaces as a client-visible error, same as a single-node query against a
-# cold 9th index in test/t/19_cache_hard_deny.pl. Neither outcome is a crash.
+# None of the 9 indexes fit the 1MB budget: each is denied via the
+# search-path check (vamanaworkersearch.c) on query, surfacing as a
+# client-visible "not loaded" error, same as test/t/19_cache_hard_deny.pl's
+# tinydb case.  Neither outcome is a crash.
 # ===========================================================================
 
 my $ok_query = 0;
 for my $i (0 .. $N_INDEXES - 1)
 {
-    my $cnt = eval {
-        $standby->safe_psql('postgres', qq{
-            SET enable_seqscan = off;
-            SELECT count(*) FROM (
-                SELECT id FROM so_tbl_$i
-                ORDER BY val <-> '[$query_sql]' LIMIT 5
-            ) sub;
-        });
-    };
-    $ok_query++ if defined $cnt && $cnt ne '';
+    my ($ret, $stdout, $stderr) = $standby->psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT id FROM so_tbl_$i ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    });
+    $ok_query++ if $ret == 0;
+    like($stderr, qr/not loaded/, "so_idx_$i is denied with 'not loaded', not a crash")
+        if $ret != 0;
 }
-is($ok_query, $N_INDEXES - 1,
-    'exactly the 8 indexes the standby cache holds after bootstrap are queryable');
+is($ok_query, 0,
+    'none of the 9 oversized indexes fit the 1MB budget');
 
 $standby->stop;
 $primary->stop;

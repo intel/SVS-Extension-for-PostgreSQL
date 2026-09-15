@@ -291,7 +291,8 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
 
 	UnlockRelationOid(relid, AccessShareLock);
 	ereport(WARNING,
-			(errmsg("vamana worker: failed to load index %u", relid)));
+			(errmsg("vamana worker: failed to load index %u", relid),
+			 errdetail("%s", result.edata->message)));
 	FreeErrorData(result.edata);
 
 	return NULL;
@@ -477,15 +478,13 @@ bool
 VamanaReconcileStandbyCache(List *targetRelids,
 							 void (*activateSlot) (Oid relid))
 {
-	Oid			cachedRelids[VAMANA_MAX_CACHED_INDEXES];
-	int			nCached = VamanaGetAllCachedRelids(cachedRelids,
-													VAMANA_MAX_CACHED_INDEXES);
+	List	   *cachedRelids = VamanaGetAllCachedRelids();
 	bool		allConverged = true;
 
-	for (int i = 0; i < nCached; i++)
+	foreach_oid(relid, cachedRelids)
 	{
-		if (!list_member_oid(targetRelids, cachedRelids[i]))
-			VamanaStandbyReleaseIndex(cachedRelids[i]);
+		if (!list_member_oid(targetRelids, relid))
+			VamanaStandbyReleaseIndex(relid);
 	}
 
 	foreach_oid(relid, targetRelids)
