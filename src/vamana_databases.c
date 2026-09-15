@@ -20,6 +20,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana_databases.h"
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
@@ -39,6 +41,8 @@
 #define VAMANA_DATABASES_ATTNUM_DATNAME			1
 #define VAMANA_DATABASES_ATTNUM_ENABLED			2
 #define VAMANA_DATABASES_ATTNUM_RESTART_GENERATION	3
+#define VAMANA_DATABASES_ATTNUM_RESIDENCY_MEMORY	6
+#define VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM	7
 
 #define VAMANA_DATABASES_QUEUE_INITIAL_CAPACITY	16
 
@@ -72,7 +76,9 @@ GetOrCreateReservationQueue(void)
 }
 
 static void
-QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_generation)
+QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_generation,
+					  int residencyMemoryMbOverride, int searchWorkMemMbOverride,
+					  uint64 durableResidencyFloorBytes)
 {
 	VamanaDatabasesReservationEntry *entry =
 		VamanaSubxidPendingArrayAppend(GetOrCreateReservationQueue());
@@ -81,6 +87,9 @@ QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_gener
 	entry->dbOid = dbOid;
 	entry->enabled = enabled;
 	entry->restart_generation = restart_generation;
+	entry->residencyMemoryMbOverride = residencyMemoryMbOverride;
+	entry->searchWorkMemMbOverride = searchWorkMemMbOverride;
+	entry->durableResidencyFloorBytes = durableResidencyFloorBytes;
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_queue_reservation);
@@ -94,9 +103,13 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	Datum		datnameDatum;
 	Datum		enabledDatum;
 	Datum		restartGenDatum;
+	Datum		residencyMemoryDatum;
+	Datum		searchWorkMemDatum;
 	Name		datname;
 	Oid			dbOid;
 	int64		restart_generation;
+	bool		residencyMemoryIsNull;
+	bool		searchWorkMemIsNull;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "vamana_databases_queue_reservation: not called by trigger manager");
@@ -129,9 +142,19 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 		elog(ERROR, "vamana_databases_queue_reservation: restart_generation is null");
 	restart_generation = DatumGetInt64(restartGenDatum);
 
+	residencyMemoryDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_RESIDENCY_MEMORY, tupdesc,
+										 &residencyMemoryIsNull);
+	searchWorkMemDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM, tupdesc,
+									   &searchWorkMemIsNull);
+
 	dbOid = get_database_oid(NameStr(*datname), false);
 
-	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation);
+	/* Resolved here, not in the PRE_COMMIT callback that drains this queue: only this trigger has an active snapshot. */
+	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation,
+						  residencyMemoryIsNull ? 0 : DatumGetInt32(residencyMemoryDatum),
+						  searchWorkMemIsNull ? 0 : DatumGetInt32(searchWorkMemDatum),
+						  DatumGetBool(enabledDatum) ?
+							  SvsIndexResidencyDurableFloor(dbOid, VamanaWorkerLookupSlot(dbOid)) : 0);
 
 	return PointerGetDatum(NULL);	/* AFTER trigger; return value is ignored */
 }
@@ -295,12 +318,15 @@ ReserveSlotsForEnabledEntries(void)
 	for (int i = 0; i < queue->count; i++)
 	{
 		VamanaDatabasesReservationEntry *entry = VamanaSubxidPendingArrayEntryAt(queue, i);
+		VamanaWorkerShmem *slotEntry;
 		bool		created;
+		uint64		residencyBudget;
 
 		if (!entry->enabled || entry->subxid == InvalidSubTransactionId)
 			continue;
 
-		if (VamanaWorkerReserveSlot(entry->dbOid, &created) == NULL)
+		slotEntry = VamanaWorkerReserveSlot(entry->dbOid, &created);
+		if (slotEntry == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("cannot enable database \"%s\": svs.max_databases (%d) already reached",
@@ -310,6 +336,13 @@ ReserveSlotsForEnabledEntries(void)
 		/* A pre-existing live slot found by this idempotent reservation must survive this transaction's abort. */
 		if (created)
 			ReservedThisXactDbOids = lappend_oid(ReservedThisXactDbOids, entry->dbOid);
+
+		/* A too-small budget fails this INSERT/UPDATE here, in the same transaction, not a later load. */
+		VamanaWorkerSetMemoryOverrides(entry->dbOid, entry->residencyMemoryMbOverride,
+										entry->searchWorkMemMbOverride);
+
+		residencyBudget = SvsMemoryResolveResidencyBudget(slotEntry);
+		SvsMemoryAdmitDatabase(entry->dbOid, residencyBudget, entry->durableResidencyFloorBytes);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -334,7 +367,7 @@ ReleaseSlotsReservedThisXact(void)
  * ----------------------------------------------------------------------- */
 
 char *
-SvsDatabasesQualifiedName(void)
+SvsExtensionQualifiedRelationName(const char *relname)
 {
 	Oid			extOid = get_extension_oid("svs", true);
 	Oid			nspOid;
@@ -343,11 +376,17 @@ SvsDatabasesQualifiedName(void)
 		return NULL;
 
 	nspOid = get_extension_schema(extOid);
-	if (!OidIsValid(get_relname_relid("vamana_databases", nspOid)))
+	if (!OidIsValid(get_relname_relid(relname, nspOid)))
 		return NULL;
 
 	return psprintf("%s.%s", quote_identifier(get_namespace_name(nspOid)),
-					quote_identifier("vamana_databases"));
+					quote_identifier(relname));
+}
+
+char *
+SvsDatabasesQualifiedName(void)
+{
+	return SvsExtensionQualifiedRelationName("vamana_databases");
 }
 
 int32

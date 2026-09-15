@@ -222,12 +222,18 @@ SELECT pg_reload_conf();
 -- svs.max_build_memory / svs.max_residency_memory / svs.default_residency_memory /
 -- svs.max_search_work_mem / svs.default_search_work_mem: all [1, INT_MAX] MB,
 -- default 100MB, PGC_SIGHUP. Always finite: no "0 means unlimited" path.
-
-SHOW svs.max_build_memory;
-SHOW svs.max_residency_memory;
-SHOW svs.default_residency_memory;
-SHOW svs.max_search_work_mem;
-SHOW svs.default_search_work_mem;
+--
+-- Asserted against pg_settings.boot_val, not SHOW: SHOW reflects whatever
+-- this cluster's own postgresql.conf currently sets each GUC to, which a
+-- real deployment (this regression environment included) legitimately
+-- overrides away from the compiled-in default. boot_val is the compiled
+-- default itself and never changes with the active config, so this stays
+-- true regardless of how the cluster under test happens to be tuned.
+SELECT name, boot_val, unit FROM pg_settings
+ WHERE name IN ('svs.max_build_memory', 'svs.max_residency_memory',
+				'svs.default_residency_memory', 'svs.max_search_work_mem',
+				'svs.default_search_work_mem')
+ ORDER BY name;
 
 -- Out-of-range (below min): rejected at ALTER SYSTEM time
 ALTER SYSTEM SET svs.max_build_memory = 0;

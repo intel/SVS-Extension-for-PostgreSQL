@@ -428,3 +428,48 @@ SELECT residency_bytes_committed = :before_621_residency_bytes_committed
    AND build_bytes_committed = :before_621_build_bytes_committed AS other_database_untouched
   FROM svs_memory_read_stats(621);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- durable_committed_floor: the fallback SvsMemoryAdmitDatabase's caller
+-- passes in place of the live counter when a worker cannot yet be trusted
+-- to answer from shared memory (svs_index_residency.h). A freshly
+-- constructed entry's committed bytes read 0 (no reconcile has ever run
+-- against it), exactly as they do on a real server restart before the
+-- worker reloads anything; the floor is the only thing standing between
+-- that 0 and a budget lowered out from under bytes a durable row still
+-- remembers. Byte-scale, not MB-scale, values throughout this section: the
+-- shared global residency ceiling is nearly exhausted by every admit
+-- earlier in this file.
+--
+-- A floor above the (here, zero) live counter blocks a decrease the live
+-- counter alone would allow.
+SELECT svs_memory_admit_database(650, (10 * 1024)::bigint);
+SELECT svs_memory_admit_database(650, (2 * 1024)::bigint, (5 * 1024)::bigint);
+SELECT residency_budget = (10 * 1024) AS budget_unchanged_by_rejected_decrease
+  FROM svs_memory_read_stats(650);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Exactly at the floor succeeds; one byte under it fails, symmetric with
+-- every other fits-check boundary in this file.
+SELECT svs_memory_admit_database(650, (5 * 1024)::bigint, (5 * 1024)::bigint);
+SELECT svs_memory_admit_database(650, (5 * 1024 - 1)::bigint, (5 * 1024)::bigint);
+SELECT residency_budget = (5 * 1024) AS budget_holds_at_the_floor
+  FROM svs_memory_read_stats(650);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- The floor never lowers the bar below what the live counter already
+-- requires: a floor under the live committed total is not a license to
+-- shrink past it.
+SELECT svs_memory_admit_database(651, (10 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(651, 1, (4 * 1024)::bigint);
+SELECT svs_memory_admit_database(651, (3 * 1024)::bigint, (1 * 1024)::bigint);
+SELECT residency_budget = (10 * 1024) AS live_counter_still_governs_over_a_lower_floor
+  FROM svs_memory_read_stats(651);
+SELECT svs_memory_admit_database(651, (4 * 1024)::bigint, (1 * 1024)::bigint);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(651, 1);
+SELECT svs_memory_admit_database(651, 1::bigint);
+
+-- A floor at or below a fresh entry's zero committed bytes admits normally:
+-- durable_committed_floor is a floor, not a mandatory minimum budget.
+SELECT svs_memory_admit_database(652, (1 * 1024)::bigint, 0::bigint);
+SELECT * FROM svs_memory_test_check_invariants();

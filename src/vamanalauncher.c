@@ -23,6 +23,7 @@
 #include "postgres.h"
 
 #include "svs_cpu_budget.h"
+#include "svs_index_residency.h"
 #include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_databases.h"
@@ -825,6 +826,45 @@ PublishCpuGrants(List *rows)
 }
 
 /*
+ * Re-validate dbOid's admitted residency budget, for a change with no
+ * catalog row to hang a synchronous trigger on: svs.default_residency_memory
+ * or svs.max_residency_memory via SIGHUP. One rejection is caught and
+ * logged so it can't stop the rest of this cycle's databases from
+ * reconciling.
+ */
+static void
+ReconcileResidencyAdmission(Oid dbOid)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+
+	if (entry == NULL)
+		return;
+
+	PG_TRY();
+	{
+		uint64		durableFloor;
+		uint64		residencyBudget;
+
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		durableFloor = SvsIndexResidencyDurableFloor(dbOid, entry);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		residencyBudget = SvsMemoryResolveResidencyBudget(entry);
+		SvsMemoryAdmitDatabase(dbOid, residencyBudget, durableFloor);
+	}
+	PG_CATCH();
+	{
+		if (IsTransactionState())
+			AbortCurrentTransaction();
+		EmitErrorReport();
+		FlushErrorState();
+	}
+	PG_END_TRY();
+}
+
+/*
  * Materialize every enabled row's memory-governance overrides into its
  * reserved shmem entry, same "reserves or refreshes the slot" cadence as
  * PublishCpuGrants: an override set after enrollment (an UPDATE, not just
@@ -844,6 +884,8 @@ PublishMemoryOverrides(List *rows)
 		VamanaWorkerSetMemoryOverrides(db->dbOid,
 										db->memory.residencyMemoryMbOverride,
 										db->memory.searchWorkMemMbOverride);
+
+		ReconcileResidencyAdmission(db->dbOid);
 	}
 }
 

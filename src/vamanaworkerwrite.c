@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
@@ -127,7 +129,8 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
 
-	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1, &errorCode);
+	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1,
+									 cache->dimensions, &errorCode);
 
 	SVSFreeBuilder(builder);
 	SVSFreeStorage(storage);
@@ -139,6 +142,29 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 				(errmsg("vamana worker: first-insert build failed for index %u",
 						relid)));
 		return NULL;
+	}
+
+	/*
+	 * cache already holds a RESIDENT reservation at 0 bytes, from the
+	 * empty-table VamanaCacheIndex call that created this entry; reconcile
+	 * it to this build's real measured size rather than accounting it as a
+	 * fresh load.
+	 */
+	{
+		uint64		measuredBytes = SVSGetIndexMemoryUsage(svsIndex);
+
+		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes))
+		{
+			SVSFreeIndex(svsIndex);
+			ereport(WARNING,
+					(errmsg("vamana worker: first-insert build for index %u exceeds this database's residency budget",
+							relid),
+					 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes)));
+			return NULL;
+		}
+
+		cache->residentBytes = measuredBytes;
+		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
 	}
 
 	cache->svsIndex = svsIndex;
@@ -540,6 +566,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		VamanaGetIndexSavePath(VamanaWorkerShmemPtr->dbOid, relid, savepath, sizeof(savepath));
 
 		config.dimensions			= params->dimensions;
+		config.numVectors			= params->numVectors;
 		config.graph_degree			= params->graph_degree;
 		config.alpha				= params->alpha;
 		config.search_window_size	= params->search_window_size;
