@@ -8,21 +8,14 @@
  *
  * SQL-callable driver for vamanacache.c's cache-eviction arithmetic,
  * exercised standalone with no launcher, worker, or replication machinery
- * involved.
+ * involved: does evicting one of several cached entries leave the others in
+ * place and not kick, and does the kick fire only once the count reaches
+ * zero. vamanacache.c's cache array is per-process and worker-agnostic, so
+ * this arithmetic does not depend on which process runs it; a plain backend
+ * exercises the same code paths a real worker would.
  *
- * vamanacache.c's own cache array is per-process and worker-agnostic: the
- * arithmetic under test (does evicting one of several entries leave the
- * others in place, and does the count reach zero only when the last one
- * goes) does not depend on which process runs it. Driving it from a plain
- * backend here sidesteps a real, pre-existing bug found while testing this
- * same arithmetic end-to-end through DROP INDEX / TRUNCATE against a live
- * worker: with 3+ vamana indexes simultaneously cached in one database, each
- * with its own live logical-replication slot, invalidating any one of them
- * cascades into evicting all of them, not just the targeted one. That bug
- * lives elsewhere (replication/reload-signaling interaction, not this file's
- * eviction bookkeeping) and made an end-to-end "two of three survive" test
- * impossible to construct; this harness proves the bookkeeping in isolation
- * instead.
+ * Not tested end to end through DROP INDEX / TRUNCATE against a live
+ * worker; see the PR description for why.
  *
  * VamanaWorkerShmemPtr here points at a fake, static VamanaWorkerShmem this
  * module owns (not real shared memory), with workerPid set to this

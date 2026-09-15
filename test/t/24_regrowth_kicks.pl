@@ -1,36 +1,31 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 24_regrowth_kicks.pl — the launcher is kicked promptly when a database's
+# 24_regrowth_kicks.pl: the launcher is kicked promptly when a database's
 # last cached index unloads, instead of waiting out the 180s naptime.
 #
-# IMPORTANT SCOPE NOTE, verified empirically before writing this file: the
-# published grant (pg_stat_vamana_worker.search_threads_granted) is computed
-# by SvsComputeCpuGrants/ComputeEffectiveDesired (svs_cpu_budget.c) purely
-# from a database's liveness and its search_num_threads catalog value --
-# never from its cached-index count or even its catalog index_count. This
-# was confirmed by hand against a running server: dropping a database's only
-# index left both its own desired/granted and a contending sibling
-# database's granted completely unchanged. So unloading a database's last
-# cached index cannot, under the current formula, make a sibling's granted
-# value rise -- regardless of how promptly the launcher reconciles.
+# SCOPE NOTE: the published grant (pg_stat_vamana_worker.search_threads_granted)
+# is computed by SvsComputeCpuGrants/ComputeEffectiveDesired (svs_cpu_budget.c)
+# purely from a database's liveness and its search_num_threads catalog value,
+# never from its cached-index count or even its catalog index_count. So
+# unloading a database's last cached index cannot, under the current formula,
+# make a sibling's granted value rise, regardless of how promptly the launcher
+# reconciles. See the PR description for the supporting evidence.
 #
-# What *is* true, and what this file actually tests, is the mechanism the
-# task requires: the worker calls SvsKickLauncher() exactly when its cache
-# transitions to zero entries, so the launcher's next reconcile pass runs
-# within a couple of seconds of that event rather than after the full 180s
-# VAMANA_LAUNCHER_NAPTIME_MS naptime. Every reconcile pass calls
-# PublishCpuGrants(), which carries a pre-existing injection point
-# ("svs-build-thread-grant-publish", added for #19's build-thread-grant
-# tests). Attaching to it in 'wait' mode and checking the launcher's
-# pg_stat_activity.wait_event is a direct, value-independent way to observe
-# "a reconcile pass just ran" without needing the grant to move at all.
+# What this file actually tests is the mechanism this task adds: the worker
+# calls SvsKickLauncher() exactly when its cache transitions to zero entries,
+# so the launcher's next reconcile pass runs within a couple of seconds of
+# that event rather than after the full 180s VAMANA_LAUNCHER_NAPTIME_MS
+# naptime. Every reconcile pass calls PublishCpuGrants(), which carries a
+# pre-existing injection point ("svs-build-thread-grant-publish", added for
+# #19's build-thread-grant tests). Attaching to it in 'wait' mode and checking
+# the launcher's pg_stat_activity.wait_event is a direct, value-independent
+# way to observe "a reconcile pass just ran" without needing the grant to
+# move at all.
 #
 # The "unloading one of several cached indexes must not kick" negative case
-# is NOT tested in this file; see test/modules/svs_cache_kick_test instead.
-# Section 2 below explains why: a separate, pre-existing bug in this
-# codebase's replication/reload-signaling makes that scenario unconstructable
-# end-to-end through SQL today.
+# is not tested in this file; see test/modules/svs_cache_kick_test and the PR
+# description.
 
 use strict;
 use warnings FATAL => 'all';
@@ -123,20 +118,6 @@ sub cache_one_index
 # $bound_ms? Polls pg_stat_activity rather than sleeping the full bound, so a
 # prompt hit is detected quickly and the elapsed time returned is meaningful.
 # ---------------------------------------------------------------------------
-sub settle
-{
-	# CREATE INDEX's build-thread-grant release kick (svs_build_thread_grant.c)
-	# is fire-and-forget from the backend's side: it calls SvsKickLauncher()
-	# and returns without waiting for the launcher to actually process that
-	# reconcile pass. Attaching the shared injection point right after setup
-	# activity can therefore catch a still-in-flight, unrelated reconcile
-	# instead of the one triggered by the action under test -- observed
-	# directly as a spurious near-instant "hit" while developing this file.
-	# A couple of seconds is generous against the sub-100ms round trip these
-	# local, tiny-table builds normally take.
-	sleep(2);
-}
-
 sub launcher_hit_injection_point
 {
 	my ($point, $bound_ms) = @_;
@@ -153,6 +134,29 @@ sub launcher_hit_injection_point
 		usleep(100_000);
 	}
 	return (0, tv_interval($t0));
+}
+
+# CREATE INDEX's build-thread-grant release kick (svs_build_thread_grant.c)
+# is fire-and-forget from the backend's side: it calls SvsKickLauncher() and
+# returns without waiting for the launcher to process that reconcile pass.
+# Attaching the shared injection point right after setup activity can catch
+# a still-in-flight, unrelated reconcile instead of the one the next action
+# under test is meant to trigger. Drain any such reconcile deterministically
+# by attaching, absorbing one hit if it lands within a short bound, and
+# waking it, rather than guessing a sleep duration.
+sub settle
+{
+	$node->safe_psql('postgres',
+		"SELECT injection_points_attach('svs-build-thread-grant-publish', 'wait');");
+	my ($hit, undef) = launcher_hit_injection_point(
+		'svs-build-thread-grant-publish', 2_000);
+	if ($hit)
+	{
+		$node->safe_psql('postgres',
+			"SELECT injection_points_wakeup('svs-build-thread-grant-publish');");
+	}
+	$node->safe_psql('postgres',
+		"SELECT injection_points_detach('svs-build-thread-grant-publish');");
 }
 
 # ---------------------------------------------------------------------------
@@ -198,29 +202,12 @@ sub launcher_hit_injection_point
 }
 
 # ---------------------------------------------------------------------------
-# 2. Negative case: with several indexes still cached in one database,
-# unloading one of them must NOT kick the launcher -- MOVED to
-# test/modules/svs_cache_kick_test, not tested here.
-#
-# Verified by hand against unpatched main, with both DROP INDEX and TRUNCATE
-# as the trigger: with 3+ vamana indexes simultaneously cached in one
-# database, each with its own live logical-replication slot, invalidating
-# any single one of them cascades into evicting *all* of them (confirmed via
-# DEBUG1 "evicting vamana cache entry for relation" lines naming every one of
-# them, all in the same instant; ruled out as a timing issue with settle
-# delays up to 15s). That is a real, pre-existing bug in the replication/
-# reload-signaling interaction, not in this file's eviction bookkeeping, and
-# it makes an end-to-end "two of three survive" TAP case unconstructable: by
-# the time only one relid has actually been targeted, the worker's cache has
-# already been wiped to zero by the unrelated cascade, so this kick fires
-# correctly (the cache genuinely reached zero) for a reason this case did not
-# intend to test.
-#
-# test/modules/svs_cache_kick_test drives vamanacache.c's eviction arithmetic
-# directly (no worker, no replication, no launcher), proving there that
-# evicting one of several cached entries leaves the rest in place and does
-# not kick, and that the kick fires only once the count reaches zero --
-# sidestepping the cascade entirely.
+# 2. Negative case (with several indexes still cached in one database,
+# unloading one of them must NOT kick the launcher): not tested here. A
+# separate, pre-existing bug in this codebase's replication/reload-signaling
+# makes it unconstructable end-to-end through SQL today; see the PR
+# description for the evidence. test/modules/svs_cache_kick_test proves the
+# same arithmetic directly, sidestepping that bug.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -231,9 +218,9 @@ sub launcher_hit_injection_point
 # involvement needed.
 #
 # Runs in idle_db, not hot_db: hot_db still holds rk_hot_idx from case 1, and
-# this case's own empty-table CREATE INDEX was observed to trigger the same
-# cross-index cascade documented in section 2, evicting rk_hot_idx as a side
-# effect and producing a real (if differently-caused) kick. idle_db has
+# an empty-table CREATE INDEX there is subject to the same cross-index
+# cascade described in section 2, which would evict rk_hot_idx as a side
+# effect and produce a kick unrelated to what this case tests. idle_db has
 # never cached anything, so there is nothing for that cascade to reach.
 # ---------------------------------------------------------------------------
 {
@@ -269,14 +256,13 @@ sub launcher_hit_injection_point
 # one pass.
 #
 # SvsKickLauncher only sets the launcher's latch, which coalesces repeat
-# calls made before the launcher wakes into a single wake-up -- so kick
-# *count* cannot be distinguished from the outside between "called once
-# after the loop" and "called once per entry" the way this test observes the
-# system. What is directly observable, and asserted below, is a single
-# reconcile pass following the full eviction and the worker staying healthy
-# throughout. The "once after the loop, not per entry" guarantee itself is
-# established by code inspection: the call site in VamanaEvictAllCacheEntries
-# is outside the for loop, confirmed by grep/read of vamanacache.c.
+# calls made before the launcher wakes into a single wake-up, so kick *count*
+# cannot be distinguished from the outside between "called once after the
+# loop" and "called once per entry" the way this test observes the system.
+# What is directly observable, and asserted below, is a single reconcile
+# pass following the full eviction and the worker staying healthy
+# throughout. test/modules/svs_cache_kick_test proves the "once after the
+# loop, not per entry" guarantee directly.
 # ---------------------------------------------------------------------------
 {
 	my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
