@@ -1,4 +1,4 @@
-# User Guide: SVS Vamana Index and LeanVec Compression
+# User Guide: SVS Vamana Index and Vector Compression
 
 > **⚠️ Disclaimer:** This is a prototype. The implementation is functional but further improvements, additional features, and production hardening are actively in progress. Interfaces, parameters, and behaviors are subject to change in future releases.
 
@@ -13,8 +13,8 @@
    - 4.3 [Query-Time Parameters](#43-query-time-parameters)
    - 4.4 [Creating an Index](#44-creating-an-index)
    - 4.5 [Running Queries](#45-running-queries)
-5. [LeanVec Compression](#5-leanvec-compression)
-   - 5.1 [How LeanVec Works](#51-how-leanvec-works)
+5. [Vector Compression: LeanVec and LVQ](#5-vector-compression-leanvec-and-lvq)
+   - 5.1 [How LeanVec and LVQ Work](#51-how-leanvec-and-lvq-work)
    - 5.2 [Compression Parameters](#52-compression-parameters)
    - 5.3 [Memory Savings Estimates](#53-memory-savings-estimates)
    - 5.4 [Choosing a Compression Configuration](#54-choosing-a-compression-configuration)
@@ -36,7 +36,7 @@
 
 ## 1. Overview
 
-This guide covers the **Vamana** index access method and **LeanVec** compression that have been added to the pgvector extension. These features are powered by Intel's **Scalable Vector Search (SVS)** library.
+This guide covers the **Vamana** index access method and the two vector compression schemes — **LeanVec** and **LVQ** — that have been added to the pgvector extension. These features are powered by Intel's **Scalable Vector Search (SVS)** library.
 
 ### What is the Vamana Index?
 
@@ -47,14 +47,18 @@ The Vamana index is a graph-based approximate nearest neighbor (ANN) index, simi
 - **Dynamic index** — the index is built from the initial table data and supports incremental updates: INSERT adds vectors to the live graph immediately via `SVSAddPoints`, and DELETE + VACUUM removes vectors via `SVSDeletePoints` with automatic graph consolidation (see [Section 7](#7-operational-considerations))
 - **On-disk persistence** — the SVS graph and TID mappings are serialized directly to files on the filesystem (via the SVS `save`/`load` API and atomic checkpoint sequence). Both are reloaded automatically on restart
 
-### What is LeanVec Compression?
+### What is Vector Compression?
 
-LeanVec is an optional compression scheme that significantly reduces the memory footprint of a Vamana index by combining:
+Two optional compression schemes reduce the memory footprint of a Vamana index.
+
+**LeanVec** combines:
 
 1. **Dimensionality reduction** (similar to PCA) — projects high-dimensional vectors into a lower-dimensional space
 2. **Integer quantization** — stores the projected vectors in 4-bit or 8-bit integers instead of 32-bit floats
 
 LeanVec is ideal when your vectors have high dimensionality (e.g., 1536D from OpenAI embeddings) and memory is a limiting factor.
+
+**LVQ** (Locally-adaptive Vector Quantization) quantizes each vector in its original space, with an optional second-level residual. It keeps the full dimensionality, so it needs no projection matrix, and it stores more per vector than LeanVec at the same bit width.
 
 ---
 
@@ -168,10 +172,10 @@ These parameters are specified in the `WITH (...)` clause of `CREATE INDEX` and 
 | `build_window_size` | integer | `-1` | -1 – 1000 | Search window used during graph construction. `-1` defaults to `2 × graph_degree`. |
 | `search_window_size` | integer | `100` | 10 – 10000 | Stored with the index. At query time the `svs.search_window_size` GUC always governs behavior; because the GUC minimum is 10, this reloption is not used as a query-time fallback in the current implementation. |
 | `use_search_history` | boolean | `true` | — | Maintain a visited-node set during graph search. Keeping this enabled (`true`) improves recall; disabling it may reduce per-query memory usage at some recall cost. Not changeable at query time — must be set at index creation. |
-| `compression_type` | integer | `0` | 0 – 2 | `0` = none, `1` = LeanVec, `2` = LVQ (reserved). |
-| `compression_primary` | integer | `8` | see §5.2 | Primary quantization precision for LeanVec. |
-| `compression_secondary` | integer | `8` | see §5.2 | Secondary quantization precision for LeanVec. |
-| `leanvec_dims` | integer | `-1` | -1 – 2000 | Reduced dimensions for LeanVec. `-1` = `dimensions / 2`. |
+| `compression_type` | integer | `0` | 0 – 2 | `0` = none, `1` = LeanVec, `2` = LVQ. |
+| `compression_primary` | integer | `4` | see §5.2 | Primary quantization precision, under either scheme. |
+| `compression_secondary` | integer | `8` | see §5.2 | LeanVec secondary quantization, or the LVQ residual (`0` = no residual, LVQ only). |
+| `leanvec_dims` | integer | `-1` | -1 – 2000 | Reduced dimensions for LeanVec. `-1` = `dimensions / 2`. Ignored under LVQ. |
 
 ### 4.3 Query-Time Parameters
 
@@ -273,11 +277,13 @@ LIMIT 5;
 
 ---
 
-## 5. LeanVec Compression
+## 5. Vector Compression: LeanVec and LVQ
 
-### 5.1 How LeanVec Works
+### 5.1 How LeanVec and LVQ Work
 
-Without compression, each vector is stored as a contiguous array of 32-bit floats — a 1536-dimensional vector occupies 6 KB. LeanVec reduces this in two steps:
+Without compression, each vector is stored as a contiguous array of 32-bit floats — a 1536-dimensional vector occupies 6 KB. The two schemes cut this down in different ways.
+
+**LeanVec** (`compression_type = 1`) reduces the dimensionality first, then quantizes:
 
 ```
 Original D-dim float32 vectors
@@ -290,7 +296,19 @@ Original D-dim float32 vectors
   + Secondary quantized residuals (4-bit or 8-bit integers)
 ```
 
-During search, the compressed representation is used for candidate filtering. The full graph topology is preserved, so recall is determined by `graph_degree` and `search_window_size` as usual.
+**LVQ** (`compression_type = 2`) keeps all D dimensions and quantizes each vector in place, with an optional residual for a second level of precision:
+
+```
+Original D-dim float32 vectors
+          │
+          ▼  Per-vector quantization in the original D-dim space
+  Primary quantized vectors  (4-bit or 8-bit integers)
+  + optional residual        (4-bit or 8-bit integers, or none)
+```
+
+LVQ has no projection matrix and no reduced dimensionality, so `leanvec_dims` does not apply to it. At the same bit width LVQ therefore stores more than LeanVec — D values per vector rather than d — and it discards no dimensions.
+
+Under either scheme the compressed representation is used for candidate filtering during search, and the full graph topology is preserved, so recall is determined by `graph_degree` and `search_window_size` as usual.
 
 ### 5.2 Compression Parameters
 
@@ -300,11 +318,13 @@ During search, the compressed representation is used for candidate filtering. Th
 |-------|---------|
 | `0`   | No compression (default) |
 | `1`   | LeanVec (dimensionality reduction + quantization) |
-| `2`   | LVQ — reserved for future use |
+| `2`   | LVQ (per-vector quantization, optional residual) |
+
+Parameters that do not belong to the scheme you selected are ignored, not rejected: `leanvec_dims` under LVQ, and every compression parameter under `compression_type = 0`.
 
 #### `compression_primary` and `compression_secondary`
 
-Both parameters accept exactly four values:
+`compression_primary` accepts exactly four values under either scheme:
 
 | Value | Data Type | Bits per element |
 |-------|-----------|-----------------|
@@ -313,13 +333,26 @@ Both parameters accept exactly four values:
 | `8`   | UINT8 (unsigned 8-bit) | 8 |
 | `-8`  | INT8  (signed 8-bit)   | 8 |
 
-**Constraint:** `abs(compression_primary) ≤ abs(compression_secondary)`. For example:
+`compression_secondary` accepts the same four values, and additionally `0` — meaning **no residual** — which is valid for LVQ only. LeanVec always has a secondary level, so `compression_secondary = 0` is rejected under `compression_type = 1`.
+
+The defaults are `compression_primary = 4`, `compression_secondary = 8`. That pair is valid under both schemes, so naming `compression_type` alone is enough to get a working index either way.
+
+**Which combinations are supported** depends on the scheme, because SVS compiles a fixed set of specializations:
+
+| Scheme | Supported (primary, secondary) by bit width |
+|--------|---------------------------------------------|
+| LeanVec (`1`) | (4, 4), (4, 8), (8, 8) |
+| LVQ (`2`)     | (4, 0), (8, 0), (4, 4), (4, 8) |
+
+For LeanVec this is the same thing as the rule `abs(compression_primary) ≤ abs(compression_secondary)`:
 - ✅ primary=`4`, secondary=`4`
 - ✅ primary=`4`, secondary=`8`
 - ✅ primary=`8`, secondary=`8`
 - ❌ primary=`8`, secondary=`4` — invalid
 
-**Rule of thumb:** Use unsigned types (`4`, `8`) unless your vectors contain negative values and you want to preserve the sign bit explicitly.
+For LVQ an 8-bit primary carries no residual, so `compression_primary = 8` requires `compression_secondary = 0`. Anything outside the table above is rejected at `CREATE INDEX` time with `unsupported LVQ configuration` rather than failing inside the library.
+
+**Signs:** LVQ keeps only the bit count, so `-4` and `4` request the same thing and the sign is ignored. Under LeanVec, use unsigned types (`4`, `8`) unless your vectors contain negative values and you want to preserve the sign bit explicitly.
 
 #### `leanvec_dims`
 
@@ -329,6 +362,8 @@ Both parameters accept exactly four values:
 | `1` to `2000` | Explicit reduced dimension count (must be < original dimensions) |
 
 More aggressive reduction (smaller `leanvec_dims`) saves more memory but may reduce recall. The default of `D/2` is a good starting point for most embedding models.
+
+This parameter applies to LeanVec only. LVQ quantizes in the original space, so a `leanvec_dims` given alongside `compression_type = 2` is accepted and ignored.
 
 ### 5.3 Memory Savings Estimates
 
@@ -344,6 +379,8 @@ For a 1536-dimensional `vector` column:
 
 > These are approximate index-side storage estimates. The PostgreSQL heap row storing the full vector is not compressed.
 
+LVQ keeps all D dimensions, so at a given primary bit width it stores more per vector than LeanVec, which quantizes only `leanvec_dims` values. Adding a residual increases the per-vector size further. Measure your own workload rather than extrapolating from the LeanVec figures above.
+
 ### 5.4 Choosing a Compression Configuration
 
 | Goal | Recommended Configuration |
@@ -352,6 +389,8 @@ For a 1536-dimensional `vector` column:
 | Balanced — good memory savings, acceptable recall trade-off | `compression_type=1`, `compression_primary=4`, `compression_secondary=8` |
 | Maximum compression — smallest index, higher recall trade-off | `compression_type=1`, `compression_primary=4`, `compression_secondary=4`, `leanvec_dims=256` |
 | Large embeddings (≥2048D), targeting ~4× reduction | `compression_type=1`, `compression_primary=8`, `compression_secondary=8`, `leanvec_dims=-1` |
+
+The rows above cover LeanVec only. This guide deliberately makes no recommendation between LeanVec and LVQ, or among the LVQ configurations: that trade-off has not been characterized here. §5.2 lists what each scheme accepts; settle the choice by measuring recall and index size on your own data.
 
 Always measure recall on a representative dataset sample before deploying a heavily compressed index in production.
 
@@ -385,8 +424,23 @@ CREATE INDEX documents_vamana_leanvec_idx
     USING vamana (embedding vector_cosine_ops)
     WITH (
         graph_degree = 64,
+        compression_type = 1,       -- enable LeanVec
+        compression_primary = 8,
+        compression_secondary = 8
+        -- leanvec_dims          = -1 means dimensions/2 (default)
+    );
+```
+
+**Defaults (4-bit primary, 8-bit secondary, auto dimensions):**
+
+```sql
+CREATE INDEX documents_vamana_default_idx
+    ON documents
+    USING vamana (embedding vector_cosine_ops)
+    WITH (
+        graph_degree = 64,
         compression_type = 1        -- enable LeanVec
-        -- compression_primary   = 8  (default)
+        -- compression_primary   = 4  (default)
         -- compression_secondary = 8  (default)
         -- leanvec_dims          = -1 means dimensions/2 (default)
     );
@@ -435,6 +489,36 @@ CREATE INDEX documents_vamana_agr_idx
         compression_secondary = 8
     );
 ```
+
+**LVQ, 8-bit, no residual (full dimensionality preserved):**
+
+```sql
+CREATE INDEX documents_vamana_lvq8_idx
+    ON documents
+    USING vamana (embedding vector_cosine_ops)
+    WITH (
+        graph_degree = 64,
+        compression_type = 2,        -- enable LVQ
+        compression_primary = 8,
+        compression_secondary = 0    -- no residual (required with an 8-bit primary)
+    );
+```
+
+**LVQ, 4-bit primary with an 8-bit residual:**
+
+```sql
+CREATE INDEX documents_vamana_lvq48_idx
+    ON documents
+    USING vamana (embedding vector_cosine_ops)
+    WITH (
+        graph_degree = 64,
+        compression_type = 2,
+        compression_primary = 4,
+        compression_secondary = 8
+    );
+```
+
+Because the defaults are `(4, 8)`, the second example is also what a bare `WITH (compression_type = 2)` produces.
 
 ---
 
@@ -743,7 +827,7 @@ Disk ≈ N × graph_degree × 8 bytes (neighbor list)
      + N × D × sizeof(stored_element)
 ```
 
-With LeanVec compression, the stored element size is much smaller than `D × 4 bytes`.
+With LeanVec compression the stored element size is much smaller than `D × 4 bytes`, and the `D` in the second term becomes `leanvec_dims`. With LVQ, `D` stays as it is and only the element size shrinks.
 
 ### PostgreSQL Restart / Crash Recovery
 
@@ -923,13 +1007,18 @@ RESET enable_seqscan;
 
 ### Error: `invalid compression_secondary value: X`
 
-**Cause:** Same as above.  
-**Fix:** Same as above.
+**Cause:** Same as above. Note that `0` — no residual — is additionally allowed under `compression_type = 2`, and only there.  
+**Fix:** Use `4`, `-4`, `8`, `-8`, or, for LVQ only, `0`.
 
 ### Error: `compression_primary (8-bit) cannot have higher precision than compression_secondary (4-bit)`
 
-**Cause:** `abs(compression_primary) > abs(compression_secondary)`.  
+**Cause:** `abs(compression_primary) > abs(compression_secondary)` under LeanVec.  
 **Fix:** Ensure primary precision ≤ secondary precision, e.g., primary=`4`, secondary=`8`.
+
+### Error: `unsupported LVQ configuration: 8-bit primary with 8-bit residual`
+
+**Cause:** The `(compression_primary, compression_secondary)` pair is not one SVS compiles an LVQ specialization for. The supported pairs, by bit width, are (4, 0), (8, 0), (4, 4) and (4, 8) — so an 8-bit primary must be paired with `compression_secondary = 0`.  
+**Fix:** Either drop the residual (`compression_secondary = 0`) or drop the primary to 4 bits.
 
 ### Error: `value X out of bounds for option "compression_type"`
 
@@ -1005,7 +1094,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 |---------|------|--------|
 | Graph structure | Hierarchical multi-layer | Single-layer |
 | Memory (uncompressed) | High | Medium |
-| Memory (compressed) | Not supported | Low — with LeanVec |
+| Memory (compressed) | Not supported | Low — with LeanVec or LVQ |
 | Parallel build model | PostgreSQL worker processes | SVS-managed OS threads |
 | Shared memory required for build | Yes | No |
 | Incremental inserts update graph | Yes | Yes (via SVS dynamic API) |
@@ -1054,10 +1143,10 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `build_window_size` | `-1` | `-1` | `1000` | Build search window; -1 = 2×graph_degree |
 | `search_window_size` | `100` | `10` | `10000` | Default query window (always governed by `svs.search_window_size` GUC at runtime) |
 | `use_search_history` | `true` | — | — | Maintain visited-node set during search; improves recall |
-| `compression_type` | `0` | `0` | `2` | 0=none, 1=leanvec, 2=lvq (reserved) |
-| `compression_primary` | `8` | — | — | One of: 4, -4, 8, -8 |
-| `compression_secondary` | `8` | — | — | One of: 4, -4, 8, -8; ≥ primary precision |
-| `leanvec_dims` | `-1` | `-1` | `2000` | Reduced dims; -1 = dimensions/2 |
+| `compression_type` | `0` | `0` | `2` | 0=none, 1=leanvec, 2=lvq |
+| `compression_primary` | `4` | — | — | One of: 4, -4, 8, -8 |
+| `compression_secondary` | `8` | — | — | One of: 4, -4, 8, -8, plus 0 (no residual, LVQ only). LeanVec: ≥ primary precision. LVQ: pairs (4,0), (8,0), (4,4), (4,8) only |
+| `leanvec_dims` | `-1` | `-1` | `2000` | Reduced dims; -1 = dimensions/2. LeanVec only |
 
 ### Session GUC Parameters (`SET …`)
 

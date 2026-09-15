@@ -87,10 +87,10 @@ VamanaInit(void)
 					  "Compression type (0=none, 1=leanvec, 2=lvq)",
 					  VAMANA_DEFAULT_COMPRESSION_TYPE, 0, 2,
 					  AccessExclusiveLock);
-	add_int_reloption(vamana_relopt_kind, "compression_primary", "LeanVec primary quantization (4=UINT4, -4=INT4, 8=UINT8, -8=INT8)",
-					  VAMANA_DEFAULT_LEANVEC_PRIMARY, -8, 8, AccessExclusiveLock);
-	add_int_reloption(vamana_relopt_kind, "compression_secondary", "LeanVec secondary quantization (4=UINT4, -4=INT4, 8=UINT8, -8=INT8)",
-					  VAMANA_DEFAULT_LEANVEC_SECONDARY, -8, 8, AccessExclusiveLock);
+	add_int_reloption(vamana_relopt_kind, "compression_primary", "Primary quantization (4=UINT4, -4=INT4, 8=UINT8, -8=INT8)",
+					  VAMANA_DEFAULT_COMPRESSION_PRIMARY, -8, 8, AccessExclusiveLock);
+	add_int_reloption(vamana_relopt_kind, "compression_secondary", "LeanVec secondary quantization / LVQ residual (4=UINT4, -4=INT4, 8=UINT8, -8=INT8, 0=no residual for LVQ)",
+					  VAMANA_DEFAULT_COMPRESSION_SECONDARY, -8, 8, AccessExclusiveLock);
 	add_int_reloption(vamana_relopt_kind, "leanvec_dims", "LeanVec dimensions (-1 = dimensions/2)",
 					  VAMANA_DEFAULT_LEANVEC_DIMS, VAMANA_MIN_LEANVEC_DIMS, VAMANA_MAX_LEANVEC_DIMS, AccessExclusiveLock);
 

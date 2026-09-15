@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PostgreSQL
 
 # 01_persistence.pl — on-disk persistence, save/load round-trips,
-# search thread configuration, and LeanVec-compressed persistence.
+# search thread configuration, and LeanVec- and LVQ-compressed persistence.
 
 use strict;
 use warnings FATAL => 'all';
@@ -711,6 +711,103 @@ use VamanaTestUtils qw(:all);
     like($third_restart_log, qr/vamana index \d+ loaded from disk/,
         'LeanVec index loaded from disk on third restart');
     ok(-d $index_dir, 'on-disk index directory still exists after third restart');
+
+    $node->stop;
+}
+
+# ===========================================================================
+# LVQ-compressed persistence — the saved file must reload under a matching spec
+#
+# Both LVQ families get their own round trip.  (4,8) uses a residual; (8,0) does
+# not, and is the only configuration that maps a compression parameter to
+# SVS_DATA_TYPE_VOID, so it exercises a distinct specialization on both the save
+# and the load side.  A spec mismatch does not fail loudly -- the worker logs
+# "failed to load" and silently rebuilds from the table -- so the load-from-disk
+# assertions below, not the query results, are what actually pin this down.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_lvq_persist');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+    $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    # label => reloptions; each gets its own table so the two indexes cannot
+    # share a load path by accident.
+    my @lvq_cases = (
+        ['residual',    'compression_primary = 4, compression_secondary = 8'],
+        ['no_residual', 'compression_primary = 8, compression_secondary = 0'],
+    );
+
+    my %baseline;
+    my %index_dir;
+
+    for my $case (@lvq_cases) {
+        my ($label, $opts) = @$case;
+
+        $node->safe_psql("postgres", qq(
+            CREATE TABLE lvq_$label (id serial PRIMARY KEY, val vector($dim));
+            INSERT INTO lvq_$label (val)
+                SELECT ARRAY[$array_sql]::vector
+                FROM generate_series(1, 200) i;
+            CREATE INDEX lvq_${label}_idx ON lvq_$label USING vamana (val vector_l2_ops)
+                WITH (compression_type = 2, $opts);
+        ));
+
+        my $index_oid = $node->safe_psql("postgres",
+            "SELECT oid FROM pg_class WHERE relname = 'lvq_${label}_idx';");
+        chomp $index_oid;
+        $index_dir{$label} = vamana_save_dir($node, 'postgres', $index_oid);
+
+        ok(-d $index_dir{$label},
+            "on-disk index directory exists after CREATE INDEX with LVQ ($label)");
+        ok(dir_size($index_dir{$label}) > 0,
+            "on-disk index directory non-empty with LVQ ($label)");
+
+        $baseline{$label} = $node->safe_psql("postgres", qq(
+            SET enable_seqscan = off;
+            SELECT id FROM lvq_$label ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+        ));
+        isnt($baseline{$label}, '', "pre-restart LVQ query returns results ($label)");
+    }
+
+    my $log_pos_before_restart = length($node->log_content());
+    $node->restart;
+
+    for my $case (@lvq_cases) {
+        my ($label) = @$case;
+
+        my $after_restart = $node->safe_psql("postgres", qq(
+            SET enable_seqscan = off;
+            SELECT id FROM lvq_$label ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+        ));
+        is($after_restart, $baseline{$label},
+            "LVQ results after restart match baseline ($label)");
+    }
+
+    my $new_log = substr($node->log_content(), $log_pos_before_restart);
+
+    unlike($new_log, qr/rebuilding vamana index from table data/,
+        'no table rebuild on post-restart LVQ query');
+    unlike($new_log, qr/vamana index not in memory, rebuilding from table/,
+        'no rebuild NOTICE on post-restart LVQ query');
+    unlike($new_log, qr/failed to load SVS index/,
+        'no load failure on post-restart LVQ query — storage spec matched');
+
+    # One "loaded from disk" line per index, so a single successful load cannot
+    # cover for the other family silently rebuilding.
+    my @loaded = ($new_log =~ /vamana index \d+ loaded from disk/g);
+    is(scalar @loaded, scalar @lvq_cases,
+        'both LVQ indexes loaded from disk after restart')
+      or diag("loaded-from-disk lines: ", scalar @loaded);
 
     $node->stop;
 }

@@ -37,13 +37,13 @@ typedef struct SVSBuildConfig
 	int			graph_degree;
 	int			alpha;
 	int			search_window_size;
-	int			compression_type;		/* 0=none, 1=leanvec */
+	int			compression_type;		/* 0=none, 1=leanvec, 2=lvq */
 	int			compression_primary;	/* Primary quantization type */
-	int			compression_secondary;	/* Secondary quantization type */
+	int			compression_secondary;	/* LeanVec secondary / LVQ residual (0 = none) */
 	SVSDistanceType distance_type;
 	SVSDType	data_type;
 	int			dimensions;				/* Vector dimensionality (needed for LeanVec load) */
-	int			leanvec_dims;			/* LeanVec reduced dims (-1 = dimensions/2) */
+	int			leanvec_dims;			/* LeanVec reduced dims (-1 = dimensions/2; unused by LVQ) */
 	int			build_window_size;		/* Build window size from reloptions (0 = use default) */
 	int			search_num_threads;		/* 0 = use SVSDefaultSearchThreads() */
 }			SVSBuildConfig;
@@ -54,6 +54,17 @@ void		SVSFreeAlgorithm(SVSAlgorithmHandle algorithm);
 
 SVSStorageHandle SVSCreateSimpleStorage(SVSDType data_type);
 SVSStorageHandle SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int primary_param, int secondary_param);
+SVSStorageHandle SVSCreateLVQStorage(int primary_param, int residual_param);
+
+/*
+ * Dispatch on compression_type.  Preferred over the three constructors above:
+ * build and load must agree on the storage spec, so they should share one
+ * decision.  data_type is used only when compression_type selects no
+ * compression.
+ */
+SVSStorageHandle SVSCreateStorageForCompression(int compression_type, SVSDType data_type,
+											   int dimensions, int leanvec_dims,
+											   int compression_primary, int compression_secondary);
 void		SVSFreeStorage(SVSStorageHandle storage);
 
 SVSBuilderHandle SVSCreateBuilder(SVSDistanceType metric, int dimensions, SVSAlgorithmHandle algorithm);
