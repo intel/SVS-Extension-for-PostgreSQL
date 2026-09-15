@@ -163,12 +163,39 @@ static const int VAMANA_VALID_COMPRESSION_VALUES[] = {
 	(sizeof(VAMANA_VALID_COMPRESSION_VALUES) / sizeof(VAMANA_VALID_COMPRESSION_VALUES[0]))
 
 /*
- * Validate compression parameter (must be one of the valid values)
+ * (primary bits, residual bits) pairs SVS compiles LVQ specializations for.
+ * A pair outside this set fails deep inside the library when the loader looks
+ * for a matching specialization, so it is rejected here instead.  Widen this
+ * table if an SVS build ever adds specializations; the rule itself does not
+ * need rewriting.
+ */
+typedef struct VamanaLVQPair
+{
+	int			primary_bits;
+	int			residual_bits;
+}			VamanaLVQPair;
+
+static const VamanaLVQPair VAMANA_VALID_LVQ_PAIRS[] = {
+	{4, 0},
+	{8, 0},
+	{4, 4},
+	{4, 8}
+};
+#define VAMANA_NUM_LVQ_PAIRS \
+	(sizeof(VAMANA_VALID_LVQ_PAIRS) / sizeof(VAMANA_VALID_LVQ_PAIRS[0]))
+
+/*
+ * Validate compression parameter (must be one of the valid values).  allow_none
+ * additionally accepts 0; pass it only for LVQ's residual, the one parameter
+ * for which "absent" is a legal value.
  */
 static void
-ValidateCompressionParam(int value, const char *param_name)
+ValidateCompressionParam(int value, const char *param_name, bool allow_none)
 {
 	bool		is_valid = false;
+
+	if (allow_none && value == VAMANA_COMPRESSION_NO_RESIDUAL)
+		return;
 
 	for (size_t i = 0; i < VAMANA_NUM_COMPRESSION_VALUES; i++)
 	{
@@ -184,9 +211,65 @@ ValidateCompressionParam(int value, const char *param_name)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid %s value: %d", param_name, value),
-				 errhint("Valid values are: %d (UINT4), %d (INT4), %d (UINT8), %d (INT8)",
+				 errhint("Valid values are: %d (UINT4), %d (INT4), %d (UINT8), %d (INT8)%s",
 						 VAMANA_LEANVEC_UINT4, VAMANA_LEANVEC_INT4,
-						 VAMANA_LEANVEC_UINT8, VAMANA_LEANVEC_INT8)));
+						 VAMANA_LEANVEC_UINT8, VAMANA_LEANVEC_INT8,
+						 allow_none ? ", 0 (no residual)" : "")));
+	}
+}
+
+/*
+ * Validate the compression reloptions as a set.  Parameters belonging to a
+ * scheme other than the one selected are ignored rather than rejected, which
+ * is how the other irrelevant-parameter cases behave (leanvec_dims under LVQ,
+ * every compression parameter under compression_type = none).
+ */
+static void
+ValidateCompressionOptions(int compression_type, int compression_primary,
+						   int compression_secondary)
+{
+	int			primary_bits = abs(compression_primary);
+	int			secondary_bits = abs(compression_secondary);
+
+	if (compression_type == VAMANA_COMPRESSION_LEANVEC)
+	{
+		ValidateCompressionParam(compression_primary, "compression_primary", false);
+		ValidateCompressionParam(compression_secondary, "compression_secondary", false);
+
+		if (primary_bits > secondary_bits)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("compression_primary (%d-bit) cannot have higher precision than compression_secondary (%d-bit)",
+							primary_bits, secondary_bits),
+					 errhint("Primary quantization must be <= secondary precision (e.g., 4-bit primary with 8-bit secondary is valid)")));
+		}
+	}
+	else if (compression_type == VAMANA_COMPRESSION_LVQ)
+	{
+		bool		is_valid = false;
+
+		ValidateCompressionParam(compression_primary, "compression_primary", false);
+		ValidateCompressionParam(compression_secondary, "compression_secondary", true);
+
+		for (size_t i = 0; i < VAMANA_NUM_LVQ_PAIRS; i++)
+		{
+			if (primary_bits == VAMANA_VALID_LVQ_PAIRS[i].primary_bits &&
+				secondary_bits == VAMANA_VALID_LVQ_PAIRS[i].residual_bits)
+			{
+				is_valid = true;
+				break;
+			}
+		}
+
+		if (!is_valid)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unsupported LVQ configuration: %d-bit primary with %d-bit residual",
+							primary_bits, secondary_bits),
+					 errhint("Supported LVQ configurations are 4- or 8-bit primary with no residual (compression_secondary = 0), or 4-bit primary with a 4- or 8-bit residual.")));
+		}
 	}
 }
 
@@ -214,27 +297,13 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 
 	buildstate->compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
 
-	buildstate->compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_LEANVEC_PRIMARY;
-	buildstate->compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_LEANVEC_SECONDARY;
+	buildstate->compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_COMPRESSION_PRIMARY;
+	buildstate->compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_COMPRESSION_SECONDARY;
 	buildstate->leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 
-	if (buildstate->compression_type == VAMANA_COMPRESSION_LEANVEC)
-	{
-		int			primary_bits = abs(buildstate->compression_primary);
-		int			secondary_bits = abs(buildstate->compression_secondary);
-
-		ValidateCompressionParam(buildstate->compression_primary, "compression_primary");
-		ValidateCompressionParam(buildstate->compression_secondary, "compression_secondary");
-
-		if (primary_bits > secondary_bits)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compression_primary (%d-bit) cannot have higher precision than compression_secondary (%d-bit)",
-							primary_bits, secondary_bits),
-					 errhint("Primary quantization must be <= secondary precision (e.g., 4-bit primary with 8-bit secondary is valid)")));
-		}
-	}
+	ValidateCompressionOptions(buildstate->compression_type,
+							   buildstate->compression_primary,
+							   buildstate->compression_secondary);
 
 	buildstate->dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
 
@@ -359,12 +428,12 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 									params->search_window_size, params->alpha,
 									params->use_search_history);
 
-	if (params->compression_type == VAMANA_COMPRESSION_LEANVEC)
-		storage = SVSCreateLeanVecStorage(params->dimensions, params->leanvec_dims,
-										   params->compression_primary,
-										   params->compression_secondary);
-	else
-		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
+	storage = SVSCreateStorageForCompression(params->compression_type,
+											 SVS_DTYPE_FLOAT32,
+											 params->dimensions,
+											 params->leanvec_dims,
+											 params->compression_primary,
+											 params->compression_secondary);
 
 	builder = SVSCreateBuilder(params->distance_type, params->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
@@ -660,8 +729,8 @@ VamanaRebuildFromTable(Relation index)
 	searchWindow = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
 	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
 	compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
-	compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_LEANVEC_PRIMARY;
-	compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_LEANVEC_SECONDARY;
+	compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_COMPRESSION_PRIMARY;
+	compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_COMPRESSION_SECONDARY;
 	leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 
 	distanceType = VamanaGetDistanceMetric(index);

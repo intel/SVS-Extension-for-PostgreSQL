@@ -204,6 +204,52 @@ CREATE INDEX ON t USING vamana (val halfvec_cosine_ops) WITH (compression_type =
 SELECT * FROM t ORDER BY val <=> '[3,3,3]', id;
 DROP TABLE t;
 
+-- LVQ compression (compression_type = 2)
+--
+-- One real build per SVS specialization: (4,0), (8,0), (4,4) and (4,8), plus a
+-- bare compression_type = 2 to pin that the shared defaults resolve to a legal
+-- LVQ pair.  The three LeanVec specializations are already built above.  Sign
+-- variants are not repeated here -- SVS keeps bit counts only, so -4 and 4 reach
+-- the same specialization, and reloption_params.sql covers their acceptance.
+-- Each build is followed by a search, so a storage spec that does not match the
+-- data shows up as a wrong answer rather than a silent pass.
+
+-- LVQ4: 4-bit primary, no residual
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops) WITH (compression_type = 2, compression_primary = 4, compression_secondary = 0);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+DROP TABLE t;
+
+-- LVQ8: 8-bit primary, no residual
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops) WITH (compression_type = 2, compression_primary = 8, compression_secondary = 0);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+DROP TABLE t;
+
+-- LVQ4x4: 4-bit primary with a 4-bit residual
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops) WITH (compression_type = 2, compression_primary = 4, compression_secondary = 4);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+DROP TABLE t;
+
+-- LVQ4x8: 4-bit primary with an 8-bit residual
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops) WITH (compression_type = 2, compression_primary = 4, compression_secondary = 8);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+DROP TABLE t;
+
+-- Defaults only: resolves to LVQ4x8
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops) WITH (compression_type = 2);
+SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
+DROP TABLE t;
+
+
 -- compression error cases
 
 -- Test invalid compression_type values

@@ -65,11 +65,18 @@
 #define VAMANA_COMPRESSION_TYPE_LVQ_STR			"lvq"
 #define VAMANA_DEFAULT_COMPRESSION_TYPE_STR		VAMANA_COMPRESSION_TYPE_NONE_STR
 
-/* LeanVec compression data types (map to SVS data types) */
+/* Quantization data types shared by LeanVec and LVQ (map to SVS data types) */
 #define VAMANA_LEANVEC_UINT4			4
 #define VAMANA_LEANVEC_INT4				-4
 #define VAMANA_LEANVEC_UINT8			8
 #define VAMANA_LEANVEC_INT8				-8
+
+/*
+ * LVQ-only compression_secondary value: no residual.  Maps to
+ * SVS_DATA_TYPE_VOID, which SVS reads as zero residual bits.  LeanVec has no
+ * such mode, so this value is rejected for compression_type = leanvec.
+ */
+#define VAMANA_COMPRESSION_NO_RESIDUAL	0
 
 /* Centralized Vamana constants */
 #define VAMANA_DEFAULT_BUILD_WINDOW_MULTIPLIER	2
@@ -81,8 +88,13 @@
 #define VAMANA_COST_SCALING_FACTOR				0.8		/* empirically tuned index cost multiplier */
 #define VAMANA_LEANVEC_DEFAULT_DIM_DIVISOR		2
 
-#define VAMANA_DEFAULT_LEANVEC_PRIMARY		VAMANA_LEANVEC_UINT8
-#define VAMANA_DEFAULT_LEANVEC_SECONDARY	VAMANA_LEANVEC_UINT8
+/*
+ * (4, 8) is the only quantization pair SVS compiles for both LeanVec and LVQ,
+ * so it is the default for both: naming compression_type alone is enough to
+ * get a working index under either scheme.
+ */
+#define VAMANA_DEFAULT_COMPRESSION_PRIMARY		VAMANA_LEANVEC_UINT4
+#define VAMANA_DEFAULT_COMPRESSION_SECONDARY	VAMANA_LEANVEC_UINT8
 #define VAMANA_DEFAULT_LEANVEC_DIMS			-1	/* -1 = dimensions / 2 */
 #define VAMANA_MIN_LEANVEC_DIMS				-1
 #define VAMANA_MAX_LEANVEC_DIMS				2000
@@ -118,9 +130,9 @@ typedef struct VamanaOptions
 	int			search_window_size;	/* Search window size for build and query */
 	bool		use_search_history;	/* Maintain visited set during search */
 	int			compression_type;	/* Compression type: 0=none, 1=leanvec, 2=lvq */
-	int			compression_primary;	/* LeanVec primary quantization (4, 8, or negative for signed) */
-	int			compression_secondary;	/* LeanVec secondary quantization */
-	int			leanvec_dims;		/* LeanVec dimensions (-1 = dimensions/2) */
+	int			compression_primary;	/* Primary quantization (4, 8, or negative for signed) */
+	int			compression_secondary;	/* LeanVec secondary / LVQ residual (0 = none) */
+	int			leanvec_dims;		/* LeanVec dimensions (-1 = dimensions/2; unused by LVQ) */
 }			VamanaOptions;
 
 typedef struct VamanaTypeInfo
@@ -183,9 +195,9 @@ typedef struct VamanaMetaPageData
 	uint32		dimensions;
 	uint16		graph_degree;
 	uint16		alpha;
-	uint8		compression_type;	/* 0=none, 1=leanvec */
-	int8		compression_primary;	/* LeanVec primary (signed for type encoding) */
-	int8		compression_secondary;	/* LeanVec secondary */
+	uint8		compression_type;	/* 0=none, 1=leanvec, 2=lvq */
+	int8		compression_primary;	/* primary quantization (signed for type encoding) */
+	int8		compression_secondary;	/* LeanVec secondary / LVQ residual (0 = none) */
 	BlockNumber indexDataBlkno; /* Start of SVS index data */
 	Size		indexDataSize;	/* Size in bytes */
 	uint32		numVectors;
