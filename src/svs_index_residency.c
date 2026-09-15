@@ -20,6 +20,7 @@
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 
 typedef struct RecordLoadArgs
@@ -67,7 +68,7 @@ SvsIndexResidencyRecordLoad(Oid indexRelid, Oid dbOid, uint64 residentBytes)
 	RecordLoadArgs args = {indexRelid, dbOid, residentBytes};
 	VamanaSubXactResult result;
 
-	if (!IsTransactionState())
+	if (!IsTransactionState() || RecoveryInProgress())
 		return;
 
 	result = VamanaRunInSubXact(RecordLoadBody, &args, NULL);
@@ -105,7 +106,7 @@ SvsIndexResidencyRecordUnload(Oid indexRelid)
 {
 	VamanaSubXactResult result;
 
-	if (!IsTransactionState())
+	if (!IsTransactionState() || RecoveryInProgress())
 		return;
 
 	result = VamanaRunInSubXact(RecordUnloadBody, &indexRelid, NULL);
@@ -119,15 +120,23 @@ SvsIndexResidencyRecordUnload(Oid indexRelid)
 					"will be corrected at the next load or unload", indexRelid)));
 }
 
-/* Row-lock dbOid's vamana_databases entry, serializing against a concurrent write to its durable residency total. */
+/*
+ * Row-lock dbOid's vamana_databases entry, serializing against a concurrent
+ * write to its durable residency total. Skipped on a standby: there is no
+ * local writer to serialize against there.
+ */
 static void
 LockDatabaseRow(const char *datname)
 {
-	char	   *qualifiedName = SvsExtensionQualifiedRelationName("vamana_databases");
+	char	   *qualifiedName;
 	Oid			argTypes[1] = {NAMEOID};
 	Datum		argValues[1];
 	NameData	nameArg;
 
+	if (RecoveryInProgress())
+		return;
+
+	qualifiedName = SvsExtensionQualifiedRelationName("vamana_databases");
 	if (qualifiedName == NULL)
 		return;
 
