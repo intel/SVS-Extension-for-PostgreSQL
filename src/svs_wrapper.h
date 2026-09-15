@@ -32,7 +32,7 @@ typedef enum
 	SVS_DTYPE_UINT4
 }			SVSDType;
 
-typedef struct SVSBuildConfig 
+typedef struct SVSBuildConfig
 {
 	int			graph_degree;
 	int			alpha;
@@ -46,6 +46,7 @@ typedef struct SVSBuildConfig
 	int			leanvec_dims;			/* LeanVec reduced dims (-1 = dimensions/2) */
 	int			build_window_size;		/* Build window size from reloptions (0 = use default) */
 	int			search_num_threads;		/* 0 = use SVSDefaultSearchThreads() */
+	int			numVectors;				/* Vector count on disk (sizes the load-time block) */
 }			SVSBuildConfig;
 
 SVSAlgorithmHandle SVSCreateAlgorithm(int graph_degree, int build_window, int search_window, int alpha,
@@ -90,13 +91,15 @@ typedef struct SVSMemoryBreakdown
 
 uint64		SVSGetIndexMemoryUsage(SVSIndexHandle index);
 void		SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out);
-void		SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out);
-uint64		SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors);
+void		SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, int dimensions, SVSMemoryBreakdown *out);
+uint64		SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors,
+									int numVectors, int dimensions);
 
 int			SVSSaveIndex(SVSIndexHandle index, const char *path);
 
 SVSIndexHandle SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
-									const size_t *ids, int num_vectors, int *error_code);
+									const size_t *ids, int num_vectors, int dimensions,
+									int *error_code);
 SVSIndexHandle SVSLoadDynamicIndex(const char *path, const SVSBuildConfig *config);
 
 int			SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int num_vectors);

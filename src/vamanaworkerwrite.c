@@ -129,7 +129,8 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
 
-	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1, &errorCode);
+	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1,
+									 cache->dimensions, &errorCode);
 
 	SVSFreeBuilder(builder);
 	SVSFreeStorage(storage);
@@ -565,6 +566,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		VamanaGetIndexSavePath(VamanaWorkerShmemPtr->dbOid, relid, savepath, sizeof(savepath));
 
 		config.dimensions			= params->dimensions;
+		config.numVectors			= params->numVectors;
 		config.graph_degree			= params->graph_degree;
 		config.alpha				= params->alpha;
 		config.search_window_size	= params->search_window_size;
