@@ -58,6 +58,24 @@ FindTestReservation(VamanaWorkerShmem *entry, Oid relid)
 	return NULL;
 }
 
+/*
+ * Several pending insert reservations can share a relid, so unlike
+ * FindTestReservation this also matches on deltaBytes to pick out one of
+ * them for owner-pid faking in a test.
+ */
+static SvsMemInsertReservation *
+FindTestInsertReservation(VamanaWorkerShmem *entry, Oid relid, uint64 deltaBytes)
+{
+	for (int i = 0; i < SVS_MAX_PENDING_INSERT_RESERVATIONS; i++)
+	{
+		SvsMemInsertReservation *r = &entry->insertReservations[i];
+
+		if (r->relid == relid && r->deltaBytes == deltaBytes)
+			return r;
+	}
+	return NULL;
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_build_ceiling_bytes);
 Datum
 svs_memory_test_build_ceiling_bytes(PG_FUNCTION_ARGS)
@@ -163,6 +181,24 @@ svs_memory_test_set_owner_pid(PG_FUNCTION_ARGS)
 						PG_GETARG_OID(0))));
 
 	reservation->ownerPid = PG_GETARG_INT32(2);
+	PG_RETURN_VOID();
+}
+
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_set_insert_reservation_owner_pid);
+Datum
+svs_memory_test_set_insert_reservation_owner_pid(PG_FUNCTION_ARGS)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(PG_GETARG_OID(0));
+	Oid			relid = PG_GETARG_OID(1);
+	uint64		deltaBytes = GetNonNegativeArgAsUint64(fcinfo, 2);
+	SvsMemInsertReservation *reservation = FindTestInsertReservation(entry, relid, deltaBytes);
+
+	if (reservation == NULL)
+		ereport(ERROR,
+				(errmsg("no pending insert reservation for index %u in database %u with delta %llu",
+						relid, PG_GETARG_OID(0), (unsigned long long) deltaBytes)));
+
+	reservation->ownerPid = PG_GETARG_INT32(3);
 	PG_RETURN_VOID();
 }
 
@@ -294,6 +330,14 @@ svs_memory_reanchor_insert(PG_FUNCTION_ARGS)
 {
 	SvsMemoryReanchorInsert(PG_GETARG_OID(0), PG_GETARG_OID(1),
 							 GetNonNegativeArgAsUint64(fcinfo, 2));
+	PG_RETURN_VOID();
+}
+
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_abort_insert);
+Datum
+svs_memory_abort_insert(PG_FUNCTION_ARGS)
+{
+	SvsMemoryAbortInsert(PG_GETARG_OID(0), PG_GETARG_OID(1));
 	PG_RETURN_VOID();
 }
 

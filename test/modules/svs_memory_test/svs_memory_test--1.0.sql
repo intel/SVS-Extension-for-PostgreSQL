@@ -96,6 +96,15 @@ CREATE FUNCTION svs_memory_reanchor_insert(db_oid oid, relid oid, measured_bytes
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_abort_insert(db_oid oid, relid oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_set_insert_reservation_owner_pid(
+    db_oid oid, relid oid, delta_bytes bigint, owner_pid int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_reap_dead_reservations()
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

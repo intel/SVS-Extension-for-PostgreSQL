@@ -194,6 +194,13 @@ extern bool SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes);
 extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
 
 /*
+ * Backend cleanup when a reserved insert never reaches the worker's
+ * reanchor. Releases the caller's own pending reservation for relid; a
+ * no-op if there is none.
+ */
+extern void SvsMemoryAbortInsert(Oid dbOid, Oid relid);
+
+/*
  * Reaps every reservation -- build or pending insert -- whose owning
  * backend is no longer alive. Called from the launcher's latch cycle and
  * its startup scan.

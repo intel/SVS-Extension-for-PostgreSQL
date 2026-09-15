@@ -322,6 +322,9 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 							(errmsg("vamana worker: SVSAddPoints failed for index %u",
 									relid)));
 
+				cache->residentBytes = SVSGetIndexMemoryUsage(index);
+				SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes);
+
 				/* Grow tidMapping if needed. */
 				if ((int) externalId >= cache->tidMappingCapacity)
 				{

@@ -12,6 +12,7 @@
 
 #include "postgres.h"
 
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_undo.h"
 #include "svs_wrapper.h"
@@ -21,6 +22,14 @@
 #include "catalog/index.h"
 #include "miscadmin.h"
 #include "utils/rel.h"
+
+/* Conservative upper bound: raw vector storage plus one full neighbor list. */
+static uint64
+VamanaEstimateInsertGrowthBytes(int dimensions, int graphDegree)
+{
+	return (uint64) dimensions * sizeof(float) +
+		(uint64) graphDegree * sizeof(uint32);
+}
 
 bool
 vamanainsert(Relation index, Datum *values, bool *isnull,
@@ -51,8 +60,29 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 				 errmsg("vector dimension %d does not match index dimension %d",
 						vec->dim, TupleDescAttr(index->rd_att, 0)->atttypmod)));
 
-	/* Submit to BGW — blocks until the worker ACKs or errors. */
-	VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid, &externalId);
+	{
+		uint64		growthBytes = VamanaEstimateInsertGrowthBytes(vec->dim,
+																	VamanaGetGraphDegree(index));
+
+		if (!SvsMemoryReserveInsert(MyDatabaseId, relid, growthBytes))
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("insert into index \"%s\" would exceed its database's residency budget",
+							RelationGetRelationName(index)),
+					 errhint("Raise this database's residency_memory or svs.max_residency_memory.")));
+
+		/* Submit to BGW — blocks until the worker ACKs or errors. */
+		PG_TRY();
+		{
+			VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid, &externalId);
+		}
+		PG_CATCH();
+		{
+			SvsMemoryAbortInsert(MyDatabaseId, relid);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 
 	pfree(vec);
 

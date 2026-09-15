@@ -473,3 +473,37 @@ SELECT svs_memory_admit_database(651, 1::bigint);
 -- durable_committed_floor is a floor, not a mandatory minimum budget.
 SELECT svs_memory_admit_database(652, (1 * 1024)::bigint, 0::bigint);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- AbortInsert releases only the calling backend's own pending reservation.
+-- Two reservations share relid 1, one faked to a different owner pid; abort
+-- must free the one owned by this session and leave the other's delta
+-- committed.
+SELECT svs_memory_admit_database(660, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_insert(660, 1, (2 * 1024)::bigint);
+SELECT svs_memory_reserve_insert(660, 1, (3 * 1024)::bigint);
+SELECT svs_memory_test_set_insert_reservation_owner_pid(660, 1, (3 * 1024)::bigint, -1);
+SELECT svs_memory_abort_insert(660, 1);
+SELECT delta_bytes = (3 * 1024) AS only_the_other_owners_reservation_remains
+  FROM svs_memory_test_insert_reservations(660);
+SELECT residency_bytes_committed = (3 * 1024) AS only_the_other_owners_delta_still_committed
+  FROM svs_memory_read_stats(660);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Abort finding a reservation for relid, but none owned by this session, is
+-- a safe no-op: the ownership match above must not degrade to "free
+-- whatever exists for this relid" when nothing matches.
+SELECT svs_memory_admit_database(661, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_insert(661, 1, (4 * 1024)::bigint);
+SELECT svs_memory_test_set_insert_reservation_owner_pid(661, 1, (4 * 1024)::bigint, -1);
+SELECT svs_memory_abort_insert(661, 1);
+SELECT count(*) = 1 AS foreign_owned_reservation_survives_the_noop_abort
+  FROM svs_memory_test_insert_reservations(661);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Abort with no reservation at all for relid is a safe no-op too, the same
+-- "safe to call more than once" contract AbortBuild already documents.
+SELECT svs_memory_admit_database(662, (1 * 1024)::bigint);
+SELECT svs_memory_abort_insert(662, 1);
+SELECT residency_bytes_committed = 0 AS unchanged_after_noop_abort
+  FROM svs_memory_read_stats(662);
+SELECT * FROM svs_memory_test_check_invariants();

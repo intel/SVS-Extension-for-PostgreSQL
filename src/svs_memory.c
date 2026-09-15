@@ -138,6 +138,19 @@ FreeInsertReservation(SvsMemInsertReservation *reservation)
 	reservation->relid = InvalidOid;
 }
 
+static SvsMemInsertReservation *
+FindInsertReservationByOwner(VamanaWorkerShmem *entry, Oid relid, int ownerPid)
+{
+	for (int i = 0; i < SVS_MAX_PENDING_INSERT_RESERVATIONS; i++)
+	{
+		SvsMemInsertReservation *candidate = &entry->insertReservations[i];
+
+		if (candidate->relid == relid && candidate->ownerPid == ownerPid)
+			return candidate;
+	}
+	return NULL;
+}
+
 /*
  * Subtracts amount from *committed, flooring at 0 and warning instead of
  * wrapping negative -- a double-release or a double-unload signal, never a
@@ -561,6 +574,27 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 
 	if (insertReservation != NULL)
 		FreeInsertReservation(insertReservation);
+
+	LWLockRelease(&entry->memLock);
+}
+
+void
+SvsMemoryAbortInsert(Oid dbOid, Oid relid)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	SvsMemInsertReservation *reservation;
+
+	Assert(OidIsValid(relid));
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	reservation = FindInsertReservationByOwner(entry, relid, MyProcPid);
+	if (reservation != NULL)
+	{
+		SubtractFloored(&entry->residencyBytesCommitted, reservation->deltaBytes,
+						"an aborted pending insert reservation");
+		FreeInsertReservation(reservation);
+	}
 
 	LWLockRelease(&entry->memLock);
 }
