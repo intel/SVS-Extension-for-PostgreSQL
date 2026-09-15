@@ -383,6 +383,38 @@ VamanaCacheGetNeedsSave(Oid indexRelid)
 }
 
 /*
+ * True iff no cache slot currently holds a valid entry.
+ */
+static bool
+VamanaCacheIsEmpty(void)
+{
+	for (int i = 0; i < vamanaCacheUsed; i++)
+	{
+		if (vamanaCacheSlots[i] != NULL && vamanaCacheSlots[i]->isValid)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Kick the launcher only on the transition to zero cached entries: every
+ * cached index shares one per-database grant, so unloading one of several
+ * frees no capacity.  Worker-only: backends share this cache code but hold
+ * no grant, so a backend's local eviction must not wake the launcher.
+ */
+static void
+VamanaCacheMaybeKickLauncher(void)
+{
+	if (VamanaWorkerShmemPtr == NULL ||
+		VamanaWorkerShmemPtr->workerPid != MyProcPid)
+		return;
+	if (!VamanaCacheIsEmpty())
+		return;
+
+	SvsKickLauncher();
+}
+
+/*
  * Invalidate cached index (called on data modifications).
  */
 void
@@ -418,6 +450,8 @@ VamanaInvalidateCache(Oid indexRelid)
 	 * relation.  The flag will be corrected on the next LoadIndexFromPages
 	 * call that discovers the directory is absent.
 	 */
+
+	VamanaCacheMaybeKickLauncher();
 }
 
 /*
@@ -443,6 +477,8 @@ VamanaEvictAllCacheEntries(void)
 
 		VamanaClearCacheEntry(entry);
 	}
+
+	VamanaCacheMaybeKickLauncher();
 }
 
 /*
@@ -489,6 +525,8 @@ VamanaEvictCacheEntry(Oid indexRelid)
 			(errmsg("evicting vamana cache entry for relation %u", indexRelid)));
 
 	VamanaClearCacheEntry(entry);
+
+	VamanaCacheMaybeKickLauncher();
 }
 
 /*

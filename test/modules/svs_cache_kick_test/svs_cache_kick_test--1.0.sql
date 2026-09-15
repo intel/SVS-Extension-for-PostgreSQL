@@ -1,0 +1,41 @@
+\echo Use "CREATE EXTENSION svs_cache_kick_test" to load this file. \quit
+
+CREATE FUNCTION svs_cache_fake_load(relid oid)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_evict(relid oid)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_evict_all()
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_invalidate(relid oid)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_count()
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_kicked()
+RETURNS bool
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_kick_count()
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_cache_reset_kick_tracking()
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
