@@ -11,6 +11,7 @@
 #include "svs_wrapper.h"
 #include "vamana.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "utils/elog.h"
 
 #include <unistd.h>
@@ -586,15 +587,98 @@ SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out)
 	out->metadataBytes = breakdown.metadata_bytes;
 }
 
+/*
+ * SVS turns blocksize_bytes into elements-per-block as blocksize_bytes /
+ * (sizeof(T) * dimensions), where T is this builder's real storage element
+ * -- compressed for a LeanVec/LVQ builder, not a float. No API exposes
+ * sizeof(T) directly, so find it by bisection: estimate_memory_dynamic is
+ * an O(1) query that fails exactly when blocksize_bytes can't hold one
+ * element, so the smallest passing value is sizeof(T) * dimensions itself.
+ */
+static size_t
+SVSFindMinViableBlockSizeBytes(svs_index_builder_h builder)
+{
+	size_t		lo = 0;
+	size_t		hi = 1;
+
+	while (hi <= ((size_t) 1 << 48))
+	{
+		svs_error_h error = svs_error_create();
+		svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+		bool		fits;
+
+		svs_index_builder_estimate_memory_dynamic(builder, 1, hi, &breakdown, error);
+		fits = svs_error_ok(error);
+		svs_error_free(error);
+
+		if (fits)
+			break;
+
+		lo = hi;
+		hi <<= 1;
+	}
+
+	if (hi > ((size_t) 1 << 48))
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not determine this index's per-vector storage size")));
+
+	while (hi - lo > 1)
+	{
+		size_t		mid = lo + (hi - lo) / 2;
+		svs_error_h error = svs_error_create();
+		svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+		bool		fits;
+
+		svs_index_builder_estimate_memory_dynamic(builder, 1, mid, &breakdown, error);
+		fits = svs_error_ok(error);
+		svs_error_free(error);
+
+		if (fits)
+			hi = mid;
+		else
+			lo = mid;
+	}
+
+	return hi;
+}
+
+/*
+ * SVS sizes a dynamic index in blocks; blocksize_bytes sets how many bytes
+ * each block covers. SVS's own default is a fixed 1 GiB regardless of how
+ * many vectors are involved, so a small index reports a footprint that has
+ * nothing to do with its actual data. Size the block to the data instead:
+ * cap it at the data's own byte size, and cap that at SVS's own default so
+ * this never asks for a bigger block than SVS would have chosen itself.
+ * Both svs_index_build_dynamic and svs_index_load_dynamic take this same
+ * parameter, so both call sites need this same computation to agree.
+ */
+static size_t
+SVSComputeBlockSizeBytes(svs_index_builder_h builder, int numVectors)
+{
+	svs_error_h error = svs_error_create();
+	size_t		defaultBlockSizeBytes = 0;
+	size_t		vectorBytes = SVSFindMinViableBlockSizeBytes(builder);
+	size_t		dataBytes = (size_t) numVectors * vectorBytes;
+
+	svs_index_builder_get_default_blocksize_bytes(builder, &defaultBlockSizeBytes, error);
+	CheckSVSError(error, "get default block size");
+	svs_error_free(error);
+
+	return pg_nextpower2_size_t(Max(vectorBytes, Min(dataBytes, defaultBlockSizeBytes)));
+}
+
 void
-SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out)
+SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, int dimensions, SVSMemoryBreakdown *out)
 {
 	svs_error_h error = svs_error_create();
 	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+	size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
+															numVectors);
 
 	svs_index_builder_estimate_memory_dynamic((svs_index_builder_h) builder,
 											   (size_t) numVectors,
-											   0, /* blocksize_bytes: use builder default */
+											   blocksizeBytes,
 											   &breakdown,
 											   error);
 
@@ -607,7 +691,8 @@ SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakd
 }
 
 uint64
-SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors)
+SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors,
+						 int numVectors, int dimensions)
 {
 	svs_error_h error = svs_error_create();
 	svs_search_params_h search_params;
@@ -624,12 +709,16 @@ SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQ
 
 	PG_TRY();
 	{
+		/* SVS currently ignores blocksize_bytes here (SVS_UNUSED in index_builder.hpp); computed anyway for consistency. */
+		size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
+																numVectors);
+
 		svs_index_builder_estimate_search_memory_dynamic((svs_index_builder_h) builder,
 														   (size_t) numQueries,
 														   (size_t) numNeighbors,
 														   search_params,
 														   NULL, /* id_filter: no qual pushdown */
-														   0,	 /* blocksize_bytes: use builder default */
+														   blocksizeBytes,
 														   &bytes,
 														   error);
 	}
@@ -672,17 +761,20 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 
 SVSIndexHandle
 SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
-					 const size_t *ids, int num_vectors, int *error_code)
+					 const size_t *ids, int num_vectors, int dimensions,
+					 int *error_code)
 {
 	svs_error_h error = svs_error_create();
 	svs_index_h index;
+	size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
+															num_vectors);
 
 	index = svs_index_build_dynamic(
 									(svs_index_builder_h) builder,
 									data,
 									ids,
 									(size_t) num_vectors,
-									0,	/* blocksize_bytes: use SVS default */
+									blocksizeBytes,
 									error);
 
 	if (error_code)
@@ -745,8 +837,13 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 							max_parallel_maintenance_workers)));
 		}
 
-		error = svs_error_create();
-		loaded = svs_index_load_dynamic((svs_index_builder_h) builder, path, 0, error);
+		{
+			size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
+																	config->numVectors);
+
+			error = svs_error_create();
+			loaded = svs_index_load_dynamic((svs_index_builder_h) builder, path, blocksizeBytes, error);
+		}
 
 		SVSFreeBuilder(builder);
 		builder = NULL;
