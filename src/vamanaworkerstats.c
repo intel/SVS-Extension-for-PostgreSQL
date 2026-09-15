@@ -82,6 +82,7 @@ typedef struct VamanaWorkerSnapshot
 	uint32		searchThreadsDesired;
 	uint32		searchThreadsGranted;
 	uint32		searchThreadsReserved;
+	uint32		searchSlotsRegistered;
 
 	/* Filled by a second, memLock-guarded pass; see pg_stat_vamana_worker(). */
 	bool		residencyAdmitted;
@@ -160,7 +161,7 @@ VamanaStatVisibilityForCaller(void)
 /* -----------------------------------------------------------------------
  * pg_stat_vamana_worker(): one row per reserved database (worker grain).
  *
- * Column layout (15 columns):
+ * Column layout (16 columns):
  *   0  db_oid                         oid
  *   1  worker_pid                     int4         (0 -> NULL)
  *   2  worker_state                   text         (see VamanaWorkerStateName)
@@ -175,7 +176,8 @@ VamanaStatVisibilityForCaller(void)
  *  11  search_threads_desired         int4         (resolved, clamped ask; 0 when not live)
  *  12  search_threads_granted         int4         (pool-arbitrated grant; 0 when not live)
  *  13  search_threads_reserved        int4         (floor actually honored; 0 when not live)
- *  14  max_search_threads_per_db      int4         (resolved ceiling; not per-entry, no lock needed)
+ *  14  search_slots_registered        int4         (slots actually held after resize; 0 when not live)
+ *  15  max_search_threads_per_db      int4         (resolved ceiling; not per-entry, no lock needed)
  *
  * residency_drift is not a column here: it needs svs_index_residency, a
  * catalog table, which this function never touches. The CREATE VIEW joins
@@ -190,7 +192,7 @@ VamanaStatVisibilityForCaller(void)
  * the launcher actually published.
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_COLS 15
+#define PG_STAT_VAMANA_WORKER_COLS 16
 
 typedef struct VamanaWorkerHydrateCtx
 {
@@ -230,6 +232,7 @@ VamanaWorkerHydrateCb(VamanaWorkerShmem *entry, void *ctxArg)
 	snap->searchThreadsDesired = pg_atomic_read_u32(&entry->desiredSearchThreads);
 	snap->searchThreadsGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
 	snap->searchThreadsReserved = pg_atomic_read_u32(&entry->reservedSearchThreads);
+	snap->searchSlotsRegistered = pg_atomic_read_u32(&entry->registeredSearchSlots);
 
 	ctx->count++;
 }
@@ -342,7 +345,8 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 		values[11] = Int32GetDatum((int32) snap->searchThreadsDesired);
 		values[12] = Int32GetDatum((int32) snap->searchThreadsGranted);
 		values[13] = Int32GetDatum((int32) snap->searchThreadsReserved);
-		values[14] = Int32GetDatum(maxSearchThreadsPerDb);
+		values[14] = Int32GetDatum((int32) snap->searchSlotsRegistered);
+		values[15] = Int32GetDatum(maxSearchThreadsPerDb);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

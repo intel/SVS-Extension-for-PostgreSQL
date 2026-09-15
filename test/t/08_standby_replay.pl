@@ -110,6 +110,10 @@ $primary->wait_for_replay_catchup($standby);
 # here.  index_count differs because VamanaIndexCountIsMaintained() is
 # specifically about the commit-order-dependent index counter, which the
 # standby's redo stream does not maintain.
+#
+# search_slots_registered follows the grant columns' convention, not
+# index_count's: the standby's own worker calls SvsSlotSetResize just like a
+# primary's does, so it is populated here too.
 # ===========================================================================
 
 my $grant_columns_ok = '';
@@ -121,6 +125,7 @@ for (1 .. 30)
             SELECT search_threads_desired IS NOT NULL
                 AND search_threads_granted IS NOT NULL
                 AND search_threads_reserved IS NOT NULL
+                AND search_slots_registered IS NOT NULL
                 AND index_count IS NULL
             FROM pg_stat_vamana_worker
             WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
@@ -131,7 +136,7 @@ for (1 .. 30)
 }
 
 is($grant_columns_ok, 't',
-    "standby replay: search_threads_desired/granted/reserved are populated on a standby, index_count is not");
+    "standby replay: search_threads_desired/granted/reserved/search_slots_registered are populated on a standby, index_count is not");
 
 # ===========================================================================
 # Test 1: Rows inserted on primary are searchable on standby
