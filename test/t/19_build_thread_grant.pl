@@ -63,8 +63,8 @@ sub check_build_slot_appnames
 	my @appnames = split /\n/, $appnames_out;
 
 	my @slot_indexes;
-	my $pattern = "^vamana: db=postgres build slot (\\d+)/$expected_total "
-	  . "\\(requested $expected_total, granted $expected_total\\)\$";
+	my $pattern = "^vamana: build slot (\\d+)/$expected_total "
+	  . "\\(requested $expected_total, granted $expected_total\\) db=postgres\$";
 	for my $name (@appnames)
 	{
 		push @slot_indexes, $1 if $name =~ /$pattern/;
