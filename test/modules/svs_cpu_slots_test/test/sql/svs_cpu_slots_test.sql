@@ -26,19 +26,21 @@ FROM pg_stat_activity
 WHERE backend_type = svs_slot_bgw_type();
 
 -- A parked slot has no BGWORKER_BACKEND_DATABASE_CONNECTION, so it never
--- calls InitPostgres and is never added to ProcArray.  pg_stat_activity's
--- wait_event columns are read from PGPROC via BackendPidGetProc(), so they
--- are always NULL for a slot like this -- unpopulated, not populated-and-
--- changing.  "Stable" here can only be checked as stably NULL across two
--- samples; that is a limitation of skipping InitPostgres, not evidence the
--- park loop is spinning instead of blocked in WaitLatch.
-SELECT bool_and(wait_event_type IS NULL AND wait_event IS NULL) AS wait_event_unavailable_sample_1
+-- calls InitPostgres.  It calls InitProcessPhase2() directly instead, which
+-- is the one thing InitPostgres would otherwise have been needed for here:
+-- making the slot visible in the shared ProcArray so BackendPidGetProc()
+-- (which pg_stat_activity's wait_event columns are read through) can find
+-- it.  The park loop blocks in WaitLatch on the named VamanaSearchSlot
+-- wait event, so both samples below should agree, not just be non-NULL.
+SELECT bool_and(wait_event_type = 'Extension' AND wait_event = 'VamanaSearchSlot')
+    AS wait_event_named_sample_1
 FROM pg_stat_activity
 WHERE backend_type = svs_slot_bgw_type();
 
 SELECT pg_sleep(0.2);
 
-SELECT bool_and(wait_event_type IS NULL AND wait_event IS NULL) AS wait_event_unavailable_sample_2
+SELECT bool_and(wait_event_type = 'Extension' AND wait_event = 'VamanaSearchSlot')
+    AS wait_event_named_sample_2
 FROM pg_stat_activity
 WHERE backend_type = svs_slot_bgw_type();
 

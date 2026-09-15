@@ -30,6 +30,7 @@
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/proc.h"
 #include "utils/backend_status.h"
 #include "utils/timestamp.h"
 
@@ -40,6 +41,7 @@
 #else
 #include "pgstat.h"
 #endif
+#include "utils/wait_event.h"
 
 /*
  * How long SvsSlotSetResize() waits for one slot to actually exit after
@@ -440,6 +442,7 @@ SvsParkedSlotMain(Datum main_arg)
 {
 	SvsParkedSlotArg arg;
 	char		appName[NAMEDATALEN + 64];
+	uint32		waitEventSearchSlot;
 
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(arg));
 
@@ -483,9 +486,31 @@ SvsParkedSlotMain(Datum main_arg)
 	pgstat_bestart();
 #endif
 
+	/*
+	 * InitProcess() (already run before this function, from
+	 * BackgroundWorkerMain()) allocates MyProc but does not make it visible
+	 * in the shared ProcArray; that step, InitProcessPhase2(), is normally
+	 * only reached via InitPostgres(), which this worker never calls.
+	 * Without it, BackendPidGetProc() cannot find this process by pid, and
+	 * pg_stat_activity's wait_event/wait_event_type columns (which are read
+	 * from the PGPROC that lookup returns) stay NULL no matter what this
+	 * worker reports through WaitLatch below.  InitProcessPhase2() needs
+	 * nothing a database connection would have provided and registers its
+	 * own ProcArray removal on exit, so it is safe to call directly here.
+	 */
+	InitProcessPhase2();
+
 	SvsFormatSearchSlotAppName(appName, sizeof(appName), arg.datname,
 							   arg.slotIndex, arg.slotTotal, arg.reserved);
 	pgstat_report_appname(appName);
+
+	/*
+	 * WaitEventExtensionNew() dedupes by name through a shared hash, so every
+	 * parked slot across every backend registering "VamanaSearchSlot" gets
+	 * back the same id with no coordination needed; each process still only
+	 * calls it the once, here, before entering its park loop.
+	 */
+	waitEventSearchSlot = WaitEventExtensionNew("VamanaSearchSlot");
 
 	for (;;)
 	{
@@ -497,7 +522,7 @@ SvsParkedSlotMain(Datum main_arg)
 			break;
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, -1,
-						PG_WAIT_EXTENSION);
+						waitEventSearchSlot);
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
 	}
