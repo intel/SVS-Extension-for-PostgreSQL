@@ -419,13 +419,10 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 static void
 VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
+	List	   *relids = VamanaGetAllCachedRelids();
 
-	for (int i = 0; i < n; i++)
+	foreach_oid(relid, relids)
 	{
-		Oid			relid = relids[i];
-
 		if (VamanaReplicationSlotWalLagExceeds(relid, vamana_max_slot_wal_size_mb))
 		{
 			ereport(LOG,
@@ -445,14 +442,13 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 static void
 VamanaWorkerDrainAllSlots(void)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n;
+	List	   *relids;
 
 	VamanaWorkerEnforceWalBudgetOnAllSlots();
 
-	n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
-	for (int i = 0; i < n; i++)
-		VamanaReplicationDrainSlot(relids[i]);
+	relids = VamanaGetAllCachedRelids();
+	foreach_oid(relid, relids)
+		VamanaReplicationDrainSlot(relid);
 }
 
 /*
@@ -604,17 +600,20 @@ VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
 static void
 VamanaWorkerDrainFinalCheckpoint(void)
 {
-	Oid			cached_relids[VAMANA_MAX_CACHED_INDEXES];
-	int			ncached;
+	List	   *relids = VamanaGetAllCachedRelids();
+	int			ncached = list_length(relids);
+	int			ci = 0;
 	TimestampTz	drainStart = GetCurrentTimestamp();
 
-	ncached = VamanaGetAllCachedRelids(cached_relids, VAMANA_MAX_CACHED_INDEXES);
-	for (int ci = 0; ci < ncached; ci++)
+	foreach_oid(relid, relids)
 	{
-		VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
+		VamanaIndexCache *cache = VamanaGetCache(relid);
 
 		if (cache == NULL || !cache->isValid || cache->svsIndex == NULL)
+		{
+			ci++;
 			continue;
+		}
 
 		if (TimestampDifferenceExceeds(drainStart, GetCurrentTimestamp(),
 									   vamana_shutdown_drain_budget_ms))
@@ -628,13 +627,14 @@ VamanaWorkerDrainFinalCheckpoint(void)
 
 		if (!VamanaTryCheckpointCachedIndex(cache))
 			ereport(LOG,
-					(errmsg("vamana shutdown: index %u not checkpointed",
-							cached_relids[ci])));
+					(errmsg("vamana shutdown: index %u not checkpointed", relid)));
 
 		INJECTION_POINT("vamana-drain-checkpoint-slow", NULL);
 
 		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts,
 							(uint64) GetCurrentTimestamp());
+
+		ci++;
 	}
 }
 
@@ -770,13 +770,11 @@ VamanaWorkerHandlePromotion(bool *wasReplayingWal, const VamanaReplayRole *role)
 static void
 VamanaWorkerCheckpointDueIndexes(void)
 {
-	Oid		cached_relids[VAMANA_MAX_CACHED_INDEXES];
-	int		ncached;
+	List	   *relids = VamanaGetAllCachedRelids();
 
-	ncached = VamanaGetAllCachedRelids(cached_relids, VAMANA_MAX_CACHED_INDEXES);
-	for (int ci = 0; ci < ncached; ci++)
+	foreach_oid(relid, relids)
 	{
-		VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
+		VamanaIndexCache *cache = VamanaGetCache(relid);
 
 		if (cache == NULL || !ShouldCheckpoint(cache))
 			continue;
@@ -784,7 +782,7 @@ VamanaWorkerCheckpointDueIndexes(void)
 		if (!VamanaTryCheckpointCachedIndex(cache))
 			ereport(LOG,
 					(errmsg("vamana checkpoint: index %u not checkpointed this cycle, will retry",
-							cached_relids[ci])));
+							relid)));
 	}
 }
 

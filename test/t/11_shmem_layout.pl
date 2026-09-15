@@ -204,6 +204,8 @@ sub enable_postgres
 
 {
     my $node = start_node('vamana_precommit_registration', 8, 'debug1');
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+    $node->reload;
 
     $node->safe_psql('postgres', qq{
         CREATE DATABASE vamana_precommit_registration_dba;
@@ -234,6 +236,8 @@ sub enable_postgres
 
 {
     my $node = start_node('vamana_precommit_capacity', 2);
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '300MB'");
+    $node->reload;
 
     $node->safe_psql('postgres', "CREATE DATABASE vamana_precommit_capacity_dba;");
 
@@ -292,6 +296,8 @@ sub enable_postgres
     # are free.  The transaction below queues 3 reservations and aborts; if any
     # slot leaked, the follow-up INSERT of 3 more rows would exceed capacity.
     my $node = start_node('vamana_precommit_abort_rollback', 4);
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+    $node->reload;
 
     $node->safe_psql('postgres', qq{
         CREATE DATABASE vamana_precommit_abort_rollback_dba;
