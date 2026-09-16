@@ -814,9 +814,8 @@ VamanaWorkerCheckpointDueIndexes(void)
 
 /*
  * Resize the worker's held search slots to the published grant and publish
- * how many it actually holds afterward.  SvsSlotSetResize can hold fewer
- * than target when the pool is exhausted; without this, that shortfall is
- * invisible outside a log line.
+ * how many it actually holds afterward: SvsSlotSetResize can silently hold
+ * fewer than the target.
  */
 static void
 VamanaWorkerConvergeSearchSlots(void)

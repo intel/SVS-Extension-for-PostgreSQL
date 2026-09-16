@@ -96,12 +96,8 @@ SELECT search_threads_desired = 6 AS desired_ok,
  t          | t           | t                  | t
 (1 row)
 
--- search_slots_registered: the count of parked slots the worker actually
--- holds after SvsSlotSetResize(target = search_threads_granted).  With an
--- ample pool (the default here) registration always meets the grant, which
--- is the invariant a DBA reads this column for in the steady state. granted
--- is contention-dependent and may still be converging toward 6 (see the
--- comment above), so wait for it to settle before comparing registered
+-- granted is contention-dependent and may still be converging toward 6 (see
+-- the comment above), so wait for it to settle before comparing registered
 -- against it.
 DO $$
 BEGIN
@@ -122,6 +118,57 @@ SELECT search_slots_registered = search_threads_granted AS registered_matches_gr
  t
 (1 row)
 
+-- Zero after a crash, not just before a first heartbeat: VamanaWorkerClearDeadEntry
+-- zeroes registeredSearchSlots once a worker's death is confirmed, so a
+-- crashed worker's last live count does not linger through its backoff
+-- window the way search_threads_granted already does not.
+CREATE EXTENSION IF NOT EXISTS injection_points;
+SELECT injection_points_attach('vamana-worker-tick-crash', 'error');
+ injection_points_attach 
+-------------------------
+ 
+(1 row)
+
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'backoff';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+SELECT worker_state = 'backoff' AS worker_is_backing_off,
+	   search_threads_granted = 0 AS granted_zeroed,
+	   search_slots_registered = 0 AS registered_zeroed
+	FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+ worker_is_backing_off | granted_zeroed | registered_zeroed 
+-----------------------+----------------+-------------------
+ t                     | t              | t
+(1 row)
+
+SELECT injection_points_detach('vamana-worker-tick-crash');
+ injection_points_detach 
+-------------------------
+ 
+(1 row)
+
+-- Let the worker recover and re-converge on its steady-state grant before
+-- the next test case runs.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running'
+			  AND search_threads_granted = 6
+			  AND search_slots_registered = 6;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
 -- Zero when not live, matching the grant columns' convention: a freshly
 -- reserved database reports desired/granted/registered as 0, not NULL,
 -- before its worker's first heartbeat has run. This is a narrow window (the
@@ -131,16 +178,13 @@ SELECT search_slots_registered = search_threads_granted AS registered_matches_gr
 -- Cleanup must wait for the worker to actually reach 'running' and be torn
 -- down with svs_teardown_database() before the row is deleted: a database
 -- disabled or dropped while its reservation is still in 'starting' never
--- releases its shmem slot (confirmed by hand against a scratch cluster,
--- reproducible with or without this column and therefore pre-existing, not
--- introduced here), and svs.max_databases is a small fixed pool shared by
--- every regression file in this run.
--- The extension is created (and the database left with it installed but
--- unreserved) before the enabling INSERT below, not after: creating it
--- concurrently with the worker's own startup, in the same target database,
--- gave an intermittent leaked reservation by hand against a scratch
--- cluster. Extension setup and reservation are kept as two clearly
--- sequential phases instead.
+-- releases its shmem slot, and svs.max_databases is a small fixed pool
+-- shared by every regression file in this run.
+-- The extension is created in the target database, and left installed but
+-- unreserved, before the enabling INSERT below, not concurrently with it:
+-- extension setup and reservation are two clearly sequential phases so the
+-- worker's own startup never races catalog changes in its own target
+-- database.
 SELECT current_database() AS this_db \gset
 CREATE DATABASE cpu_governance_not_live;
 \c cpu_governance_not_live
@@ -191,18 +235,10 @@ DROP DATABASE cpu_governance_not_live;
 -- search_threads_granted, and search_threads_granted must keep reporting the
 -- launcher's number rather than being silently pulled down to match.
 --
--- max_parallel_workers is PGC_USERSET and can be raised past the fixed-size
--- max_worker_processes slot array without a restart (max_worker_processes is
--- PGC_POSTMASTER). Raising max_parallel_workers here lets the launcher grant
--- a number of search threads that the shared slot array can never register
--- in full, since every background worker on the instance -- parallel or
--- not -- comes out of that same fixed array. This is a stable, permanent
--- shortfall (bounded by the fixed array), not a transient one that would
--- resolve itself given enough time to poll for.
---
--- No new database is created for this: the shortfall is driven entirely by
--- GUCs and this database's own search_num_threads, so there is no row to
--- leak if a DELETE ever raced a 'starting' worker.
+-- Raising max_parallel_workers past the fixed-size max_worker_processes
+-- array produces a stable, permanent shortfall (bounded by the array size)
+-- rather than a transient one, and needs no throwaway database: the ask
+-- comes from this database's own search_num_threads.
 SELECT (setting::int + 20) AS mwp_plus_20, (setting::int + 10) AS mwp_plus_10
 	FROM pg_settings WHERE name = 'max_worker_processes' \gset
 ALTER SYSTEM SET max_parallel_workers = :mwp_plus_20;
@@ -234,13 +270,9 @@ BEGIN
 	END LOOP;
 END $$;
 DROP TABLE cpu_governance_shortfall_target;
--- The grant is settled, but registration against it is not necessarily
--- done: the worker converges once per heartbeat (~1s) and each parked slot
--- it registers is a real background worker the postmaster must start, which
--- takes longer than that. Poll until search_slots_registered stops moving
--- between consecutive reads, rather than assuming a fixed number of
--- heartbeats is enough -- registering many slots for an oversized ask can
--- still be in flight seconds later.
+-- The grant is settled, but registering many real background workers for an
+-- oversized ask can still be in flight; poll until search_slots_registered
+-- stops moving between consecutive reads rather than assuming it is done.
 DO $$
 DECLARE
 	prev int := -1;
@@ -341,9 +373,8 @@ CREATE ROLE cpu_governance_unpriv NOLOGIN;
 CREATE ROLE cpu_governance_privileged NOLOGIN;
 GRANT pg_read_all_stats TO cpu_governance_privileged;
 -- Unprivileged: sees exactly its own database's row, never the other one.
--- search_slots_registered is a column on that same row, so it inherits the
--- gate for free; read it here to confirm the added column carries no gate
--- of its own.
+-- The visibility gate is per-row, not per-column, so search_slots_registered
+-- is readable wherever the row itself is visible and nowhere else.
 SET ROLE cpu_governance_unpriv;
 SELECT count(DISTINCT db_oid) AS visible_rows,
 	   bool_and(db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())) AS only_self,
@@ -376,9 +407,8 @@ DROP ROLE cpu_governance_privileged;
 -- 'postgres'), so this succeeds regardless of whether the launcher has
 -- released the shmem slot yet.
 DELETE FROM vamana_databases WHERE datname = 'postgres';
--- Wait for the release to actually land before this file finishes: the
--- shortfall case above makes this file run visibly longer than it used to,
--- and vamana_databases.sql (which runs later in this suite) inserts its own
+-- Wait for the release to actually land before this file finishes:
+-- vamana_databases.sql (which runs later in this suite) inserts its own
 -- fresh 'postgres' row and expects a clean slate rather than a still-
 -- releasing one from here.
 DO $$

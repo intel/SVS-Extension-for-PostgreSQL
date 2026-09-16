@@ -1165,6 +1165,11 @@ VamanaWorkerReleaseSlot(Oid dbOid)
  * merely stuck must be left for VamanaWorkerEntryIsLive's heartbeat check to
  * catch instead. Backoff counters, index locks, and queued reloads are left
  * untouched for the replacement to inherit.
+ *
+ * registeredSearchSlots is zeroed here too: a dead worker holds no parked
+ * search slots (the postmaster reaps them independently of this bookkeeping),
+ * so the stat view must not keep reporting its last live count until a
+ * replacement worker's own first heartbeat overwrites it.
  */
 void
 VamanaWorkerClearDeadEntry(Oid dbOid)
@@ -1182,6 +1187,7 @@ VamanaWorkerClearDeadEntry(Oid dbOid)
 	{
 		entry->workerPid = 0;
 		pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+		pg_atomic_write_u32(&entry->registeredSearchSlots, 0);
 	}
 
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
