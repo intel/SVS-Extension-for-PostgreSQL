@@ -374,7 +374,7 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 }
 
 bool
-SvsMemoryHandoffBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredResidencyBytes)
+SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredResidencyBytes)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
@@ -419,6 +419,31 @@ SvsMemoryHandoffBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredRes
 	LWLockRelease(&entry->memLock);
 
 	return fits;
+}
+
+void
+SvsMemoryHandoffBuild(Oid dbOid, Oid relid)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	SvsMemReservation *reservation;
+
+	Assert(OidIsValid(relid));
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	reservation = FindReservation(entry, relid);
+	if (reservation == NULL)
+	{
+		LWLockRelease(&entry->memLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no confirmed build reservation for index %u in database %u", relid, dbOid)));
+	}
+
+	Assert(reservation->state == SVS_MEM_CONFIRMED);
+	reservation->state = SVS_MEM_HANDOFF;
+
+	LWLockRelease(&entry->memLock);
 }
 
 void
@@ -667,20 +692,20 @@ OwnerPidIsDead(int ownerPid, TimestampTz reservedAt)
 
 /*
  * Reclaims only RESERVED reservations -- a build a backend started but
- * never finished. CONFIRMED and RESIDENT both mean the build succeeded;
- * a dead owner there is never an abandoned build, since every path off of
- * CONFIRMED already releases it elsewhere: a clean error unwinds through
- * SvsMemoryAbortBuild before commit, and a backend crash forces a full
- * postmaster restart that wipes this shared memory outright. Reaping
- * CONFIRMED would instead delete a committed, on-disk index's reservation
- * the moment its building backend's ordinary post-commit disconnect makes
- * that stale PID look dead.
+ * never finished. CONFIRMED, HANDOFF, and RESIDENT all mean the build
+ * succeeded; a dead owner there is never an abandoned build, since every
+ * path off of CONFIRMED already releases it elsewhere: a clean error
+ * unwinds through SvsMemoryAbortBuild before commit, and a backend crash
+ * forces a full postmaster restart that wipes this shared memory outright.
+ * Reaping CONFIRMED or HANDOFF would instead delete a committed, on-disk
+ * index's reservation the moment its building backend's ordinary
+ * post-commit disconnect makes that stale PID look dead.
  *
  * For a RESERVED record, buildPeakBytes is always still outstanding --
- * only HandoffBuild/AbortBuild ever zero it -- so it is released here too,
+ * only ConfirmBuild/AbortBuild ever zero it -- so it is released here too,
  * against both the per-database and the global build counters. Without
  * this second release, a backend that crashes between ReserveBuild and
- * HandoffBuild would leak its build peak against svs.max_build_memory
+ * ConfirmBuild would leak its build peak against svs.max_build_memory
  * forever, since neither the crashed backend nor anything else ever calls
  * SvsMemoryAbortBuild for it.
  */

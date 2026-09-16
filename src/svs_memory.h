@@ -13,9 +13,9 @@
  *
  * A successful build's reservation transfers ownership rather than
  * releasing outright: RESERVED(estimate, backend) -> CONFIRMED(measured,
- * backend) -> RESIDENT(measured, worker). The reservation is visible under
- * this module's accounting continuously across that lifecycle, so a
- * concurrent admission check never reads a gap.
+ * backend) -> HANDOFF(measured, backend) -> RESIDENT(measured, worker). The
+ * reservation is visible under this module's accounting continuously across
+ * that lifecycle, so a concurrent admission check never reads a gap.
  *
  * SvsMemReservation and SvsMemInsertReservation are declared here, not in
  * vamanaworkershmem.c, because this module owns their shape and every
@@ -51,14 +51,15 @@ typedef enum SvsMemReservationState
 {
 	SVS_MEM_RESERVED,
 	SVS_MEM_CONFIRMED,
+	SVS_MEM_HANDOFF,
 	SVS_MEM_RESIDENT,
 } SvsMemReservationState;
 
 /*
  * One index's build-to-residency lifecycle, keyed by relid within its
  * database's control block. ownerPid is the reserving backend while
- * RESERVED/CONFIRMED, and 0 once RESIDENT: residency then belongs to the
- * database, not to whichever process last touched it. relid == InvalidOid
+ * RESERVED/CONFIRMED/HANDOFF, and 0 once RESIDENT: residency then belongs to
+ * the database, not to whichever process last touched it. relid == InvalidOid
  * marks a free slot, the same "0 is free" convention VamanaIndexLockSlot
  * and VamanaWorkerReloadRequest already use.
  *
@@ -84,7 +85,7 @@ typedef struct SvsMemReservation
 
 	/*
 	 * The build peak reserved for this index, still outstanding. Zeroed by
-	 * SvsMemoryHandoffBuild once released; SvsMemoryAbortBuild releases it
+	 * SvsMemoryConfirmBuild once released; SvsMemoryAbortBuild releases it
 	 * too but drops the whole reservation via FreeReservation rather than
 	 * zeroing this field in place. Read by the reaper, which has no other
 	 * way to learn a dead backend's build peak.
@@ -152,31 +153,41 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
 /*
  * Backend, after a successful build and before serializing to disk.
  * Releases buildPeak unconditionally and reconciles the residency
- * reservation from estimate to measuredResidencyBytes. Returns false, and
- * drops the reservation entirely, if the measured bytes do not fit dbOid's
- * residency budget -- the caller must fail CREATE INDEX without serializing
- * or contacting the worker. Returns true once the reservation is confirmed
- * at the exact measured size.
+ * reservation from estimate to measuredResidencyBytes (RESERVED ->
+ * CONFIRMED). Returns false, and drops the reservation entirely, if the
+ * measured bytes do not fit dbOid's residency budget -- the caller must
+ * fail CREATE INDEX without serializing or contacting the worker. Returns
+ * true once the reservation is confirmed at the exact measured size.
  */
-extern bool SvsMemoryHandoffBuild(Oid dbOid, Oid relid,
+extern bool SvsMemoryConfirmBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 measuredResidencyBytes);
 
 /*
+ * Backend, after serializing a confirmed build to disk and before asking
+ * the worker to load it (CONFIRMED -> HANDOFF). Pure state transition, no
+ * byte accounting: the measured bytes ConfirmBuild already committed are
+ * unaffected, and ownership stays with the calling backend until the
+ * worker's own SvsMemoryReconcileLoad claims it.
+ */
+extern void SvsMemoryHandoffBuild(Oid dbOid, Oid relid);
+
+/*
  * Backend, on any build error, whether before or after a successful
- * handoff. Releases whatever relid's reservation still holds -- its build
- * peak if HandoffBuild hasn't already released it, and its estimate or its
+ * confirm. Releases whatever relid's reservation still holds -- its build
+ * peak if ConfirmBuild hasn't already released it, and its estimate or its
  * measured bytes, whichever the reservation's own state says is currently
  * committed -- then drops the reservation. Safe to call more than once or
- * after HandoffBuild already ran; there is nothing left to release once
+ * after ConfirmBuild already ran; there is nothing left to release once
  * relid has no reservation.
  */
 extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
 
 /*
- * Worker, at load. Reconciles a pending handoff to measuredBytes in place,
- * or -- for a reload or restart adopt with no pending reservation --
- * accounts measuredBytes directly. Returns false, committing nothing, if
- * measuredBytes does not fit dbOid's residency budget.
+ * Worker, at load. Reconciles a pending HANDOFF reservation to
+ * measuredBytes in place (HANDOFF -> RESIDENT), or -- for a reload or
+ * restart adopt with no pending reservation -- accounts measuredBytes
+ * directly. Returns false, committing nothing, if measuredBytes does not
+ * fit dbOid's residency budget.
  */
 extern bool SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes);
 

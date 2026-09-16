@@ -43,6 +43,8 @@ ReservationStateName(SvsMemReservationState state)
 			return "RESERVED";
 		case SVS_MEM_CONFIRMED:
 			return "CONFIRMED";
+		case SVS_MEM_HANDOFF:
+			return "HANDOFF";
 		case SVS_MEM_RESIDENT:
 			return "RESIDENT";
 	}
@@ -285,15 +287,23 @@ svs_memory_reserve_build(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_handoff_build);
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_confirm_build);
 Datum
-svs_memory_handoff_build(PG_FUNCTION_ARGS)
+svs_memory_confirm_build(PG_FUNCTION_ARGS)
 {
-	bool		confirmed = SvsMemoryHandoffBuild(PG_GETARG_OID(0), PG_GETARG_OID(1),
+	bool		confirmed = SvsMemoryConfirmBuild(PG_GETARG_OID(0), PG_GETARG_OID(1),
 												   GetNonNegativeArgAsUint64(fcinfo, 2),
 												   GetNonNegativeArgAsUint64(fcinfo, 3));
 
 	PG_RETURN_BOOL(confirmed);
+}
+
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_handoff_build);
+Datum
+svs_memory_handoff_build(PG_FUNCTION_ARGS)
+{
+	SvsMemoryHandoffBuild(PG_GETARG_OID(0), PG_GETARG_OID(1));
+	PG_RETURN_VOID();
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_abort_build);

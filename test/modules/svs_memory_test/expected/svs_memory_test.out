@@ -109,7 +109,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
--- A build peak at handoff that does not match what was reserved is capped
+-- A build peak at confirm that does not match what was reserved is capped
 -- at zero rather than driving the per-database build counter negative.
 SELECT svs_memory_reserve_build(100, 11, (2 * 1024 * 1024)::bigint, (2 * 1024 * 1024)::bigint);
  svs_memory_reserve_build 
@@ -117,10 +117,10 @@ SELECT svs_memory_reserve_build(100, 11, (2 * 1024 * 1024)::bigint, (2 * 1024 * 
  
 (1 row)
 
-SELECT svs_memory_handoff_build(100, 11, (50 * 1024 * 1024)::bigint, (2 * 1024 * 1024)::bigint);
+SELECT svs_memory_confirm_build(100, 11, (50 * 1024 * 1024)::bigint, (2 * 1024 * 1024)::bigint);
 WARNING:  SVS memory accounting underflow releasing a build peak: releasing 52428800 bytes but only 2097152 committed
 WARNING:  SVS memory accounting underflow releasing a build peak: releasing 52428800 bytes but only 2097152 committed
- svs_memory_handoff_build 
+ svs_memory_confirm_build 
 --------------------------
  t
 (1 row)
@@ -148,7 +148,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
--- Build reserve, then a handoff whose measured bytes fit: build peak
+-- Build reserve, then a confirm whose measured bytes fit: build peak
 -- releases, residency reconciles from estimate to measured.
 SELECT svs_memory_reserve_build(100, 1, (10 * 1024 * 1024)::bigint, (10 * 1024 * 1024)::bigint);
  svs_memory_reserve_build 
@@ -162,8 +162,8 @@ SELECT * FROM svs_memory_read_stats(100);
          41943040 |                  10485760 |              10485760
 (1 row)
 
-SELECT svs_memory_handoff_build(100, 1, (10 * 1024 * 1024)::bigint, (9 * 1024 * 1024)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(100, 1, (10 * 1024 * 1024)::bigint, (9 * 1024 * 1024)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  t
 (1 row)
@@ -180,7 +180,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 (0 rows)
 
 -- A worker's own measurement at load can differ from what the backend
--- recorded at handoff; the committed counter tracks the new figure
+-- recorded at confirm; the committed counter tracks the new figure
 -- exactly, not the old one.
 SELECT svs_memory_reserve_build(100, 10, (2 * 1024 * 1024)::bigint, (8 * 1024 * 1024)::bigint);
  svs_memory_reserve_build 
@@ -188,8 +188,8 @@ SELECT svs_memory_reserve_build(100, 10, (2 * 1024 * 1024)::bigint, (8 * 1024 * 
  
 (1 row)
 
-SELECT svs_memory_handoff_build(100, 10, (2 * 1024 * 1024)::bigint, (8 * 1024 * 1024)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(100, 10, (2 * 1024 * 1024)::bigint, (8 * 1024 * 1024)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  t
 (1 row)
@@ -229,15 +229,15 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
--- A handoff whose measured bytes do not fit drops the reservation entirely.
+-- A confirm whose measured bytes do not fit drops the reservation entirely.
 SELECT svs_memory_reserve_build(100, 2, (5 * 1024 * 1024)::bigint, (5 * 1024 * 1024)::bigint);
  svs_memory_reserve_build 
 --------------------------
  
 (1 row)
 
-SELECT svs_memory_handoff_build(100, 2, (5 * 1024 * 1024)::bigint, (35 * 1024 * 1024)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(100, 2, (5 * 1024 * 1024)::bigint, (35 * 1024 * 1024)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  f
 (1 row)
@@ -277,7 +277,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
--- Reconcile load on a fresh handoff (index 1) is a re-verification: no change.
+-- Reconcile load on a fresh confirm (index 1) is a re-verification: no change.
 SELECT svs_memory_reconcile_load(100, 1, (9 * 1024 * 1024)::bigint);
  svs_memory_reconcile_load 
 ---------------------------
@@ -639,7 +639,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
--- HandoffBuild's own fits check: measured bytes exactly at budget succeed;
+-- ConfirmBuild's own fits check: measured bytes exactly at budget succeed;
 -- one byte more drops the reservation entirely.
 SELECT svs_memory_admit_database(532, (1 * 1024 * 1024)::bigint);
  svs_memory_admit_database 
@@ -653,8 +653,8 @@ SELECT svs_memory_reserve_build(532, 4, 1024::bigint, (512 * 1024)::bigint);
  
 (1 row)
 
-SELECT svs_memory_handoff_build(532, 4, 1024::bigint, (1 * 1024 * 1024)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(532, 4, 1024::bigint, (1 * 1024 * 1024)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  t
 (1 row)
@@ -677,8 +677,8 @@ SELECT svs_memory_reserve_build(532, 5, 1024::bigint, (512 * 1024)::bigint);
  
 (1 row)
 
-SELECT svs_memory_handoff_build(532, 5, 1024::bigint, (1 * 1024 * 1024 + 1)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(532, 5, 1024::bigint, (1 * 1024 * 1024 + 1)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  f
 (1 row)
@@ -956,8 +956,8 @@ SELECT svs_memory_reserve_build(540, 1, 1024::bigint, (5 * 1024 * 1024)::bigint)
  
 (1 row)
 
-SELECT svs_memory_handoff_build(540, 1, 1024::bigint, (7 * 1024 * 1024)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(540, 1, 1024::bigint, (7 * 1024 * 1024)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  t
 (1 row)
@@ -1126,7 +1126,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 SELECT svs_memory_admit_database(601, 0::bigint);
 ERROR:  database 601 cannot be admitted at a zero residency budget
 HINT:  A budget of 0 means "not admitted" everywhere else in this module; every admitted database needs a budget greater than zero.
--- Guard: a handoff with no matching build reservation errors instead of
+-- Guard: a confirm with no matching build reservation errors instead of
 -- silently accounting bytes no reservation ever claimed.
 SELECT svs_memory_admit_database(602, (1 * 1024)::bigint);
  svs_memory_admit_database 
@@ -1134,14 +1134,14 @@ SELECT svs_memory_admit_database(602, (1 * 1024)::bigint);
  
 (1 row)
 
-SELECT svs_memory_handoff_build(602, 1, 0::bigint, 100::bigint);
+SELECT svs_memory_confirm_build(602, 1, 0::bigint, 100::bigint);
 ERROR:  no pending build reservation for index 1 in database 602
 SELECT * FROM svs_memory_test_check_invariants();
  db_oid | violation 
 --------+-----------
 (0 rows)
 
--- HandoffBuild zeros buildPeakBytes once released, so nothing later
+-- ConfirmBuild zeros buildPeakBytes once released, so nothing later
 -- re-releases it; a later abort on the same (now-confirmed) reservation
 -- then leaves the global build counter untouched.
 SELECT svs_memory_admit_database(603, (1 * 1024)::bigint);
@@ -1156,15 +1156,15 @@ SELECT svs_memory_reserve_build(603, 1, 500::bigint, 100::bigint);
  
 (1 row)
 
-SELECT svs_memory_handoff_build(603, 1, 500::bigint, 100::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(603, 1, 500::bigint, 100::bigint);
+ svs_memory_confirm_build 
 --------------------------
  t
 (1 row)
 
-SELECT build_peak_bytes = 0 AS build_peak_zeroed_after_handoff
+SELECT build_peak_bytes = 0 AS build_peak_zeroed_after_confirm
   FROM svs_memory_test_reservations(603);
- build_peak_zeroed_after_handoff 
+ build_peak_zeroed_after_confirm 
 ---------------------------------
  t
 (1 row)
@@ -1189,7 +1189,7 @@ SELECT * FROM svs_memory_test_check_invariants();
 (0 rows)
 
 -- The reaper reclaims only RESERVED reservations; a dead owner on a
--- CONFIRMED record is never treated as an abandoned build.
+-- CONFIRMED or HANDOFF record is never treated as an abandoned build.
 SELECT svs_memory_admit_database(604, (10 * 1024)::bigint);
  svs_memory_admit_database 
 ---------------------------
@@ -1208,10 +1208,28 @@ SELECT svs_memory_reserve_build(604, 2, 0::bigint, (1 * 1024)::bigint);
  
 (1 row)
 
-SELECT svs_memory_handoff_build(604, 2, 0::bigint, (1 * 1024)::bigint);
- svs_memory_handoff_build 
+SELECT svs_memory_confirm_build(604, 2, 0::bigint, (1 * 1024)::bigint);
+ svs_memory_confirm_build 
 --------------------------
  t
+(1 row)
+
+SELECT svs_memory_reserve_build(604, 3, 0::bigint, (1 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_confirm_build(604, 3, 0::bigint, (1 * 1024)::bigint);
+ svs_memory_confirm_build 
+--------------------------
+ t
+(1 row)
+
+SELECT svs_memory_handoff_build(604, 3);
+ svs_memory_handoff_build 
+--------------------------
+ 
 (1 row)
 
 SELECT svs_memory_test_set_owner_pid(604, 1, 2147483647);
@@ -1221,6 +1239,12 @@ SELECT svs_memory_test_set_owner_pid(604, 1, 2147483647);
 (1 row)
 
 SELECT svs_memory_test_set_owner_pid(604, 2, 2147483647);
+ svs_memory_test_set_owner_pid 
+-------------------------------
+ 
+(1 row)
+
+SELECT svs_memory_test_set_owner_pid(604, 3, 2147483647);
  svs_memory_test_set_owner_pid 
 -------------------------------
  
@@ -1236,7 +1260,8 @@ SELECT relid, state FROM svs_memory_test_reservations(604) ORDER BY relid;
  relid |   state   
 -------+-----------
      2 | CONFIRMED
-(1 row)
+     3 | HANDOFF
+(2 rows)
 
 SELECT * FROM svs_memory_test_check_invariants();
  db_oid | violation 
@@ -1739,6 +1764,147 @@ SELECT residency_bytes_committed = 0 AS unchanged_after_noop_abort
  t
 (1 row)
 
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+-- Full lifecycle RESERVED -> CONFIRMED -> HANDOFF -> RESIDENT: the measured
+-- bytes committed at confirm carry through handoff untouched, ownerPid
+-- stays with the confirming backend through HANDOFF, and only clears once
+-- the worker's own reconcile lands the reservation on RESIDENT.
+SELECT svs_memory_admit_database(670, (10 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reserve_build(670, 1, 1024::bigint, (4 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_confirm_build(670, 1, 1024::bigint, (5 * 1024)::bigint);
+ svs_memory_confirm_build 
+--------------------------
+ t
+(1 row)
+
+SELECT residency_bytes_committed = (5 * 1024) AS committed_at_confirm
+  FROM svs_memory_read_stats(670);
+ committed_at_confirm 
+----------------------
+ t
+(1 row)
+
+SELECT svs_memory_handoff_build(670, 1);
+ svs_memory_handoff_build 
+--------------------------
+ 
+(1 row)
+
+SELECT state, owner_pid = pg_backend_pid() AS owned_by_confirming_backend, measured_bytes
+  FROM svs_memory_test_reservations(670);
+  state  | owned_by_confirming_backend | measured_bytes 
+---------+-----------------------------+----------------
+ HANDOFF | t                           |           5120
+(1 row)
+
+SELECT residency_bytes_committed = (5 * 1024) AS committed_unchanged_by_handoff
+  FROM svs_memory_read_stats(670);
+ committed_unchanged_by_handoff 
+--------------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reconcile_load(670, 1, (5 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT state, owner_pid FROM svs_memory_test_reservations(670);
+  state   | owner_pid 
+----------+-----------
+ RESIDENT |         0
+(1 row)
+
+SELECT residency_bytes_committed = (5 * 1024) AS committed_unchanged_by_reconcile
+  FROM svs_memory_read_stats(670);
+ committed_unchanged_by_reconcile 
+----------------------------------
+ t
+(1 row)
+
+SELECT svs_memory_account_unload(670, 1);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+-- Abort on a HANDOFF record releases its measured bytes, the same as abort
+-- on a CONFIRMED or RESIDENT record: HANDOFF sits in the same
+-- measured-bytes bucket, not the RESERVED estimate.
+SELECT svs_memory_admit_database(671, (10 * 1024)::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reserve_build(671, 1, 1024::bigint, (4 * 1024)::bigint);
+ svs_memory_reserve_build 
+--------------------------
+ 
+(1 row)
+
+SELECT svs_memory_confirm_build(671, 1, 1024::bigint, (6 * 1024)::bigint);
+ svs_memory_confirm_build 
+--------------------------
+ t
+(1 row)
+
+SELECT svs_memory_handoff_build(671, 1);
+ svs_memory_handoff_build 
+--------------------------
+ 
+(1 row)
+
+SELECT residency_bytes_committed = (6 * 1024) AS committed_at_handoff
+  FROM svs_memory_read_stats(671);
+ committed_at_handoff 
+----------------------
+ t
+(1 row)
+
+SELECT svs_memory_abort_build(671, 1);
+ svs_memory_abort_build 
+------------------------
+ 
+(1 row)
+
+SELECT residency_bytes_committed = 0 AS committed_back_to_zero_after_abort
+  FROM svs_memory_read_stats(671);
+ committed_back_to_zero_after_abort 
+------------------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+-- Guard: a handoff with no matching build reservation errors instead of
+-- silently flipping a state no reservation ever reached. Reuses db 670,
+-- already admitted above and now empty after its unload.
+SELECT svs_memory_handoff_build(670, 1);
+ERROR:  no confirmed build reservation for index 1 in database 670
 SELECT * FROM svs_memory_test_check_invariants();
  db_oid | violation 
 --------+-----------

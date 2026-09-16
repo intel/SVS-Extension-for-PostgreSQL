@@ -76,8 +76,12 @@ CREATE FUNCTION svs_memory_reserve_build(db_oid oid, relid oid, build_peak bigin
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION svs_memory_handoff_build(db_oid oid, relid oid, build_peak bigint, measured_residency_bytes bigint)
+CREATE FUNCTION svs_memory_confirm_build(db_oid oid, relid oid, build_peak bigint, measured_residency_bytes bigint)
 RETURNS boolean
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_handoff_build(db_oid oid, relid oid)
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION svs_memory_abort_build(db_oid oid, relid oid)
