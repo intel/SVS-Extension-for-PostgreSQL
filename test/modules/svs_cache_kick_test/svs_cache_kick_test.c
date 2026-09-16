@@ -175,12 +175,8 @@ PG_FUNCTION_INFO_V1(svs_cache_count);
 Datum
 svs_cache_count(PG_FUNCTION_ARGS)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n;
-
 	EnsureFakeWorkerContext();
-	n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
-	PG_RETURN_INT32(n);
+	PG_RETURN_INT32(list_length(VamanaGetAllCachedRelids()));
 }
 
 PG_FUNCTION_INFO_V1(svs_cache_kicked);

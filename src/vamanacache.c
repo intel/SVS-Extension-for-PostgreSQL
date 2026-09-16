@@ -395,10 +395,20 @@ VamanaCacheGetNeedsSave(Oid indexRelid)
 static bool
 VamanaCacheIsEmpty(void)
 {
-	for (int i = 0; i < vamanaCacheUsed; i++)
+	HASH_SEQ_STATUS status;
+	VamanaCacheHashEntry *hashEntry;
+
+	if (vamanaIndexCacheHash == NULL)
+		return true;
+
+	hash_seq_init(&status, vamanaIndexCacheHash);
+	while ((hashEntry = hash_seq_search(&status)) != NULL)
 	{
-		if (vamanaCacheSlots[i] != NULL && vamanaCacheSlots[i]->isValid)
+		if (hashEntry->cache->isValid)
+		{
+			hash_seq_term(&status);
 			return false;
+		}
 	}
 	return true;
 }
