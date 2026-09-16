@@ -31,6 +31,7 @@
 9. [Troubleshooting](#9-troubleshooting)
 10. [Appendix: Vamana vs. HNSW Comparison](#10-appendix-vamana-vs-hnsw-comparison)
 11. [Reference: Parameter Summary](#11-reference-parameter-summary)
+12. [Resource Sizing](RESOURCE_SIZING.md)
 
 ---
 
@@ -59,6 +60,8 @@ LeanVec is ideal when your vectors have high dimensionality (e.g., 1536D from Op
 ---
 
 ## 2. Prerequisites
+
+Before enrolling databases, size `max_worker_processes` and `max_parallel_workers` for your deployment; see [Resource Sizing](RESOURCE_SIZING.md).
 
 - The `svs` extension (version **0.1.0 or later**) installed and enabled. This also installs the `vector` extension as a dependency:
 

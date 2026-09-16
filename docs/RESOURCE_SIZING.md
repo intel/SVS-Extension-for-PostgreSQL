@@ -1,0 +1,147 @@
+# Resource Sizing for Operators
+
+This guide covers the background-worker and CPU resource settings a DBA must size before
+enrolling databases with the `svs` extension. It assumes the extension is already installed;
+see [`docs/USER_GUIDE.md`](USER_GUIDE.md) for installation and index creation.
+
+## Table of Contents
+
+1. [Required Settings](#1-required-settings)
+2. [Sizing `max_parallel_workers`](#2-sizing-max_parallel_workers)
+3. [The Per-Database Levers](#3-the-per-database-levers)
+4. [Reading `pg_stat_vamana_worker`](#4-reading-pg_stat_vamana_worker)
+5. [Restart, Reload, or Neither](#5-restart-reload-or-neither)
+
+## 1. Required Settings
+
+Add the extension to `shared_preload_libraries` and restart the server:
+
+```
+shared_preload_libraries = 'svs'
+```
+
+This is sufficient on its own. `svs.so` does not call into `vector.so` at runtime; the two
+extensions' preload order does not matter. `svs.control` declares `requires = 'vector'`, but that
+is a SQL-level dependency on the `vector` type, satisfied when you run `CREATE EXTENSION vector`
+(or let `CREATE EXTENSION svs` pull it in automatically) — it has no bearing on preload order.
+
+### `max_worker_processes`
+
+Every background worker the extension uses, including the parked worker processes that stand
+in for search threads, draws a slot from `max_worker_processes`. Size it as:
+
+```
+max_worker_processes >= 1                          (the launcher)
+                       + 1 per enrolled database    (one worker each)
+                       + autovacuum_max_workers      (default 3)
+                       + logical replication workers, if used
+                       + max_parallel_workers
+```
+
+Worked example: 2 enrolled databases, default `autovacuum_max_workers`, no logical replication,
+`max_parallel_workers = 8`:
+
+```
+1 + 2 + 3 + 0 + 8 = 14
+```
+
+The PostgreSQL default of `max_worker_processes = 8` is not enough. This setting takes effect
+only on restart.
+
+### `svs.max_databases`
+
+Sizes the per-database control-block array the extension keeps in shared memory. Default 8,
+range 1-128. If you plan to enroll more than 8 databases, raise this before you need it — it also
+takes effect only on restart.
+
+## 2. Sizing `max_parallel_workers`
+
+This is the setting operators most often get wrong, because the extension's use of it does not
+match the usual mental model of "workers run while a query runs."
+
+**A database's granted search threads are held continuously for as long as its worker is
+enrolled and live, not only while a search query is executing.** Once the launcher grants a
+database N search threads, those N slots are parked and unavailable to anything else, whether or
+not that database is currently being queried.
+
+Size the pool for **how many databases you enroll, not how many queries run concurrently**:
+
+```
+max_parallel_workers >= sum of every enrolled database's effective search-thread grant
+                       + headroom for concurrent CREATE INDEX
+                       + headroom for core parallel query
+```
+
+The "headroom for concurrent `CREATE INDEX`" term is not a vague safety margin: an index build's
+requested threads and every enrolled database's search demand draw from the same
+`max_parallel_workers`-bounded pool and are apportioned by the same arbitration, so a build in
+progress can visibly reduce what is left over for search grants (and vice versa).
+
+An unconfigured enrolled database (no `search_num_threads` override in `vamana_databases`)
+resolves to a **1-thread grant**. Concretely: `svs.max_databases` defaults to 8,
+`max_parallel_workers` defaults to 8, and **eight enrolled databases at stock settings hold the
+entire default parallel pool permanently, with zero SVS queries running**, leaving nothing for
+core parallel query or a parallel `CREATE INDEX`.
+
+This is expected behavior, not a leak. If you see it, raise `max_parallel_workers` (and
+`max_worker_processes` with it, per the formula above) to the sum of what your enrolled databases
+actually need plus your usual core-parallel-query headroom.
+
+Unlike `max_worker_processes`, `max_parallel_workers` takes effect on `SIGHUP` (`pg_reload_conf()`
+or `SET` by a superuser) — no restart required.
+
+## 3. The Per-Database Levers
+
+Per-database overrides live in the `vamana_databases` catalog table. `SELECT` on this table is
+not granted to `PUBLIC`; query it as the table owner or a superuser. All three levers below take
+effect live, on the next launcher reconciliation, with no restart:
+
+- **`search_num_threads`** — this database's search-thread request. `NULL` (the default) means
+  "use the cluster default," which today resolves to a 1-thread grant. A positive value requests
+  that many threads instead, still bounded by the shared pool and by
+  `svs.max_search_threads_per_db` if you have set that GUC.
+- **`search_threads_reserved`** — a floor for this database's grant. `NULL` (the default) means
+  no floor: the database's request is pure best-effort against the shared pool and can be
+  reduced when the pool is oversubscribed. A positive value guarantees that many threads are
+  honored before anything else is distributed.
+- **`maintenance_num_threads`** — the thread count requested for this database's index builds
+  (`CREATE INDEX`, and the equivalent maintenance paths). `NULL` (the default) means "follow the
+  cluster build-thread default." `0` means serial.
+
+## 4. Reading `pg_stat_vamana_worker`
+
+`pg_stat_vamana_worker` exposes, per enrolled database, what was asked for and what was actually
+handed out. The four columns that matter for CPU sizing:
+
+| Column | Meaning |
+|---|---|
+| `search_threads_desired` | What the database asked for, after resolving `search_num_threads` and clamping to any per-database ceiling. |
+| `search_threads_granted` | What the launcher actually allotted from the shared `max_parallel_workers` pool. |
+| `search_threads_reserved` | The floor actually honored for this database, `0` if none is configured. |
+| `search_slots_registered` | What the worker actually holds after resizing to the grant. |
+
+All four read `0` when a database's worker is not live.
+
+Two distinct problems produce a shortfall, and they call for different fixes:
+
+- **`search_threads_granted` below `search_threads_desired`:** the shared pool is
+  oversubscribed. Raise `max_parallel_workers` (see §2).
+- **`search_slots_registered` below `search_threads_granted`:** the worker was granted threads
+  it could not register, which points at the `max_worker_processes` slot array being exhausted.
+  Raise `max_worker_processes` (see §1) — note this is restart-only, unlike
+  `max_parallel_workers`.
+
+The view has more columns than the four above, including several from the memory-management
+domain (residency and search-scratch memory); the full, current list is in
+`sql/svs--0.1.0.sql`.
+
+## 5. Restart, Reload, or Neither
+
+| Setting | Effect timing |
+|---|---|
+| `max_worker_processes` | Restart only |
+| `svs.max_databases` | Restart only |
+| `max_parallel_workers` | Reload (`SIGHUP`) — no restart |
+| `vamana_databases.search_num_threads` | Live, on the next launcher reconciliation |
+| `vamana_databases.search_threads_reserved` | Live, on the next launcher reconciliation |
+| `vamana_databases.maintenance_num_threads` | Live, on the next launcher reconciliation |
