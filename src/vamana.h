@@ -335,6 +335,8 @@ void		VamanaEvictCacheEntry(Oid indexRelid);
 void		VamanaForceHeapRebuild(Oid indexRelid);
 void		VamanaEvictAllCacheEntries(void);
 List	   *VamanaGetAllCachedRelids(void);
+void		VamanaWorkerRefreshSearchScratchCosts(void);
+void		VamanaWorkerEnsureSearchScratchCostComputed(Oid relid);
 void		VamanaCacheSetNeedsSave(Oid indexRelid, bool flag);
 bool		VamanaCacheGetNeedsSave(Oid indexRelid);
 SVSIndexHandle VamanaRebuildFromTable(Relation index);

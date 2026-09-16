@@ -246,6 +246,20 @@ extern void SvsMemoryRecheckSearchScratchOptions(Oid dbOid, Oid relid,
 												  int searchWindowSize,
 												  bool useSearchHistory);
 
+/* Stores relid's just-computed per-query search-scratch cost. No-op if relid has no reservation. */
+extern void SvsMemorySetSearchScratchBytesPerQuery(Oid dbOid, Oid relid,
+													uint64 bytesPerQuery);
+
+/*
+ * Dispatch-time gate: atomically admits batchBytes against dbOid's
+ * search-scratch budget, adding to the in-flight total only if it fits.
+ * Lock-free against other databases and other indexes in the same database.
+ */
+extern bool SvsMemoryReserveSearchScratch(Oid dbOid, uint64 batchBytes);
+
+/* Releases batchBytes admitted by SvsMemoryReserveSearchScratch, floored at 0. */
+extern void SvsMemoryReleaseSearchScratch(Oid dbOid, uint64 batchBytes);
+
 /*
  * Tear down every accounting counter and reservation owned by entry, and
  * unwind its contribution to the header's global roll-ups. Called only when

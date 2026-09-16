@@ -32,6 +32,8 @@
 #include "commands/extension.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -157,6 +159,90 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 							  SvsIndexResidencyDurableFloor(dbOid, VamanaWorkerLookupSlot(dbOid)) : 0);
 
 	return PointerGetDatum(NULL);	/* AFTER trigger; return value is ignored */
+}
+
+/*
+ * BEFORE INSERT OR UPDATE trigger: rejects a row whose resolved
+ * search_work_mem would push the cluster-wide sum over
+ * svs.max_search_work_mem. ShareRowExclusiveLock (self-conflicting)
+ * serializes concurrent statements against this sum; the row lock the
+ * INSERT/UPDATE already holds only covers the one row being changed.
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_check_search_work_mem_ceiling);
+Datum
+vamana_databases_check_search_work_mem_ceiling(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	HeapTuple	tuple;
+	TupleDesc	tupdesc;
+	bool		isnull;
+	Datum		datnameDatum;
+	Datum		searchWorkMemDatum;
+	Name		datname;
+	int32		resolvedMb;
+	char	   *qualifiedName;
+	Oid			paramTypes[1] = {NAMEOID};
+	Datum		paramValues[1];
+	uint64		otherRowsSumMb;
+	uint64		projectedTotalMb;
+	bool		sumIsNull;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: not called by trigger manager");
+
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event) || !TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: must be a BEFORE ... FOR EACH ROW trigger");
+
+	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
+		tuple = trigdata->tg_trigtuple;
+	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		tuple = trigdata->tg_newtuple;
+	else
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: must be fired by INSERT or UPDATE");
+
+	tupdesc = trigdata->tg_relation->rd_att;
+
+	datnameDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_DATNAME, tupdesc, &isnull);
+	if (isnull)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: datname is null");
+	datname = DatumGetName(datnameDatum);
+
+	searchWorkMemDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM, tupdesc, &isnull);
+	resolvedMb = isnull ? vamana_default_search_work_mem_mb : DatumGetInt32(searchWorkMemDatum);
+
+	LockRelationOid(trigdata->tg_relation->rd_id, ShareRowExclusiveLock);
+
+	qualifiedName = SvsDatabasesQualifiedName();
+	if (qualifiedName == NULL)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: vamana_databases not found in search path");
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: SPI_connect failed");
+
+	paramValues[0] = datnameDatum;
+
+	if (SPI_execute_with_args(psprintf("SELECT COALESCE(SUM(COALESCE(search_work_mem, %d)), 0) FROM %s WHERE datname <> $1",
+										vamana_default_search_work_mem_mb, qualifiedName),
+							   1, paramTypes, paramValues, NULL, true, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: sum query failed");
+
+	otherRowsSumMb = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &sumIsNull));
+	Assert(!sumIsNull);
+
+	SPI_finish();
+
+	projectedTotalMb = otherRowsSumMb + (uint64) resolvedMb;
+
+	if (projectedTotalMb > (uint64) vamana_max_search_work_mem_mb)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("setting \"%s\".search_work_mem would exceed svs.max_search_work_mem",
+						NameStr(*datname)),
+				 errdetail("Every database's resolved search_work_mem would sum to %llu MB, over the %d MB ceiling.",
+						   (unsigned long long) projectedTotalMb, vamana_max_search_work_mem_mb)));
+
+	return PointerGetDatum(tuple);
 }
 
 /*

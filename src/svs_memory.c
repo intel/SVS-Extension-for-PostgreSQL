@@ -799,6 +799,76 @@ SvsMemoryRecheckSearchScratchOptions(Oid dbOid, Oid relid, int searchWindowSize,
 	LWLockRelease(&entry->memLock);
 }
 
+void
+SvsMemorySetSearchScratchBytesPerQuery(Oid dbOid, Oid relid, uint64 bytesPerQuery)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+	SvsMemReservation *reservation;
+
+	Assert(OidIsValid(relid));
+
+	if (entry == NULL)
+		return;
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	reservation = FindReservation(entry, relid);
+	if (reservation != NULL)
+		reservation->searchScratchBytesPerQuery = bytesPerQuery;
+
+	LWLockRelease(&entry->memLock);
+}
+
+bool
+SvsMemoryReserveSearchScratch(Oid dbOid, uint64 batchBytes)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
+	uint64		budget;
+	uint64		current;
+
+	/* searchWorkMemMbOverride is guarded by the header lock, not memLock (Section 5.5). */
+	LWLockAcquire(header->lock, LW_SHARED);
+	budget = SvsMemoryResolveSearchWorkMem(entry);
+	LWLockRelease(header->lock);
+
+	current = pg_atomic_read_u64(&entry->searchScratchBytesInFlight);
+	for (;;)
+	{
+		if (current + batchBytes > budget)
+			return false;
+
+		if (pg_atomic_compare_exchange_u64(&entry->searchScratchBytesInFlight,
+											&current, current + batchBytes))
+			return true;
+
+		/* CAS failure refreshed current to the live value; retry against it. */
+	}
+}
+
+void
+SvsMemoryReleaseSearchScratch(Oid dbOid, uint64 batchBytes)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	uint64		before = pg_atomic_read_u64(&entry->searchScratchBytesInFlight);
+
+	for (;;)
+	{
+		uint64		updated = (batchBytes > before) ? 0 : before - batchBytes;
+
+		if (pg_atomic_compare_exchange_u64(&entry->searchScratchBytesInFlight,
+											&before, updated))
+			break;
+	}
+
+	if (batchBytes > before)
+		ereport(WARNING,
+				(errmsg("SVS search-scratch accounting underflow releasing database %u: "
+						"releasing %llu bytes but only %llu in flight",
+						dbOid,
+						(unsigned long long) batchBytes, (unsigned long long) before)));
+}
+
 uint64
 SvsMemoryResolveResidencyBudget(const VamanaWorkerShmem *entry)
 {

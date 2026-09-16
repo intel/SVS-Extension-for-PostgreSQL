@@ -109,6 +109,15 @@ CREATE TRIGGER vamana_databases_queue_reservation
 	AFTER INSERT OR UPDATE ON vamana_databases
 	FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation();
 
+-- Rejects an INSERT/UPDATE whose resolved search_work_mem would push the
+-- cluster-wide sum over svs.max_search_work_mem.
+CREATE FUNCTION vamana_databases_check_search_work_mem_ceiling() RETURNS trigger
+	AS 'MODULE_PATHNAME', 'vamana_databases_check_search_work_mem_ceiling' LANGUAGE C;
+
+CREATE TRIGGER vamana_databases_check_search_work_mem_ceiling
+	BEFORE INSERT OR UPDATE ON vamana_databases
+	FOR EACH ROW EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling();
+
 -- TRUNCATE bypasses DELETE triggers; block it since no role has a
 -- legitimate reason to bulk-wipe this table. The owner retains TRUNCATE
 -- regardless of this revoke.

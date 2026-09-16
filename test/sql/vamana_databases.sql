@@ -27,7 +27,14 @@ INSERT INTO vamana_databases (datname)
 -- the INSERT above). The default is not a single shared allowance one
 -- database's admission consumes for the others: every one of the three is
 -- admitted at the same, full default-derived budget.
+--
+-- search_work_mem is NULL on all three too, and resolves the same way
+-- against svs.default_search_work_mem -- a different GUC from the ceiling
+-- (svs.max_search_work_mem), so all three admitting here proves the
+-- default and the ceiling are read from different places, not the same
+-- number doing double duty.
 SELECT count(DISTINCT residency_memory_limit) = 1 AS all_three_resolve_to_the_same_default,
+       count(DISTINCT search_work_mem_limit) = 1 AS all_three_resolve_search_work_mem_the_same,
        count(*) = 3 AS all_three_admitted
   FROM pg_stat_vamana_worker w
   JOIN pg_database d ON d.oid = w.db_oid
@@ -92,6 +99,18 @@ INSERT INTO vamana_databases (datname, residency_memory)
 SELECT count(*) = 0 AS oversized_override_never_committed
 	FROM vamana_databases WHERE datname = 'template1';
 
+-- Same shape, for search_work_mem against svs.max_search_work_mem: the
+-- catalog-time sum check (Group 4) rejects a single row that alone exceeds
+-- the ceiling just as synchronously as Group 1's residency admission does,
+-- even though the two checks live in separate triggers and one reads shmem
+-- while the other reads only this table.
+\set VERBOSITY terse
+INSERT INTO vamana_databases (datname, search_work_mem)
+	VALUES ('template1', 2 * 1024 * 1024);
+\set VERBOSITY default
+SELECT count(*) = 0 AS oversized_search_work_mem_never_committed
+	FROM vamana_databases WHERE datname = 'template1';
+
 -- total_memory_mb no longer exists: the residency/build axis split (design
 -- doc Section 5.3) dissolved the combined cap.
 SELECT total_memory_mb FROM vamana_databases LIMIT 0;
@@ -107,6 +126,15 @@ DELETE FROM vamana_databases WHERE datname = 'postgres';
 TRUNCATE vamana_databases;
 RESET ROLE;
 DROP ROLE vamana_databases_test_nonowner;
+
+-- Unlike residency_memory, search_work_mem has no decrease-validation
+-- trigger at all (Group 4 design: nothing about this axis is durable or
+-- crash-sensitive, so there is nothing a lower value could make unsafe).
+-- dbe already has search_work_mem = 2048 from its enrollment above;
+-- lowering it while nothing is in flight simply succeeds, with no special
+-- UPDATE-time check to bypass.
+UPDATE vamana_databases SET search_work_mem = 1 WHERE datname = 'vamana_databases_test_dbe';
+SELECT search_work_mem FROM vamana_databases WHERE datname = 'vamana_databases_test_dbe';
 
 TRUNCATE vamana_databases;
 SELECT count(*) FROM vamana_databases;

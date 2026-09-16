@@ -205,6 +205,7 @@ sub enable_postgres
 {
     my $node = start_node('vamana_precommit_registration', 8, 'debug1');
     $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+    $node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
     $node->reload;
 
     $node->safe_psql('postgres', qq{
@@ -237,6 +238,7 @@ sub enable_postgres
 {
     my $node = start_node('vamana_precommit_capacity', 2);
     $node->append_conf('postgresql.conf', "svs.max_residency_memory = '300MB'");
+    $node->append_conf('postgresql.conf', "svs.max_search_work_mem = '300MB'");
     $node->reload;
 
     $node->safe_psql('postgres', "CREATE DATABASE vamana_precommit_capacity_dba;");
@@ -297,6 +299,7 @@ sub enable_postgres
     # slot leaked, the follow-up INSERT of 3 more rows would exceed capacity.
     my $node = start_node('vamana_precommit_abort_rollback', 4);
     $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+    $node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
     $node->reload;
 
     $node->safe_psql('postgres', qq{
@@ -343,6 +346,8 @@ sub enable_postgres
     # than creating one. An abort must release only slots this transaction
     # actually created, not ones it merely found.
     my $node = start_node('vamana_precommit_abort_preserves_live', 1);
+    $node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
+    $node->reload;
     enable_postgres($node);
 
     $node->poll_query_until('postgres', qq{

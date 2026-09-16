@@ -23,6 +23,7 @@ $node->append_conf('postgresql.conf', "max_replication_slots = 10");
 $node->append_conf('postgresql.conf', "max_wal_senders = 10");
 $node->append_conf('postgresql.conf', "log_min_messages = 'log'");
 $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+$node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
 $node->start;
 
 $node->safe_psql("postgres", "CREATE EXTENSION vector;");

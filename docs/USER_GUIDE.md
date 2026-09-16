@@ -793,6 +793,8 @@ INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from 
 
 The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `residency_memory > 0`, `search_work_mem > 0`, and `search_num_threads BETWEEN 1 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
 
+Beyond those CHECK constraints, two triggers reject writes based on live state rather than the value alone. Lowering `residency_memory` on an `UPDATE` is rejected if the new value is below the database's currently committed resident bytes — read from shared memory if its worker is live, or from `svs_index_residency` if it isn't, so a worker that's down doesn't let a shrink through that would fail the next reload. Raising or setting `search_work_mem` on an `INSERT` or `UPDATE` is rejected if the resulting cluster-wide sum across all enabled databases would exceed `svs.max_search_work_mem`.
+
 ---
 
 ## 8. Monitoring
@@ -829,8 +831,14 @@ FROM pg_stat_vamana_worker;
 | `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)). NULL on a standby, where the counter is not maintained. |
 | `evict_all` | `true` while the worker is draining every cached index (e.g. during a restart or shutdown); normally `false` |
 | `heartbeat_ts` | Last time the worker updated its heartbeat |
+| `residency_bytes_committed` | Live shared-memory total of resident index bytes for this database; NULL if the database has never been admitted |
+| `build_bytes_committed` | Live shared-memory total reserved for in-progress `CREATE INDEX`/`REINDEX` builds; NULL if the database has never been admitted |
+| `residency_memory_limit` | The resolved residency budget in effect for this database (its `residency_memory` override, or `svs.default_residency_memory`); NULL if the database has never been admitted |
+| `residency_drift` | `residency_bytes_committed` minus the durable sum from `svs_index_residency`; nonzero briefly during a load/unload race, persistently nonzero is a bug |
+| `search_work_mem_limit` | The resolved per-query search-scratch budget in effect for this database |
+| `search_scratch_bytes_in_flight` | Shared-memory total of search-scratch bytes currently reserved for in-flight queries in this database; resets to `0` on worker restart |
 
-`pg_stat_vamana_worker_slot` reports one row per worker request slot per visible database — including idle (`empty`) slots, not just in-flight ones — for finer-grained diagnosis of what a worker is currently processing (`slot_status`, `slot_kind`, `index_relid`, `error_message`).
+`pg_stat_vamana_worker_slot` reports one row per worker request slot per visible database — including idle (`empty`) slots, not just in-flight ones — for finer-grained diagnosis of what a worker is currently processing (`slot_status`, `slot_kind`, `index_relid`, `error_message`, `search_scratch_bytes_per_query`).
 
 > **Cross-database visibility:** both views are cluster-wide. An ordinary user sees only their own database's rows; a `pg_read_all_stats` member sees all databases. When you care about the current database only, filter by `db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`.
 
@@ -1086,6 +1094,11 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |
 | `svs.worker_stop_timeout_ms` | `30000` | `0` | `600000` | Wait for a restarting worker to report stopped before giving up; does not force-kill |
 | `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
+| `svs.max_build_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory |
+| `svs.max_residency_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved residency budget; checked at `vamana_databases` enrollment |
+| `svs.default_residency_memory` | `100MB` | `1MB` | — | Residency budget for a database whose `vamana_databases.residency_memory` is `NULL`; independent of `svs.max_residency_memory` |
+| `svs.max_search_work_mem` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved search-scratch budget; checked as a catalog aggregate at `vamana_databases` insert/update time |
+| `svs.default_search_work_mem` | `100MB` | `1MB` | — | Search-scratch budget for a database whose `vamana_databases.search_work_mem` is `NULL`; independent of `svs.max_search_work_mem` |
 | `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |
 | `svs.checkpoint_min_ops` | `10000` | — | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
@@ -1106,7 +1119,8 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | Object | Purpose |
 |--------|---------|
 | `vamana_databases` | Per-database enablement (`INSERT` to enable, `UPDATE ... SET enabled` to pause/resume, two-step teardown + `DELETE` to remove) |
-| `pg_stat_vamana_worker` | One row per enabled database: worker PID, state, index count, heartbeat |
+| `svs_index_residency` | Durable record of each index's last-known resident bytes, kept for databases whose worker isn't currently live; not written to or read from directly by operators |
+| `pg_stat_vamana_worker` | One row per enabled database: worker PID, state, index count, heartbeat, and residency/build/search-work-mem accounting |
 | `pg_stat_vamana_worker_slot` | One row per in-flight IPC work-request slot |
 
 ### Operator Classes

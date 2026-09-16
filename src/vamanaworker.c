@@ -902,6 +902,7 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		{
 			ProcessConfigFile(PGC_SIGHUP);
 			worker_got_sighup = false;
+			VamanaWorkerRefreshSearchScratchCosts();
 		}
 
 		VamanaWorkerProcessSlotDrops();
@@ -1020,9 +1021,15 @@ VamanaWorkerMain(Datum main_arg)
 	 * A reused block may carry a previous instance's liveness state: a crash
 	 * exits without releasing the slot, so its pid and heartbeat survive.  The
 	 * worker owns these fields; reset them before announcing readiness.
+	 *
+	 * searchScratchBytesInFlight is the same kind of worker-owned state: it
+	 * has no reload path to reconcile it the way residencyBytesCommitted
+	 * gets corrected as each index reloads, so a crash mid-dispatch would
+	 * otherwise leak it forever.
 	 */
 	VamanaWorkerShmemPtr->workerPid = 0;
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
+	pg_atomic_write_u64(&VamanaWorkerShmemPtr->searchScratchBytesInFlight, 0);
 	InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
 	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
 

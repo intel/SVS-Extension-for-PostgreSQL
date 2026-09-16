@@ -710,6 +710,18 @@ The launcher runs one background worker per enabled database. Which databases ar
 | `svs.shutdown_drain_budget_ms` | int | 30000 | 0–600000 | `PGC_SIGHUP` | Time budget for the worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
 | `svs.worker_stop_timeout_ms` | int | 30000 | 0–600000 | `PGC_SIGHUP` | Milliseconds the launcher waits for a restarting worker to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
 
+### 6.2a Memory Management Parameters
+
+Residency and build memory are two independent axes, each with its own cluster-wide ceiling and per-database default; a per-database override lives in `vamana_databases.residency_memory`/`search_work_mem` (see [Section 6](../USER_GUIDE.md) of the User Guide). The `max_*` and `default_*` GUCs in each pair are deliberately independent, not one derived from the other: collapsing them would let a single unconfigured database's default consume the whole cluster ceiling.
+
+| GUC | Type | Default | Range | Scope | Description |
+|---|---|---|---|---|---|
+| `svs.max_build_memory` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory. Always finite; there is no "0 means unlimited" path. |
+| `svs.max_residency_memory` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every database's resolved residency budget. Checked at config-time admission (`vamana_databases` enrollment), not at query time. |
+| `svs.default_residency_memory` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Residency budget for a database whose `vamana_databases.residency_memory` is `NULL`. |
+| `svs.max_search_work_mem` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every database's resolved search-scratch (per-query candidate buffer) budget. Checked as a plain catalog aggregate at `vamana_databases` insert/update time, not against live worker state. |
+| `svs.default_search_work_mem` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Search-scratch budget for a database whose `vamana_databases.search_work_mem` is `NULL`. |
+
 ### 6.3 Index Creation Parameters
 
 Specified in the `WITH (...)` clause of `CREATE INDEX`.
@@ -809,6 +821,8 @@ The TID mapping array is sized by `tidMappingCapacity`, not by the live vector c
 
 In addition to the graph edges and stored vectors, the SVS dynamic index maintains a small amount of per-vector bookkeeping (delete flags, insertion metadata). This overhead is small relative to the graph itself but grows linearly with `tidMappingCapacity`.
 
+**Cache eviction.** `VamanaIndexCache` is a byte-bounded, relid-keyed table governed by each database's residency budget (`vamana_databases.residency_memory`, or `svs.default_residency_memory`/`svs.max_residency_memory`; see [Section 6.2a](#62a-memory-management-parameters)), not a fixed slot count. A load that would push a database's committed resident bytes over its budget is refused before the cache is touched, with an error naming `svs.max_residency_memory`. Each index's exact resident bytes, as last measured by the worker, are also durably recorded in `svs_index_residency` so a `residency_memory` decrease can be validated even while that database's worker is not running.
+
 ---
 
 ## 9. Security Objectives
@@ -826,6 +840,7 @@ This section summarizes the security objectives for each extension-managed asset
 | Per-transaction undo log (`vamana_undo.c`) | — | Required | Required (bounded growth) |
 | Launcher and per-database BGW main loops (one worker per enabled database) | — | Required | Required (restart recovery, crash backoff) |
 | BGW index cache (`VamanaIndexCache`) | Required (embeddings in memory) | Required | — |
+| `svs_index_residency` catalog table | — | Required (a stale entry could wrongly permit or block a `residency_memory` decrease) | — |
 | Per-index logical replication slot (`pg_replslot/vamana_*`) | — | Required | Required (WAL retention bound) |
 
 ### 9.2 Key Security Properties

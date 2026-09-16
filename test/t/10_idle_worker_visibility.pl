@@ -31,6 +31,7 @@ sub start_node
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
     $node->append_conf('postgresql.conf', "svs.max_residency_memory = '500MB'");
+    $node->append_conf('postgresql.conf', "svs.max_search_work_mem = '500MB'");
     $node->start;
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");
     $node->safe_psql('postgres', "CREATE EXTENSION svs;");
