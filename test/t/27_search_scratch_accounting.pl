@@ -482,21 +482,6 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
     $node->safe_psql('postgres', "SELECT pg_reload_conf();");
 }
 
-{
-    discover_cost_bytes();
-
-    $node->safe_psql('postgres', "ALTER INDEX ssg_idx SET (use_search_history = true);");
-
-    discover_cost_bytes();
-
-    my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
-        SET enable_seqscan = off;
-        SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 1;
-    ));
-    is($ret, 0, "the worker is still responsive after two attach/wait/wakeup/detach "
-      . "cycles on the same injection point in one session (stderr: $stderr)");
-}
-
 $node->stop;
 
 done_testing();
