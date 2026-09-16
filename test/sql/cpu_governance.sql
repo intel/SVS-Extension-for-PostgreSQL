@@ -31,7 +31,6 @@ END $$;
 -- then restore it once this assertion is taken.
 ALTER SYSTEM SET svs.search_num_threads = 0;
 SELECT pg_reload_conf();
-SELECT pg_sleep(0.1);
 
 UPDATE vamana_databases SET search_num_threads = NULL, search_threads_reserved = 0
 	WHERE datname = current_database();
@@ -58,7 +57,6 @@ SELECT search_threads_desired, search_threads_reserved FROM pg_stat_vamana_worke
 -- test file in this suite.
 ALTER SYSTEM SET svs.search_num_threads = 8;
 SELECT pg_reload_conf();
-SELECT pg_sleep(0.1);
 
 -- Columns reflect configuration: a per-database UPDATE, driven through
 -- catalog DML so the vamana_databases_changed NOTIFY wakes the launcher
@@ -88,6 +86,210 @@ SELECT search_threads_desired = 6 AS desired_ok,
 	   search_threads_granted >= search_threads_reserved AS granted_ge_reserved
 	FROM pg_stat_vamana_worker
 	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- granted is contention-dependent and may still be converging toward 6 (see
+-- the comment above), so wait for it to settle before comparing registered
+-- against it.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND search_threads_granted = 6
+			  AND search_slots_registered = 6;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+SELECT search_slots_registered = search_threads_granted AS registered_matches_granted_steady_state
+	FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+-- Zero after a crash, not just before a first heartbeat: VamanaWorkerClearDeadEntry
+-- zeroes registeredSearchSlots once a worker's death is confirmed, so a
+-- crashed worker's last live count does not linger through its backoff
+-- window the way search_threads_granted already does not.
+CREATE EXTENSION IF NOT EXISTS injection_points;
+SELECT injection_points_attach('vamana-worker-tick-crash', 'error');
+
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'backoff';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+SELECT worker_state = 'backoff' AS worker_is_backing_off,
+	   search_threads_granted = 0 AS granted_zeroed,
+	   search_slots_registered = 0 AS registered_zeroed
+	FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+SELECT injection_points_detach('vamana-worker-tick-crash');
+
+-- Let the worker recover and re-converge on its steady-state grant before
+-- the next test case runs.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running'
+			  AND search_threads_granted = 6
+			  AND search_slots_registered = 6;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+-- Zero when not live, matching the grant columns' convention: a freshly
+-- reserved database reports desired/granted/registered as 0, not NULL,
+-- before its worker's first heartbeat has run. This is a narrow window (the
+-- launcher has not yet reconciled the new row and the worker has not yet
+-- started), so the row is read immediately after INSERT with no wait.
+--
+-- Cleanup must wait for the worker to actually reach 'running' and be torn
+-- down with svs_teardown_database() before the row is deleted: a database
+-- disabled or dropped while its reservation is still in 'starting' never
+-- releases its shmem slot, and svs.max_databases is a small fixed pool
+-- shared by every regression file in this run.
+-- The extension is created in the target database, and left installed but
+-- unreserved, before the enabling INSERT below, not concurrently with it:
+-- extension setup and reservation are two clearly sequential phases so the
+-- worker's own startup never races catalog changes in its own target
+-- database.
+SELECT current_database() AS this_db \gset
+
+CREATE DATABASE cpu_governance_not_live;
+\c cpu_governance_not_live
+CREATE EXTENSION vector;
+CREATE EXTENSION svs;
+\c :this_db
+
+INSERT INTO vamana_databases (datname, enabled) VALUES ('cpu_governance_not_live', true);
+SELECT worker_state,
+	   search_threads_desired,
+	   search_threads_granted,
+	   search_slots_registered
+	FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'cpu_governance_not_live');
+
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'cpu_governance_not_live')
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+\c cpu_governance_not_live
+SELECT svs_teardown_database();
+\c :this_db
+
+DELETE FROM vamana_databases WHERE datname = 'cpu_governance_not_live';
+
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'cpu_governance_not_live');
+		EXIT WHEN NOT FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+DROP DATABASE cpu_governance_not_live;
+
+-- A shortfall must be visible: search_slots_registered can fall below
+-- search_threads_granted, and search_threads_granted must keep reporting the
+-- launcher's number rather than being silently pulled down to match.
+--
+-- Raising max_parallel_workers past the fixed-size max_worker_processes
+-- array produces a stable, permanent shortfall (bounded by the array size)
+-- rather than a transient one, and needs no throwaway database: the ask
+-- comes from this database's own search_num_threads.
+SELECT (setting::int + 20) AS mwp_plus_20, (setting::int + 10) AS mwp_plus_10
+	FROM pg_settings WHERE name = 'max_worker_processes' \gset
+
+ALTER SYSTEM SET max_parallel_workers = :mwp_plus_20;
+ALTER SYSTEM SET svs.max_search_threads_per_db = :mwp_plus_20;
+SELECT pg_reload_conf();
+
+UPDATE vamana_databases SET search_num_threads = :mwp_plus_10
+	WHERE datname = current_database();
+
+-- The target ask is stashed in a temp table rather than a psql variable:
+-- psql does not interpolate :variables inside a dollar-quoted DO body, and
+-- the poll loop below needs the value there.
+CREATE TEMP TABLE cpu_governance_shortfall_target AS
+	SELECT :mwp_plus_10 AS shortfall_target;
+
+DO $$
+DECLARE
+	target int;
+BEGIN
+	SELECT shortfall_target INTO target FROM cpu_governance_shortfall_target;
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND search_threads_granted = target;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+DROP TABLE cpu_governance_shortfall_target;
+
+-- The grant is settled, but registering many real background workers for an
+-- oversized ask can still be in flight; poll until search_slots_registered
+-- stops moving between consecutive reads rather than assuming it is done.
+DO $$
+DECLARE
+	prev int := -1;
+	cur int;
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		SELECT search_slots_registered INTO cur FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+		EXIT WHEN cur = prev;
+		prev := cur;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+SELECT search_threads_desired = search_threads_granted AS grant_meets_the_oversized_ask,
+	   search_slots_registered < search_threads_granted AS registration_falls_short_of_the_grant
+	FROM pg_stat_vamana_worker
+	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+ALTER SYSTEM RESET max_parallel_workers;
+ALTER SYSTEM RESET svs.max_search_threads_per_db;
+SELECT pg_reload_conf();
+UPDATE vamana_databases SET search_num_threads = 6 WHERE datname = current_database();
+
+-- Wait for the worker to fully unwind the oversized slot set it registered
+-- above before moving on: SvsSlotSetResize tears down one parked slot at a
+-- time, and letting later tests run while that teardown is still in flight
+-- would contend with them for the same shared max_worker_processes array.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND search_threads_granted = 6
+			  AND search_slots_registered = 6;
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
 
 -- max_search_threads_per_db reports the resolved ceiling (it follows
 -- max_parallel_workers when svs.max_search_threads_per_db is left at its
@@ -134,15 +336,20 @@ CREATE ROLE cpu_governance_privileged NOLOGIN;
 GRANT pg_read_all_stats TO cpu_governance_privileged;
 
 -- Unprivileged: sees exactly its own database's row, never the other one.
+-- The visibility gate is per-row, not per-column, so search_slots_registered
+-- is readable wherever the row itself is visible and nowhere else.
 SET ROLE cpu_governance_unpriv;
 SELECT count(DISTINCT db_oid) AS visible_rows,
-	   bool_and(db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())) AS only_self
+	   bool_and(db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())) AS only_self,
+	   bool_and(search_slots_registered IS NOT NULL) AS registered_readable
 	FROM pg_stat_vamana_worker;
 RESET ROLE;
 
 -- pg_read_all_stats member: sees both.
 SET ROLE cpu_governance_privileged;
-SELECT count(DISTINCT db_oid) >= 2 AS sees_all_rows FROM pg_stat_vamana_worker;
+SELECT count(DISTINCT db_oid) >= 2 AS sees_all_rows,
+	   bool_and(search_slots_registered IS NOT NULL) AS registered_readable
+	FROM pg_stat_vamana_worker;
 RESET ROLE;
 
 DROP ROLE cpu_governance_unpriv;
@@ -156,6 +363,20 @@ DROP ROLE cpu_governance_privileged;
 -- 'postgres'), so this succeeds regardless of whether the launcher has
 -- released the shmem slot yet.
 DELETE FROM vamana_databases WHERE datname = 'postgres';
+
+-- Wait for the release to actually land before this file finishes:
+-- vamana_databases.sql (which runs later in this suite) inserts its own
+-- fresh 'postgres' row and expects a clean slate rather than a still-
+-- releasing one from here.
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+		EXIT WHEN NOT FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
 
 -- Restore this database's own row to its pre-test configuration, so later
 -- regression files that share contrib_regression don't inherit this file's

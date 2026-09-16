@@ -154,6 +154,7 @@ CREATE FUNCTION pg_stat_vamana_worker()
 		search_threads_desired          int,
 		search_threads_granted          int,
 		search_threads_reserved         int,
+		search_slots_registered         int,
 		max_search_threads_per_db       int
 	)
 	AS 'MODULE_PATHNAME', 'pg_stat_vamana_worker'
@@ -177,6 +178,7 @@ CREATE VIEW pg_stat_vamana_worker AS
 		   w.search_threads_desired,
 		   w.search_threads_granted,
 		   w.search_threads_reserved,
+		   w.search_slots_registered,
 		   w.max_search_threads_per_db
 	  FROM pg_stat_vamana_worker() w
 	  LEFT JOIN (

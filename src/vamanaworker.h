@@ -285,6 +285,15 @@ typedef struct VamanaWorkerShmem
 	pg_atomic_uint32 grantedSearchThreads;
 	pg_atomic_uint32 reservedSearchThreads;
 
+	/*
+	 * Slots the worker actually holds after calling SvsSlotSetResize with
+	 * grantedSearchThreads as the target.  Can be less than grantedSearchThreads
+	 * when max_parallel_workers or the max_worker_processes slot array is
+	 * exhausted.  Zeroed by VamanaWorkerClearDeadEntry once a worker's death is
+	 * confirmed, so it never outlives the worker that registered it.
+	 */
+	pg_atomic_uint32 registeredSearchSlots;
+
 	SvsBuildRequest buildRequests[SVS_MAX_PENDING_BUILDS];
 
 	int				maxSlots;

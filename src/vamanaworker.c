@@ -813,6 +813,19 @@ VamanaWorkerCheckpointDueIndexes(void)
 }
 
 /*
+ * Resize the worker's held search slots to the published grant and publish
+ * how many it actually holds afterward: SvsSlotSetResize can silently hold
+ * fewer than the target.
+ */
+static void
+VamanaWorkerConvergeSearchSlots(void)
+{
+	int held = SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
+
+	pg_atomic_write_u32(&VamanaWorkerShmemPtr->registeredSearchSlots, (uint32) held);
+}
+
+/*
  * Bootstrap the standby cache, announce readiness, then service requests until
  * a shutdown is requested.  A shutdown cancel raised anywhere in this span —
  * including the blocking slot activation that waits on the primary's WAL —
@@ -912,7 +925,7 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		 * exceed MAX_PARALLEL_WORKER_LIMIT (1024) in the first place, so
 		 * there is nothing here for a second clamp to guard against.
 		 */
-		(void) SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
+		VamanaWorkerConvergeSearchSlots();
 
 		/*
 		 * Process pending search requests on every iteration, not only when
@@ -1044,7 +1057,7 @@ VamanaWorkerMain(Datum main_arg)
 	 * per-heartbeat block below closes that gap; nothing here changes
 	 * the target the worker converges to.
 	 */
-	(void) SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
+	VamanaWorkerConvergeSearchSlots();
 
 	/*
 	 * A standby's logical slot reads catalog rows the primary must not VACUUM
