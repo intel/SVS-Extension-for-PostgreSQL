@@ -78,9 +78,9 @@ CREATE TABLE vamana_databases (
 SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');
 
 -- Durable fallback for the residency override's decrease-validation trigger
--- when the owning worker isn't live to answer against shmem (design doc
--- Section 5.3a). Written by build confirm and by the worker's load/unload
--- reconcile; not yet read or written by any Phase 0 code path.
+-- when the owning worker isn't live to answer against shmem. Read by the
+-- decrease-validation trigger; written by the worker's load/unload
+-- reconcile. Build confirm does not write it yet.
 CREATE TABLE svs_index_residency (
 	index_relid     oid PRIMARY KEY,
 	db_oid          oid NOT NULL,

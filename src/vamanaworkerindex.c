@@ -226,7 +226,7 @@ ComputeSearchScratchBytesPerQuery(const SVSBuildConfig *config, bool useSearchHi
 
 	bytesPerQuery = SVSEstimateSearchMemory(builder, config->search_window_size, 1,
 											 config->search_window_size,
-											 config->numVectors, config->dimensions);
+											 config->numVectors);
 
 	SVSFreeBuilder(builder);
 	SVSFreeStorage(storage);

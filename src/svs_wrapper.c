@@ -669,7 +669,7 @@ SVSComputeBlockSizeBytes(svs_index_builder_h builder, int numVectors)
 }
 
 void
-SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, int dimensions, SVSMemoryBreakdown *out)
+SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out)
 {
 	svs_error_h error = svs_error_create();
 	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
@@ -692,26 +692,28 @@ SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, int dimensions,
 
 uint64
 SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors,
-						 int numVectors, int dimensions)
+						 int numVectors)
 {
 	svs_error_h error = svs_error_create();
 	svs_search_params_h search_params;
 	size_t		bytes = 0;
 
 	search_params = svs_search_params_create_vamana((size_t) searchWindowSize, error);
+	CheckSVSError(error, "create search params for search memory estimate");
+	svs_error_free(error);
 
-	if (!svs_error_ok(error) || search_params == NULL)
-	{
-		CheckSVSError(error, "create search params for search memory estimate");
-		svs_error_free(error);
-		return 0;
-	}
+	if (search_params == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("SVS reported success but returned no search parameters")));
 
 	PG_TRY();
 	{
 		/* SVS currently ignores blocksize_bytes here (SVS_UNUSED in index_builder.hpp); computed anyway for consistency. */
 		size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
 																numVectors);
+
+		error = svs_error_create();
 
 		svs_index_builder_estimate_search_memory_dynamic((svs_index_builder_h) builder,
 														   (size_t) numQueries,

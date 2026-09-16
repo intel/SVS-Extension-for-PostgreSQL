@@ -142,7 +142,7 @@ unlike($log, qr/cache slots/,
 # ===========================================================================
 # None of the 9 indexes fit the 1MB budget: each is denied via the
 # search-path check (vamanaworkersearch.c) on query, surfacing as a
-# client-visible "not loaded" error, same as test/t/19_cache_hard_deny.pl's
+# client-visible residency-budget error, same as test/t/19_cache_hard_deny.pl's
 # tinydb case.  Neither outcome is a crash.
 # ===========================================================================
 
@@ -154,7 +154,7 @@ for my $i (0 .. $N_INDEXES - 1)
         SELECT id FROM so_tbl_$i ORDER BY val <-> '[$query_sql]' LIMIT 5;
     });
     $ok_query++ if $ret == 0;
-    like($stderr, qr/not loaded/, "so_idx_$i is denied with 'not loaded', not a crash")
+    like($stderr, qr/residency budget/, "so_idx_$i is denied with a residency-budget error, not a crash")
         if $ret != 0;
 }
 is($ok_query, 0,
