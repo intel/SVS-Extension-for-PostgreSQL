@@ -199,38 +199,36 @@ VamanaCacheFullError(void)
 }
 
 /*
- * searchWindowSize doubles as numNeighbors: SVS requires window >= k, so
+ * search_window_size doubles as numNeighbors: SVS requires window >= k, so
  * the window bounds whatever k a query actually requests.
  */
 static uint64
-ComputeSearchScratchBytesPerQuery(Relation indexRel, VamanaIndexCache *cache,
-								   const VamanaOptions *opts,
-								   int searchWindowSize, bool useSearchHistory)
+ComputeSearchScratchBytesPerQuery(const SVSBuildConfig *config, bool useSearchHistory)
 {
-	int			buildWindow = (opts && opts->build_window_size > 0)
-		? opts->build_window_size
-		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
-	int			rawAlpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
+	int			buildWindow = (config->build_window_size > 0)
+		? config->build_window_size
+		: VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
 	SVSAlgorithmHandle algorithm;
 	SVSStorageHandle storage;
 	SVSBuilderHandle builder;
 	uint64		bytesPerQuery;
 
-	algorithm = SVSCreateAlgorithm(cache->graph_degree, buildWindow, searchWindowSize,
-									rawAlpha, useSearchHistory);
+	algorithm = SVSCreateAlgorithm(config->graph_degree, buildWindow, config->search_window_size,
+									config->alpha, useSearchHistory);
 
-	if (opts && opts->compression_type == VAMANA_COMPRESSION_LEANVEC)
-		storage = SVSCreateLeanVecStorage(cache->dimensions, opts->leanvec_dims,
-										   opts->compression_primary,
-										   opts->compression_secondary);
+	if (config->compression_type == VAMANA_COMPRESSION_LEANVEC)
+		storage = SVSCreateLeanVecStorage(config->dimensions, config->leanvec_dims,
+										   config->compression_primary,
+										   config->compression_secondary);
 	else
 		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
 
-	builder = SVSCreateBuilder(VamanaGetDistanceMetric(indexRel), cache->dimensions, algorithm);
+	builder = SVSCreateBuilder(config->distance_type, config->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
 
-	bytesPerQuery = SVSEstimateSearchMemory(builder, searchWindowSize, 1, searchWindowSize,
-											 cache->numVectors, cache->dimensions);
+	bytesPerQuery = SVSEstimateSearchMemory(builder, config->search_window_size, 1,
+											 config->search_window_size,
+											 config->numVectors, config->dimensions);
 
 	SVSFreeBuilder(builder);
 	SVSFreeStorage(storage);
@@ -239,24 +237,22 @@ ComputeSearchScratchBytesPerQuery(Relation indexRel, VamanaIndexCache *cache,
 	return bytesPerQuery;
 }
 
-/* Recomputes relid's memoized search-scratch cost only if stale or unset. */
-static void
-RefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCache *cache,
-							   const VamanaOptions *opts)
+/*
+ * Shared core: recomputes relid's memoized search-scratch cost only if
+ * stale or unset. Callers adapt whatever context they have (an open
+ * Relation's reloptions, or a load slot's already-resolved SVSBuildConfig)
+ * into config; this never opens a transaction or touches a relcache entry
+ * itself, so it is safe to call from the dispatch path.
+ */
+void
+VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config, bool useSearchHistory)
 {
-	int			searchWindowSize = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
-	bool		useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
-
-	if (cache == NULL)
-		return;
-
-	SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, relid, searchWindowSize, useSearchHistory);
+	SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, relid, config->search_window_size,
+										  useSearchHistory);
 
 	if (SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid) == 0)
 	{
-		uint64		bytesPerQuery = ComputeSearchScratchBytesPerQuery(indexRel, cache, opts,
-																		searchWindowSize,
-																		useSearchHistory);
+		uint64		bytesPerQuery = ComputeSearchScratchBytesPerQuery(config, useSearchHistory);
 
 		ereport(DEBUG1,
 				(errmsg("vamana worker: computed search-scratch cost of %llu bytes for index %u",
@@ -264,6 +260,38 @@ RefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCache *ca
 
 		SvsMemorySetSearchScratchBytesPerQuery(MyDatabaseId, relid, bytesPerQuery);
 	}
+}
+
+/*
+ * Adapter for callers holding an open Relation and its current reloptions
+ * (a load or reload, where nothing has resolved these into an SVSBuildConfig
+ * already). Assembles one and delegates to the shared core.
+ */
+void
+VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCache *cache,
+									 const VamanaOptions *opts)
+{
+	SVSBuildConfig config;
+
+	if (cache == NULL)
+		return;
+
+	config.graph_degree = cache->graph_degree;
+	config.alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
+	config.search_window_size = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	config.compression_type = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
+	config.compression_primary = opts ? opts->compression_primary : 0;
+	config.compression_secondary = opts ? opts->compression_secondary : 0;
+	config.distance_type = VamanaGetDistanceMetric(indexRel);
+	config.data_type = SVS_DTYPE_FLOAT32;
+	config.dimensions = cache->dimensions;
+	config.leanvec_dims = opts ? opts->leanvec_dims : -1;
+	config.build_window_size = opts ? opts->build_window_size : 0;
+	config.search_num_threads = 0;
+	config.numVectors = cache->numVectors;
+
+	VamanaSeedSearchScratchCostFromConfig(relid, &config,
+										   opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
 }
 
 /* Worker SIGHUP handling: refreshes every cached index's search-scratch cost. */
@@ -285,8 +313,8 @@ VamanaWorkerRefreshSearchScratchCosts(void)
 		PushActiveSnapshot(GetTransactionSnapshot());
 
 		indexRel = index_open(relid, AccessShareLock);
-		RefreshIndexSearchScratchCost(indexRel, relid, cache,
-									   (VamanaOptions *) indexRel->rd_options);
+		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
+											 (VamanaOptions *) indexRel->rd_options);
 		index_close(indexRel, AccessShareLock);
 
 		PopActiveSnapshot();
@@ -297,21 +325,14 @@ VamanaWorkerRefreshSearchScratchCosts(void)
 }
 
 /*
- * Dispatch-side fallback: an index that became resident via a path other
- * than GetOrLoadIndexBody (e.g. the first-insert build in
- * vamanaworkerwrite.c, which calls SvsMemoryReconcileLoad directly rather
- * than through this file's load path) never otherwise gets its
- * search-scratch cost computed. Called from the dispatch gate itself, so
- * this only opens a transaction and pays for the native estimate once per
- * index -- SvsMemorySearchScratchBytesPerQuery is nonzero on every dispatch
- * after the first.
+ * Backstop for any load path that didn't seed relid's search-scratch cost
+ * itself. A no-op once it's known, so this only pays for a transaction and
+ * the native estimate on an index's first dispatch, ever.
  *
- * The transaction this opens calls AcceptInvalidationMessages(), which can
- * process a still-queued relcache invalidation for relid (e.g. from the
- * CREATE INDEX that just made it resident) and evict it via
- * VamanaRelcacheCallback -- freeing the very SVSIndexHandle the caller
- * already fetched for this same dispatch. vamana_eviction_suppressed_for_relid
- * is the existing guard against exactly this (see VamanaWorkerProcessWriteSlot).
+ * The transaction's AcceptInvalidationMessages() can evict relid via
+ * VamanaRelcacheCallback, freeing the SVSIndexHandle the caller already
+ * fetched for this dispatch; vamana_eviction_suppressed_for_relid guards
+ * against that (see VamanaWorkerProcessWriteSlot).
  */
 void
 VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
@@ -329,8 +350,8 @@ VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
 	PushActiveSnapshot(GetTransactionSnapshot());
 
 	indexRel = index_open(relid, AccessShareLock);
-	RefreshIndexSearchScratchCost(indexRel, relid, cache,
-								   (VamanaOptions *) indexRel->rd_options);
+	VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
+										 (VamanaOptions *) indexRel->rd_options);
 	index_close(indexRel, AccessShareLock);
 
 	PopActiveSnapshot();
@@ -366,8 +387,8 @@ GetOrLoadIndexBody(void *arg)
 	 * not before the two calls above, since either can process that
 	 * invalidation and free the relcache entry's prior rd_options.
 	 */
-	RefreshIndexSearchScratchCost(indexRel, a->relid, VamanaGetCache(a->relid),
-								   (VamanaOptions *) indexRel->rd_options);
+	VamanaRefreshIndexSearchScratchCost(indexRel, a->relid, VamanaGetCache(a->relid),
+										 (VamanaOptions *) indexRel->rd_options);
 
 	index_close(indexRel, AccessShareLock);
 }

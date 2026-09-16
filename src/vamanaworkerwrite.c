@@ -105,6 +105,12 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	VamanaOptions  *opts;
 	int				rawAlpha;
 	SVSDistanceType distanceType;
+	int				searchWindowSize;
+	bool			useSearchHistory;
+	int				compressionType;
+	int				compressionPrimary;
+	int				compressionSecondary;
+	int				leanvecDims;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -117,6 +123,12 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		? opts->build_window_size
 		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
 	distanceType = VamanaGetDistanceMetric(indexRel);
+	searchWindowSize = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
+	compressionType = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
+	compressionPrimary = opts ? opts->compression_primary : 0;
+	compressionSecondary = opts ? opts->compression_secondary : 0;
+	leanvecDims = opts ? opts->leanvec_dims : -1;
 
 	index_close(indexRel, AccessShareLock);
 	PopActiveSnapshot();
@@ -170,6 +182,26 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	cache->svsIndex = svsIndex;
 	cache->nextExternalId = 1;
 	cache->numVectors = 1;
+
+	{
+		SVSBuildConfig config = {
+			.graph_degree = cache->graph_degree,
+			.alpha = rawAlpha,
+			.search_window_size = searchWindowSize,
+			.compression_type = compressionType,
+			.compression_primary = compressionPrimary,
+			.compression_secondary = compressionSecondary,
+			.distance_type = distanceType,
+			.data_type = SVS_DTYPE_FLOAT32,
+			.dimensions = cache->dimensions,
+			.leanvec_dims = leanvecDims,
+			.build_window_size = buildWindow,
+			.search_num_threads = 0,
+			.numVectors = cache->numVectors,
+		};
+
+		VamanaSeedSearchScratchCostFromConfig(relid, &config, useSearchHistory);
+	}
 
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	cache->tidMapping = palloc0((Size) 1024 * sizeof(ItemPointerData));
@@ -646,6 +678,9 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 				cache->replicationSlot = VamanaReplicationOpen(
 					VamanaWorkerShmemPtr->dbOid, relid);
 				cache->lastReplayLsn = GetFlushRecPtr(NULL);
+
+				VamanaSeedSearchScratchCostFromConfig(relid, &config,
+													   VAMANA_DEFAULT_USE_SEARCH_HISTORY);
 			}
 		}
 
