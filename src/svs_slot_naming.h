@@ -18,9 +18,20 @@ typedef enum SvsSlotKind
 extern const char *SvsSlotKindBgwType(SvsSlotKind kind);
 
 /*
+ * Name of the wait event a parked search slot reports while blocked in its
+ * park loop, registered with WaitEventExtensionNew().  Search slots only:
+ * a build slot's park loop is untouched and still waits on plain
+ * PG_WAIT_EXTENSION.
+ */
+extern const char *SvsSearchSlotWaitEventName(void);
+
+/*
  * application_name for a search slot, set via pgstat_report_appname() from
  * inside the running fiction worker.  Called again whenever granted/reserved
- * change, since neither is fixed for the slot's lifetime.
+ * change, since neither is fixed for the slot's lifetime.  Format is
+ * "vamana: search slot %d/%d (reserved %d) db=%s"; the counts come first so
+ * NAMEDATALEN truncation costs datname rather than the counts, and datname
+ * is sanitized so a control character in it cannot reach application_name.
  */
 extern void SvsFormatSearchSlotAppName(char *buf, size_t bufsize,
 										const char *datname, int slotIndex,
@@ -28,7 +39,10 @@ extern void SvsFormatSearchSlotAppName(char *buf, size_t bufsize,
 
 /*
  * application_name for a build slot, set once the launcher answers the
- * grant request.
+ * grant request.  Format is
+ * "vamana: build slot %d/%d (requested %d, granted %d) db=%s", with the
+ * same counts-first ordering and datname sanitizing as the search slot
+ * formatter.
  */
 extern void SvsFormatBuildSlotAppName(char *buf, size_t bufsize,
 									   const char *datname, int slotIndex,

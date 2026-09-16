@@ -62,8 +62,8 @@ sub db_oid
 # cluster. That column cannot attribute a slot to a database. The only
 # per-database signal a parked slot publishes at all is its
 # application_name, set by SvsFormatSearchSlotAppName as
-# "vamana: db=<datname> search slot <i>/<n> (reserved <n>)"; matching on the
-# "db=<datname> " prefix is therefore the only available per-database
+# "vamana: search slot <i>/<n> (reserved <n>) db=<datname>"; matching on the
+# " db=<datname>" suffix is therefore the only available per-database
 # filter, not a preference over the datname column.
 sub search_slot_count
 {
@@ -71,7 +71,7 @@ sub search_slot_count
     my $c = $node->safe_psql('postgres',
         "SELECT count(*) FROM pg_stat_activity "
       . "WHERE backend_type = 'vamana search slot' "
-      . "AND application_name LIKE 'vamana: db=$db %';");
+      . "AND application_name LIKE '%db=$db';");
     chomp $c;
     return $c;
 }
@@ -431,7 +431,7 @@ is($pid_after_12, $pg_worker_pid,
                 $held = $poll->query_safe(
                     "SELECT count(*) FROM pg_stat_activity "
                   . "WHERE backend_type = 'vamana search slot' "
-                  . "AND application_name LIKE 'vamana: db=fresh_db %';");
+                  . "AND application_name LIKE '%db=fresh_db';");
                 chomp $held;
                 last if $held eq '1';
 
