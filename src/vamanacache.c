@@ -614,6 +614,24 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	if (prev_vamana_object_access_hook)
 		(*prev_vamana_object_access_hook) (access, classId, objectId, subId, arg);
 
+	/* NoLock: caller already holds AccessExclusiveLock. Recheck compares
+	 * against cached values, so a no-op alter costs nothing. */
+	if (access == OAT_POST_ALTER && classId == RelationRelationId && subId == 0)
+	{
+		Oid			vamanaAm = get_index_am_oid("vamana", true);
+
+		if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
+		{
+			Relation	indexRel = index_open(objectId, NoLock);
+			VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+
+			SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, objectId,
+												  VamanaResolveSearchWindowSize(opts),
+												  opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+			index_close(indexRel, NoLock);
+		}
+	}
+
 	/*
 	 * Index creation: count the new relation only if it is a vamana index.
 	 * subId == 0 restricts this to the relation itself, not its columns.

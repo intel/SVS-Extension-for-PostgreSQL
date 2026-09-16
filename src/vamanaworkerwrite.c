@@ -123,7 +123,7 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		? opts->build_window_size
 		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
 	distanceType = VamanaGetDistanceMetric(indexRel);
-	searchWindowSize = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	searchWindowSize = VamanaResolveSearchWindowSize(opts);
 	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
 	compressionType = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
 	compressionPrimary = opts ? opts->compression_primary : 0;
@@ -135,8 +135,8 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	CommitTransactionCommand();
 
 	algorithm = SVSCreateAlgorithm(cache->graph_degree, buildWindow,
-								   vamana_search_window_size,
-								   rawAlpha, VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+								   searchWindowSize,
+								   rawAlpha, useSearchHistory);
 	storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
 	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);

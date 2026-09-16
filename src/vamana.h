@@ -118,6 +118,9 @@ typedef struct VamanaOptions
 	int			leanvec_dims;		/* LeanVec dimensions (-1 = dimensions/2) */
 }			VamanaOptions;
 
+/* Search window size: svs.search_window_size GUC, else opts' reloption, else the default. */
+extern int VamanaResolveSearchWindowSize(const VamanaOptions *opts);
+
 typedef struct VamanaTypeInfo
 {
 	int			maxDimensions;

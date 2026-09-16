@@ -37,6 +37,7 @@ $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
 $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 $node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
 $node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
+$node->append_conf('postgresql.conf', "svs.search_window_size = 10000");
 $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION vector;");
@@ -113,8 +114,7 @@ $node->safe_psql('postgres', qq(
     CREATE TABLE ssg_tbl (id serial PRIMARY KEY, val vector($dim));
     INSERT INTO ssg_tbl (val)
         SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 300) i;
-    CREATE INDEX ssg_idx ON ssg_tbl USING vamana (val vector_l2_ops)
-        WITH (search_window_size = 10000);
+    CREATE INDEX ssg_idx ON ssg_tbl USING vamana (val vector_l2_ops);
 ));
 my $relid = $node->safe_psql('postgres', "SELECT 'ssg_idx'::regclass::oid;");
 

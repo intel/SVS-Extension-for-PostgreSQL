@@ -209,7 +209,7 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 	/* If alpha = -1, SVS uses its internal default (1.2 for L2) */
 	buildstate->alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
 	buildstate->build_window_size = opts ? opts->build_window_size : VAMANA_DEFAULT_BUILD_WINDOW;
-	buildstate->search_window_size = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	buildstate->search_window_size = VamanaResolveSearchWindowSize(opts);
 	buildstate->use_search_history = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
 
 	buildstate->compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
@@ -543,7 +543,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					(int) meta.dimensions,
 					(int) meta.graph_degree,
 					(int) meta.alpha,
-					opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW,
+					VamanaResolveSearchWindowSize(opts),
 					(opts && opts->build_window_size > 0) ? opts->build_window_size : 0,
 					(int) meta.compression_type,
 					(int) meta.compression_primary,
@@ -660,7 +660,7 @@ VamanaRebuildFromTable(Relation index)
 	alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
 	buildWindow = (opts && opts->build_window_size > 0) ?
 		opts->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(graph_degree);
-	searchWindow = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	searchWindow = VamanaResolveSearchWindowSize(opts);
 	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
 	compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
 	compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_LEANVEC_PRIMARY;

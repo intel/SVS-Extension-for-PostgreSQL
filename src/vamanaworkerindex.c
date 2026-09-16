@@ -276,7 +276,7 @@ VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCac
 
 	config.graph_degree = cache->graph_degree;
 	config.alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	config.search_window_size = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	config.search_window_size = VamanaResolveSearchWindowSize(opts);
 	config.compression_type = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
 	config.compression_primary = opts ? opts->compression_primary : 0;
 	config.compression_secondary = opts ? opts->compression_secondary : 0;
