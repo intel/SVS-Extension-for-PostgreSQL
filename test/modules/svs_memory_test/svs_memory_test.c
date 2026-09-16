@@ -260,6 +260,15 @@ svs_memory_test_recheck_search_scratch_options(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_set_search_scratch_bytes_per_query);
+Datum
+svs_memory_test_set_search_scratch_bytes_per_query(PG_FUNCTION_ARGS)
+{
+	SvsMemorySetSearchScratchBytesPerQuery(PG_GETARG_OID(0), PG_GETARG_OID(1),
+											(uint64) PG_GETARG_INT64(2));
+	PG_RETURN_VOID();
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_admit_database);
 Datum
 svs_memory_admit_database(PG_FUNCTION_ARGS)

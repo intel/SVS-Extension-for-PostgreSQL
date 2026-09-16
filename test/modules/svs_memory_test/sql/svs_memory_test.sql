@@ -569,3 +569,21 @@ SELECT * FROM svs_memory_test_check_invariants();
 -- already admitted above and now empty after its unload.
 SELECT svs_memory_handoff_build(670, 1);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- RecheckSearchScratchOptions: matching the cached reloption values is a
+-- no-op; a mismatch on either search_window_size or use_search_history
+-- invalidates the memoized cost back to unknown (0). Reuses db 671, already
+-- admitted above and empty after its unload.
+SELECT svs_memory_reconcile_load(671, 1, (512)::bigint);
+SELECT svs_memory_test_set_search_scratch_bytes_per_query(671, 1, 500::bigint);
+SELECT svs_memory_test_recheck_search_scratch_options(671, 1, 0, false);
+SELECT svs_memory_test_search_scratch_bytes_per_query(671, 1) AS bytes_per_query;
+SELECT svs_memory_test_recheck_search_scratch_options(671, 1, 64, false);
+SELECT svs_memory_test_search_scratch_bytes_per_query(671, 1) AS bytes_per_query;
+SELECT svs_memory_test_set_search_scratch_bytes_per_query(671, 1, 500::bigint);
+SELECT svs_memory_test_recheck_search_scratch_options(671, 1, 64, true);
+SELECT svs_memory_test_search_scratch_bytes_per_query(671, 1) AS bytes_per_query;
+
+-- Recheck against a relid with no reservation is a safe no-op.
+SELECT svs_memory_test_recheck_search_scratch_options(671, 99, 64, true);
+SELECT * FROM svs_memory_test_check_invariants();

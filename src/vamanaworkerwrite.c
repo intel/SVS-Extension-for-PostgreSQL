@@ -326,6 +326,8 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	if (rwlock != NULL)
 		LWLockAcquire(rwlock, LW_EXCLUSIVE);
 
+	INJECTION_POINT("vamana-write-holds-exclusive-lock", NULL);
+
 	switch (slot->slotKind)
 	{
 		case VAMANA_SLOTKIND_INSERT:
@@ -580,6 +582,11 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
  * setting the slot PENDING.  On success the cache entry is live and the
  * waiting backend's VamanaWorkerSubmitLoad returns true.
  *
+ * VamanaCacheIndex runs inside its own short transaction: it durably
+ * records the index's residency via SPI, which needs one. That transaction
+ * closes before VamanaReplicationCreate/Open below, which must run outside
+ * any write transaction (CreateInitDecodingContext rejects those).
+ *
  * Must not throw: all errors are converted to VAMANA_SLOT_ERROR.
  */
 void
@@ -646,6 +653,11 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		 * CREATE INDEX commit's relcache invalidation arrives.
 		 */
 		vamana_eviction_suppressed_for_relid = relid;
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
 		VamanaCacheIndex(relid, svsIndex,
 						 params->dimensions,
 						 params->graph_degree,
@@ -655,6 +667,9 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 						 params->tidMappingCapacity,
 						 params->nextExternalId,
 						 params->numDeleted);
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
 
 		/* Ownership passed to the cache entry; a later error must not free these. */
 		svsIndex = NULL;
@@ -694,6 +709,9 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		ErrorData  *edata;
 
 		vamana_eviction_suppressed_for_relid = InvalidOid;
+
+		if (IsTransactionState())
+			AbortCurrentTransaction();
 
 		/* Leave ErrorContext before allocating anything; errfinish() left us in it. */
 		MemoryContextSwitchTo(oldcontext);

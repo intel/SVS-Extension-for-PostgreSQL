@@ -434,6 +434,69 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
         'a new batch is checked against the lower ceiling, not the one in effect when it was reserved');
 }
 
+# ---------------------------------------------------------------------------
+# Case 5: the two non-hot-path recompute triggers for the memoized per-query
+# cost (see the design's three-trigger list; the hot-path trigger, at index
+# load, is already exercised implicitly by every case above).
+#
+# Trigger 2, ALTER INDEX: the OAT_POST_ALTER hook rechecks the memoized cost
+# against the index's current reloptions and invalidates it on a real
+# change. This hook runs inside the same command as the catalog update, one
+# CommandCounterIncrement before that update's self-invalidation would
+# otherwise be visible -- calling it explicitly is what makes the hook's own
+# index_open see the just-altered options instead of a stale copy.
+#
+# Trigger 3, SIGHUP: unlike the hook above, VamanaWorkerRefreshSearchScratchCosts
+# runs entirely inside the worker's own fresh transaction, so it was never
+# exposed to the same staleness.
+# ---------------------------------------------------------------------------
+{
+    my $log_pos = length($node->log_content());
+    $node->safe_psql('postgres', "ALTER INDEX ssg_idx SET (use_search_history = false);");
+    $node->safe_psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/vamana worker: computed search-scratch cost/,
+        'ALTER INDEX ... SET (use_search_history=...) invalidates the memoized '
+      . 'search-scratch cost, so the next search recomputes it');
+
+    $log_pos = length($node->log_content());
+    $node->safe_psql('postgres', "ALTER SYSTEM SET svs.search_window_size = 5000;");
+    $node->safe_psql('postgres', "SELECT pg_reload_conf();");
+
+    my $recomputed = '';
+    for (1 .. 100)
+    {
+        usleep(100_000);
+        $recomputed = substr($node->log_content(), $log_pos);
+        last if $recomputed =~ /vamana worker: computed search-scratch cost/;
+    }
+    like($recomputed, qr/vamana worker: computed search-scratch cost/,
+        'a SIGHUP that changes svs.search_window_size invalidates every cached '
+      . "index's memoized search-scratch cost");
+
+    $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.search_window_size;");
+    $node->safe_psql('postgres', "SELECT pg_reload_conf();");
+}
+
+{
+    discover_cost_bytes();
+
+    $node->safe_psql('postgres', "ALTER INDEX ssg_idx SET (use_search_history = true);");
+
+    discover_cost_bytes();
+
+    my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 1;
+    ));
+    is($ret, 0, "the worker is still responsive after two attach/wait/wakeup/detach "
+      . "cycles on the same injection point in one session (stderr: $stderr)");
+}
+
 $node->stop;
 
 done_testing();

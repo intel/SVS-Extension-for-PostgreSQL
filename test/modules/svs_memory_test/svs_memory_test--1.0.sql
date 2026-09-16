@@ -64,6 +64,11 @@ CREATE FUNCTION svs_memory_test_recheck_search_scratch_options(
 ) RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_test_set_search_scratch_bytes_per_query(
+    db_oid oid, relid oid, bytes_per_query bigint
+) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_admit_database(db_oid oid, residency_budget bigint, durable_committed_floor bigint DEFAULT 0)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

@@ -269,6 +269,77 @@ my $baseline = committed_bytes();
         "the dropped index's stale reservation does not survive the worker's restart");
 }
 
+# ---------------------------------------------------------------------------
+# Case 7: dropping an index while its worker is up releases its committed
+# bytes immediately -- no restart-time reconcile needed, unlike Case 6.
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE dropup_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO dropup_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+        CREATE INDEX dropup_idx ON dropup_tbl USING vamana (val vector_l2_ops);
+    ));
+    wait_for_worker($node);
+
+    cmp_ok(committed_bytes(), '>', 0,
+        'dropup_idx is resident and committed before it is dropped');
+
+    $node->safe_psql('postgres', "DROP INDEX dropup_idx;");
+
+    is(committed_bytes(), '0',
+        'dropping an index while its worker is up releases its bytes with no restart');
+
+    $node->safe_psql('postgres', "DROP TABLE dropup_tbl;");
+}
+
+# ---------------------------------------------------------------------------
+# Case 8: lowering residency_memory below a durable resident_bytes floor is
+# refused while the worker is down. SvsIndexResidencyDurableFloor queries
+# svs_index_residency for real here, unlike the unit test's direct call
+# with a hand-supplied floor.
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE floor_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO floor_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000);
+        CREATE INDEX floor_idx ON floor_tbl USING vamana (val vector_l2_ops);
+    ));
+    wait_for_worker($node);
+
+    my $durable_floor_bytes = $node->safe_psql('postgres',
+        "SELECT resident_bytes FROM svs_index_residency "
+      . "WHERE index_relid = 'floor_idx'::regclass;");
+    chomp $durable_floor_bytes;
+    cmp_ok($durable_floor_bytes, '>', 1024 * 1024,
+        'floor_idx has a durable resident-bytes row above 1MB before its worker goes down');
+
+    kill_worker_and_wait();
+
+    my $budget_before_decrease = $node->safe_psql('postgres',
+        "SELECT residency_memory_limit FROM pg_stat_vamana_worker "
+      . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+    chomp $budget_before_decrease;
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET residency_memory = 1 WHERE datname = 'postgres';");
+
+    my $budget_after_decrease = $node->safe_psql('postgres',
+        "SELECT residency_memory_limit FROM pg_stat_vamana_worker "
+      . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+    chomp $budget_after_decrease;
+    is($budget_after_decrease, $budget_before_decrease,
+        'a decrease below the durable resident-bytes floor is rejected while the worker is down');
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true, residency_memory = NULL "
+      . "WHERE datname = 'postgres';");
+    wait_for_worker($node);
+    $node->safe_psql('postgres', "DROP INDEX floor_idx;");
+    $node->safe_psql('postgres', "DROP TABLE floor_tbl;");
+}
+
 $node->stop;
 
 done_testing();

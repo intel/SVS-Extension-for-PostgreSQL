@@ -23,6 +23,7 @@
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
@@ -622,8 +623,20 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 
 		if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
 		{
-			Relation	indexRel = index_open(objectId, NoLock);
-			VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+			Relation	indexRel;
+			VamanaOptions *opts;
+
+			/*
+			 * ATExecSetRelOptions's catalog update only queues this
+			 * session's own relcache invalidation for the next
+			 * CommandCounterIncrement; this hook runs before that CCI, so
+			 * without it index_open below would still return the pre-ALTER
+			 * options.
+			 */
+			CommandCounterIncrement();
+
+			indexRel = index_open(objectId, NoLock);
+			opts = (VamanaOptions *) indexRel->rd_options;
 
 			SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, objectId,
 												  VamanaResolveSearchWindowSize(opts),
