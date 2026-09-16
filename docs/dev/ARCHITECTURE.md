@@ -722,9 +722,9 @@ Specified in the `WITH (...)` clause of `CREATE INDEX`.
 | `search_window_size` | int | 100 | 10–10000 | Search window during build and initial queries. |
 | `use_search_history` | bool | `true` | — | Maintain the visited-node set during search. |
 | `compression_type` | int | 0 | 0–2 | `0` = none, `1` = LeanVec, `2` = LVQ. |
-| `compression_primary` | int | 8 | -8–8 | LeanVec primary quantization: `4`=UINT4, `-4`=INT4, `8`=UINT8, `-8`=INT8. |
-| `compression_secondary` | int | 8 | -8–8 | LeanVec secondary quantization (same values as primary). |
-| `leanvec_dims` | int | -1 | -1–2000 | Reduced dimensions for LeanVec. `-1` = `dimensions / 2`. |
+| `compression_primary` | int | 4 | -8–8 | Primary quantization under either scheme: `4`=UINT4, `-4`=INT4, `8`=UINT8, `-8`=INT8. |
+| `compression_secondary` | int | 8 | -8–8 | LeanVec secondary quantization, or the LVQ residual. Same values as primary, plus `0` = no residual (LVQ only). LVQ accepts the bit-width pairs (4,0), (8,0), (4,4), (4,8) and discards the sign; LeanVec requires `abs(primary) <= abs(secondary)`. |
+| `leanvec_dims` | int | -1 | -1–2000 | Reduced dimensions for LeanVec. `-1` = `dimensions / 2`. Ignored under LVQ, which quantizes in the original space. |
 
 ---
 

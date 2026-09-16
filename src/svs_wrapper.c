@@ -93,10 +93,17 @@ CheckSVSError(svs_error_h error, const char *operation)
 	}
 }
 
-/* param encoding: 4=UINT4, -4=INT4, 8=UINT8, -8=INT8 */
+/*
+ * param encoding: 4=UINT4, -4=INT4, 8=UINT8, -8=INT8.  allow_none additionally
+ * accepts 0, mapping it to SVS_DATA_TYPE_VOID; pass it only for LVQ's residual,
+ * the one parameter for which "absent" is a legal value.
+ */
 static svs_data_type_t
-MapCompressionParamToSVSType(int param, const char *param_name)
+MapCompressionParamToSVSType(int param, const char *param_name, bool allow_none)
 {
+	if (allow_none && param == VAMANA_COMPRESSION_NO_RESIDUAL)
+		return SVS_DATA_TYPE_VOID;
+
 	for (size_t i = 0; i < NUM_COMPRESSION_MAPPINGS; i++)
 	{
 		if (param == compression_mappings[i].param)
@@ -106,9 +113,10 @@ MapCompressionParamToSVSType(int param, const char *param_name)
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("invalid %s value: %d", param_name, param),
-			 errhint("Valid values are: %d (UINT4), %d (INT4), %d (UINT8), %d (INT8)",
+			 errhint("Valid values are: %d (UINT4), %d (INT4), %d (UINT8), %d (INT8)%s",
 					 VAMANA_LEANVEC_UINT4, VAMANA_LEANVEC_INT4,
-					 VAMANA_LEANVEC_UINT8, VAMANA_LEANVEC_INT8)));
+					 VAMANA_LEANVEC_UINT8, VAMANA_LEANVEC_INT8,
+					 allow_none ? ", 0 (no residual)" : "")));
 
 	return SVS_DATA_TYPE_VOID;	/* unreachable */
 }
@@ -217,8 +225,8 @@ SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int primary_param, int
 	if (actual_leanvec_dims == 0)
 		actual_leanvec_dims = 1;	/* Minimum 1 dimension */
 
-	svs_primary = MapCompressionParamToSVSType(primary_param, "compression_primary");
-	svs_secondary = MapCompressionParamToSVSType(secondary_param, "compression_secondary");
+	svs_primary = MapCompressionParamToSVSType(primary_param, "compression_primary", false);
+	svs_secondary = MapCompressionParamToSVSType(secondary_param, "compression_secondary", false);
 
 	storage = svs_storage_create_leanvec(actual_leanvec_dims, svs_primary, svs_secondary, error);
 
@@ -226,6 +234,55 @@ SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int primary_param, int
 	svs_error_free(error);
 
 	return (SVSStorageHandle) storage;
+}
+
+/*
+ * LVQ quantizes in the original vector space, so unlike LeanVec it takes no
+ * reduced dimensionality.  residual_param may be VAMANA_COMPRESSION_NO_RESIDUAL,
+ * which SVS reads as zero residual bits.
+ */
+SVSStorageHandle
+SVSCreateLVQStorage(int primary_param, int residual_param)
+{
+	svs_error_h error = svs_error_create();
+	svs_storage_h storage;
+	svs_data_type_t svs_primary;
+	svs_data_type_t svs_residual;
+
+	svs_primary = MapCompressionParamToSVSType(primary_param, "compression_primary", false);
+	svs_residual = MapCompressionParamToSVSType(residual_param, "compression_secondary", true);
+
+	storage = svs_storage_create_lvq(svs_primary, svs_residual, error);
+
+	CheckSVSError(error, "LVQ storage creation");
+	svs_error_free(error);
+
+	return (SVSStorageHandle) storage;
+}
+
+/*
+ * Single place that turns a compression_type into an SVS storage spec.  Every
+ * path that constructs or reloads an index goes through here, so a build and
+ * the later load of its saved file cannot disagree about the storage layout --
+ * which is what SVS requires, and what three separate copies of this branch did
+ * not guarantee.
+ */
+SVSStorageHandle
+SVSCreateStorageForCompression(int compression_type, SVSDType data_type,
+							   int dimensions, int leanvec_dims,
+							   int compression_primary, int compression_secondary)
+{
+	switch (compression_type)
+	{
+		case VAMANA_COMPRESSION_LEANVEC:
+			return SVSCreateLeanVecStorage(dimensions, leanvec_dims,
+										   compression_primary,
+										   compression_secondary);
+		case VAMANA_COMPRESSION_LVQ:
+			return SVSCreateLVQStorage(compression_primary, compression_secondary);
+		default:
+			return SVSCreateSimpleStorage(data_type);
+	}
 }
 
 void
@@ -725,12 +782,12 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 								   config->dimensions,
 								   algorithm);
 
-		if (config->compression_type == VAMANA_COMPRESSION_LEANVEC)
-			storage = SVSCreateLeanVecStorage(config->dimensions, config->leanvec_dims,
-											  config->compression_primary,
-											  config->compression_secondary);
-		else
-			storage = SVSCreateSimpleStorage(config->data_type);
+		storage = SVSCreateStorageForCompression(config->compression_type,
+												config->data_type,
+												config->dimensions,
+												config->leanvec_dims,
+												config->compression_primary,
+												config->compression_secondary);
 
 		SVSBuilderSetStorage(builder, storage);
 		{

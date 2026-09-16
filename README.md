@@ -56,7 +56,7 @@ CREATE INDEX ON items USING vamana (embedding vector_l2_ops);
 SELECT id FROM items ORDER BY embedding <-> '[0.1, 0.2, ...]' LIMIT 10;
 ```
 
-Vamana is a graph-based ANN algorithm, similar in spirit to HNSW but using a single flat graph and a robust-pruning rule that keeps recall high even at low search-window sizes. LeanVec and LVQ are two compression modes that trade memory for a small amount of recall — LeanVec projects vectors into a lower-dimensional space before quantizing and suits large, high-dimensional datasets; LVQ quantizes vectors in their original space with no training step and suits smaller datasets or constrained build times.
+Vamana is a graph-based ANN algorithm, similar in spirit to HNSW but using a single flat graph and a robust-pruning rule that keeps recall high even at low search-window sizes. LeanVec and LVQ are two compression modes that trade memory for a small amount of recall — LeanVec projects vectors into a lower-dimensional space before quantizing and suits large, high-dimensional datasets; LVQ quantizes vectors in their original space, with no projection to fit, and suits smaller datasets or constrained build times.
 
 For index options, compression tuning, session parameters, the background worker, operational guidance, monitoring, and troubleshooting, see the [user guide](docs/USER_GUIDE.md).
 

@@ -205,3 +205,185 @@ CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 CREATE INDEX ON t USING vamana (val vector_l2_ops)
     WITH (compression_type = 1, compression_primary = 4, compression_secondary = -9);
 DROP TABLE t;
+
+-- Compression combination matrix: every (compression_type, compression_primary,
+-- compression_secondary) triple the reloption layer lets through, at every sign.
+--
+-- Validation runs in InitBuildState, ahead of the heap scan, so an empty table
+-- exercises every combination: an accepted triple costs two NOTICEs and builds
+-- nothing, a rejected one costs a single ERROR.  Each index is named after its
+-- triple (pn8 = primary -8, s0 = secondary 0) so a failing diff names the
+-- combination rather than an anonymous cmatrix_val_idx.  DROP INDEX IF EXISTS
+-- runs after every case, so the "does not exist, skipping" NOTICE is itself
+-- confirmation that the CREATE was rejected.
+
+CREATE TABLE cmatrix (id serial PRIMARY KEY, val vector(3));
+
+-- compression_type = 1 (LeanVec): {+-4, +-8} squared.  Accepted unless the
+-- primary carries more precision than the secondary.  SVS discards the sign, but
+-- validation does not, so both signs are exercised at both magnitudes.
+CREATE INDEX leanvec_p4_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 4);
+DROP INDEX IF EXISTS leanvec_p4_s4;
+CREATE INDEX leanvec_p4_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = -4);
+DROP INDEX IF EXISTS leanvec_p4_sn4;
+CREATE INDEX leanvec_p4_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8);
+DROP INDEX IF EXISTS leanvec_p4_s8;
+CREATE INDEX leanvec_p4_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = -8);
+DROP INDEX IF EXISTS leanvec_p4_sn8;
+CREATE INDEX leanvec_pn4_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = 4);
+DROP INDEX IF EXISTS leanvec_pn4_s4;
+CREATE INDEX leanvec_pn4_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = -4);
+DROP INDEX IF EXISTS leanvec_pn4_sn4;
+CREATE INDEX leanvec_pn4_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = 8);
+DROP INDEX IF EXISTS leanvec_pn4_s8;
+CREATE INDEX leanvec_pn4_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -4, compression_secondary = -8);
+DROP INDEX IF EXISTS leanvec_pn4_sn8;
+CREATE INDEX leanvec_p8_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 4);
+DROP INDEX IF EXISTS leanvec_p8_s4;
+CREATE INDEX leanvec_p8_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = -4);
+DROP INDEX IF EXISTS leanvec_p8_sn4;
+CREATE INDEX leanvec_p8_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
+DROP INDEX IF EXISTS leanvec_p8_s8;
+CREATE INDEX leanvec_p8_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = -8);
+DROP INDEX IF EXISTS leanvec_p8_sn8;
+CREATE INDEX leanvec_pn8_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = 4);
+DROP INDEX IF EXISTS leanvec_pn8_s4;
+CREATE INDEX leanvec_pn8_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = -4);
+DROP INDEX IF EXISTS leanvec_pn8_sn4;
+CREATE INDEX leanvec_pn8_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = 8);
+DROP INDEX IF EXISTS leanvec_pn8_s8;
+CREATE INDEX leanvec_pn8_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = -8, compression_secondary = -8);
+DROP INDEX IF EXISTS leanvec_pn8_sn8;
+
+-- compression_secondary = 0 means "no residual", which only LVQ has; LeanVec
+-- must reject it as an out-of-set value rather than treating it as a combination
+-- failure.
+CREATE INDEX leanvec_p4_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 0);
+DROP INDEX IF EXISTS leanvec_p4_s0;
+CREATE INDEX leanvec_p8_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 8, compression_secondary = 0);
+DROP INDEX IF EXISTS leanvec_p8_s0;
+
+-- compression_type = 2 (LVQ): {+-4, +-8} x {0, +-4, +-8}.  SVS compiles
+-- specializations for (4,0), (8,0), (4,4) and (4,8) only, so an 8-bit primary
+-- takes no residual and every other pair is rejected as a combination.
+CREATE INDEX lvq_p4_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 4, compression_secondary = 0);
+DROP INDEX IF EXISTS lvq_p4_s0;
+CREATE INDEX lvq_p4_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 4, compression_secondary = 4);
+DROP INDEX IF EXISTS lvq_p4_s4;
+CREATE INDEX lvq_p4_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 4, compression_secondary = -4);
+DROP INDEX IF EXISTS lvq_p4_sn4;
+CREATE INDEX lvq_p4_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 4, compression_secondary = 8);
+DROP INDEX IF EXISTS lvq_p4_s8;
+CREATE INDEX lvq_p4_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 4, compression_secondary = -8);
+DROP INDEX IF EXISTS lvq_p4_sn8;
+CREATE INDEX lvq_pn4_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -4, compression_secondary = 0);
+DROP INDEX IF EXISTS lvq_pn4_s0;
+CREATE INDEX lvq_pn4_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -4, compression_secondary = 4);
+DROP INDEX IF EXISTS lvq_pn4_s4;
+CREATE INDEX lvq_pn4_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -4, compression_secondary = -4);
+DROP INDEX IF EXISTS lvq_pn4_sn4;
+CREATE INDEX lvq_pn4_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -4, compression_secondary = 8);
+DROP INDEX IF EXISTS lvq_pn4_s8;
+CREATE INDEX lvq_pn4_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -4, compression_secondary = -8);
+DROP INDEX IF EXISTS lvq_pn4_sn8;
+CREATE INDEX lvq_p8_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 8, compression_secondary = 0);
+DROP INDEX IF EXISTS lvq_p8_s0;
+CREATE INDEX lvq_p8_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 8, compression_secondary = 4);
+DROP INDEX IF EXISTS lvq_p8_s4;
+CREATE INDEX lvq_p8_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 8, compression_secondary = -4);
+DROP INDEX IF EXISTS lvq_p8_sn4;
+CREATE INDEX lvq_p8_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 8, compression_secondary = 8);
+DROP INDEX IF EXISTS lvq_p8_s8;
+CREATE INDEX lvq_p8_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 8, compression_secondary = -8);
+DROP INDEX IF EXISTS lvq_p8_sn8;
+CREATE INDEX lvq_pn8_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -8, compression_secondary = 0);
+DROP INDEX IF EXISTS lvq_pn8_s0;
+CREATE INDEX lvq_pn8_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -8, compression_secondary = 4);
+DROP INDEX IF EXISTS lvq_pn8_s4;
+CREATE INDEX lvq_pn8_sn4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -8, compression_secondary = -4);
+DROP INDEX IF EXISTS lvq_pn8_sn4;
+CREATE INDEX lvq_pn8_s8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -8, compression_secondary = 8);
+DROP INDEX IF EXISTS lvq_pn8_s8;
+CREATE INDEX lvq_pn8_sn8 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = -8, compression_secondary = -8);
+DROP INDEX IF EXISTS lvq_pn8_sn8;
+
+-- compression_type = 0: no scheme is selected, so no compression parameter is
+-- validated at all -- including values and combinations that either scheme would
+-- reject.  This is the same convention leanvec_dims follows under LVQ below.
+CREATE INDEX none_p4_s0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 0, compression_primary = 4, compression_secondary = 0);
+DROP INDEX IF EXISTS none_p4_s0;
+CREATE INDEX none_p5 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 0, compression_primary = 5);
+DROP INDEX IF EXISTS none_p5;
+CREATE INDEX none_p8_s4 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 0, compression_primary = 8, compression_secondary = 4);
+DROP INDEX IF EXISTS none_p8_s4;
+
+-- Values inside the reloption range [-8, 8] but outside {0, +-4, +-8} are
+-- rejected by value, under either scheme, before any combination rule runs.
+-- (compression_type = 1 with primary 5 and secondary 5 also appears in the
+-- boundary block above; repeated here so the matrix stands on its own.)
+CREATE INDEX ct1_p0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 0, compression_secondary = 8);
+DROP INDEX IF EXISTS ct1_p0;
+CREATE INDEX ct1_p5 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 5, compression_secondary = 8);
+DROP INDEX IF EXISTS ct1_p5;
+CREATE INDEX ct1_s5 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 1, compression_primary = 4, compression_secondary = 5);
+DROP INDEX IF EXISTS ct1_s5;
+CREATE INDEX ct2_p0 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 0, compression_secondary = 8);
+DROP INDEX IF EXISTS ct2_p0;
+CREATE INDEX ct2_p5 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 5, compression_secondary = 8);
+DROP INDEX IF EXISTS ct2_p5;
+CREATE INDEX ct2_s5 ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, compression_primary = 4, compression_secondary = 5);
+DROP INDEX IF EXISTS ct2_s5;
+
+-- leanvec_dims belongs to LeanVec; under LVQ it is ignored, not rejected.
+CREATE INDEX lvq_leanvec_dims ON cmatrix USING vamana (val vector_l2_ops)
+    WITH (compression_type = 2, leanvec_dims = 32);
+DROP INDEX IF EXISTS lvq_leanvec_dims;
+
+DROP TABLE cmatrix;
