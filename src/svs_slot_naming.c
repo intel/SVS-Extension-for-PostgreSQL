@@ -13,6 +13,8 @@
 
 #include "postgres.h"
 
+#include "common/string.h"
+
 #include "svs_slot_naming.h"
 
 const char *
@@ -35,23 +37,20 @@ SvsSearchSlotWaitEventName(void)
 }
 
 /*
- * Copy datname into dst, replacing any control character (including
- * newline) with a space.  datname is chosen by anyone with CREATEDB and
- * lands in application_name, which is world-readable in pg_stat_activity
- * and consumed by line-oriented log parsers, so it must not carry a byte
- * that could inject a line break.
+ * Copy datname into dst, run through core's pg_clean_ascii() first.
+ * datname is chosen by anyone with CREATEDB and lands in application_name,
+ * which is world-readable in pg_stat_activity and consumed by line-oriented
+ * log parsers, so it must not carry a byte that could inject a line break;
+ * pg_clean_ascii() is the same function core's own backend_startup.c uses
+ * to sanitize application_name from a startup packet.
  */
 static void
 CopySanitizedDatname(char *dst, size_t dstsize, const char *datname)
 {
-	char	   *p;
+	char	   *clean = pg_clean_ascii(datname, 0);
 
-	strlcpy(dst, datname, dstsize);
-	for (p = dst; *p != '\0'; p++)
-	{
-		if ((unsigned char) *p < 0x20 || *p == 0x7f)
-			*p = ' ';
-	}
+	strlcpy(dst, clean, dstsize);
+	pfree(clean);
 }
 
 void

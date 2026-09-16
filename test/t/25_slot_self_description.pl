@@ -185,9 +185,9 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 	my $granted = wait_for_granted($node, $nl_oid, 1, 40);
 	is($granted, '1', "the newline-named database's search_threads_granted reaches 1");
 
-	my $appname = wait_for_appname_containing($node, "nldb_before after", 40);
+	my $appname = wait_for_appname_containing($node, "nldb_before\\x0aafter", 40);
 	ok(defined($appname),
-		'a parked slot self-describes with the newline replaced by a space');
+		'a parked slot self-describes with the newline escaped as \x0a');
 	unlike($appname, qr/\n/,
 		'the published application_name carries no newline from datname');
 }

@@ -17,6 +17,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
@@ -125,6 +126,148 @@ sub check_build_slot_appnames
 
 	$node->safe_psql('postgres',
 		"SELECT injection_points_detach('svs-build-thread-grant-acquired');");
+}
+
+# ---------------------------------------------------------------------------
+# The build-slot application_name formatter (SvsFormatBuildSlotAppName)
+# shares its counts-first ordering and ASCII-sanitizing with the
+# search-slot formatter, but has its own caller (svs_parallel_build.c) and
+# its own truncation math, so it gets its own adversarial datname coverage
+# rather than relying on the search-slot cases in
+# test/t/25_slot_self_description.pl.  Drives a single-threaded build to
+# completion on a database with the given name, paused via the same
+# injection point as the case above, and checks the one parked worker's
+# application_name.
+# ---------------------------------------------------------------------------
+sub check_adversarial_build_appname
+{
+	my ($node, $dbname, $expect_appname_qr, $test_name) = @_;
+
+	$node->safe_psql('postgres', qq(CREATE DATABASE "$dbname";));
+	$node->safe_psql('postgres',
+		"INSERT INTO vamana_databases (datname, enabled) VALUES ('$dbname', true);");
+	wait_for_worker_db($node, $dbname);
+
+	# SvsDatabasesGetMyMaintenanceNumThreads() resolves maintenance_num_threads
+	# via SPI with "WHERE datname = current_database()", against whichever
+	# database the build itself runs in -- a separate, local copy of
+	# vamana_databases from the launcher's own copy in 'postgres' above,
+	# which only registers the database with the launcher.
+	$node->safe_psql($dbname, qq(
+		CREATE EXTENSION vector;
+		CREATE EXTENSION svs;
+		INSERT INTO vamana_databases (datname, enabled, maintenance_num_threads)
+			VALUES ('$dbname', true, 1);
+	));
+	$node->safe_psql('postgres',
+		"SELECT injection_points_attach('svs-build-thread-grant-acquired', 'wait');"
+	);
+
+	# Connects directly to $dbname rather than to 'postgres' and then \c-ing
+	# over: \c is a line-oriented meta-command, and a datname containing a
+	# raw newline (case below) splits its quoted argument across what psql
+	# sees as two separate input lines, breaking the reconnect. Passing
+	# $dbname as the connection parameter instead goes through libpq's
+	# connection handling, which raises no such problem for any of this
+	# file's adversarial names (proven already by the plain SQL statements
+	# and the $dbname-as-parameter safe_psql call above).
+	my $build = $node->background_psql($dbname, on_error_stop => 1);
+	my $pid_out = $build->query('SELECT pg_backend_pid()');
+	my ($build_pid) = $pid_out =~ /(\d+)/;
+
+	$build->query_until(qr/build_started/, qq(
+		\\echo build_started
+		CREATE TABLE btg_tbl (id serial PRIMARY KEY, val vector(8));
+		INSERT INTO btg_tbl (val)
+			SELECT ARRAY[random(),random(),random(),random(),
+						 random(),random(),random(),random()]::vector(8)
+			FROM generate_series(1, 50);
+		CREATE INDEX btg_idx ON btg_tbl USING vamana (val vector_l2_ops);
+	));
+
+	$node->wait_for_event('client backend', 'svs-build-thread-grant-acquired');
+
+	my $appname = $node->safe_psql('postgres',
+		"SELECT application_name FROM pg_stat_activity "
+	  . "WHERE backend_type = 'parallel worker' AND leader_pid = $build_pid;");
+	chomp $appname;
+	like($appname, qr/^vamana: build slot 1\/1 \(requested 1, granted 1\)/,
+		"$test_name: build slot counts are intact");
+	like($appname, $expect_appname_qr,
+		"$test_name: build slot application_name matches expected sanitized db name");
+
+	$node->safe_psql('postgres',
+		"SELECT injection_points_wakeup('svs-build-thread-grant-acquired');");
+	$build->query('SELECT 1');
+	$build->quit;
+
+	$node->safe_psql('postgres',
+		"SELECT injection_points_detach('svs-build-thread-grant-acquired');");
+
+	# Disable and wait for the per-database worker to exit before dropping:
+	# DROP DATABASE fails while any other backend, including that worker,
+	# still holds a connection to it.
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET enabled = false WHERE datname = '$dbname';");
+	my $alive = '?';
+	for (1 .. 60)    # up to 30s for the graceful drain to finish
+	{
+		usleep(500_000);
+		$alive = $node->safe_psql('postgres',
+			"SELECT count(*) FROM pg_stat_activity "
+		  . "WHERE backend_type = 'vamana worker' AND datname = '$dbname';");
+		chomp $alive;
+		last if $alive eq '0';
+	}
+
+	# The worker's own replication slot outlives the worker; core refuses to
+	# drop a database that still has one attached, so it has to go first
+	# (matching test_svs_ext_regression.sh's own teardown of
+	# contrib_regression's slot before dropping that database).
+	$node->safe_psql('postgres',
+		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+	  . "WHERE database = '$dbname';");
+
+	# DROP DATABASE, not just DELETE the catalog row: vamana_databases has a
+	# reject-delete-with-live-indexes trigger, and this database's build
+	# just created one (btg_idx), so deleting the row first would be
+	# rejected. Dropping the database removes the index along with it,
+	# leaving nothing for a later DELETE of the now-unreferenced row to
+	# reject.
+	$node->safe_psql('postgres', qq(DROP DATABASE "$dbname";));
+	$node->safe_psql('postgres',
+		"DELETE FROM vamana_databases WHERE datname = '$dbname';");
+}
+
+# Numbers survive a long database name in a build slot's application_name,
+# the same truncation guard proven for search slots in
+# test/t/25_slot_self_description.pl.
+{
+	my $longdb = "longbuilddb_" . ("x" x 51);    # 63 chars, NAMEDATALEN - 1
+	my $prefix = substr($longdb, 0, 10);
+	check_adversarial_build_appname($node, $longdb, qr/db=\Q$prefix\E/,
+		'long datname');
+}
+
+# A control character in datname reaches a build slot's application_name
+# only in pg_clean_ascii's escaped \xXX form, never as a raw control byte.
+{
+	# Short on purpose: the build-slot prefix ("vamana: build slot 1/1
+	# (requested 1, granted 1) db=") leaves less room before NAMEDATALEN
+	# truncation than the search-slot prefix does, and truncation of a
+	# long datname is already covered by the case above; this case is
+	# only about sanitizing, so it must fit well inside that room intact.
+	my $nldb = "nl\ndb";
+	check_adversarial_build_appname($node, $nldb, qr/db=nl\\x0adb/,
+		'newline datname');
+}
+
+# A literal '%' in datname is preserved as-is in a build slot's
+# application_name, proving no format confusion was introduced.
+{
+	my $pctdb = "pct100%db";
+	check_adversarial_build_appname($node, $pctdb, qr/db=pct100%db/,
+		'percent datname');
 }
 
 # ---------------------------------------------------------------------------
