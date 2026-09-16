@@ -1,12 +1,12 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 26_insert_growth_gate.pl — the insert growth gate (Group 3): an INSERT that
-# would grow a resident index past its database's residency budget is
-# refused before the write lock is taken, with the committed total
-# untouched; DELETE is never gated; and a reservation that never reaches a
-# worker's successful apply -- because the worker died, or because the
-# reserving backend itself died -- never leaks into the committed total.
+# 26_residency_accounting.pl — the residency-bytes-committed counter stays
+# correct under the insert growth gate (refusal before the write lock,
+# DELETE ungated, reanchor on a fitting insert), under a crash before a
+# pending insert reaches the worker (backend-side or reaper cleanup), and
+# across a DROP INDEX that commits while the worker is down (reconciled at
+# the worker's next restart).
 
 use strict;
 use warnings FATAL => 'all';
@@ -24,7 +24,7 @@ if (($ENV{enable_injection_points} // 'no') ne 'yes')
     plan skip_all => 'server not built with --enable-injection-points';
 }
 
-my $node = PostgreSQL::Test::Cluster->new('insert_growth_gate');
+my $node = PostgreSQL::Test::Cluster->new('residency_accounting');
 $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'vector,svs'");
 $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
@@ -47,6 +47,30 @@ sub committed_bytes
       . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
     chomp $bytes;
     return $bytes;
+}
+
+# Disables postgres first so the launcher does not race a respawn, SIGTERMs
+# its worker, and waits for the process to actually exit.
+sub kill_worker_and_wait
+{
+    my $worker_pid = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
+    chomp $worker_pid;
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = false WHERE datname = 'postgres';");
+
+    my $log_pos = length($node->log_content());
+    kill('TERM', $worker_pid);
+    $node->wait_for_log(qr/vamana background worker shutting down/, $log_pos);
+    for (1 .. 100)
+    {
+        usleep(100_000);
+        my $alive = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker';");
+        chomp $alive;
+        last if $alive eq '0';
+    }
 }
 
 $node->safe_psql('postgres', qq(
@@ -147,24 +171,7 @@ my $baseline = committed_bytes();
     ));
     $node->wait_for_event('client backend', 'vamana-enqueue-before-publish');
 
-    my $worker_pid = $node->safe_psql('postgres',
-        "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
-    chomp $worker_pid;
-    $node->safe_psql('postgres',
-        "UPDATE vamana_databases SET enabled = false WHERE datname = 'postgres';");
-
-    my $log_pos = length($node->log_content());
-    kill('TERM', $worker_pid);
-    $node->wait_for_log(qr/vamana background worker shutting down/, $log_pos);
-    for (1 .. 100)
-    {
-        usleep(100_000);
-        my $alive = $node->safe_psql('postgres',
-            "SELECT count(*) FROM pg_stat_activity "
-          . "WHERE backend_type = 'vamana worker';");
-        chomp $alive;
-        last if $alive eq '0';
-    }
+    kill_worker_and_wait();
 
     $node->safe_psql('postgres',
         "SELECT injection_points_wakeup('vamana-enqueue-before-publish');");
@@ -231,6 +238,35 @@ my $baseline = committed_bytes();
 
     $node->safe_psql('postgres',
         "SELECT injection_points_detach('vamana-enqueue-before-publish');");
+}
+
+# ---------------------------------------------------------------------------
+# Case 6: growth_idx is dropped while its worker is down. Nothing evicts a
+# stale reservation for an index the worker never saw dropped -- only the
+# worker's own startup reconcile against the live catalog can.
+# ---------------------------------------------------------------------------
+{
+    my $committed_before_drop = committed_bytes();
+    cmp_ok($committed_before_drop, '>', 0,
+        'growth_idx is still resident and committed before its worker goes down');
+
+    kill_worker_and_wait();
+
+    $node->safe_psql('postgres', "DROP INDEX growth_idx;");
+
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';");
+    wait_for_worker($node);
+
+    my $committed_after_restart;
+    for (1 .. 30)
+    {
+        $committed_after_restart = committed_bytes();
+        last if $committed_after_restart eq '0';
+        usleep(500_000);
+    }
+    is($committed_after_restart, '0',
+        "the dropped index's stale reservation does not survive the worker's restart");
 }
 
 $node->stop;

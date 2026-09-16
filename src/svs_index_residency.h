@@ -10,8 +10,7 @@
  * svs_index_residency catalog table, and the one number derived from it
  * that matters to a caller outside this file -- the floor a residency
  * budget must never be lowered under while the owning worker cannot be
- * trusted to answer from shared memory (memory-management design, Section
- * 5.3a).
+ * trusted to answer from shared memory.
  *
  * svs_memory.c never touches SQL or the catalog; this module is the one
  * place that bridges live shared-memory accounting to a fact that survives
@@ -44,8 +43,8 @@ extern void SvsIndexResidencyRecordUnload(Oid indexRelid);
  * index's last known committed bytes for dbOid. entry may be NULL -- no
  * reserved slot at all is not live either. Read under a lock on dbOid's
  * vamana_databases row, so this can never race a concurrent write to the
- * same durable total (Section 5.3a) -- any future writer of that total
- * must take the same lock before writing.
+ * same durable total -- any future writer of that total must take the
+ * same lock before writing.
  *
  * Unlike the two functions above, a failure here propagates rather than
  * being swallowed: a caller deciding whether a budget change is safe must

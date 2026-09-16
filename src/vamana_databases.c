@@ -54,6 +54,15 @@ static VamanaSubxidPendingArray *CurrentReservationQueue = NULL;
 /* dbOids reserved by this transaction; released on ABORT. TopTransactionContext-scoped. */
 static List *ReservedThisXactDbOids = NIL;
 
+/* Pre-existing databases whose budget this transaction changed at PRE_COMMIT; restored on ABORT. */
+typedef struct ResidencyBudgetSnapshot
+{
+	Oid			dbOid;
+	uint64		priorBudget;
+} ResidencyBudgetSnapshot;
+
+static List *ResidencyBudgetSnapshotsThisXact = NIL;
+
 static bool ReservationCallbacksRegistered = false;
 
 static void EnsureReservationCallbacksRegistered(void);
@@ -64,6 +73,22 @@ static void VamanaDatabasesSubXactCallback(SubXactEvent event,
 											void *arg);
 static void ReserveSlotsForEnabledEntries(void);
 static void ReleaseSlotsReservedThisXact(void);
+static void RestoreResidencyBudgetSnapshotsThisXact(void);
+
+static bool
+ResidencyBudgetAlreadySnapshotted(Oid dbOid)
+{
+	ListCell   *lc;
+
+	foreach(lc, ResidencyBudgetSnapshotsThisXact)
+	{
+		ResidencyBudgetSnapshot *snapshot = (ResidencyBudgetSnapshot *) lfirst(lc);
+
+		if (snapshot->dbOid == dbOid)
+			return true;
+	}
+	return false;
+}
 
 static VamanaSubxidPendingArray *
 GetOrCreateReservationQueue(void)
@@ -344,12 +369,14 @@ VamanaDatabasesXactCallback(XactEvent event, void *arg)
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 			ReservedThisXactDbOids = NIL;
+			ResidencyBudgetSnapshotsThisXact = NIL;
 			CurrentReservationQueue = NULL;
 			break;
 
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			ReleaseSlotsReservedThisXact();
+			RestoreResidencyBudgetSnapshotsThisXact();
 			CurrentReservationQueue = NULL;
 			break;
 
@@ -422,6 +449,15 @@ ReserveSlotsForEnabledEntries(void)
 		/* A pre-existing live slot found by this idempotent reservation must survive this transaction's abort. */
 		if (created)
 			ReservedThisXactDbOids = lappend_oid(ReservedThisXactDbOids, entry->dbOid);
+		else if (!list_member_oid(ReservedThisXactDbOids, entry->dbOid) &&
+				 !ResidencyBudgetAlreadySnapshotted(entry->dbOid))
+		{
+			ResidencyBudgetSnapshot *snapshot = palloc(sizeof(ResidencyBudgetSnapshot));
+
+			snapshot->dbOid = entry->dbOid;
+			snapshot->priorBudget = slotEntry->residencyBudget;
+			ResidencyBudgetSnapshotsThisXact = lappend(ResidencyBudgetSnapshotsThisXact, snapshot);
+		}
 
 		/* A too-small budget fails this INSERT/UPDATE here, in the same transaction, not a later load. */
 		VamanaWorkerSetMemoryOverrides(entry->dbOid, entry->residencyMemoryMbOverride,
@@ -446,6 +482,21 @@ ReleaseSlotsReservedThisXact(void)
 		VamanaWorkerReleaseSlot(dbOid);
 
 	ReservedThisXactDbOids = NIL;
+}
+
+static void
+RestoreResidencyBudgetSnapshotsThisXact(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, ResidencyBudgetSnapshotsThisXact)
+	{
+		ResidencyBudgetSnapshot *snapshot = (ResidencyBudgetSnapshot *) lfirst(lc);
+
+		SvsMemoryRestoreResidencyBudget(snapshot->dbOid, snapshot->priorBudget);
+	}
+
+	ResidencyBudgetSnapshotsThisXact = NIL;
 }
 
 /* -----------------------------------------------------------------------

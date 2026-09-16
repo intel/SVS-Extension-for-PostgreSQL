@@ -16,7 +16,7 @@
  * the header's global roll-ups, reached via VamanaWorkerHeader. A
  * check-then-add is atomic under that database's memLock; the header lock
  * additionally guards the global roll-ups it feeds, always acquired after
- * memLock (Section 5.5 of the memory-management design doc).
+ * memLock.
  */
 
 #include "postgres.h"
@@ -62,15 +62,18 @@ LookupEntryOrError(Oid dbOid)
 	return entry;
 }
 
-/* Call under entry->memLock. */
+/* Call under entry->memLock; releases it and errors if dbOid was never admitted. */
 static void
 RequireAdmitted(VamanaWorkerShmem *entry, Oid dbOid)
 {
-	if (entry->residencyBudget == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("database %u has no SVS memory accounting entry", dbOid),
-				 errhint("SvsMemoryAdmitDatabase must run before any build, load, or insert accounting for this database.")));
+	if (entry->residencyBudget != 0)
+		return;
+
+	LWLockRelease(&entry->memLock);
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("database %u has no SVS memory accounting entry", dbOid),
+			 errhint("SvsMemoryAdmitDatabase must run before any build, load, or insert accounting for this database.")));
 }
 
 static SvsMemReservation *
@@ -82,17 +85,21 @@ FindReservation(VamanaWorkerShmem *entry, Oid relid)
 	return NULL;
 }
 
+/* Call under entry->memLock; releases it and errors if no slot is free. */
 static SvsMemReservation *
 AllocateReservation(VamanaWorkerShmem *entry, Oid relid)
 {
 	SvsMemReservation *freeSlot = FindReservation(entry, InvalidOid);
 
 	if (freeSlot == NULL)
+	{
+		LWLockRelease(&entry->memLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("too many concurrently tracked SVS indexes for this database"),
 				 errdetail("VAMANA_MAX_INDEXES (%d) reservation slots are all in use.",
 						   VAMANA_MAX_INDEXES)));
+	}
 
 	*freeSlot = (SvsMemReservation) {0};
 	freeSlot->relid = relid;
@@ -263,6 +270,39 @@ SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget, uint64 durableCommitte
 
 	header->totalResidencyCommittedGlobal = projectedGlobalTotal;
 	entry->residencyBudget = residencyBudget;
+
+	LWLockRelease(header->lock);
+	LWLockRelease(&entry->memLock);
+}
+
+void
+SvsMemoryRestoreResidencyBudget(Oid dbOid, uint64 priorBudget)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+	VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
+	uint64		restoredBudget;
+	uint64		projectedGlobalTotal;
+
+	if (entry == NULL)
+		return;
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	restoredBudget = Max(priorBudget, entry->residencyBytesCommitted);
+	if (restoredBudget != priorBudget)
+		ereport(WARNING,
+				(errmsg("SVS memory accounting: database %u's residency budget restored to %llu bytes on transaction abort, not its pre-transaction %llu, to cover bytes already committed under the aborted value",
+						dbOid,
+						(unsigned long long) restoredBudget,
+						(unsigned long long) priorBudget)));
+
+	LWLockAcquire(header->lock, LW_EXCLUSIVE);
+
+	projectedGlobalTotal = header->totalResidencyCommittedGlobal;
+	SubtractFloored(&projectedGlobalTotal, entry->residencyBudget,
+					 "a database's aborted residency budget change");
+	header->totalResidencyCommittedGlobal = projectedGlobalTotal + restoredBudget;
+	entry->residencyBudget = restoredBudget;
 
 	LWLockRelease(header->lock);
 	LWLockRelease(&entry->memLock);
@@ -690,13 +730,52 @@ ReapEntryReservations(VamanaWorkerShmem *entry)
 	LWLockRelease(&entry->memLock);
 }
 
+static bool
+OidInArray(Oid relid, const Oid *array, int count)
+{
+	for (int i = 0; i < count; i++)
+		if (array[i] == relid)
+			return true;
+	return false;
+}
+
+void
+SvsMemoryReconcileResidentReservations(Oid dbOid, const Oid *liveRelids, int numLiveRelids,
+										Oid *droppedRelids, int *numDropped)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+
+	*numDropped = 0;
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
+	{
+		SvsMemReservation *reservation = &entry->reservations[i];
+
+		if (reservation->relid == InvalidOid)
+			continue;
+		if (reservation->state != SVS_MEM_RESIDENT)
+			continue;
+		if (OidInArray(reservation->relid, liveRelids, numLiveRelids))
+			continue;
+
+		SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
+						 "a dropped index's stale resident reservation");
+		droppedRelids[(*numDropped)++] = reservation->relid;
+		FreeReservation(reservation);
+	}
+
+	LWLockRelease(&entry->memLock);
+}
+
 /*
  * Snapshots which databases currently hold a slot under one LW_SHARED pass
  * over the header, then processes each separately so memLock is always
  * acquired without the header lock already held -- the reverse of that
- * would invert Section 5.5's mandated "memLock before the header lock"
- * order, since ReapEntryReservations itself takes the header lock whenever
- * it releases a dead build peak.
+ * would invert the mandated "memLock before the header lock" order, since
+ * ReapEntryReservations itself takes the header lock whenever it releases a
+ * dead build peak.
  */
 void
 SvsMemoryReapDeadReservations(void)
@@ -827,7 +906,7 @@ SvsMemoryReserveSearchScratch(Oid dbOid, uint64 batchBytes)
 	uint64		budget;
 	uint64		current;
 
-	/* searchWorkMemMbOverride is guarded by the header lock, not memLock (Section 5.5). */
+	/* searchWorkMemMbOverride is guarded by the header lock, not memLock. */
 	LWLockAcquire(header->lock, LW_SHARED);
 	budget = SvsMemoryResolveSearchWorkMem(entry);
 	LWLockRelease(header->lock);

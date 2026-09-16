@@ -14,6 +14,25 @@ SELECT * FROM svs_memory_read_stats(100);
 SELECT svs_memory_admit_database(100, (40 * 1024 * 1024)::bigint);
 SELECT * FROM svs_memory_test_check_invariants();
 
+-- Restoring a residency budget on transaction abort (an UPDATE's PRE_COMMIT
+-- ran, then something else aborted the transaction anyway) lands on exactly
+-- the pre-transaction value when nothing since-committed would be undercut.
+SELECT svs_memory_restore_residency_budget(100, (25 * 1024 * 1024)::bigint);
+SELECT residency_budget FROM svs_memory_read_stats(100);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_admit_database(100, (40 * 1024 * 1024)::bigint);
+
+-- A restore that would undercut bytes a build or load committed under the
+-- now-reverted budget instead clamps to the committed floor, with a
+-- WARNING, rather than stranding those bytes over budget.
+SELECT svs_memory_reconcile_load(100, 999, (35 * 1024 * 1024)::bigint);
+SELECT svs_memory_restore_residency_budget(100, (20 * 1024 * 1024)::bigint);
+SELECT residency_budget FROM svs_memory_read_stats(100);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(100, 999);
+SELECT svs_memory_admit_database(100, (40 * 1024 * 1024)::bigint);
+SELECT * FROM svs_memory_test_check_invariants();
+
 -- A build peak at handoff that does not match what was reserved is capped
 -- at zero rather than driving the per-database build counter negative.
 SELECT svs_memory_reserve_build(100, 11, (2 * 1024 * 1024)::bigint, (2 * 1024 * 1024)::bigint);
@@ -429,16 +448,14 @@ SELECT residency_bytes_committed = :before_621_residency_bytes_committed
   FROM svs_memory_read_stats(621);
 SELECT * FROM svs_memory_test_check_invariants();
 
--- durable_committed_floor: the fallback SvsMemoryAdmitDatabase's caller
--- passes in place of the live counter when a worker cannot yet be trusted
--- to answer from shared memory (svs_index_residency.h). A freshly
--- constructed entry's committed bytes read 0 (no reconcile has ever run
--- against it), exactly as they do on a real server restart before the
--- worker reloads anything; the floor is the only thing standing between
--- that 0 and a budget lowered out from under bytes a durable row still
--- remembers. Byte-scale, not MB-scale, values throughout this section: the
--- shared global residency ceiling is nearly exhausted by every admit
--- earlier in this file.
+-- durable_committed_floor: what SvsMemoryAdmitDatabase's caller passes in
+-- place of the live counter when a worker cannot yet be trusted to answer
+-- from shared memory (svs_index_residency.h). A fresh entry's committed
+-- bytes read 0, same as after a real server restart before the worker
+-- reloads anything; the floor guards against lowering a budget under bytes
+-- a durable row still remembers. Byte-scale, not MB-scale, values
+-- throughout: the shared global residency ceiling is nearly exhausted by
+-- every admit earlier in this file.
 --
 -- A floor above the (here, zero) live counter blocks a decrease the live
 -- counter alone would allow.

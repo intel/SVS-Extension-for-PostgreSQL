@@ -153,10 +153,9 @@ typedef struct SvsDbCpuColumns
  * consumer (PublishMemoryOverrides) reads only this, never the CPU fields.
  *
  * NULL residency_memory/search_work_mem become 0, matching the shmem
- * override fields' own "0 means unset, resolve to the default GUC" idiom
- * (memory-management-design.md Section 5.3/5.3b); unlike CPU's threads,
- * 0 is never a valid override value here, so it doubles cleanly as the
- * NULL sentinel with no separate -1 encoding needed.
+ * override fields' own "0 means unset, resolve to the default GUC" idiom;
+ * unlike CPU's threads, 0 is never a valid override value here, so it
+ * doubles cleanly as the NULL sentinel with no separate -1 encoding needed.
  */
 typedef struct SvsDbMemoryColumns
 {

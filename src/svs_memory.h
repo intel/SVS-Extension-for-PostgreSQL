@@ -134,6 +134,13 @@ extern void SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget,
 									uint64 durableCommittedFloor);
 
 /*
+ * Backend, on transaction abort. Restores dbOid's budget to priorBudget,
+ * floored at what's currently committed so the restore strands nothing.
+ * Never errors; no-op if dbOid has no slot.
+ */
+extern void SvsMemoryRestoreResidencyBudget(Oid dbOid, uint64 priorBudget);
+
+/*
  * Backend build gate, at CREATE INDEX. Reserves buildPeak against the
  * global build ceiling and residencyEstimate against dbOid's residency
  * budget, keyed by relid, owned by the calling backend. Errors on either
@@ -206,6 +213,17 @@ extern void SvsMemoryAbortInsert(Oid dbOid, Oid relid);
  * its startup scan.
  */
 extern void SvsMemoryReapDeadReservations(void);
+
+/*
+ * Worker, at startup. Drops every RESIDENT reservation for dbOid not in
+ * liveRelids -- an index dropped while the worker was down. RESERVED/
+ * CONFIRMED reservations belong to a live backend; SvsMemoryReapDeadReservations
+ * covers those. droppedRelids needs VAMANA_MAX_INDEXES entries of room;
+ * caller clears each dropped relid's durable record.
+ */
+extern void SvsMemoryReconcileResidentReservations(Oid dbOid,
+													const Oid *liveRelids, int numLiveRelids,
+													Oid *droppedRelids, int *numDropped);
 
 typedef struct SvsMemoryStats
 {

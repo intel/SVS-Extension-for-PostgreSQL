@@ -68,6 +68,10 @@ CREATE FUNCTION svs_memory_admit_database(db_oid oid, residency_budget bigint, d
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_restore_residency_budget(db_oid oid, prior_budget bigint)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_reserve_build(db_oid oid, relid oid, build_peak bigint, residency_estimate bigint)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

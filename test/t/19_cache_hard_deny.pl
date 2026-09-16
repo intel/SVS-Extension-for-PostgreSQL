@@ -149,8 +149,8 @@ $node->safe_psql("tinydb", qq(
     ));
     isnt($qret, 0,
         'querying the index the worker could not load fails');
-    like($qstderr, qr/not loaded/,
-        'the query error is "not loaded", not a slot-count denial');
+    like($qstderr, qr/residency budget/,
+        'the query error names the residency budget, not a generic "not loaded" message');
 }
 
 # ---------------------------------------------------------------------------

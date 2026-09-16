@@ -22,6 +22,7 @@
 #include "vamana.h"
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
+#include "svs_index_residency.h"
 #include "vamanaworker.h"
 #include "svs_cpu_slots.h"
 #include "svs_wrapper.h"
@@ -565,6 +566,35 @@ VamanaWorkerSeedIndexCount(void)
 }
 
 /*
+ * An index dropped while the worker was down leaves its RESIDENT
+ * reservation stale -- nothing reloads it, and relcache invalidation only
+ * evicts entries already in this (freshly started, empty) process's cache.
+ */
+static void
+VamanaWorkerReconcileResidencyOnStartup(void)
+{
+	List	   *liveRelidsList = VamanaWorkerEnumerateIndexes();
+	int			numLive = list_length(liveRelidsList);
+	Oid		   *liveRelids = palloc(sizeof(Oid) * numLive);
+	Oid			droppedRelids[VAMANA_MAX_INDEXES];
+	int			numDropped;
+	int			i = 0;
+
+	foreach_oid(relid, liveRelidsList)
+		liveRelids[i++] = relid;
+
+	SvsMemoryReconcileResidentReservations(VamanaWorkerShmemPtr->dbOid,
+											liveRelids, numLive,
+											droppedRelids, &numDropped);
+
+	for (i = 0; i < numDropped; i++)
+		SvsIndexResidencyRecordUnload(droppedRelids[i]);
+
+	list_free(liveRelidsList);
+	pfree(liveRelids);
+}
+
+/*
  * VamanaWorkerStopAccepting: close the request intake with a full barrier so
  * the drain's final sweep is ordered after every enqueue that observed the
  * worker as accepting.  The full barrier is required: the enqueue side pairs
@@ -741,10 +771,11 @@ VamanaStandbyActivateSlotBounded(Oid relid)
 }
 
 /*
- * VamanaWorkerRunStartupTransaction: record the already-captured database
- * name for the txn-less heartbeat loop, log readiness, and seed indexCount
- * from the live catalog (primary-only — a standby neither maintains the
- * counter nor can run the enumerating SPI).  SPI requires a live
+ * VamanaWorkerRunStartupTransaction: capture the database name for the
+ * txn-less heartbeat loop, log readiness, reconcile stale residency
+ * reservations, and seed indexCount from the live catalog (the last one
+ * primary-only — a standby neither maintains the counter nor can run the
+ * enumerating SPI).  Catalog access and SPI both require a live
  * transaction and snapshot, which only this call provides.
  */
 static void
@@ -756,6 +787,7 @@ VamanaWorkerRunStartupTransaction(VamanaZeroIndexState *zeroIndexState, char *da
 	zeroIndexState->dbname = datname;
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
 						 zeroIndexState->dbname)));
+	VamanaWorkerReconcileResidencyOnStartup();
 	if (VamanaIndexCountIsMaintained())
 		VamanaWorkerSeedIndexCount();
 	PopActiveSnapshot();

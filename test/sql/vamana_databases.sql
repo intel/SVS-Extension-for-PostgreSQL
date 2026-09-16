@@ -21,18 +21,13 @@ INSERT INTO vamana_databases (datname) VALUES ('vamana_databases_test_missing');
 INSERT INTO vamana_databases (datname)
 	VALUES ('template1'), ('postgres'), ('vamana_databases_test_dbc');
 
--- Each of the three rows just inserted has residency_memory NULL, so each
--- resolves independently against svs.default_residency_memory (Group 1
--- item 3's synchronous admission already ran, in the same transaction as
--- the INSERT above). The default is not a single shared allowance one
--- database's admission consumes for the others: every one of the three is
--- admitted at the same, full default-derived budget.
+-- All three rows have residency_memory NULL, so each resolves independently
+-- against svs.default_residency_memory: not a shared allowance one
+-- database's admission consumes for the others.
 --
--- search_work_mem is NULL on all three too, and resolves the same way
--- against svs.default_search_work_mem -- a different GUC from the ceiling
--- (svs.max_search_work_mem), so all three admitting here proves the
--- default and the ceiling are read from different places, not the same
--- number doing double duty.
+-- search_work_mem is NULL on all three too, resolving against
+-- svs.default_search_work_mem -- a different GUC from the ceiling
+-- (svs.max_search_work_mem).
 SELECT count(DISTINCT residency_memory_limit) = 1 AS all_three_resolve_to_the_same_default,
        count(DISTINCT search_work_mem_limit) = 1 AS all_three_resolve_search_work_mem_the_same,
        count(*) = 3 AS all_three_admitted
@@ -78,20 +73,14 @@ INSERT INTO vamana_databases (datname, search_work_mem) VALUES ('vamana_database
 INSERT INTO vamana_databases (datname, search_work_mem) VALUES ('vamana_databases_test_dbd', -1);
 
 -- A residency_memory override that alone exceeds svs.max_residency_memory is
--- rejected in the enrolling transaction itself (Group 1 item 3), not at some
--- later load: the INSERT never commits, so the row never exists to load
--- against. 2 TB is larger than any sane cluster-wide ceiling, so this holds
--- regardless of how the ceiling GUC happens to be tuned in this environment.
--- template1 rather than dbd: dbd already has a row (above), and this must
--- be a fresh enrollment, not an UPDATE on an existing one; template1's own
--- earlier row was deleted, but the database itself still exists.
+-- rejected in the enrolling transaction itself, not at some later load: the
+-- INSERT never commits, so the row never exists to load against. 2 TB is
+-- larger than any sane cluster-wide ceiling. template1 rather than dbd: dbd
+-- already has a row (above), and this must be a fresh enrollment.
 --
--- The error's DETAIL line names the live global committed sum, which
--- depends on whatever else this regression run has already admitted
--- elsewhere in the suite -- terse verbosity keeps this assertion
--- deterministic by dropping that line, leaving only the primary message
--- (fixed: template1's OID and this statement's own 2 TB request never
--- change).
+-- The error's DETAIL line names the live global committed sum, which varies
+-- with the rest of this regression run; terse verbosity drops it, leaving
+-- only the primary message.
 \set VERBOSITY terse
 INSERT INTO vamana_databases (datname, residency_memory)
 	VALUES ('template1', 2 * 1024 * 1024);
@@ -100,10 +89,9 @@ SELECT count(*) = 0 AS oversized_override_never_committed
 	FROM vamana_databases WHERE datname = 'template1';
 
 -- Same shape, for search_work_mem against svs.max_search_work_mem: the
--- catalog-time sum check (Group 4) rejects a single row that alone exceeds
--- the ceiling just as synchronously as Group 1's residency admission does,
--- even though the two checks live in separate triggers and one reads shmem
--- while the other reads only this table.
+-- catalog-time sum check rejects a single row that alone exceeds the
+-- ceiling, even though it lives in a separate trigger from the residency
+-- check and reads only this table, not shmem.
 \set VERBOSITY terse
 INSERT INTO vamana_databases (datname, search_work_mem)
 	VALUES ('template1', 2 * 1024 * 1024);
@@ -111,8 +99,8 @@ INSERT INTO vamana_databases (datname, search_work_mem)
 SELECT count(*) = 0 AS oversized_search_work_mem_never_committed
 	FROM vamana_databases WHERE datname = 'template1';
 
--- total_memory_mb no longer exists: the residency/build axis split (design
--- doc Section 5.3) dissolved the combined cap.
+-- total_memory_mb no longer exists: the residency/build axis split
+-- dissolved the combined cap.
 SELECT total_memory_mb FROM vamana_databases LIMIT 0;
 
 -- INSERT/UPDATE/DELETE/TRUNCATE are all revoked from PUBLIC; the table owner
@@ -128,11 +116,8 @@ RESET ROLE;
 DROP ROLE vamana_databases_test_nonowner;
 
 -- Unlike residency_memory, search_work_mem has no decrease-validation
--- trigger at all (Group 4 design: nothing about this axis is durable or
--- crash-sensitive, so there is nothing a lower value could make unsafe).
--- dbe already has search_work_mem = 2048 from its enrollment above;
--- lowering it while nothing is in flight simply succeeds, with no special
--- UPDATE-time check to bypass.
+-- trigger at all: nothing about this axis is durable or crash-sensitive, so
+-- a lower value has nothing to make unsafe.
 UPDATE vamana_databases SET search_work_mem = 1 WHERE datname = 'vamana_databases_test_dbe';
 SELECT search_work_mem FROM vamana_databases WHERE datname = 'vamana_databases_test_dbe';
 
@@ -167,17 +152,13 @@ DROP DATABASE vamana_databases_test_leak;
 INSERT INTO vamana_databases (datname, enabled) VALUES ('contrib_regression', true);
 
 -- New memory-accounting stats columns: shape, zero-vs-NULL, and visibility.
--- The enrolling INSERT above already admitted this database into the
--- accounting module synchronously, in the same transaction (Group 1 item
--- 3), so residency_bytes_committed/build_bytes_committed read 0, not NULL
--- -- nothing has loaded into *this admission* yet, but "admitted at zero"
--- and "never admitted" are different states. (The exact-zero case,
--- including residency_drift, is proven above against
--- vamana_databases_test_dbc, a database nothing else in the suite can have
--- touched; contrib_regression is the one database every other regression
--- file also builds real indexes in, so residency_drift here can be
--- nonzero if this file runs after them in the same regression run -- it
--- reflects a durable row not yet reconciled by a fresh reload, not a bug.)
+-- The enrolling INSERT above already admitted this database synchronously,
+-- in the same transaction, so residency_bytes_committed/build_bytes_committed
+-- read 0, not NULL: "admitted at zero" and "never admitted" are different
+-- states. (The exact-zero case, including residency_drift, is proven above
+-- against vamana_databases_test_dbc; contrib_regression is shared with
+-- every other regression file, so its drift can be nonzero here -- a
+-- durable row not yet reconciled by a fresh reload, not a bug.)
 SELECT residency_bytes_committed = 0 AS committed_is_zero,
        build_bytes_committed = 0 AS build_is_zero,
        residency_drift IS NOT NULL AS drift_is_not_null,
@@ -195,14 +176,10 @@ SELECT DISTINCT search_scratch_bytes_per_query IS NULL AS unset_before_any_searc
 -- second database gives a real foreign row to check the unprivileged role
 -- cannot see, not just a NULL one indistinguishable from "nothing admitted".
 --
--- postgres's row from the earlier INSERT/UPDATE/TRUNCATE dance above is
--- long gone (TRUNCATE emptied the whole table), but the worker slot that
--- enrollment reserved is released only on the launcher's own async
--- reconcile, not synchronously with the TRUNCATE. Wait for that stale slot
--- to actually clear first, so the row this block finds below is the fresh
--- one it creates here, never a leftover from before -- otherwise this
--- check's result depends on how much wall-clock time happened to pass
--- since the TRUNCATE, not on anything this block itself does.
+-- postgres's earlier worker slot outlives the TRUNCATE that emptied the
+-- table (it's released only on the launcher's own async reconcile), so wait
+-- for it to clear before enrolling again, or the row found below could be
+-- that stale slot rather than this fresh enrollment.
 DO $$
 BEGIN
 	FOR i IN 1 .. 300 LOOP
@@ -231,9 +208,8 @@ SELECT count(*) = 1 AS foreign_row_exists_for_superuser
   FROM pg_stat_vamana_worker
  WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
 
--- residency_drift as a boolean, not a raw value, for the same reason as the
--- earlier check on this same database: contrib_regression's drift can be
--- nonzero depending on what the rest of the suite already built here.
+-- residency_drift as a boolean, not a raw value: contrib_regression's drift
+-- can be nonzero depending on what the rest of the suite already built here.
 CREATE ROLE vamana_databases_test_stats_reader NOLOGIN;
 SET ROLE vamana_databases_test_stats_reader;
 SELECT residency_bytes_committed, build_bytes_committed,

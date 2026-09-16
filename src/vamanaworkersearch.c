@@ -52,10 +52,9 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	 * Get or load the index.  Avoid the transaction and catch-up drain if the
 	 * index is already warm in process memory.
 	 *
-	 * VamanaWorkerEnsureIndexCurrent calls VamanaWorkerGetOrLoadIndex, which
-	 * propagates ERRCODE_CONFIGURATION_LIMIT_EXCEEDED (cache full) rather than
-	 * returning NULL.  Catch that here so a full-cache denial on the search path
-	 * fails the queued slots cleanly instead of escaping to the BGW top-level
+	 * VamanaWorkerEnsureIndexCurrent propagates ERRCODE_OUT_OF_MEMORY
+	 * (residency refusal) rather than returning NULL. Catch it here so the
+	 * queued slots fail cleanly instead of escaping to the BGW top-level
 	 * handler and killing the worker.
 	 */
 	{
@@ -99,12 +98,12 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 					AbortCurrentTransaction();
 
 				/*
-				 * Only forward the cache-full message verbatim: it is a sanitized
-				 * compile-time constant.  Any other load error (SVS library failure,
-				 * I/O error) may contain internal detail, so substitute a generic
+				 * Forward the residency-refusal message verbatim -- its only
+				 * dynamic content is a relid and a byte count. Any other load
+				 * error may carry internal detail, so substitute a generic
 				 * string and keep the detail in the server log only.
 				 */
-				if (edata->sqlerrcode == ERRCODE_CONFIGURATION_LIMIT_EXCEEDED &&
+				if (edata->sqlerrcode == ERRCODE_OUT_OF_MEMORY &&
 					edata->message != NULL)
 					snprintf(loadErrMsg, sizeof(loadErrMsg), "%s", edata->message);
 				else
@@ -172,6 +171,15 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 
 	if (scratchReserved > 0 && !SvsMemoryReserveSearchScratch(MyDatabaseId, scratchReserved))
 	{
+		VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
+		uint64		resolvedLimit;
+		bool		isOverride;
+
+		LWLockAcquire(header->lock, LW_SHARED);
+		resolvedLimit = SvsMemoryResolveSearchWorkMem(VamanaWorkerShmemPtr);
+		isOverride = VamanaWorkerShmemPtr->searchWorkMemMbOverride > 0;
+		LWLockRelease(header->lock);
+
 		for (int i = 0; i < n; i++)
 		{
 			VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
@@ -179,7 +187,9 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 			slot->numResults = 0;
 			snprintf(slot->errorMessage, sizeof(slot->errorMessage),
 					 "vamana worker: batch against index %u exceeds this database's "
-					 "search-scratch budget", relid);
+					 "search-scratch budget of %llu bytes%s",
+					 relid, (unsigned long long) resolvedLimit,
+					 isOverride ? " (search_work_mem override)" : " (svs.default_search_work_mem)");
 			slot->errorCategory = VAMANA_ERR_OOM;
 			pg_write_barrier();
 			pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);

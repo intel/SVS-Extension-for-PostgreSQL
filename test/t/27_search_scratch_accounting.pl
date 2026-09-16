@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 27_search_scratch_gate.pl — the search-scratch axis (Group 4): a catalog-time
+# 27_search_scratch_accounting.pl — the search-scratch axis: a catalog-time
 # sum check on search_work_mem rejects an enrollment that would push the
 # cluster-wide sum over svs.max_search_work_mem, serialized against a
 # concurrent enrollment doing the same; a batch of queries whose combined
@@ -27,7 +27,7 @@ if (($ENV{enable_injection_points} // 'no') ne 'yes')
     plan skip_all => 'server not built with --enable-injection-points';
 }
 
-my $node = PostgreSQL::Test::Cluster->new('search_scratch_gate');
+my $node = PostgreSQL::Test::Cluster->new('search_scratch_accounting');
 $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'vector,svs'");
 $node->append_conf('postgresql.conf', "wal_level = logical");
@@ -48,8 +48,8 @@ wait_for_worker($node);
 
 # ---------------------------------------------------------------------------
 # Case 0: the catalog-time sum check serializes concurrent enrollments, the
-# same as Group 1's residency admission does for a decrease, but here for a
-# plain sum across every row. 240MB each fits alone under the 400MB ceiling;
+# same way residency admission serializes a decrease, but here for a plain
+# sum across every row. 240MB each fits alone under the 400MB ceiling;
 # both together (480MB) do not, so exactly one of the two must commit.
 # ---------------------------------------------------------------------------
 {
@@ -349,8 +349,8 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
 # ---------------------------------------------------------------------------
 # Case 4: lowering search_work_mem while a batch is in flight disturbs
 # nothing already admitted -- no decrease-validation trigger exists for this
-# axis (Behavior 13) -- and the lower ceiling is simply what the next batch
-# is checked against.
+# axis -- and the lower ceiling is simply what the next batch is checked
+# against.
 # ---------------------------------------------------------------------------
 {
     $node->safe_psql('postgres',

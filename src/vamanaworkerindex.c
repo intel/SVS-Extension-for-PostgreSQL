@@ -176,26 +176,24 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  * the on-disk checkpoint (not a heap rebuild): such a handle predates any
  * post-checkpoint commit still pending in the replication slot.
  *
- * When propagateCacheFull is true, ERRCODE_CONFIGURATION_LIMIT_EXCEEDED
- * (cache full) is re-thrown to the caller rather than swallowed. The
- * AccessShareLock taken below is released either way; a caller that opts in
- * still owns its own transaction, snapshot, and any suppression guard it set
- * around this call. All other errors are always caught, logged as WARNING,
- * and result in a NULL return.
+ * When propagateResidencyRefusal is true, a residency-budget refusal
+ * (ERRCODE_OUT_OF_MEMORY) is re-thrown rather than swallowed; the
+ * AccessShareLock below is released either way. All other errors are
+ * caught, logged as WARNING, and return NULL.
  *
  * Must be called from within an active transaction (or the caller must open
  * one).
  */
 
 /*
- * Propagation predicate for VamanaRunInSubXact: return true when the cache is
- * full so the hard-deny reaches the caller rather than being swallowed here.
- * The predicate style follows VamanaShutdownCancelPending in vamanaworker.c.
+ * Propagation predicate for VamanaRunInSubXact: true when the load failed
+ * on a residency refusal, so it reaches the caller instead of being
+ * swallowed. Style follows VamanaShutdownCancelPending in vamanaworker.c.
  */
 static bool
-VamanaCacheFullError(void)
+VamanaResidencyRefusedError(void)
 {
-	return geterrcode() == ERRCODE_CONFIGURATION_LIMIT_EXCEEDED;
+	return geterrcode() == ERRCODE_OUT_OF_MEMORY;
 }
 
 /*
@@ -394,7 +392,7 @@ GetOrLoadIndexBody(void *arg)
 }
 
 SVSIndexHandle
-VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheFull)
+VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateResidencyRefusal)
 {
 	bool		needsRebuild;
 	SVSIndexHandle index;
@@ -428,7 +426,7 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
 	args.index = NULL;
 
 	/*
-	 * When propagateCacheFull is true, VamanaRunInSubXact re-throws instead of
+	 * When propagateResidencyRefusal is true, VamanaRunInSubXact re-throws instead of
 	 * returning, so the UnlockRelationOid below is never reached on that path.
 	 * Catch here just to release the lock before re-throwing further up to
 	 * the caller that opted in.
@@ -436,7 +434,7 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
 	PG_TRY();
 	{
 		result = VamanaRunInSubXact(GetOrLoadIndexBody, &args,
-									 propagateCacheFull ? VamanaCacheFullError : NULL);
+									 propagateResidencyRefusal ? VamanaResidencyRefusedError : NULL);
 	}
 	PG_CATCH();
 	{
@@ -467,12 +465,12 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
  * would re-apply post-checkpoint commits the rebuild already contains.
  *
  * Owns its transaction; the caller must not open one.  Returns NULL on
- * failure.  propagateCacheFull is forwarded to VamanaWorkerGetOrLoadIndex
+ * failure.  propagateResidencyRefusal is forwarded to VamanaWorkerGetOrLoadIndex
  * unchanged; see its header comment for what opting in obligates the caller
  * to clean up.
  */
 SVSIndexHandle
-VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull)
+VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateResidencyRefusal)
 {
 	bool		loadedFromDisk;
 	bool		needsRebuild;
@@ -481,7 +479,7 @@ VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull)
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk, propagateCacheFull);
+	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk, propagateResidencyRefusal);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 

@@ -79,12 +79,12 @@ VamanaGetCacheHash(void)
 static void
 VamanaFreeCacheEntryResources(VamanaIndexCache *entry)
 {
+	/* Every cached entry has a reservation, even the empty-table 0-byte case (VamanaCacheIndex). */
+	SvsMemoryAccountUnload(MyDatabaseId, entry->indexRelid);
+	SvsIndexResidencyRecordUnload(entry->indexRelid);
+
 	if (entry->svsIndex)
-	{
-		SvsMemoryAccountUnload(MyDatabaseId, entry->indexRelid);
-		SvsIndexResidencyRecordUnload(entry->indexRelid);
 		SVSFreeIndex(entry->svsIndex);
-	}
 
 	if (entry->tidMapping)
 		pfree(entry->tidMapping);

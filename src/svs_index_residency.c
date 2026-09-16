@@ -37,15 +37,44 @@ ConnectOrError(const char *callerName)
 		elog(ERROR, "%s: SPI_connect failed", callerName);
 }
 
+/*
+ * Row-lock dbOid's vamana_databases entry, serializing against a concurrent
+ * writer of its durable residency total. Skipped on a standby: there is no
+ * local writer to serialize against there. Caller must already hold an SPI
+ * connection.
+ */
+static void
+LockDatabaseRow(const char *datname)
+{
+	char	   *qualifiedName;
+	Oid			argTypes[1] = {NAMEOID};
+	Datum		argValues[1];
+	NameData	nameArg;
+
+	if (RecoveryInProgress())
+		return;
+
+	qualifiedName = SvsExtensionQualifiedRelationName("vamana_databases");
+	if (qualifiedName == NULL)
+		return;
+
+	namestrcpy(&nameArg, datname);
+	argValues[0] = NameGetDatum(&nameArg);
+
+	SPI_execute_with_args(psprintf("SELECT 1 FROM %s WHERE datname = $1 FOR UPDATE", qualifiedName),
+						   1, argTypes, argValues, NULL, false, 0);
+}
+
 static void
 RecordLoadBody(void *arg)
 {
 	RecordLoadArgs *args = (RecordLoadArgs *) arg;
 	char	   *qualifiedName = SvsExtensionQualifiedRelationName("svs_index_residency");
+	char	   *datname = get_database_name(args->dbOid);
 	Oid			argTypes[3] = {OIDOID, OIDOID, INT8OID};
 	Datum		argValues[3];
 
-	if (qualifiedName == NULL)
+	if (qualifiedName == NULL || datname == NULL)
 		return;
 
 	argValues[0] = ObjectIdGetDatum(args->indexRelid);
@@ -53,6 +82,7 @@ RecordLoadBody(void *arg)
 	argValues[2] = Int64GetDatum((int64) args->residentBytes);
 
 	ConnectOrError("SvsIndexResidencyRecordLoad");
+	LockDatabaseRow(datname);
 	SPI_execute_with_args(psprintf("INSERT INTO %s (index_relid, db_oid, resident_bytes) "
 									"VALUES ($1, $2, $3) "
 									"ON CONFLICT (index_relid) DO UPDATE SET "
@@ -87,15 +117,17 @@ RecordUnloadBody(void *arg)
 {
 	Oid			indexRelid = *(Oid *) arg;
 	char	   *qualifiedName = SvsExtensionQualifiedRelationName("svs_index_residency");
+	char	   *datname = get_database_name(MyDatabaseId);
 	Oid			argTypes[1] = {OIDOID};
 	Datum		argValues[1];
 
-	if (qualifiedName == NULL)
+	if (qualifiedName == NULL || datname == NULL)
 		return;
 
 	argValues[0] = ObjectIdGetDatum(indexRelid);
 
 	ConnectOrError("SvsIndexResidencyRecordUnload");
+	LockDatabaseRow(datname);
 	SPI_execute_with_args(psprintf("DELETE FROM %s WHERE index_relid = $1", qualifiedName),
 						   1, argTypes, argValues, NULL, false, 0);
 	SPI_finish();
@@ -118,33 +150,6 @@ SvsIndexResidencyRecordUnload(Oid indexRelid)
 	ereport(LOG,
 			(errmsg("vamana index %u: could not remove durable residency record; "
 					"will be corrected at the next load or unload", indexRelid)));
-}
-
-/*
- * Row-lock dbOid's vamana_databases entry, serializing against a concurrent
- * write to its durable residency total. Skipped on a standby: there is no
- * local writer to serialize against there.
- */
-static void
-LockDatabaseRow(const char *datname)
-{
-	char	   *qualifiedName;
-	Oid			argTypes[1] = {NAMEOID};
-	Datum		argValues[1];
-	NameData	nameArg;
-
-	if (RecoveryInProgress())
-		return;
-
-	qualifiedName = SvsExtensionQualifiedRelationName("vamana_databases");
-	if (qualifiedName == NULL)
-		return;
-
-	namestrcpy(&nameArg, datname);
-	argValues[0] = NameGetDatum(&nameArg);
-
-	SPI_execute_with_args(psprintf("SELECT 1 FROM %s WHERE datname = $1 FOR UPDATE", qualifiedName),
-						   1, argTypes, argValues, NULL, false, 0);
 }
 
 static uint64

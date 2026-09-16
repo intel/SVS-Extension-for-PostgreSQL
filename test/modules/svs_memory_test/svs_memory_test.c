@@ -267,6 +267,14 @@ svs_memory_admit_database(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_restore_residency_budget);
+Datum
+svs_memory_restore_residency_budget(PG_FUNCTION_ARGS)
+{
+	SvsMemoryRestoreResidencyBudget(PG_GETARG_OID(0), GetNonNegativeArgAsUint64(fcinfo, 1));
+	PG_RETURN_VOID();
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_reserve_build);
 Datum
 svs_memory_reserve_build(PG_FUNCTION_ARGS)
