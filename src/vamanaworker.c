@@ -69,17 +69,17 @@ volatile sig_atomic_t worker_got_sighup = false;
 /*
  * Two eviction-suppression guards, checked together by VamanaRelcacheCallback:
  *
- * vamana_eviction_suppressed -- set by drain/checkpoint/standby paths to
- *   suppress ALL evictions (e.g. during graceful shutdown drain, where every
- *   live entry must survive until it is checkpointed).
+ * vamana_eviction_suppressed -- blanket suppression for drain/checkpoint/standby.
  *
- * vamana_eviction_suppressed_for_relid -- set by write/warmup/reload paths
- *   to protect only the single relid being written.  Other relids are not
- *   suppressed, so DROP TABLE invalidations for stale cache entries can still
- *   fire and free their slots.
+ * vamana_active_load_relid -- set by write/warmup/reload paths for their own
+ *   transaction's duration. Suppresses eviction of every relid, not just this
+ *   one: a queued invalidation for an unrelated cached relid can be delivered
+ *   on this transaction's StartTransactionCommand. DROP INDEX reaches the
+ *   worker through VamanaReplicationQueueDropAtCommit, not this callback, so
+ *   suppressing here cannot miss a drop.
  */
 bool		vamana_eviction_suppressed = false;
-Oid			vamana_eviction_suppressed_for_relid = InvalidOid;
+Oid			vamana_active_load_relid = InvalidOid;
 
 /*
  * Set by VamanaRelcacheCallback when a relid outside the cache is invalidated;
@@ -384,9 +384,9 @@ VamanaWorkerProcessReloads(void)
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_eviction_suppressed_for_relid = relid;
+		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -416,18 +416,8 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 	if (vamana_eviction_suppressed)
 		return;
 
-	/*
-	 * Write/warmup/reload: suppress only the relid being actively operated on.
-	 * A global invalidation (relid == InvalidOid, meaning the SI queue
-	 * overflowed and any relation may have changed) is treated as a match
-	 * here too, so it is suppressed along with the protected relid rather
-	 * than evicting every other cached entry.  This mirrors the older
-	 * vamana_eviction_suppressed blanket flag's behavior for the same case,
-	 * so it is not a new gap; the standbyRediscoverPending flag set above
-	 * still catches a suppressed global invalidation on reconciliation.
-	 */
-	if (vamana_eviction_suppressed_for_relid != InvalidOid &&
-		(relid == InvalidOid || relid == vamana_eviction_suppressed_for_relid))
+	/* Write/warmup/reload: see vamana_active_load_relid's comment above. */
+	if (vamana_active_load_relid != InvalidOid)
 		return;
 
 	if (relid == InvalidOid)

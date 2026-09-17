@@ -329,7 +329,7 @@ VamanaWorkerRefreshSearchScratchCosts(void)
  *
  * The transaction's AcceptInvalidationMessages() can evict relid via
  * VamanaRelcacheCallback, freeing the SVSIndexHandle the caller already
- * fetched for this dispatch; vamana_eviction_suppressed_for_relid guards
+ * fetched for this dispatch; vamana_active_load_relid guards
  * against that (see VamanaWorkerProcessWriteSlot).
  */
 void
@@ -341,7 +341,7 @@ VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
 	if (cache == NULL || SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid) != 0)
 		return;
 
-	vamana_eviction_suppressed_for_relid = relid;
+	vamana_active_load_relid = relid;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -355,7 +355,7 @@ VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	vamana_eviction_suppressed_for_relid = InvalidOid;
+	vamana_active_load_relid = InvalidOid;
 }
 
 typedef struct GetOrLoadIndexArgs
