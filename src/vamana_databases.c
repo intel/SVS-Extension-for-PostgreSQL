@@ -440,7 +440,7 @@ ReserveSlotsForEnabledEntries(void)
 			ResidencyBudgetSnapshot *snapshot = palloc(sizeof(ResidencyBudgetSnapshot));
 
 			snapshot->dbOid = entry->dbOid;
-			snapshot->priorBudget = slotEntry->residencyBudget;
+			snapshot->priorBudget = SvsMemoryResidencyBudget(entry->dbOid);
 			ResidencyBudgetSnapshotsThisXact = lappend(ResidencyBudgetSnapshotsThisXact, snapshot);
 		}
 

@@ -178,6 +178,20 @@ SubtractFloored(uint64 *committed, uint64 amount, const char *what)
 		*committed -= amount;
 }
 
+/* Caller holds entry->memLock. A no-op if relid has no pending insert reservation. */
+static void
+ReleaseOldestInsertReservation(VamanaWorkerShmem *entry, Oid relid)
+{
+	SvsMemInsertReservation *reservation = FindOldestInsertReservation(entry, relid);
+
+	if (reservation != NULL)
+	{
+		SubtractFloored(&entry->residencyBytesCommitted, reservation->deltaBytes,
+						 "a released pending insert reservation");
+		FreeInsertReservation(reservation);
+	}
+}
+
 /* Global build ceiling. Caller holds entry->memLock; this also takes the header lock. */
 static bool
 TryAddGlobalBuildCommitted(uint64 amount)
@@ -275,6 +289,7 @@ SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget, uint64 durableCommitte
 	LWLockRelease(&entry->memLock);
 }
 
+/* No ceiling re-check here: already-committed bytes must never be stranded, even if that leaves the total over svs.max_residency_memory until the next admission. */
 void
 SvsMemoryRestoreResidencyBudget(Oid dbOid, uint64 priorBudget)
 {
@@ -440,7 +455,13 @@ SvsMemoryHandoffBuild(Oid dbOid, Oid relid)
 				 errmsg("no confirmed build reservation for index %u in database %u", relid, dbOid)));
 	}
 
-	Assert(reservation->state == SVS_MEM_CONFIRMED);
+	if (reservation->state != SVS_MEM_CONFIRMED)
+	{
+		LWLockRelease(&entry->memLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("build reservation for index %u in database %u is not confirmed, cannot hand off", relid, dbOid)));
+	}
 	reservation->state = SVS_MEM_HANDOFF;
 
 	LWLockRelease(&entry->memLock);
@@ -603,9 +624,6 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
-	SvsMemInsertReservation *insertReservation;
-	uint64		priorMeasured;
-	uint64		pendingDelta;
 
 	Assert(OidIsValid(relid));
 
@@ -620,12 +638,9 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 				 errmsg("no resident reservation for index %u in database %u to reanchor", relid, dbOid)));
 	}
 
-	insertReservation = FindOldestInsertReservation(entry, relid);
-	priorMeasured = reservation->measuredBytes;
-	pendingDelta = (insertReservation != NULL) ? insertReservation->deltaBytes : 0;
-
-	SubtractFloored(&entry->residencyBytesCommitted, priorMeasured + pendingDelta,
+	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
 					"an index's pre-reanchor residency");
+	ReleaseOldestInsertReservation(entry, relid);
 	entry->residencyBytesCommitted += measuredBytes;
 	reservation->measuredBytes = measuredBytes;
 
@@ -637,9 +652,24 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 						   (unsigned long long) entry->residencyBytesCommitted,
 						   (unsigned long long) entry->residencyBudget)));
 
-	if (insertReservation != NULL)
-		FreeInsertReservation(insertReservation);
+	LWLockRelease(&entry->memLock);
+}
 
+/*
+ * Closes out the pending insert reservation vamanainsert() opened for relid,
+ * once its bytes are already accounted for under a reservation created by
+ * SvsMemoryReconcileLoad rather than an existing one, as SvsMemoryReanchorInsert
+ * assumes.
+ */
+void
+SvsMemoryCloseInsertReservation(Oid dbOid, Oid relid)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+
+	Assert(OidIsValid(relid));
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+	ReleaseOldestInsertReservation(entry, relid);
 	LWLockRelease(&entry->memLock);
 }
 

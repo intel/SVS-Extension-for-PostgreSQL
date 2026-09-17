@@ -360,6 +360,14 @@ svs_memory_reanchor_insert(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_close_insert_reservation);
+Datum
+svs_memory_close_insert_reservation(PG_FUNCTION_ARGS)
+{
+	SvsMemoryCloseInsertReservation(PG_GETARG_OID(0), PG_GETARG_OID(1));
+	PG_RETURN_VOID();
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_abort_insert);
 Datum
 svs_memory_abort_insert(PG_FUNCTION_ARGS)

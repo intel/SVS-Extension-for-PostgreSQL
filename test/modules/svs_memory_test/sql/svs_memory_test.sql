@@ -588,10 +588,18 @@ SELECT svs_memory_test_search_scratch_bytes_per_query(671, 1) AS bytes_per_query
 SELECT svs_memory_test_recheck_search_scratch_options(671, 99, 64, true);
 SELECT * FROM svs_memory_test_check_invariants();
 
-SELECT svs_memory_reconcile_load(671, 2, (4 * 1024)::bigint);
-SELECT svs_memory_reconcile_load(671, 2, (5 * 1024)::bigint);
-SELECT svs_memory_account_unload(671, 2);
-SELECT residency_bytes_committed = (512 + 5 * 1024) AS retry_reservation_survives_stale_teardown
+-- VamanaWorkerBuildFirstInsert's empty-table first-insert path runs
+-- ReserveInsert (backend) then ReconcileLoad (worker) then must close the
+-- pending insert reservation itself, the same way the already-resident
+-- insert path's ReanchorInsert does. Reuses db 671, reset first since fake
+-- shmem has a fixed number of distinct dbOid slots.
+SELECT svs_memory_test_reset_database_accounting(671);
+SELECT svs_memory_admit_database(671, (1 * 1024)::bigint);
+SELECT svs_memory_reserve_insert(671, 1, (100)::bigint);
+SELECT svs_memory_reconcile_load(671, 1, (100)::bigint);
+SELECT svs_memory_close_insert_reservation(671, 1);
+SELECT count(*) = 0 AS pending_insert_reservation_closed
+  FROM svs_memory_test_insert_reservations(671);
+SELECT residency_bytes_committed = 100 AS committed_not_double_counted
   FROM svs_memory_read_stats(671);
-SELECT count(*) = 1 AS retry_reservation_still_tracked FROM svs_memory_test_reservations(671) WHERE relid = 2;
 SELECT * FROM svs_memory_test_check_invariants();

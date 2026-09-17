@@ -186,13 +186,6 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 
 	entry = VamanaAllocCacheSlot(indexRelid);
 
-	/*
-	 * Reconciled after any stale entry is torn down, so a refusal here
-	 * leaves this fresh entry empty rather than colliding with a
-	 * reservation the teardown above just released. Does not free svsIndex:
-	 * the caller still owns it exactly as if this function had never been
-	 * called, and frees it through their own existing cleanup path.
-	 */
 	if (!SvsMemoryReconcileLoad(MyDatabaseId, indexRelid, measuredBytes))
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),

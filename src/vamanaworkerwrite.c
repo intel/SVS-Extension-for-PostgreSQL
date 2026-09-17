@@ -175,6 +175,9 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 			return NULL;
 		}
 
+		/* ReconcileLoad only reconciles the build reservation; the inserting backend's own pending-insert reservation is separate and untouched by it. */
+		SvsMemoryCloseInsertReservation(MyDatabaseId, relid);
+
 		cache->residentBytes = measuredBytes;
 		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
 	}

@@ -212,6 +212,13 @@ extern bool SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes);
 extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
 
 /*
+ * Worker, on the empty-table first-insert build path: relid's reservation
+ * comes from SvsMemoryReconcileLoad rather than pre-existing, so this closes
+ * the oldest pending insert reservation for relid without reanchoring one.
+ */
+extern void SvsMemoryCloseInsertReservation(Oid dbOid, Oid relid);
+
+/*
  * Backend cleanup when a reserved insert never reaches the worker's
  * reanchor. Releases the caller's own pending reservation for relid; a
  * no-op if there is none.
