@@ -1980,3 +1980,39 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
+SELECT svs_memory_reconcile_load(671, 2, (4 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_reconcile_load(671, 2, (5 * 1024)::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_account_unload(671, 2);
+ svs_memory_account_unload 
+---------------------------
+ 
+(1 row)
+
+SELECT residency_bytes_committed = (512 + 5 * 1024) AS retry_reservation_survives_stale_teardown
+  FROM svs_memory_read_stats(671);
+ retry_reservation_survives_stale_teardown
+-------------------------------------------
+ t
+(1 row)
+
+SELECT count(*) = 1 AS retry_reservation_still_tracked FROM svs_memory_test_reservations(671) WHERE relid = 2;
+ retry_reservation_still_tracked
+---------------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+

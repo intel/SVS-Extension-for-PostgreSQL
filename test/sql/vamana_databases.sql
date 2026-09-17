@@ -6,6 +6,20 @@
 \d vamana_databases
 \d svs_index_residency
 
+CREATE DATABASE vamana_databases_test_bypass_a;
+CREATE DATABASE vamana_databases_test_bypass_b;
+
+\set VERBOSITY terse
+INSERT INTO vamana_databases (datname, search_work_mem)
+	VALUES ('vamana_databases_test_bypass_a', 70000), ('vamana_databases_test_bypass_b', 70000);
+\set VERBOSITY default
+SELECT count(*) = 0 AS multi_row_over_ceiling_fully_rejected
+  FROM vamana_databases
+ WHERE datname IN ('vamana_databases_test_bypass_a', 'vamana_databases_test_bypass_b');
+
+DROP DATABASE vamana_databases_test_bypass_a;
+DROP DATABASE vamana_databases_test_bypass_b;
+
 -- The row-level trigger resolves datname against pg_database, so every row
 -- here must name a database that actually exists.
 CREATE DATABASE vamana_databases_test_dbc;

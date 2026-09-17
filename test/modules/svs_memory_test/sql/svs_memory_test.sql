@@ -587,3 +587,11 @@ SELECT svs_memory_test_search_scratch_bytes_per_query(671, 1) AS bytes_per_query
 -- Recheck against a relid with no reservation is a safe no-op.
 SELECT svs_memory_test_recheck_search_scratch_options(671, 99, 64, true);
 SELECT * FROM svs_memory_test_check_invariants();
+
+SELECT svs_memory_reconcile_load(671, 2, (4 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(671, 2, (5 * 1024)::bigint);
+SELECT svs_memory_account_unload(671, 2);
+SELECT residency_bytes_committed = (512 + 5 * 1024) AS retry_reservation_survives_stale_teardown
+  FROM svs_memory_read_stats(671);
+SELECT count(*) = 1 AS retry_reservation_still_tracked FROM svs_memory_test_reservations(671) WHERE relid = 2;
+SELECT * FROM svs_memory_test_check_invariants();

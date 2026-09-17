@@ -25,7 +25,8 @@ Check constraints:
     "vamana_databases_search_work_mem_check" CHECK (search_work_mem > 0)
 Triggers:
     vamana_databases_changed AFTER INSERT OR DELETE OR UPDATE ON vamana_databases FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_notify()
-    vamana_databases_check_search_work_mem_ceiling BEFORE INSERT OR UPDATE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling()
+    vamana_databases_check_search_work_mem_ceiling_ins AFTER INSERT ON vamana_databases REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling()
+    vamana_databases_check_search_work_mem_ceiling_upd AFTER UPDATE ON vamana_databases REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling()
     vamana_databases_queue_reservation AFTER INSERT OR UPDATE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation()
     vamana_databases_reject_delete_with_live_indexes BEFORE DELETE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_reject_delete_with_live_indexes()
 
@@ -39,6 +40,23 @@ Triggers:
 Indexes:
     "svs_index_residency_pkey" PRIMARY KEY, btree (index_relid)
 
+CREATE DATABASE vamana_databases_test_bypass_a;
+CREATE DATABASE vamana_databases_test_bypass_b;
+\set VERBOSITY terse
+INSERT INTO vamana_databases (datname, search_work_mem)
+	VALUES ('vamana_databases_test_bypass_a', 70000), ('vamana_databases_test_bypass_b', 70000);
+ERROR:  search_work_mem total would exceed svs.max_search_work_mem
+\set VERBOSITY default
+SELECT count(*) = 0 AS multi_row_over_ceiling_fully_rejected
+  FROM vamana_databases
+ WHERE datname IN ('vamana_databases_test_bypass_a', 'vamana_databases_test_bypass_b');
+ multi_row_over_ceiling_fully_rejected 
+---------------------------------------
+ t
+(1 row)
+
+DROP DATABASE vamana_databases_test_bypass_a;
+DROP DATABASE vamana_databases_test_bypass_b;
 -- The row-level trigger resolves datname against pg_database, so every row
 -- here must name a database that actually exists.
 CREATE DATABASE vamana_databases_test_dbc;
@@ -150,7 +168,7 @@ SELECT count(*) = 0 AS oversized_override_never_committed
 \set VERBOSITY terse
 INSERT INTO vamana_databases (datname, search_work_mem)
 	VALUES ('template1', 2 * 1024 * 1024);
-ERROR:  setting "template1".search_work_mem would exceed svs.max_search_work_mem
+ERROR:  search_work_mem total would exceed svs.max_search_work_mem
 \set VERBOSITY default
 SELECT count(*) = 0 AS oversized_search_work_mem_never_committed
 	FROM vamana_databases WHERE datname = 'template1';
