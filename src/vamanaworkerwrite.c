@@ -16,6 +16,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
@@ -103,6 +105,12 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	VamanaOptions  *opts;
 	int				rawAlpha;
 	SVSDistanceType distanceType;
+	int				searchWindowSize;
+	bool			useSearchHistory;
+	int				compressionType;
+	int				compressionPrimary;
+	int				compressionSecondary;
+	int				leanvecDims;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
@@ -115,19 +123,26 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		? opts->build_window_size
 		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
 	distanceType = VamanaGetDistanceMetric(indexRel);
+	searchWindowSize = VamanaResolveSearchWindowSize(opts);
+	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
+	compressionType = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
+	compressionPrimary = opts ? opts->compression_primary : 0;
+	compressionSecondary = opts ? opts->compression_secondary : 0;
+	leanvecDims = opts ? opts->leanvec_dims : -1;
 
 	index_close(indexRel, AccessShareLock);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	algorithm = SVSCreateAlgorithm(cache->graph_degree, buildWindow,
-								   vamana_search_window_size,
-								   rawAlpha, VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+								   searchWindowSize,
+								   rawAlpha, useSearchHistory);
 	storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
 	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
 
-	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1, &errorCode);
+	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1,
+									 cache->graph_degree, cache->dimensions, &errorCode);
 
 	SVSFreeBuilder(builder);
 	SVSFreeStorage(storage);
@@ -141,9 +156,55 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		return NULL;
 	}
 
+	/*
+	 * cache already holds a RESIDENT reservation at 0 bytes, from the
+	 * empty-table VamanaCacheIndex call that created this entry; reconcile
+	 * it to this build's real measured size rather than accounting it as a
+	 * fresh load.
+	 */
+	{
+		uint64		measuredBytes = SVSGetIndexMemoryUsage(svsIndex);
+
+		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes))
+		{
+			SVSFreeIndex(svsIndex);
+			ereport(WARNING,
+					(errmsg("vamana worker: first-insert build for index %u exceeds this database's residency budget",
+							relid),
+					 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes)));
+			return NULL;
+		}
+
+		/* ReconcileLoad only reconciles the build reservation; the inserting backend's own pending-insert reservation is separate and untouched by it. */
+		SvsMemoryCloseInsertReservation(MyDatabaseId, relid);
+
+		cache->residentBytes = measuredBytes;
+		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
+	}
+
 	cache->svsIndex = svsIndex;
 	cache->nextExternalId = 1;
 	cache->numVectors = 1;
+
+	{
+		SVSBuildConfig config = {
+			.graph_degree = cache->graph_degree,
+			.alpha = rawAlpha,
+			.search_window_size = searchWindowSize,
+			.compression_type = compressionType,
+			.compression_primary = compressionPrimary,
+			.compression_secondary = compressionSecondary,
+			.distance_type = distanceType,
+			.data_type = SVS_DTYPE_FLOAT32,
+			.dimensions = cache->dimensions,
+			.leanvec_dims = leanvecDims,
+			.build_window_size = buildWindow,
+			.search_num_threads = 0,
+			.numVectors = cache->numVectors,
+		};
+
+		VamanaSeedSearchScratchCostFromConfig(relid, &config, useSearchHistory);
+	}
 
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	cache->tidMapping = palloc0((Size) 1024 * sizeof(ItemPointerData));
@@ -250,10 +311,9 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	 * LOAD slot, but that slot was processed after this write slot was already
 	 * collected as PENDING.  A second attempt will find the fresh entry.
 	 *
-	 * propagateCacheFull is false at both calls above: a cache-full denial
-	 * here must not skip this retry or the empty-table fallback below, since
-	 * neither exists to handle cache-full specifically and both are equally
-	 * valid when the index simply is not resident right now.
+	 * propagateResidencyRefusal is false at both calls: a refusal here must
+	 * not skip this retry or the empty-table fallback below, since both are
+	 * equally valid when the index simply is not resident yet.
 	 */
 	if (index == NULL)
 		index = VamanaWorkerEnsureIndexCurrent(relid, false);
@@ -268,6 +328,8 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
 	if (rwlock != NULL)
 		LWLockAcquire(rwlock, LW_EXCLUSIVE);
+
+	INJECTION_POINT("vamana-write-holds-exclusive-lock", NULL);
 
 	switch (slot->slotKind)
 	{
@@ -295,6 +357,9 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 					ereport(ERROR,
 							(errmsg("vamana worker: SVSAddPoints failed for index %u",
 									relid)));
+
+				cache->residentBytes = SVSGetIndexMemoryUsage(index);
+				SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes);
 
 				/* Grow tidMapping if needed. */
 				if ((int) externalId >= cache->tidMappingCapacity)
@@ -455,18 +520,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 {
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 
-	/*
-	 * Suppress VamanaRelcacheCallback for the entire duration of this write
-	 * slot.  The CREATE INDEX that triggered a preceding LOAD slot commits
-	 * only after that LOAD slot marks DONE — meaning the relcache invalidation
-	 * arrives after the LOAD slot has already cleared the flag.  The very
-	 * next write slot then calls StartTransactionCommand(), which calls
-	 * AcceptInvalidationMessages() and processes the queued invalidation.
-	 * Without the guard, VamanaRelcacheCallback evicts the index mid-write,
-	 * freeing the SVSIndexHandle we already retrieved and causing a
-	 * use-after-free or stale-index write.
-	 */
-	vamana_eviction_suppressed_for_relid = slot->indexRelid;
+	vamana_active_load_relid = slot->indexRelid;
 
 	PG_TRY();
 	{
@@ -498,12 +552,12 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 							 VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
 
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
 		return;
 	}
 	PG_END_TRY();
 
-	vamana_eviction_suppressed_for_relid = InvalidOid;
+	vamana_active_load_relid = InvalidOid;
 }
 
 /* -----------------------------------------------------------------------
@@ -519,6 +573,11 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
  * The backend packed a VamanaLoadParams into the queryVec buffer before
  * setting the slot PENDING.  On success the cache entry is live and the
  * waiting backend's VamanaWorkerSubmitLoad returns true.
+ *
+ * VamanaCacheIndex runs inside its own short transaction: it durably
+ * records the index's residency via SPI, which needs one. That transaction
+ * closes before VamanaReplicationCreate/Open below, which must run outside
+ * any write transaction (CreateInitDecodingContext rejects those).
  *
  * Must not throw: all errors are converted to VAMANA_SLOT_ERROR.
  */
@@ -540,6 +599,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		VamanaGetIndexSavePath(VamanaWorkerShmemPtr->dbOid, relid, savepath, sizeof(savepath));
 
 		config.dimensions			= params->dimensions;
+		config.numVectors			= params->numVectors;
 		config.graph_degree			= params->graph_degree;
 		config.alpha				= params->alpha;
 		config.search_window_size	= params->search_window_size;
@@ -572,19 +632,19 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		}
 
 		/*
-		 * Protect this relid from eviction while populating its cache entry.
-		 * Any relcache invalidation that fires inside VamanaCacheIndex (e.g.
-		 * from a concurrent DROP) must not free the handle mid-populate.
-		 * Invalidations for other relids are not suppressed: DROP TABLE events
-		 * from earlier rounds may be pending, and allowing them to fire here
-		 * lets VamanaRelcacheCallback mark stale slots invalid so Branch 3 of
-		 * VamanaAllocCacheSlot can reclaim them.
-		 *
-		 * The guard is cleared only after DONE is written.  The next write
-		 * slot sets its own guard on entry, covering the window where the
-		 * CREATE INDEX commit's relcache invalidation arrives.
+		 * Protects relid's own cache entry from eviction while it's being
+		 * populated; see vamana_active_load_relid's declaration for why every
+		 * other cached relid is also protected for the same window. Cleared
+		 * only after DONE is written, so the next write slot's own guard
+		 * covers the window where the CREATE INDEX commit's invalidation
+		 * arrives.
 		 */
-		vamana_eviction_suppressed_for_relid = relid;
+		vamana_active_load_relid = relid;
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
 		VamanaCacheIndex(relid, svsIndex,
 						 params->dimensions,
 						 params->graph_degree,
@@ -594,6 +654,9 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 						 params->tidMappingCapacity,
 						 params->nextExternalId,
 						 params->numDeleted);
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
 
 		/* Ownership passed to the cache entry; a later error must not free these. */
 		svsIndex = NULL;
@@ -616,20 +679,38 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 				cache->replicationSlot = VamanaReplicationOpen(
 					VamanaWorkerShmemPtr->dbOid, relid);
 				cache->lastReplayLsn = GetFlushRecPtr(NULL);
+
+				VamanaSeedSearchScratchCostFromConfig(relid, &config,
+													   VAMANA_DEFAULT_USE_SEARCH_HISTORY);
 			}
 		}
 
 		slot->numResults = params->numVectors;
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
 		loadSucceeded = true;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata;
 
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
+
+		/*
+		 * VamanaReplicationCreate runs after the residency transaction already
+		 * committed, and can throw while holding ReplicationSlotAllocationLock
+		 * (e.g. "all replication slots are in use"). AbortCurrentTransaction
+		 * would be a no-op here since no transaction is open, leaking that lock
+		 * for the rest of the worker's life; unwind unconditionally instead, as
+		 * VamanaWorkerProcessWriteSlot's catch block does.
+		 */
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		AbortOutOfAnyTransaction();
+		RESUME_INTERRUPTS();
 
 		/* Leave ErrorContext before allocating anything; errfinish() left us in it. */
 		MemoryContextSwitchTo(oldcontext);
@@ -710,9 +791,9 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_eviction_suppressed_for_relid = relid;
+		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, true);
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -724,7 +805,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 	{
 		ErrorData  *edata;
 
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
 
 		if (IsTransactionState())
 			AbortCurrentTransaction();

@@ -326,7 +326,7 @@ typedef struct VamanaWorkerShmem
 	/*
 	 * Live sum of this database's currently-dispatched search batches'
 	 * scratch cost. Its own atomic, never memLock: it must not contend with
-	 * a build gate or a load reconcile (Section 5.8 of the design doc).
+	 * a build gate or a load reconcile.
 	 */
 	pg_atomic_uint64 searchScratchBytesInFlight;
 
@@ -397,7 +397,7 @@ typedef struct VamanaWorkerShmemHeader
 	 * sum, see SvsMemoryAdmitDatabase) and every database's in-progress
 	 * build peaks. Guarded by lock; each per-database delta is folded in
 	 * only after that database's own memLock section has already committed
-	 * it, memLock always acquired first (Section 5.5 of the design doc).
+	 * it, memLock always acquired first.
 	 */
 	uint64			totalResidencyCommittedGlobal;
 	uint64			totalBuildCommittedGlobal;
@@ -570,7 +570,7 @@ void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 cat
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
-extern Oid	vamana_eviction_suppressed_for_relid;
+extern Oid	vamana_active_load_relid;
 
 /*
  * True when the error currently being handled is the query-cancel raised by the
@@ -627,19 +627,17 @@ List   *VamanaWorkerEnumerateIndexes(void);
 List   *VamanaWorkerEnumerateAllIndexes(void);
 
 /*
- * propagateCacheFull: when true, a cache-full denial (ERRCODE_CONFIGURATION_
- * LIMIT_EXCEEDED) is re-thrown to the caller instead of being swallowed into a
- * NULL return.  The relation lock taken internally is released either way. A
- * caller that opts in still owns its own transaction, active snapshot, and
- * any eviction-suppression guard it set around the call: those are outside
- * this function and are not unwound by the throw.  Pass false unless the
- * caller specifically needs the denial to reach its client (search dispatch,
- * explicit warmup); every other caller wants the pre-existing "NULL means try
- * again later" contract.
+ * propagateResidencyRefusal: when true, a residency-budget refusal
+ * (ERRCODE_OUT_OF_MEMORY) is re-thrown instead of returning NULL. The
+ * caller's own transaction, snapshot, and any suppression guard are not
+ * unwound by the throw -- only the internal relation lock is released
+ * either way. Pass false unless the caller needs the refusal to reach its
+ * client (search dispatch, explicit warmup); everyone else wants the
+ * existing "NULL means try again later" contract.
  */
 SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk,
-										  bool propagateCacheFull);
-SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull);
+										  bool propagateResidencyRefusal);
+SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateResidencyRefusal);
 void	VamanaWorkerResetStaleSlots(void);
 
 /* Converges a standby's cache onto targetRelids; returns true once every relid has a live slot. */

@@ -21,11 +21,6 @@
 
 #define VAMANA_MAX_DIM 2000
 
-/*
- * Maximum number of SVS index handles cached per process (background worker).
- */
-#define VAMANA_MAX_CACHED_INDEXES 8
-
 /* Support functions */
 #define VAMANA_DISTANCE_PROC 1
 #define VAMANA_NORM_PROC 2
@@ -134,6 +129,9 @@ typedef struct VamanaOptions
 	int			compression_secondary;	/* LeanVec secondary / LVQ residual (0 = none) */
 	int			leanvec_dims;		/* LeanVec dimensions (-1 = dimensions/2; unused by LVQ) */
 }			VamanaOptions;
+
+/* Search window size: svs.search_window_size GUC, else opts' reloption, else the default. */
+extern int VamanaResolveSearchWindowSize(const VamanaOptions *opts);
 
 typedef struct VamanaTypeInfo
 {
@@ -250,6 +248,7 @@ typedef struct VamanaIndexCache
 	int			tidMappingCapacity; /* allocated slots in tidMapping */
 	uint64		nextExternalId; /* local mirror of metapage nextExternalId */
 	int			numDeleted;		/* soft-deleted entries not yet compacted */
+	uint64		residentBytes;	/* exact bytes accounted at load; what unload must subtract */
 
 	/* Replication slot and WAL replay state */
 	struct VamanaReplicationSlot *replicationSlot;
@@ -350,7 +349,13 @@ void		VamanaInvalidateCache(Oid indexRelid);
 void		VamanaEvictCacheEntry(Oid indexRelid);
 void		VamanaForceHeapRebuild(Oid indexRelid);
 void		VamanaEvictAllCacheEntries(void);
-int			VamanaGetAllCachedRelids(Oid *out, int maxout);
+List	   *VamanaGetAllCachedRelids(void);
+void		VamanaWorkerRefreshSearchScratchCosts(void);
+void		VamanaWorkerEnsureSearchScratchCostComputed(Oid relid);
+void		VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid,
+												 VamanaIndexCache *cache, const VamanaOptions *opts);
+void		VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config,
+												   bool useSearchHistory);
 void		VamanaCacheSetNeedsSave(Oid indexRelid, bool flag);
 bool		VamanaCacheGetNeedsSave(Oid indexRelid);
 SVSIndexHandle VamanaRebuildFromTable(Relation index);

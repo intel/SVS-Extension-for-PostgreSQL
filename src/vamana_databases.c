@@ -20,6 +20,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana_databases.h"
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
@@ -30,6 +32,8 @@
 #include "commands/extension.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -39,6 +43,8 @@
 #define VAMANA_DATABASES_ATTNUM_DATNAME			1
 #define VAMANA_DATABASES_ATTNUM_ENABLED			2
 #define VAMANA_DATABASES_ATTNUM_RESTART_GENERATION	3
+#define VAMANA_DATABASES_ATTNUM_RESIDENCY_MEMORY	6
+#define VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM	7
 
 #define VAMANA_DATABASES_QUEUE_INITIAL_CAPACITY	16
 
@@ -47,6 +53,15 @@ static VamanaSubxidPendingArray *CurrentReservationQueue = NULL;
 
 /* dbOids reserved by this transaction; released on ABORT. TopTransactionContext-scoped. */
 static List *ReservedThisXactDbOids = NIL;
+
+/* Pre-existing databases whose budget this transaction changed at PRE_COMMIT; restored on ABORT. */
+typedef struct ResidencyBudgetSnapshot
+{
+	Oid			dbOid;
+	uint64		priorBudget;
+} ResidencyBudgetSnapshot;
+
+static List *ResidencyBudgetSnapshotsThisXact = NIL;
 
 static bool ReservationCallbacksRegistered = false;
 
@@ -58,6 +73,22 @@ static void VamanaDatabasesSubXactCallback(SubXactEvent event,
 											void *arg);
 static void ReserveSlotsForEnabledEntries(void);
 static void ReleaseSlotsReservedThisXact(void);
+static void RestoreResidencyBudgetSnapshotsThisXact(void);
+
+static bool
+ResidencyBudgetAlreadySnapshotted(Oid dbOid)
+{
+	ListCell   *lc;
+
+	foreach(lc, ResidencyBudgetSnapshotsThisXact)
+	{
+		ResidencyBudgetSnapshot *snapshot = (ResidencyBudgetSnapshot *) lfirst(lc);
+
+		if (snapshot->dbOid == dbOid)
+			return true;
+	}
+	return false;
+}
 
 static VamanaSubxidPendingArray *
 GetOrCreateReservationQueue(void)
@@ -72,7 +103,9 @@ GetOrCreateReservationQueue(void)
 }
 
 static void
-QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_generation)
+QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_generation,
+					  int residencyMemoryMbOverride, int searchWorkMemMbOverride,
+					  uint64 durableResidencyFloorBytes)
 {
 	VamanaDatabasesReservationEntry *entry =
 		VamanaSubxidPendingArrayAppend(GetOrCreateReservationQueue());
@@ -81,6 +114,9 @@ QueueReservationEntry(Name datname, Oid dbOid, bool enabled, int64 restart_gener
 	entry->dbOid = dbOid;
 	entry->enabled = enabled;
 	entry->restart_generation = restart_generation;
+	entry->residencyMemoryMbOverride = residencyMemoryMbOverride;
+	entry->searchWorkMemMbOverride = searchWorkMemMbOverride;
+	entry->durableResidencyFloorBytes = durableResidencyFloorBytes;
 }
 
 PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_queue_reservation);
@@ -94,9 +130,13 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	Datum		datnameDatum;
 	Datum		enabledDatum;
 	Datum		restartGenDatum;
+	Datum		residencyMemoryDatum;
+	Datum		searchWorkMemDatum;
 	Name		datname;
 	Oid			dbOid;
 	int64		restart_generation;
+	bool		residencyMemoryIsNull;
+	bool		searchWorkMemIsNull;
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "vamana_databases_queue_reservation: not called by trigger manager");
@@ -129,11 +169,90 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 		elog(ERROR, "vamana_databases_queue_reservation: restart_generation is null");
 	restart_generation = DatumGetInt64(restartGenDatum);
 
+	residencyMemoryDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_RESIDENCY_MEMORY, tupdesc,
+										 &residencyMemoryIsNull);
+	searchWorkMemDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM, tupdesc,
+									   &searchWorkMemIsNull);
+
 	dbOid = get_database_oid(NameStr(*datname), false);
 
-	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation);
+	/* Resolved here, not in the PRE_COMMIT callback that drains this queue: only this trigger has an active snapshot. */
+	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation,
+						  residencyMemoryIsNull ? 0 : DatumGetInt32(residencyMemoryDatum),
+						  searchWorkMemIsNull ? 0 : DatumGetInt32(searchWorkMemDatum),
+						  DatumGetBool(enabledDatum) ?
+							  SvsIndexResidencyDurableFloor(dbOid, VamanaWorkerLookupSlot(dbOid)) : 0);
 
 	return PointerGetDatum(NULL);	/* AFTER trigger; return value is ignored */
+}
+
+/*
+ * AFTER INSERT OR UPDATE, FOR EACH STATEMENT: rejects the whole statement if
+ * every row's resolved search_work_mem now sums past
+ * svs.max_search_work_mem. A FOR EACH ROW trigger can't see its own
+ * statement's sibling rows yet, so a multi-row INSERT could pass this check
+ * once per row while its real total went unchecked; running once per
+ * statement closes that gap, but the base table still doesn't reflect this
+ * same statement's own rows (same command ID), so this statement's rows
+ * come from the new_rows transition table instead, added to every other
+ * row already committed by an earlier statement.
+ * ShareRowExclusiveLock (self-conflicting) serializes concurrent statements
+ * against this sum.
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_check_search_work_mem_ceiling);
+Datum
+vamana_databases_check_search_work_mem_ceiling(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	char	   *qualifiedName;
+	uint64		totalMb;
+	bool		isnull;
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: not called by trigger manager");
+
+	if (!TRIGGER_FIRED_AFTER(trigdata->tg_event) || !TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: must be an AFTER ... FOR EACH STATEMENT trigger");
+
+	if (!TRIGGER_FIRED_BY_INSERT(trigdata->tg_event) && !TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: must be fired by INSERT or UPDATE");
+
+	LockRelationOid(trigdata->tg_relation->rd_id, ShareRowExclusiveLock);
+
+	qualifiedName = SvsDatabasesQualifiedName();
+	if (qualifiedName == NULL)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: vamana_databases not found in search path");
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: SPI_connect failed");
+
+	if (SPI_register_trigger_data(trigdata) != SPI_OK_TD_REGISTER)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: SPI_register_trigger_data failed");
+
+	if (SPI_execute(psprintf(
+						"SELECT "
+						"(SELECT COALESCE(SUM(COALESCE(search_work_mem, %d)), 0) FROM %s "
+						"  WHERE datname NOT IN (SELECT datname FROM new_rows)) + "
+						"(SELECT COALESCE(SUM(COALESCE(search_work_mem, %d)), 0) FROM new_rows)",
+						vamana_default_search_work_mem_mb, qualifiedName,
+						vamana_default_search_work_mem_mb),
+					 true, 0) != SPI_OK_SELECT ||
+		SPI_processed != 1)
+		elog(ERROR, "vamana_databases_check_search_work_mem_ceiling: sum query failed");
+
+	totalMb = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
+	Assert(!isnull);
+
+	SPI_finish();
+
+	if (totalMb > (uint64) vamana_max_search_work_mem_mb)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("search_work_mem total would exceed svs.max_search_work_mem"),
+				 errdetail("Every database's resolved search_work_mem would sum to %llu MB, over the %d MB ceiling.",
+						   (unsigned long long) totalMb, vamana_max_search_work_mem_mb)));
+
+	return PointerGetDatum(NULL);
 }
 
 /*
@@ -235,12 +354,14 @@ VamanaDatabasesXactCallback(XactEvent event, void *arg)
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 			ReservedThisXactDbOids = NIL;
+			ResidencyBudgetSnapshotsThisXact = NIL;
 			CurrentReservationQueue = NULL;
 			break;
 
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			ReleaseSlotsReservedThisXact();
+			RestoreResidencyBudgetSnapshotsThisXact();
 			CurrentReservationQueue = NULL;
 			break;
 
@@ -295,12 +416,15 @@ ReserveSlotsForEnabledEntries(void)
 	for (int i = 0; i < queue->count; i++)
 	{
 		VamanaDatabasesReservationEntry *entry = VamanaSubxidPendingArrayEntryAt(queue, i);
+		VamanaWorkerShmem *slotEntry;
 		bool		created;
+		uint64		residencyBudget;
 
 		if (!entry->enabled || entry->subxid == InvalidSubTransactionId)
 			continue;
 
-		if (VamanaWorkerReserveSlot(entry->dbOid, &created) == NULL)
+		slotEntry = VamanaWorkerReserveSlot(entry->dbOid, &created);
+		if (slotEntry == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("cannot enable database \"%s\": svs.max_databases (%d) already reached",
@@ -310,6 +434,22 @@ ReserveSlotsForEnabledEntries(void)
 		/* A pre-existing live slot found by this idempotent reservation must survive this transaction's abort. */
 		if (created)
 			ReservedThisXactDbOids = lappend_oid(ReservedThisXactDbOids, entry->dbOid);
+		else if (!list_member_oid(ReservedThisXactDbOids, entry->dbOid) &&
+				 !ResidencyBudgetAlreadySnapshotted(entry->dbOid))
+		{
+			ResidencyBudgetSnapshot *snapshot = palloc(sizeof(ResidencyBudgetSnapshot));
+
+			snapshot->dbOid = entry->dbOid;
+			snapshot->priorBudget = SvsMemoryResidencyBudget(entry->dbOid);
+			ResidencyBudgetSnapshotsThisXact = lappend(ResidencyBudgetSnapshotsThisXact, snapshot);
+		}
+
+		/* A too-small budget fails this INSERT/UPDATE here, in the same transaction, not a later load. */
+		VamanaWorkerSetMemoryOverrides(entry->dbOid, entry->residencyMemoryMbOverride,
+										entry->searchWorkMemMbOverride);
+
+		residencyBudget = SvsMemoryResolveResidencyBudget(slotEntry);
+		SvsMemoryAdmitDatabase(entry->dbOid, residencyBudget, entry->durableResidencyFloorBytes);
 	}
 
 	MemoryContextSwitchTo(oldContext);
@@ -329,12 +469,27 @@ ReleaseSlotsReservedThisXact(void)
 	ReservedThisXactDbOids = NIL;
 }
 
+static void
+RestoreResidencyBudgetSnapshotsThisXact(void)
+{
+	ListCell   *lc;
+
+	foreach(lc, ResidencyBudgetSnapshotsThisXact)
+	{
+		ResidencyBudgetSnapshot *snapshot = (ResidencyBudgetSnapshot *) lfirst(lc);
+
+		SvsMemoryRestoreResidencyBudget(snapshot->dbOid, snapshot->priorBudget);
+	}
+
+	ResidencyBudgetSnapshotsThisXact = NIL;
+}
+
 /* -----------------------------------------------------------------------
  * Table reads (SPI)
  * ----------------------------------------------------------------------- */
 
 char *
-SvsDatabasesQualifiedName(void)
+SvsExtensionQualifiedRelationName(const char *relname)
 {
 	Oid			extOid = get_extension_oid("svs", true);
 	Oid			nspOid;
@@ -343,11 +498,17 @@ SvsDatabasesQualifiedName(void)
 		return NULL;
 
 	nspOid = get_extension_schema(extOid);
-	if (!OidIsValid(get_relname_relid("vamana_databases", nspOid)))
+	if (!OidIsValid(get_relname_relid(relname, nspOid)))
 		return NULL;
 
 	return psprintf("%s.%s", quote_identifier(get_namespace_name(nspOid)),
-					quote_identifier("vamana_databases"));
+					quote_identifier(relname));
+}
+
+char *
+SvsDatabasesQualifiedName(void)
+{
+	return SvsExtensionQualifiedRelationName("vamana_databases");
 }
 
 int32

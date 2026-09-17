@@ -22,6 +22,7 @@
 #include "vamana.h"
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
+#include "svs_index_residency.h"
 #include "vamanaworker.h"
 #include "svs_cpu_slots.h"
 #include "svs_wrapper.h"
@@ -68,17 +69,17 @@ volatile sig_atomic_t worker_got_sighup = false;
 /*
  * Two eviction-suppression guards, checked together by VamanaRelcacheCallback:
  *
- * vamana_eviction_suppressed -- set by drain/checkpoint/standby paths to
- *   suppress ALL evictions (e.g. during graceful shutdown drain, where every
- *   live entry must survive until it is checkpointed).
+ * vamana_eviction_suppressed -- blanket suppression for drain/checkpoint/standby.
  *
- * vamana_eviction_suppressed_for_relid -- set by write/warmup/reload paths
- *   to protect only the single relid being written.  Other relids are not
- *   suppressed, so DROP TABLE invalidations for stale cache entries can still
- *   fire and free their slots.
+ * vamana_active_load_relid -- set by write/warmup/reload paths for their own
+ *   transaction's duration. Suppresses eviction of every relid, not just this
+ *   one: a queued invalidation for an unrelated cached relid can be delivered
+ *   on this transaction's StartTransactionCommand. DROP INDEX reaches the
+ *   worker through VamanaReplicationQueueDropAtCommit, not this callback, so
+ *   suppressing here cannot miss a drop.
  */
 bool		vamana_eviction_suppressed = false;
-Oid			vamana_eviction_suppressed_for_relid = InvalidOid;
+Oid			vamana_active_load_relid = InvalidOid;
 
 /*
  * Set by VamanaRelcacheCallback when a relid outside the cache is invalidated;
@@ -383,9 +384,9 @@ VamanaWorkerProcessReloads(void)
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_eviction_suppressed_for_relid = relid;
+		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
-		vamana_eviction_suppressed_for_relid = InvalidOid;
+		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
@@ -415,18 +416,8 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 	if (vamana_eviction_suppressed)
 		return;
 
-	/*
-	 * Write/warmup/reload: suppress only the relid being actively operated on.
-	 * A global invalidation (relid == InvalidOid, meaning the SI queue
-	 * overflowed and any relation may have changed) is treated as a match
-	 * here too, so it is suppressed along with the protected relid rather
-	 * than evicting every other cached entry.  This mirrors the older
-	 * vamana_eviction_suppressed blanket flag's behavior for the same case,
-	 * so it is not a new gap; the standbyRediscoverPending flag set above
-	 * still catches a suppressed global invalidation on reconciliation.
-	 */
-	if (vamana_eviction_suppressed_for_relid != InvalidOid &&
-		(relid == InvalidOid || relid == vamana_eviction_suppressed_for_relid))
+	/* Write/warmup/reload: see vamana_active_load_relid's comment above. */
+	if (vamana_active_load_relid != InvalidOid)
 		return;
 
 	if (relid == InvalidOid)
@@ -443,13 +434,10 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 static void
 VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
+	List	   *relids = VamanaGetAllCachedRelids();
 
-	for (int i = 0; i < n; i++)
+	foreach_oid(relid, relids)
 	{
-		Oid			relid = relids[i];
-
 		if (VamanaReplicationSlotWalLagExceeds(relid, vamana_max_slot_wal_size_mb))
 		{
 			ereport(LOG,
@@ -469,14 +457,13 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 static void
 VamanaWorkerDrainAllSlots(void)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n;
+	List	   *relids;
 
 	VamanaWorkerEnforceWalBudgetOnAllSlots();
 
-	n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
-	for (int i = 0; i < n; i++)
-		VamanaReplicationDrainSlot(relids[i]);
+	relids = VamanaGetAllCachedRelids();
+	foreach_oid(relid, relids)
+		VamanaReplicationDrainSlot(relid);
 }
 
 /*
@@ -569,6 +556,45 @@ VamanaWorkerSeedIndexCount(void)
 }
 
 /*
+ * An index dropped while the worker was down leaves its RESIDENT
+ * reservation stale -- nothing reloads it, and relcache invalidation only
+ * evicts entries already in this (freshly started, empty) process's cache.
+ *
+ * Deliberately does not reset every reservation to 0 and re-derive it by
+ * measurement: a live index's RESIDENT reservation is a persistent fact
+ * that survives the restart untouched. Resetting it would open a window,
+ * between the reset and the first re-measure, where a concurrent check of
+ * a lowered residency_memory override (see the decrease-validation trigger
+ * on vamana_databases) reads zero committed bytes for an index that is
+ * still fully resident, and could wave through a decrease the graph cannot
+ * survive. Keeping the reservation means the counter never understates
+ * what is actually loaded.
+ */
+static void
+VamanaWorkerReconcileResidencyOnStartup(void)
+{
+	List	   *liveRelidsList = VamanaWorkerEnumerateIndexes();
+	int			numLive = list_length(liveRelidsList);
+	Oid		   *liveRelids = palloc(sizeof(Oid) * numLive);
+	Oid			droppedRelids[VAMANA_MAX_INDEXES];
+	int			numDropped;
+	int			i = 0;
+
+	foreach_oid(relid, liveRelidsList)
+		liveRelids[i++] = relid;
+
+	SvsMemoryReconcileResidentReservations(VamanaWorkerShmemPtr->dbOid,
+											liveRelids, numLive,
+											droppedRelids, &numDropped);
+
+	for (i = 0; i < numDropped; i++)
+		SvsIndexResidencyRecordUnload(droppedRelids[i]);
+
+	list_free(liveRelidsList);
+	pfree(liveRelids);
+}
+
+/*
  * VamanaWorkerStopAccepting: close the request intake with a full barrier so
  * the drain's final sweep is ordered after every enqueue that observed the
  * worker as accepting.  The full barrier is required: the enqueue side pairs
@@ -628,17 +654,20 @@ VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
 static void
 VamanaWorkerDrainFinalCheckpoint(void)
 {
-	Oid			cached_relids[VAMANA_MAX_CACHED_INDEXES];
-	int			ncached;
+	List	   *relids = VamanaGetAllCachedRelids();
+	int			ncached = list_length(relids);
+	int			ci = 0;
 	TimestampTz	drainStart = GetCurrentTimestamp();
 
-	ncached = VamanaGetAllCachedRelids(cached_relids, VAMANA_MAX_CACHED_INDEXES);
-	for (int ci = 0; ci < ncached; ci++)
+	foreach_oid(relid, relids)
 	{
-		VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
+		VamanaIndexCache *cache = VamanaGetCache(relid);
 
 		if (cache == NULL || !cache->isValid || cache->svsIndex == NULL)
+		{
+			ci++;
 			continue;
+		}
 
 		if (TimestampDifferenceExceeds(drainStart, GetCurrentTimestamp(),
 									   vamana_shutdown_drain_budget_ms))
@@ -652,13 +681,14 @@ VamanaWorkerDrainFinalCheckpoint(void)
 
 		if (!VamanaTryCheckpointCachedIndex(cache))
 			ereport(LOG,
-					(errmsg("vamana shutdown: index %u not checkpointed",
-							cached_relids[ci])));
+					(errmsg("vamana shutdown: index %u not checkpointed", relid)));
 
 		INJECTION_POINT("vamana-drain-checkpoint-slow", NULL);
 
 		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts,
 							(uint64) GetCurrentTimestamp());
+
+		ci++;
 	}
 }
 
@@ -741,10 +771,11 @@ VamanaStandbyActivateSlotBounded(Oid relid)
 }
 
 /*
- * VamanaWorkerRunStartupTransaction: record the already-captured database
- * name for the txn-less heartbeat loop, log readiness, and seed indexCount
- * from the live catalog (primary-only — a standby neither maintains the
- * counter nor can run the enumerating SPI).  SPI requires a live
+ * VamanaWorkerRunStartupTransaction: capture the database name for the
+ * txn-less heartbeat loop, log readiness, reconcile stale residency
+ * reservations, and seed indexCount from the live catalog (the last one
+ * primary-only — a standby neither maintains the counter nor can run the
+ * enumerating SPI).  Catalog access and SPI both require a live
  * transaction and snapshot, which only this call provides.
  */
 static void
@@ -756,6 +787,7 @@ VamanaWorkerRunStartupTransaction(VamanaZeroIndexState *zeroIndexState, char *da
 	zeroIndexState->dbname = datname;
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
 						 zeroIndexState->dbname)));
+	VamanaWorkerReconcileResidencyOnStartup();
 	if (VamanaIndexCountIsMaintained())
 		VamanaWorkerSeedIndexCount();
 	PopActiveSnapshot();
@@ -794,13 +826,11 @@ VamanaWorkerHandlePromotion(bool *wasReplayingWal, const VamanaReplayRole *role)
 static void
 VamanaWorkerCheckpointDueIndexes(void)
 {
-	Oid		cached_relids[VAMANA_MAX_CACHED_INDEXES];
-	int		ncached;
+	List	   *relids = VamanaGetAllCachedRelids();
 
-	ncached = VamanaGetAllCachedRelids(cached_relids, VAMANA_MAX_CACHED_INDEXES);
-	for (int ci = 0; ci < ncached; ci++)
+	foreach_oid(relid, relids)
 	{
-		VamanaIndexCache *cache = VamanaGetCache(cached_relids[ci]);
+		VamanaIndexCache *cache = VamanaGetCache(relid);
 
 		if (cache == NULL || !ShouldCheckpoint(cache))
 			continue;
@@ -808,7 +838,7 @@ VamanaWorkerCheckpointDueIndexes(void)
 		if (!VamanaTryCheckpointCachedIndex(cache))
 			ereport(LOG,
 					(errmsg("vamana checkpoint: index %u not checkpointed this cycle, will retry",
-							cached_relids[ci])));
+							relid)));
 	}
 }
 
@@ -904,6 +934,7 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		{
 			ProcessConfigFile(PGC_SIGHUP);
 			worker_got_sighup = false;
+			VamanaWorkerRefreshSearchScratchCosts();
 		}
 
 		VamanaWorkerProcessSlotDrops();
@@ -1022,9 +1053,15 @@ VamanaWorkerMain(Datum main_arg)
 	 * A reused block may carry a previous instance's liveness state: a crash
 	 * exits without releasing the slot, so its pid and heartbeat survive.  The
 	 * worker owns these fields; reset them before announcing readiness.
+	 *
+	 * searchScratchBytesInFlight is the same kind of worker-owned state: it
+	 * has no reload path to reconcile it the way residencyBytesCommitted
+	 * gets corrected as each index reloads, so a crash mid-dispatch would
+	 * otherwise leak it forever.
 	 */
 	VamanaWorkerShmemPtr->workerPid = 0;
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
+	pg_atomic_write_u64(&VamanaWorkerShmemPtr->searchScratchBytesInFlight, 0);
 	InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
 	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
 

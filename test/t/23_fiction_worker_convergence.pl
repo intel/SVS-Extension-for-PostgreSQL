@@ -220,6 +220,8 @@ $node->append_conf('postgresql.conf', "max_wal_senders = 10");
 $node->append_conf('postgresql.conf', "max_worker_processes = 24");
 $node->append_conf('postgresql.conf', "max_parallel_workers = 8");
 $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+$node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+$node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
 $node->start;
 
 # Anchor every crash check to this run's log, not offset 0: the log file on

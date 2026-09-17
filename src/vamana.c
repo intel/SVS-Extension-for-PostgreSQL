@@ -40,6 +40,17 @@
 #endif
 
 int			vamana_search_window_size = VAMANA_DEFAULT_SEARCH_WINDOW;
+
+int
+VamanaResolveSearchWindowSize(const VamanaOptions *opts)
+{
+	if (vamana_search_window_size > 0)
+		return vamana_search_window_size;
+	if (opts != NULL && opts->search_window_size > 0)
+		return opts->search_window_size;
+	return VAMANA_DEFAULT_SEARCH_WINDOW;
+}
+
 int			vamana_search_num_threads = 0;
 int			vamana_compact_threshold_pct = 10;
 

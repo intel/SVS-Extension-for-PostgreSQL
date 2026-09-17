@@ -1345,4 +1345,109 @@ SKIP: {
     $node->stop;
 }
 
+# ===========================================================================
+# A concurrent write holding the per-index rwlock LW_EXCLUSIVE should only
+# block a concurrent search, never wedge the worker: once the write
+# releases, the blocked search must complete, and a fresh search afterward
+# must still succeed.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 3
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_write_search_race');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'vector,svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker_db($node, 'postgres', 30);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE write_race_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO write_race_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50) i;
+        CREATE INDEX write_race_idx ON write_race_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    $node->safe_psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM write_race_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    $node->safe_psql('postgres', "ALTER INDEX write_race_idx SET (use_search_history = false);");
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-write-holds-exclusive-lock', 'wait');");
+
+    my $writer = $node->background_psql('postgres', on_error_stop => 0);
+    $writer->query_until(qr//, qq(
+        INSERT INTO write_race_tbl (val) VALUES ('[$query_sql]'::vector);
+    ));
+
+    my $writer_parked = '';
+    for (1 .. 100) {
+        usleep(100_000);
+        $writer_parked = $node->safe_psql('postgres',
+            "SELECT pid FROM pg_stat_activity "
+          . "WHERE wait_event = 'vamana-write-holds-exclusive-lock';");
+        last if $writer_parked ne '';
+    }
+    isnt($writer_parked, '', 'the writer parks holding the rwlock LW_EXCLUSIVE');
+
+    my $searcher = $node->background_psql('postgres', on_error_stop => 0);
+    my $searcher_pid = $searcher->query('SELECT pg_backend_pid();');
+    chomp $searcher_pid;
+    $searcher->query_until(qr//, qq(
+        SET enable_seqscan = off;
+        SELECT id FROM write_race_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    usleep(500_000);
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_wakeup('vamana-write-holds-exclusive-lock');");
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-write-holds-exclusive-lock');");
+    $writer->quit;
+
+    my $search_done = 0;
+    for (1 .. 100) {
+        usleep(100_000);
+        my $busy = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity "
+          . "WHERE pid = $searcher_pid AND state = 'active';");
+        chomp $busy;
+        if ($busy eq '0') {
+            $search_done = 1;
+            last;
+        }
+    }
+    ok($search_done,
+        'the search blocked behind the writer eventually returns, one way or '
+      . 'another, within the worker response timeout');
+
+    if (!$search_done) {
+        $node->safe_psql('postgres', "SELECT pg_cancel_backend($searcher_pid);");
+        usleep(500_000);
+    }
+    $searcher->quit;
+
+    my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM write_race_tbl ORDER BY val <-> '[$query_sql]' LIMIT 1;
+    ));
+    is($ret, 0, "the worker is still responsive after the write/search race: a "
+      . "fresh search succeeds (stderr: $stderr)");
+
+    $node->stop;
+}
+
 done_testing();

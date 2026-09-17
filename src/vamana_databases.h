@@ -11,6 +11,15 @@
 /*
  * Per-row entry queued by the vamana_databases row-level trigger, backing
  * the PRE_COMMIT reservation callback in vamana_databases.c.
+ *
+ * residencyMemoryMbOverride/searchWorkMemMbOverride mirror the shmem
+ * override fields they get materialized into (VamanaWorkerSetMemoryOverrides):
+ * 0 means "column was NULL, use the GUC default".
+ *
+ * durableResidencyFloorBytes is computed here in the trigger, which still
+ * has the active snapshot a catalog read needs, rather than in the
+ * PRE_COMMIT callback that drains this queue, which does not (see
+ * svs_index_residency.h).
  */
 typedef struct VamanaDatabasesReservationEntry
 {
@@ -18,14 +27,20 @@ typedef struct VamanaDatabasesReservationEntry
 	Oid			dbOid;
 	bool		enabled;
 	int64		restart_generation;
+	int			residencyMemoryMbOverride;
+	int			searchWorkMemMbOverride;
+	uint64		durableResidencyFloorBytes;
 	SubTransactionId subxid;
 } VamanaDatabasesReservationEntry;
 
 /*
- * Schema-qualified "vamana_databases", resolved via the svs extension's own
- * namespace rather than search_path.  NULL if the extension (and therefore
- * the table) doesn't exist yet in this database.
+ * Schema-qualified relname, resolved via the svs extension's own namespace
+ * rather than search_path.  NULL if the extension (and therefore relname)
+ * doesn't exist yet in this database.
  */
+extern char *SvsExtensionQualifiedRelationName(const char *relname);
+
+/* Schema-qualified "vamana_databases". Equivalent to the call above for that one relation. */
 extern char *SvsDatabasesQualifiedName(void);
 
 /* NULL means "follow the GUC default"; the calculator's sentinel for that is -1. */

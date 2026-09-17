@@ -439,35 +439,23 @@ SELECT pg_reload_conf();
 -- svs.max_build_memory / svs.max_residency_memory / svs.default_residency_memory /
 -- svs.max_search_work_mem / svs.default_search_work_mem: all [1, INT_MAX] MB,
 -- default 100MB, PGC_SIGHUP. Always finite: no "0 means unlimited" path.
-SHOW svs.max_build_memory;
- svs.max_build_memory 
-----------------------
- 100MB
-(1 row)
-
-SHOW svs.max_residency_memory;
- svs.max_residency_memory 
---------------------------
- 100MB
-(1 row)
-
-SHOW svs.default_residency_memory;
- svs.default_residency_memory 
-------------------------------
- 100MB
-(1 row)
-
-SHOW svs.max_search_work_mem;
- svs.max_search_work_mem 
--------------------------
- 100MB
-(1 row)
-
-SHOW svs.default_search_work_mem;
- svs.default_search_work_mem 
------------------------------
- 100MB
-(1 row)
+--
+-- Asserted against pg_settings.boot_val, not SHOW: SHOW reflects whatever
+-- this cluster's postgresql.conf currently sets, while boot_val is the
+-- compiled-in default and stays fixed regardless of that override.
+SELECT name, boot_val, unit FROM pg_settings
+ WHERE name IN ('svs.max_build_memory', 'svs.max_residency_memory',
+				'svs.default_residency_memory', 'svs.max_search_work_mem',
+				'svs.default_search_work_mem')
+ ORDER BY name;
+             name             | boot_val | unit 
+------------------------------+----------+------
+ svs.default_residency_memory | 100      | MB
+ svs.default_search_work_mem  | 100      | MB
+ svs.max_build_memory         | 100      | MB
+ svs.max_residency_memory     | 100      | MB
+ svs.max_search_work_mem      | 100      | MB
+(5 rows)
 
 -- Out-of-range (below min): rejected at ALTER SYSTEM time
 ALTER SYSTEM SET svs.max_build_memory = 0;

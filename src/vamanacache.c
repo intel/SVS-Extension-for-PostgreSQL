@@ -12,6 +12,8 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
@@ -21,11 +23,13 @@
 #include "access/htup_details.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -33,150 +37,136 @@
 /*
  * In-Memory Index Cache Management
  *
- * Per-process cache: up to VAMANA_MAX_CACHED_INDEXES SVS index handles
- * (background worker only).
- *
- * Eviction policy: hard-deny.  When all slots hold live indexes, a new load
- * is refused with an explicit error.  The operator unloads one index first.
- * vamanaCacheUsed is a high-water mark and never shrinks; VamanaAllocCacheSlot
- * reclaims invalidated slots so evictions can free capacity.
+ * Per-process cache (background worker only): live SVS index handles, keyed
+ * by index relid in a dynamically sized hash table.  Capacity comes from
+ * this database's residency budget, not from a count of cache entries --
+ * VamanaCacheIndex refuses a load only when SvsMemoryReconcileLoad
+ * (svs_memory.c) reports that budget exhausted.  This module never repeats
+ * that check; it only decides which handle occupies which entry.
  */
 
-/* Array of per-process cache entries */
-static VamanaIndexCache *vamanaCacheSlots[VAMANA_MAX_CACHED_INDEXES];
-static int	vamanaCacheUsed = 0;	/* high-water mark of allocated slots */
-
-/*
- * Free resources held by a cache entry and mark it invalid.
- */
-static void
-VamanaClearCacheEntry(VamanaIndexCache *entry)
+/* Hash key must be indexRelid, and must be the first field. */
+typedef struct VamanaCacheHashEntry
 {
-	if (entry->svsIndex)
-	{
-		SVSFreeIndex(entry->svsIndex);
-		entry->svsIndex = NULL;
-	}
-	if (entry->tidMapping)
-	{
-		pfree(entry->tidMapping);
-		entry->tidMapping = NULL;
-	}
-	entry->isValid = false;
-	entry->needsSave = false;
+	Oid			indexRelid;
+	VamanaIndexCache *cache;
+}			VamanaCacheHashEntry;
 
-	if (entry->tidToExternalId != NULL)
-	{
-		hash_destroy(entry->tidToExternalId);
-		entry->tidToExternalId = NULL;
-	}
+static HTAB *vamanaIndexCacheHash = NULL;
 
-	VamanaReplicationClose(entry->replicationSlot);
-	entry->replicationSlot = NULL;
-	entry->lastReplayLsn = InvalidXLogRecPtr;
-	entry->lastReplayWalEnd = InvalidXLogRecPtr;
-	entry->opsSinceCheckpoint = 0;
-	entry->lastWriteTime = 0;
-	entry->lastCheckpointTime = 0;
-	entry->checkpointInProgress = false;
-	entry->searchThreadsApplied = 0;
+static HTAB *
+VamanaGetCacheHash(void)
+{
+	if (vamanaIndexCacheHash == NULL)
+	{
+		HASHCTL		hctl;
+
+		memset(&hctl, 0, sizeof(hctl));
+		hctl.keysize = sizeof(Oid);
+		hctl.entrysize = sizeof(VamanaCacheHashEntry);
+		hctl.hcxt = TopMemoryContext;
+
+		vamanaIndexCacheHash = hash_create("vamana index cache",
+											16,
+											&hctl,
+											HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	return vamanaIndexCacheHash;
 }
 
 /*
- * Find a cache slot by indexRelid.  Returns pointer to the slot, or NULL.
+ * Free every resource a cache entry owns.  Leaves the entry itself and its
+ * place in the hash table for the caller to dispose of.
+ */
+static void
+VamanaFreeCacheEntryResources(VamanaIndexCache *entry)
+{
+	/* Every cached entry has a reservation, even the empty-table 0-byte case (VamanaCacheIndex). */
+	SvsMemoryAccountUnload(MyDatabaseId, entry->indexRelid);
+	SvsIndexResidencyRecordUnload(entry->indexRelid);
+
+	if (entry->svsIndex)
+		SVSFreeIndex(entry->svsIndex);
+
+	if (entry->tidMapping)
+		pfree(entry->tidMapping);
+
+	if (entry->tidToExternalId != NULL)
+		hash_destroy(entry->tidToExternalId);
+
+	VamanaReplicationClose(entry->replicationSlot);
+}
+
+/*
+ * Find a cached entry by indexRelid.  Returns NULL if not cached, or if a
+ * prior load into this relid never finished populating it.
  */
 static VamanaIndexCache *
 VamanaFindCacheSlot(Oid indexRelid)
 {
-	for (int i = 0; i < vamanaCacheUsed; i++)
-	{
-		if (vamanaCacheSlots[i] != NULL &&
-			vamanaCacheSlots[i]->isValid &&
-			vamanaCacheSlots[i]->indexRelid == indexRelid)
-			return vamanaCacheSlots[i];
-	}
-	return NULL;
+	VamanaCacheHashEntry *hashEntry;
+
+	if (vamanaIndexCacheHash == NULL)
+		return NULL;
+
+	hashEntry = hash_search(vamanaIndexCacheHash, &indexRelid, HASH_FIND, NULL);
+	if (hashEntry == NULL || !hashEntry->cache->isValid)
+		return NULL;
+
+	return hashEntry->cache;
 }
 
 /*
- * Allocate a cache slot for indexRelid.  Returns a pointer to an empty (or
- * freshly cleared) VamanaIndexCache that the caller should fill.  Throws
- * ERRCODE_CONFIGURATION_LIMIT_EXCEEDED when all slots hold live indexes.
+ * Tear down and remove indexRelid's cache entry, if it has one.  A no-op
+ * otherwise.
+ */
+static void
+VamanaDestroyCacheEntry(Oid indexRelid)
+{
+	VamanaCacheHashEntry *hashEntry;
+
+	if (vamanaIndexCacheHash == NULL)
+		return;
+
+	hashEntry = hash_search(vamanaIndexCacheHash, &indexRelid, HASH_FIND, NULL);
+	if (hashEntry == NULL)
+		return;
+
+	VamanaFreeCacheEntryResources(hashEntry->cache);
+	MemoryContextDelete(hashEntry->cache->memCtx);
+	pfree(hashEntry->cache);
+
+	hash_search(vamanaIndexCacheHash, &indexRelid, HASH_REMOVE, NULL);
+}
+
+/*
+ * Create a fresh, empty cache entry for indexRelid, destroying any existing
+ * entry under that relid first.  Returns the entry for the caller to
+ * populate and validate.
  */
 static VamanaIndexCache *
 VamanaAllocCacheSlot(Oid indexRelid)
 {
-	int			slot;
+	VamanaCacheHashEntry *hashEntry;
 	VamanaIndexCache *entry;
 	MemoryContext oldCtx;
+	bool		found;
 
-	/* Branch 1: existing slot for this relid, valid or not. */
-	for (int i = 0; i < vamanaCacheUsed; i++)
-	{
-		if (vamanaCacheSlots[i] != NULL &&
-			vamanaCacheSlots[i]->indexRelid == indexRelid)
-		{
-			entry = vamanaCacheSlots[i];
-			VamanaClearCacheEntry(entry);
-			return entry;
-		}
-	}
+	VamanaDestroyCacheEntry(indexRelid);
 
-	/* Branch 2: grow into a never-used slot. */
-	if (vamanaCacheUsed < VAMANA_MAX_CACHED_INDEXES)
-	{
-		slot = vamanaCacheUsed;
-		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
-		entry = palloc0(sizeof(VamanaIndexCache));
-		entry->memCtx = AllocSetContextCreate(TopMemoryContext,
-											  "Vamana index cache",
-											  ALLOCSET_DEFAULT_SIZES);
-		MemoryContextSwitchTo(oldCtx);
-		vamanaCacheSlots[slot] = entry;
-		vamanaCacheUsed++;
-		return entry;
-	}
+	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+	entry = palloc0(sizeof(VamanaIndexCache));
+	entry->memCtx = AllocSetContextCreate(TopMemoryContext,
+										  "Vamana index cache",
+										  ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(oldCtx);
+	entry->indexRelid = indexRelid;
 
-	/*
-	 * Branch 3: reclaim an invalidated slot.  vamanaCacheUsed is a high-water
-	 * mark and never shrinks, so an array that has held 8 distinct indexes
-	 * stays "full" even after every entry is invalidated.  Without this branch
-	 * the hard-deny below would be permanent rather than a live-capacity signal,
-	 * and unloading an index could never make room for another.
-	 */
-	for (int i = 0; i < vamanaCacheUsed; i++)
-	{
-		entry = vamanaCacheSlots[i];
-		if (entry != NULL && !entry->isValid)
-		{
-			VamanaClearCacheEntry(entry);	/* idempotent; drops any residue */
-			/*
-			 * Clear the stale relid before returning.  The caller assigns
-			 * entry->indexRelid a few lines later, so the stale value is
-			 * normally overwritten.  Clearing it guards the narrow window
-			 * where an error between here and that assignment would otherwise
-			 * leave a slot matchable by Branch 1 under the wrong OID.
-			 */
-			entry->indexRelid = InvalidOid;
-			return entry;
-		}
-	}
+	hashEntry = hash_search(VamanaGetCacheHash(), &indexRelid, HASH_ENTER, &found);
+	Assert(!found);
+	hashEntry->cache = entry;
 
-	/*
-	 * Hard deny.  Every slot holds a live index.  Refuse rather than evict:
-	 * FIFO eviction was activity-blind and could knock a busy index out of
-	 * cache purely because it loaded first.  The operator unloads one
-	 * explicitly instead.
-	 *
-	 * Only the compile-time slot count is mentioned: a caller who cannot see
-	 * another database's pg_class must not learn which indexes are resident.
-	 */
-	ereport(ERROR,
-			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-			 errmsg("cannot load vamana index: all %d index cache slots are in use",
-					VAMANA_MAX_CACHED_INDEXES),
-			 errhint("Unload a cached vamana index in this database before loading another.")));
-	pg_unreachable();
+	return entry;
 }
 
 /*
@@ -192,8 +182,23 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	VamanaIndexCache *entry;
 	MemoryContext oldCtx;
 	int			capacity = (tidMappingCapacity > numVectors) ? tidMappingCapacity : numVectors;
+	uint64		measuredBytes = (svsIndex != NULL) ? SVSGetIndexMemoryUsage(svsIndex) : 0;
 
 	entry = VamanaAllocCacheSlot(indexRelid);
+
+	if (!SvsMemoryReconcileLoad(MyDatabaseId, indexRelid, measuredBytes))
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("cannot load vamana index %u: exceeds this database's residency budget",
+						indexRelid),
+				 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes),
+				 errhint("Raise svs.max_residency_memory, this database's residency_memory override, "
+						 "or unload another index in this database.")));
+
+	entry->residentBytes = measuredBytes;
+	SvsIndexResidencyRecordLoad(indexRelid, MyDatabaseId, measuredBytes);
+
+	INJECTION_POINT("vamana-cache-index-load-failure", NULL);
 
 	if (tidMapping != NULL && capacity > 0)
 	{
@@ -211,7 +216,6 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	}
 
 	entry->svsIndex = svsIndex;
-	entry->indexRelid = indexRelid;
 	entry->dimensions = dimensions;
 	entry->graph_degree = graph_degree;
 	entry->alpha = alpha;
@@ -388,10 +392,20 @@ VamanaCacheGetNeedsSave(Oid indexRelid)
 static bool
 VamanaCacheIsEmpty(void)
 {
-	for (int i = 0; i < vamanaCacheUsed; i++)
+	HASH_SEQ_STATUS status;
+	VamanaCacheHashEntry *hashEntry;
+
+	if (vamanaIndexCacheHash == NULL)
+		return true;
+
+	hash_seq_init(&status, vamanaIndexCacheHash);
+	while ((hashEntry = hash_seq_search(&status)) != NULL)
 	{
-		if (vamanaCacheSlots[i] != NULL && vamanaCacheSlots[i]->isValid)
+		if (hashEntry->cache->isValid)
+		{
+			hash_seq_term(&status);
 			return false;
+		}
 	}
 	return true;
 }
@@ -420,14 +434,12 @@ VamanaCacheMaybeKickLauncher(void)
 void
 VamanaInvalidateCache(Oid indexRelid)
 {
-	VamanaIndexCache *entry = VamanaFindCacheSlot(indexRelid);
-
-	if (entry != NULL)
+	if (VamanaFindCacheSlot(indexRelid) != NULL)
 	{
 		ereport(DEBUG1,
 				(errmsg("invalidating cached vamana index for relation %u",
 						indexRelid)));
-		VamanaClearCacheEntry(entry);
+		VamanaDestroyCacheEntry(indexRelid);
 	}
 
 	/*
@@ -464,67 +476,66 @@ VamanaInvalidateCache(Oid indexRelid)
 void
 VamanaEvictAllCacheEntries(void)
 {
-	for (int i = 0; i < vamanaCacheUsed; i++)
+	List	   *relids = VamanaGetAllCachedRelids();
+
+	foreach_oid(relid, relids)
 	{
-		VamanaIndexCache *entry = vamanaCacheSlots[i];
-
-		if (entry == NULL || !entry->isValid)
-			continue;
-
 		ereport(DEBUG1,
 				(errmsg("evicting vamana cache entry for relation %u (full eviction)",
-						entry->indexRelid)));
+						relid)));
 
-		VamanaClearCacheEntry(entry);
+		VamanaDestroyCacheEntry(relid);
 	}
 
 	VamanaCacheMaybeKickLauncher();
 }
 
 /*
- * Fill `out` with the OIDs of all currently valid cache entries.
- * Returns the number written; callers must size `out` to VAMANA_MAX_CACHED_INDEXES.
+ * Snapshot the relids of all currently cached indexes.
  *
- * Taking a snapshot of OIDs before iterating lets callers call VamanaGetCache()
- * per-entry without holding any lock, and gracefully handles mid-loop evictions
- * (VamanaGetCache returns NULL for a stale OID).
+ * Taking the snapshot before iterating lets callers call VamanaGetCache()
+ * per-entry without holding any lock, and gracefully handles mid-loop
+ * evictions (VamanaGetCache returns NULL for a stale relid).
  */
-int
-VamanaGetAllCachedRelids(Oid *out, int maxout)
+List *
+VamanaGetAllCachedRelids(void)
 {
-	int			n = 0;
+	List	   *relids = NIL;
+	HASH_SEQ_STATUS status;
+	VamanaCacheHashEntry *hashEntry;
 
-	for (int i = 0; i < vamanaCacheUsed && n < maxout; i++)
+	if (vamanaIndexCacheHash == NULL)
+		return NIL;
+
+	hash_seq_init(&status, vamanaIndexCacheHash);
+	while ((hashEntry = hash_seq_search(&status)) != NULL)
 	{
-		VamanaIndexCache *entry = vamanaCacheSlots[i];
-
-		if (entry != NULL && entry->isValid)
-			out[n++] = entry->indexRelid;
+		if (hashEntry->cache->isValid)
+			relids = lappend_oid(relids, hashEntry->indexRelid);
 	}
-	return n;
+
+	return relids;
 }
 
 /*
  * VamanaEvictCacheEntry - worker-safe cache eviction.
  *
- * Frees the in-process SVS handle and TID mapping for the given index and
- * marks the slot invalid.  Unlike VamanaInvalidateCache(), this function does
- * NOT delete the on-disk saved copy (so the caller can still load from disk)
- * and does NOT signal the background worker (avoiding reload loops when called
- * from within the worker process itself).
+ * Frees the in-process SVS handle and TID mapping for the given index.
+ * Unlike VamanaInvalidateCache(), this function does NOT delete the on-disk
+ * saved copy (so the caller can still load from disk) and does NOT signal
+ * the background worker (avoiding reload loops when called from within the
+ * worker process itself).
  */
 void
 VamanaEvictCacheEntry(Oid indexRelid)
 {
-	VamanaIndexCache *entry = VamanaFindCacheSlot(indexRelid);
-
-	if (entry == NULL)
+	if (VamanaFindCacheSlot(indexRelid) == NULL)
 		return;
 
 	ereport(DEBUG1,
 			(errmsg("evicting vamana cache entry for relation %u", indexRelid)));
 
-	VamanaClearCacheEntry(entry);
+	VamanaDestroyCacheEntry(indexRelid);
 
 	VamanaCacheMaybeKickLauncher();
 }
@@ -610,6 +621,36 @@ VamanaObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId,
 	/* Chain to any previously-installed hook */
 	if (prev_vamana_object_access_hook)
 		(*prev_vamana_object_access_hook) (access, classId, objectId, subId, arg);
+
+	/* NoLock: caller already holds AccessExclusiveLock. Recheck compares
+	 * against cached values, so a no-op alter costs nothing. */
+	if (access == OAT_POST_ALTER && classId == RelationRelationId && subId == 0)
+	{
+		Oid			vamanaAm = get_index_am_oid("vamana", true);
+
+		if (OidIsValid(vamanaAm) && get_rel_relam(objectId) == vamanaAm)
+		{
+			Relation	indexRel;
+			VamanaOptions *opts;
+
+			/*
+			 * ATExecSetRelOptions's catalog update only queues this
+			 * session's own relcache invalidation for the next
+			 * CommandCounterIncrement; this hook runs before that CCI, so
+			 * without it index_open below would still return the pre-ALTER
+			 * options.
+			 */
+			CommandCounterIncrement();
+
+			indexRel = index_open(objectId, NoLock);
+			opts = (VamanaOptions *) indexRel->rd_options;
+
+			SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, objectId,
+												  VamanaResolveSearchWindowSize(opts),
+												  opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+			index_close(indexRel, NoLock);
+		}
+	}
 
 	/*
 	 * Index creation: count the new relation only if it is a vamana index.

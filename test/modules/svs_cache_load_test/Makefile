@@ -1,11 +1,11 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-MODULE_big = svs_cache_kick_test
-OBJS = svs_cache_kick_test.o vamanacache.o
+MODULE_big = svs_cache_load_test
+OBJS = svs_cache_load_test.o vamanacache.o
 
-EXTENSION = svs_cache_kick_test
-DATA = svs_cache_kick_test--1.0.sql
+EXTENSION = svs_cache_load_test
+DATA = svs_cache_load_test--1.0.sql
 
 # A pattern-scoped vpath (not VPATH) so only .c lookups reach into src/;
 # VPATH would also redirect the install step's search for our .control file.

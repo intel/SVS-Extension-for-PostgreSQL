@@ -78,9 +78,9 @@ CREATE TABLE vamana_databases (
 SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');
 
 -- Durable fallback for the residency override's decrease-validation trigger
--- when the owning worker isn't live to answer against shmem (design doc
--- Section 5.3a). Written by build confirm and by the worker's load/unload
--- reconcile; not yet read or written by any Phase 0 code path.
+-- when the owning worker isn't live to answer against shmem. Read by the
+-- decrease-validation trigger; written by the worker's load/unload
+-- reconcile. Build confirm does not write it yet.
 CREATE TABLE svs_index_residency (
 	index_relid     oid PRIMARY KEY,
 	db_oid          oid NOT NULL,
@@ -108,6 +108,21 @@ CREATE FUNCTION vamana_databases_queue_reservation() RETURNS trigger
 CREATE TRIGGER vamana_databases_queue_reservation
 	AFTER INSERT OR UPDATE ON vamana_databases
 	FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation();
+
+-- Rejects an INSERT/UPDATE whose resolved search_work_mem would push the
+-- cluster-wide sum over svs.max_search_work_mem.
+CREATE FUNCTION vamana_databases_check_search_work_mem_ceiling() RETURNS trigger
+	AS 'MODULE_PATHNAME', 'vamana_databases_check_search_work_mem_ceiling' LANGUAGE C;
+
+CREATE TRIGGER vamana_databases_check_search_work_mem_ceiling_ins
+	AFTER INSERT ON vamana_databases
+	REFERENCING NEW TABLE AS new_rows
+	FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling();
+
+CREATE TRIGGER vamana_databases_check_search_work_mem_ceiling_upd
+	AFTER UPDATE ON vamana_databases
+	REFERENCING NEW TABLE AS new_rows
+	FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling();
 
 -- TRUNCATE bypasses DELETE triggers; block it since no role has a
 -- legitimate reason to bulk-wipe this table. The owner retains TRUNCATE

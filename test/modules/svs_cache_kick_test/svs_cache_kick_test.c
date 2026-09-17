@@ -27,10 +27,12 @@
 
 #include "postgres.h"
 
+#include "svs_index_residency.h"
+#include "svs_memory.h"
+#include "svs_wrapper.h"
 #include "vamana.h"
 #include "vamana_replication.h"
 #include "vamanaworker.h"
-#include "svs_wrapper.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -105,6 +107,12 @@ VamanaWorkerLookupSlot(Oid dbOid)
 	return NULL;
 }
 
+bool
+VamanaWorkerWithEntry(Oid dbOid, VamanaEntryMutatorCb cb, void *ctx)
+{
+	return false;
+}
+
 void
 VamanaWorkerQueueIndexCountDelta(Oid dbOid, int delta)
 {
@@ -118,6 +126,45 @@ VamanaWorkerSignalReload(Oid indexRelid)
 void
 SVSFreeIndex(SVSIndexHandle index)
 {
+}
+
+int
+VamanaResolveSearchWindowSize(const VamanaOptions *opts)
+{
+	return VAMANA_DEFAULT_SEARCH_WINDOW;
+}
+
+void
+SvsMemoryRecheckSearchScratchOptions(Oid dbOid, Oid relid, int searchWindowSize,
+									 bool useSearchHistory)
+{
+}
+
+bool
+SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
+{
+	return true;
+}
+
+void
+SvsMemoryAccountUnload(Oid dbOid, Oid relid)
+{
+}
+
+void
+SvsIndexResidencyRecordLoad(Oid indexRelid, Oid dbOid, uint64 residentBytes)
+{
+}
+
+void
+SvsIndexResidencyRecordUnload(Oid indexRelid)
+{
+}
+
+uint64
+SVSGetIndexMemoryUsage(SVSIndexHandle index)
+{
+	return 0;
 }
 
 /* ---------------------------------------------------------------------
@@ -175,12 +222,8 @@ PG_FUNCTION_INFO_V1(svs_cache_count);
 Datum
 svs_cache_count(PG_FUNCTION_ARGS)
 {
-	Oid			relids[VAMANA_MAX_CACHED_INDEXES];
-	int			n;
-
 	EnsureFakeWorkerContext();
-	n = VamanaGetAllCachedRelids(relids, VAMANA_MAX_CACHED_INDEXES);
-	PG_RETURN_INT32(n);
+	PG_RETURN_INT32(list_length(VamanaGetAllCachedRelids()));
 }
 
 PG_FUNCTION_INFO_V1(svs_cache_kicked);

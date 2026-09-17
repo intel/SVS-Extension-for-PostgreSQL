@@ -64,7 +64,16 @@ CREATE FUNCTION svs_memory_test_recheck_search_scratch_options(
 ) RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION svs_memory_admit_database(db_oid oid, residency_budget bigint)
+CREATE FUNCTION svs_memory_test_set_search_scratch_bytes_per_query(
+    db_oid oid, relid oid, bytes_per_query bigint
+) RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_admit_database(db_oid oid, residency_budget bigint, durable_committed_floor bigint DEFAULT 0)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_restore_residency_budget(db_oid oid, prior_budget bigint)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
@@ -72,8 +81,12 @@ CREATE FUNCTION svs_memory_reserve_build(db_oid oid, relid oid, build_peak bigin
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION svs_memory_handoff_build(db_oid oid, relid oid, build_peak bigint, measured_residency_bytes bigint)
+CREATE FUNCTION svs_memory_confirm_build(db_oid oid, relid oid, build_peak bigint, measured_residency_bytes bigint)
 RETURNS boolean
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_handoff_build(db_oid oid, relid oid)
+RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION svs_memory_abort_build(db_oid oid, relid oid)
@@ -93,6 +106,19 @@ RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION svs_memory_reanchor_insert(db_oid oid, relid oid, measured_bytes bigint)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_close_insert_reservation(db_oid oid, relid oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_abort_insert(db_oid oid, relid oid)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_test_set_insert_reservation_owner_pid(
+    db_oid oid, relid oid, delta_bytes bigint, owner_pid int)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 

@@ -22,13 +22,8 @@ use VamanaTestUtils qw(:all);
 
 my $N_TABLES = 17;    # one more than VAMANA_MAX_RELOAD_QUEUE (16)
 
-# Querying a table loads its index into the worker's cache, and the cache
-# hard-deny (VAMANA_MAX_CACHED_INDEXES == 8) refuses a 9th resident index
-# instead of evicting one. The reload-queue overflow this test exercises
-# does not need residency: VamanaInvalidateCache signals a reload for any
-# invalidated OID whether or not it currently has a cache entry. So only
-# the query loops (not table creation or TRUNCATE) are capped to cache
-# capacity, keeping $N_TABLES at 17 for the actual queue overflow.
+# A subset of the 17 tables is enough to exercise the query and post-drain
+# result-check loops together with the reload-queue overflow itself.
 my $N_QUERY_TABLES = 8;
 
 {
@@ -108,10 +103,8 @@ my $N_QUERY_TABLES = 8;
     # The evict_all handler returns before draining the per-OID reload queue
     # (vamanaworker.c VamanaWorkerProcessReloads), so the 16 relids already
     # queued when the 17th signal tripped evict_all are still sitting there.
-    # The worker's very next cycle drains all 16 through the per-OID loop
-    # against the 8-slot cache: exactly the more-than-8-distinct-indexes-in-
-    # one-pass workload that used to throw a cache-full error out of that
-    # loop and kill the worker. Confirm it now survives.
+    # The worker's very next cycle drains all 16 through the per-OID loop.
+    # Confirm it survives draining that many distinct indexes in one pass.
     my $pid_after_overflow = $node->safe_psql('postgres',
         "SELECT pid FROM pg_stat_activity "
       . "WHERE backend_type = 'vamana worker' LIMIT 1;");
@@ -137,8 +130,8 @@ my $N_QUERY_TABLES = 8;
         'no worker crash-exit in the server log');
     unlike($log, qr/Segmentation fault/,
         'no segfault in the server log');
-    like($log, qr/vamana worker: failed to load index \d+/,
-        'cache-full denials during the drain surfaced as WARNING, not a crash');
+    unlike($log, qr/vamana worker: failed to load index \d+/,
+        'draining 16 distinct indexes in one pass loads every one, none refused');
 
     my $nonempty = 0;
     for my $i (0 .. $N_QUERY_TABLES - 1)

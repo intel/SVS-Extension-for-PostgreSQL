@@ -1,11 +1,12 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 19_cache_hard_deny.pl — cache hard-deny: when all 8 index cache slots are
-# occupied, a 9th load is refused with an explicit error rather than silently
-# evicting the oldest entry.  Covers: deny at full capacity, no eviction of
-# the 8 existing entries, reclaim of an invalidated slot after an unload, and
-# worker survival after the denial.
+# 19_cache_hard_deny.pl — the index cache is byte-bounded, not slot-bounded:
+# loading more than eight small, well-under-budget indexes succeeds with no
+# artificial deny, from both the warmup path and the plain search path, and
+# with no eviction of any already-resident index.  A real refusal still
+# happens once a database's own residency budget is actually exhausted, and
+# that refusal names the residency ceiling, not a slot count.
 
 use strict;
 use warnings FATAL => 'all';
@@ -29,6 +30,8 @@ $node->append_conf('postgresql.conf', "wal_level = logical");
 $node->append_conf('postgresql.conf', "max_replication_slots = 20");
 $node->append_conf('postgresql.conf', "max_wal_senders = 10");
 $node->append_conf('postgresql.conf', "log_min_messages = 'log'");
+$node->append_conf('postgresql.conf', "svs.max_residency_memory = '150MB'");
+$node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
 $node->start;
 
 $node->safe_psql("postgres", "CREATE EXTENSION vector;");
@@ -39,10 +42,12 @@ my $wpid = wait_for_worker($node);
 like($wpid, qr/^\d+$/, 'vamana worker started');
 
 # ---------------------------------------------------------------------------
-# Create 11 tables (VAMANA_MAX_CACHED_INDEXES + 3 extras for the repeat test)
+# 11 small, well-under-budget indexes: one more than the old 8-slot cap.
 # ---------------------------------------------------------------------------
 
-for my $i (1 .. 11)
+my $N_TABLES = 11;
+
+for my $i (1 .. $N_TABLES)
 {
     $node->safe_psql("postgres", qq(
         CREATE TABLE t$i (id serial PRIMARY KEY, val vector($dim));
@@ -53,10 +58,8 @@ for my $i (1 .. 11)
 }
 wait_for_worker($node);
 
-# Capture baseline query results for indexes 1-8 so we can verify they are
-# not evicted by the failed attempt to load index 9.
 my @baseline;
-for my $i (1 .. 8)
+for my $i (1 .. $N_TABLES)
 {
     my $res = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
@@ -65,99 +68,96 @@ for my $i (1 .. 8)
     push @baseline, $res;
 }
 
-# Warm indexes 1-8 to fill all cache slots.
-for my $i (1 .. 8)
-{
-    $node->safe_psql("postgres", "SELECT svs_warmup_index('idx$i');");
-}
-
 # ---------------------------------------------------------------------------
-# Case 1: deny at 9
+# Case 1: every one of the 11 loads via svs_warmup_index, no deny.
 # ---------------------------------------------------------------------------
 
+for my $i (1 .. $N_TABLES)
 {
     my ($ret, $stdout, $stderr) = $node->psql("postgres",
-        "SELECT svs_warmup_index('idx9');");
-    isnt($ret, 0,
-        'warming a 9th index fails when all 8 cache slots are in use');
-    like($stderr, qr/all \d+ index cache slots are in use/,
-        'error message names the cache-full condition');
+        "SELECT svs_warmup_index('idx$i');");
+    is($ret, 0, "idx$i warms successfully (index $i of $N_TABLES)");
 }
 
 # ---------------------------------------------------------------------------
-# Case 2: no eviction — all 8 original indexes still return correct results
+# Case 2: no eviction — every index still returns its baseline result.
 # ---------------------------------------------------------------------------
 
+for my $i (1 .. $N_TABLES)
 {
-    for my $i (1 .. 8)
-    {
-        my $res = $node->safe_psql("postgres", qq(
-            SET enable_seqscan = off;
-            SELECT id FROM t$i ORDER BY val <-> '[$query_sql]' LIMIT 3;
-        ));
-        is($res, $baseline[$i - 1],
-            "idx$i query results unchanged after failed load of idx9 (no eviction)");
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Case 4: worker survives — heartbeat advances and a successful query follows
-# ---------------------------------------------------------------------------
-
-{
-    my $hb0 = $node->safe_psql("postgres",
-        "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
-      . "WHERE worker_pid = $wpid;");
-    my $hb_advanced = '';
-    for my $i (1 .. 40)
-    {
-        usleep(250_000);
-        my $hb = $node->safe_psql("postgres",
-            "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
-          . "WHERE worker_pid = $wpid;");
-        if ($hb ne '' && $hb0 ne '' && $hb gt $hb0)
-        {
-            $hb_advanced = 1;
-            last;
-        }
-    }
-    ok($hb_advanced, 'worker heartbeat advances after cache-full denial');
-
-    my $state = $node->safe_psql("postgres",
-        "SELECT worker_state FROM pg_stat_vamana_worker "
-      . "WHERE worker_pid = $wpid;");
-    isnt($state, '', 'worker state is still visible in pg_stat_vamana_worker');
-
     my $res = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
-        SELECT id FROM t1 ORDER BY val <-> '[$query_sql]' LIMIT 3;
+        SELECT id FROM t$i ORDER BY val <-> '[$query_sql]' LIMIT 3;
     ));
-    isnt($res, '', 'worker still serves queries after cache-full denial');
+    is($res, $baseline[$i - 1],
+        "idx$i query results unchanged after warming all $N_TABLES indexes");
 }
 
 # ---------------------------------------------------------------------------
-# Case 6: search-path denial
-#
-# Cases 1, 2 and 5 all reach the deny through svs_warmup_index(), which loads
-# via VamanaWorkerProcessWarmupSlot.  A plain index scan against a cold index
-# loads via a different path: VamanaWorkerRunBatch's PG_TRY/PG_CATCH around
-# VamanaWorkerEnsureIndexCurrent (vamanaworkersearch.c).  idx9 has never been
-# warmed or queried up to this point and the cache still holds exactly
-# idx1..idx8, so this is the first thing to touch idx9 without going through
-# svs_warmup_index() — it must fail through the search-path catch block, not
-# the warmup path, and the query error (not a WARNING) must reach the client.
+# Case 3: the plain search path also loads a 12th, never-warmed index with
+# no deny.  This exercises VamanaWorkerEnsureIndexCurrent directly, not
+# svs_warmup_index / VamanaWorkerProcessWarmupSlot.
 # ---------------------------------------------------------------------------
+
+$node->safe_psql("postgres", qq(
+    CREATE TABLE t12 (id serial PRIMARY KEY, val vector($dim));
+    INSERT INTO t12 (val)
+        SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 100) s;
+    CREATE INDEX idx12 ON t12 USING vamana (val vector_l2_ops);
+));
+wait_for_worker($node);
 
 {
     my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
         SET enable_seqscan = off;
-        SELECT id FROM t9 ORDER BY val <-> '[$query_sql]' LIMIT 3;
+        SELECT id FROM t12 ORDER BY val <-> '[$query_sql]' LIMIT 3;
     ));
-    isnt($ret, 0,
-        'plain query against a cold 9th index fails when all 8 cache slots are in use');
-    like($stderr, qr/all \d+ index cache slots are in use/,
-        'search-path denial message names the cache-full condition');
+    is($ret, 0, 'a cold 12th index loads via the search path with no deny');
+}
 
+# ---------------------------------------------------------------------------
+# Case 4: a real refusal still happens once a database's own residency
+# budget is exhausted, and it names the ceiling, not a slot count.
+# ---------------------------------------------------------------------------
+
+$node->safe_psql("postgres", "CREATE DATABASE tinydb;");
+$node->safe_psql("tinydb", "CREATE EXTENSION vector;");
+$node->safe_psql("tinydb", "CREATE EXTENSION svs;");
+$node->safe_psql("postgres",
+    "INSERT INTO vamana_databases (datname, enabled, residency_memory) "
+  . "VALUES ('tinydb', true, 1);");
+wait_for_worker_db($node, 'tinydb', 30);
+
+$node->safe_psql("tinydb", qq(
+    CREATE TABLE big_tbl (id serial PRIMARY KEY, val vector($dim));
+    INSERT INTO big_tbl (val)
+        SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000) s;
+));
+
+{
+    my ($ret, $stdout, $stderr) = $node->psql("tinydb",
+        "CREATE INDEX big_idx ON big_tbl USING vamana (val vector_l2_ops);");
+    is($ret, 0, 'CREATE INDEX itself succeeds; the worker load is asynchronous');
+    like($stderr, qr/residency budget/,
+        "the worker's load warning names the residency ceiling, not a slot count");
+    unlike($stderr, qr/cache slots/,
+        'the load warning is not the old slot-count message');
+
+    my ($qret, $qstdout, $qstderr) = $node->psql("tinydb", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM big_tbl ORDER BY val <-> '[$query_sql]' LIMIT 3;
+    ));
+    isnt($qret, 0,
+        'querying the index the worker could not load fails');
+    like($qstderr, qr/residency budget/,
+        'the query error names the residency budget, not a generic "not loaded" message');
+}
+
+# ---------------------------------------------------------------------------
+# The worker for postgres is unaffected by tinydb's refusal.
+# ---------------------------------------------------------------------------
+
+{
     my $hb0 = $node->safe_psql("postgres",
         "SELECT heartbeat_ts FROM pg_stat_vamana_worker "
       . "WHERE worker_pid = $wpid;");
@@ -174,81 +174,14 @@ for my $i (1 .. 8)
             last;
         }
     }
-    ok($hb_advanced, 'worker heartbeat advances after search-path denial');
+    ok($hb_advanced, 'postgres worker heartbeat advances after tinydb\'s refusal');
 
     my $res = $node->safe_psql("postgres", qq(
         SET enable_seqscan = off;
         SELECT id FROM t1 ORDER BY val <-> '[$query_sql]' LIMIT 3;
     ));
     is($res, $baseline[0],
-        'idx1 (warm incumbent) still returns its baseline result after search-path denial');
-}
-
-# ---------------------------------------------------------------------------
-# Case 3: reclaim after unload
-#
-# This is the regression test for the high-water-mark trap: vamanaCacheUsed
-# never decrements, so without the reclaim branch in VamanaAllocCacheSlot an
-# invalidated slot is never reused and the denial becomes permanent.
-# ---------------------------------------------------------------------------
-
-{
-    # Drop idx1: this invalidates its cache slot in the worker via the relcache
-    # callback fired inside StartTransactionCommand when the next warmup request
-    # opens a transaction.  By the time VamanaAllocCacheSlot runs for idx9, the
-    # reclaim branch sees isValid=false and returns that slot.
-    $node->safe_psql("postgres", "DROP INDEX idx1;");
-
-    $node->safe_psql("postgres", "SELECT svs_warmup_index('idx9');");
-    ok(1, 'idx9 loads successfully after idx1 is dropped, freeing its slot');
-
-    # Confirm the load actually worked: a query returns results.
-    my $res = $node->safe_psql("postgres", qq(
-        SET enable_seqscan = off;
-        SELECT id FROM t9 ORDER BY val <-> '[$query_sql]' LIMIT 3;
-    ));
-    isnt($res, '', 'idx9 query returns results after reclaim load');
-}
-
-# ---------------------------------------------------------------------------
-# Case 5: repeat — prove the reclaim path does not leak or drift
-#
-# Run cases 1 and 3 a few more times with fresh indexes.  After each round the
-# cache holds exactly 8 valid entries (no slot count drift, no memory leak).
-# ---------------------------------------------------------------------------
-
-# State after case 3: cache holds idx2..idx9 (8 entries).
-# Round 2: deny idx10, drop idx2, warm idx10.
-# Round 3: deny idx11, drop idx3, warm idx11.
-
-for my $round (2 .. 3)
-{
-    my $new_idx  = 8 + $round;
-    my $drop_idx = $round;
-
-    # Case 1 re-check: new index is denied (all 8 slots still live).
-    {
-        my ($ret, $stdout, $stderr) = $node->psql("postgres",
-            "SELECT svs_warmup_index('idx${new_idx}');");
-        isnt($ret, 0,
-            "round $round: warming idx${new_idx} fails — all slots occupied");
-        like($stderr, qr/all \d+ index cache slots are in use/,
-            "round $round: deny message present");
-    }
-
-    # Case 3 re-check: drop one entry, warm the new index.
-    {
-        $node->safe_psql("postgres", "DROP INDEX idx${drop_idx};");
-        $node->safe_psql("postgres",
-            "SELECT svs_warmup_index('idx${new_idx}');");
-        ok(1, "round $round: idx${new_idx} loads after idx${drop_idx} dropped");
-
-        my $res = $node->safe_psql("postgres", qq(
-            SET enable_seqscan = off;
-            SELECT id FROM t${new_idx} ORDER BY val <-> '[$query_sql]' LIMIT 3;
-        ));
-        isnt($res, '', "round $round: idx${new_idx} query returns results");
-    }
+        'idx1 still returns its baseline result after tinydb\'s refusal');
 }
 
 $node->stop;

@@ -176,26 +176,186 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  * the on-disk checkpoint (not a heap rebuild): such a handle predates any
  * post-checkpoint commit still pending in the replication slot.
  *
- * When propagateCacheFull is true, ERRCODE_CONFIGURATION_LIMIT_EXCEEDED
- * (cache full) is re-thrown to the caller rather than swallowed. The
- * AccessShareLock taken below is released either way; a caller that opts in
- * still owns its own transaction, snapshot, and any suppression guard it set
- * around this call. All other errors are always caught, logged as WARNING,
- * and result in a NULL return.
+ * When propagateResidencyRefusal is true, a residency-budget refusal
+ * (ERRCODE_OUT_OF_MEMORY) is re-thrown rather than swallowed; the
+ * AccessShareLock below is released either way. All other errors are
+ * caught, logged as WARNING, and return NULL.
  *
  * Must be called from within an active transaction (or the caller must open
  * one).
  */
 
 /*
- * Propagation predicate for VamanaRunInSubXact: return true when the cache is
- * full so the hard-deny reaches the caller rather than being swallowed here.
- * The predicate style follows VamanaShutdownCancelPending in vamanaworker.c.
+ * Propagation predicate for VamanaRunInSubXact: true when the load failed
+ * on a residency refusal, so it reaches the caller instead of being
+ * swallowed. Style follows VamanaShutdownCancelPending in vamanaworker.c.
  */
 static bool
-VamanaCacheFullError(void)
+VamanaResidencyRefusedError(void)
 {
-	return geterrcode() == ERRCODE_CONFIGURATION_LIMIT_EXCEEDED;
+	return geterrcode() == ERRCODE_OUT_OF_MEMORY;
+}
+
+/*
+ * search_window_size doubles as numNeighbors: SVS requires window >= k, so
+ * the window bounds whatever k a query actually requests.
+ */
+static uint64
+ComputeSearchScratchBytesPerQuery(const SVSBuildConfig *config, bool useSearchHistory)
+{
+	int			buildWindow = (config->build_window_size > 0)
+		? config->build_window_size
+		: VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
+	SVSAlgorithmHandle algorithm;
+	SVSStorageHandle storage;
+	SVSBuilderHandle builder;
+	uint64		bytesPerQuery;
+
+	algorithm = SVSCreateAlgorithm(config->graph_degree, buildWindow, config->search_window_size,
+									config->alpha, useSearchHistory);
+
+	if (config->compression_type == VAMANA_COMPRESSION_LEANVEC)
+		storage = SVSCreateLeanVecStorage(config->dimensions, config->leanvec_dims,
+										   config->compression_primary,
+										   config->compression_secondary);
+	else
+		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
+
+	builder = SVSCreateBuilder(config->distance_type, config->dimensions, algorithm);
+	SVSBuilderSetStorage(builder, storage);
+
+	bytesPerQuery = SVSEstimateSearchMemory(builder, config->search_window_size, 1,
+											 config->search_window_size,
+											 config->numVectors);
+
+	SVSFreeBuilder(builder);
+	SVSFreeStorage(storage);
+	SVSFreeAlgorithm(algorithm);
+
+	return bytesPerQuery;
+}
+
+/*
+ * Shared core: recomputes relid's memoized search-scratch cost only if
+ * stale or unset. Callers adapt whatever context they have (an open
+ * Relation's reloptions, or a load slot's already-resolved SVSBuildConfig)
+ * into config; this never opens a transaction or touches a relcache entry
+ * itself, so it is safe to call from the dispatch path.
+ */
+void
+VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config, bool useSearchHistory)
+{
+	SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, relid, config->search_window_size,
+										  useSearchHistory);
+
+	if (SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid) == 0)
+	{
+		uint64		bytesPerQuery = ComputeSearchScratchBytesPerQuery(config, useSearchHistory);
+
+		ereport(DEBUG1,
+				(errmsg("vamana worker: computed search-scratch cost of %llu bytes for index %u",
+						(unsigned long long) bytesPerQuery, relid)));
+
+		SvsMemorySetSearchScratchBytesPerQuery(MyDatabaseId, relid, bytesPerQuery);
+	}
+}
+
+/*
+ * Adapter for callers holding an open Relation and its current reloptions
+ * (a load or reload, where nothing has resolved these into an SVSBuildConfig
+ * already). Assembles one and delegates to the shared core.
+ */
+void
+VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCache *cache,
+									 const VamanaOptions *opts)
+{
+	SVSBuildConfig config;
+
+	if (cache == NULL)
+		return;
+
+	config.graph_degree = cache->graph_degree;
+	config.alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
+	config.search_window_size = VamanaResolveSearchWindowSize(opts);
+	config.compression_type = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
+	config.compression_primary = opts ? opts->compression_primary : 0;
+	config.compression_secondary = opts ? opts->compression_secondary : 0;
+	config.distance_type = VamanaGetDistanceMetric(indexRel);
+	config.data_type = SVS_DTYPE_FLOAT32;
+	config.dimensions = cache->dimensions;
+	config.leanvec_dims = opts ? opts->leanvec_dims : -1;
+	config.build_window_size = opts ? opts->build_window_size : 0;
+	config.search_num_threads = 0;
+	config.numVectors = cache->numVectors;
+
+	VamanaSeedSearchScratchCostFromConfig(relid, &config,
+										   opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+}
+
+/* Worker SIGHUP handling: refreshes every cached index's search-scratch cost. */
+void
+VamanaWorkerRefreshSearchScratchCosts(void)
+{
+	List	   *relids = VamanaGetAllCachedRelids();
+
+	foreach_oid(relid, relids)
+	{
+		VamanaIndexCache *cache = VamanaGetCache(relid);
+		Relation	indexRel;
+
+		if (cache == NULL)
+			continue;
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		indexRel = index_open(relid, AccessShareLock);
+		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
+											 (VamanaOptions *) indexRel->rd_options);
+		index_close(indexRel, AccessShareLock);
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+
+	list_free(relids);
+}
+
+/*
+ * Backstop for any load path that didn't seed relid's search-scratch cost
+ * itself. A no-op once it's known, so this only pays for a transaction and
+ * the native estimate on an index's first dispatch, ever.
+ *
+ * The transaction's AcceptInvalidationMessages() can evict relid via
+ * VamanaRelcacheCallback, freeing the SVSIndexHandle the caller already
+ * fetched for this dispatch; vamana_active_load_relid guards
+ * against that (see VamanaWorkerProcessWriteSlot).
+ */
+void
+VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
+{
+	VamanaIndexCache *cache = VamanaGetCache(relid);
+	Relation	indexRel;
+
+	if (cache == NULL || SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid) != 0)
+		return;
+
+	vamana_active_load_relid = relid;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	indexRel = index_open(relid, AccessShareLock);
+	VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
+										 (VamanaOptions *) indexRel->rd_options);
+	index_close(indexRel, AccessShareLock);
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	vamana_active_load_relid = InvalidOid;
 }
 
 typedef struct GetOrLoadIndexArgs
@@ -210,7 +370,6 @@ GetOrLoadIndexBody(void *arg)
 {
 	GetOrLoadIndexArgs *a = (GetOrLoadIndexArgs *) arg;
 	Relation	indexRel = index_open(a->relid, NoLock);
-	VamanaOptions *opts;
 
 	/* Test hook: TAP forces a failure while indexRel/lock are held. */
 	INJECTION_POINT("vamana-get-or-load-index-error", NULL);
@@ -226,16 +385,14 @@ GetOrLoadIndexBody(void *arg)
 	 * not before the two calls above, since either can process that
 	 * invalidation and free the relcache entry's prior rd_options.
 	 */
-	opts = (VamanaOptions *) indexRel->rd_options;
-	SvsMemoryRecheckSearchScratchOptions(MyDatabaseId, a->relid,
-										  opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW,
-										  opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+	VamanaRefreshIndexSearchScratchCost(indexRel, a->relid, VamanaGetCache(a->relid),
+										 (VamanaOptions *) indexRel->rd_options);
 
 	index_close(indexRel, AccessShareLock);
 }
 
 SVSIndexHandle
-VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheFull)
+VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateResidencyRefusal)
 {
 	bool		needsRebuild;
 	SVSIndexHandle index;
@@ -269,7 +426,7 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
 	args.index = NULL;
 
 	/*
-	 * When propagateCacheFull is true, VamanaRunInSubXact re-throws instead of
+	 * When propagateResidencyRefusal is true, VamanaRunInSubXact re-throws instead of
 	 * returning, so the UnlockRelationOid below is never reached on that path.
 	 * Catch here just to release the lock before re-throwing further up to
 	 * the caller that opted in.
@@ -277,7 +434,7 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
 	PG_TRY();
 	{
 		result = VamanaRunInSubXact(GetOrLoadIndexBody, &args,
-									 propagateCacheFull ? VamanaCacheFullError : NULL);
+									 propagateResidencyRefusal ? VamanaResidencyRefusedError : NULL);
 	}
 	PG_CATCH();
 	{
@@ -291,7 +448,8 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
 
 	UnlockRelationOid(relid, AccessShareLock);
 	ereport(WARNING,
-			(errmsg("vamana worker: failed to load index %u", relid)));
+			(errmsg("vamana worker: failed to load index %u", relid),
+			 errdetail("%s", result.edata->message)));
 	FreeErrorData(result.edata);
 
 	return NULL;
@@ -307,12 +465,12 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateCacheF
  * would re-apply post-checkpoint commits the rebuild already contains.
  *
  * Owns its transaction; the caller must not open one.  Returns NULL on
- * failure.  propagateCacheFull is forwarded to VamanaWorkerGetOrLoadIndex
+ * failure.  propagateResidencyRefusal is forwarded to VamanaWorkerGetOrLoadIndex
  * unchanged; see its header comment for what opting in obligates the caller
  * to clean up.
  */
 SVSIndexHandle
-VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull)
+VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateResidencyRefusal)
 {
 	bool		loadedFromDisk;
 	bool		needsRebuild;
@@ -321,7 +479,7 @@ VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateCacheFull)
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
-	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk, propagateCacheFull);
+	index = VamanaWorkerGetOrLoadIndex(relid, &loadedFromDisk, propagateResidencyRefusal);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
@@ -477,15 +635,13 @@ bool
 VamanaReconcileStandbyCache(List *targetRelids,
 							 void (*activateSlot) (Oid relid))
 {
-	Oid			cachedRelids[VAMANA_MAX_CACHED_INDEXES];
-	int			nCached = VamanaGetAllCachedRelids(cachedRelids,
-													VAMANA_MAX_CACHED_INDEXES);
+	List	   *cachedRelids = VamanaGetAllCachedRelids();
 	bool		allConverged = true;
 
-	for (int i = 0; i < nCached; i++)
+	foreach_oid(relid, cachedRelids)
 	{
-		if (!list_member_oid(targetRelids, cachedRelids[i]))
-			VamanaStandbyReleaseIndex(cachedRelids[i]);
+		if (!list_member_oid(targetRelids, relid))
+			VamanaStandbyReleaseIndex(relid);
 	}
 
 	foreach_oid(relid, targetRelids)

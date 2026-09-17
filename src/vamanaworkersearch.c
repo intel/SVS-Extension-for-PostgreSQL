@@ -12,6 +12,7 @@
 
 #include "postgres.h"
 
+#include "svs_memory.h"
 #include "vamana.h"
 #include "vamanaworker.h"
 #include "svs_wrapper.h"
@@ -44,15 +45,16 @@ static void
 VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 {
 	SVSIndexHandle index;
+	uint64		scratchReserved;
+	uint64		scratchPerQuery;
 
 	/*
 	 * Get or load the index.  Avoid the transaction and catch-up drain if the
 	 * index is already warm in process memory.
 	 *
-	 * VamanaWorkerEnsureIndexCurrent calls VamanaWorkerGetOrLoadIndex, which
-	 * propagates ERRCODE_CONFIGURATION_LIMIT_EXCEEDED (cache full) rather than
-	 * returning NULL.  Catch that here so a full-cache denial on the search path
-	 * fails the queued slots cleanly instead of escaping to the BGW top-level
+	 * VamanaWorkerEnsureIndexCurrent propagates ERRCODE_OUT_OF_MEMORY
+	 * (residency refusal) rather than returning NULL. Catch it here so the
+	 * queued slots fail cleanly instead of escaping to the BGW top-level
 	 * handler and killing the worker.
 	 */
 	{
@@ -96,12 +98,12 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 					AbortCurrentTransaction();
 
 				/*
-				 * Only forward the cache-full message verbatim: it is a sanitized
-				 * compile-time constant.  Any other load error (SVS library failure,
-				 * I/O error) may contain internal detail, so substitute a generic
+				 * Forward the residency-refusal message verbatim -- its only
+				 * dynamic content is a relid and a byte count. Any other load
+				 * error may carry internal detail, so substitute a generic
 				 * string and keep the detail in the server log only.
 				 */
-				if (edata->sqlerrcode == ERRCODE_CONFIGURATION_LIMIT_EXCEEDED &&
+				if (edata->sqlerrcode == ERRCODE_OUT_OF_MEMORY &&
 					edata->message != NULL)
 					snprintf(loadErrMsg, sizeof(loadErrMsg), "%s", edata->message);
 				else
@@ -159,6 +161,45 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 		return;
 	}
 
+	scratchPerQuery = SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid);
+	if (scratchPerQuery == 0)
+	{
+		VamanaWorkerEnsureSearchScratchCostComputed(relid);
+		scratchPerQuery = SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid);
+	}
+	scratchReserved = scratchPerQuery * (uint64) n;
+
+	if (scratchReserved > 0 && !SvsMemoryReserveSearchScratch(MyDatabaseId, scratchReserved))
+	{
+		VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
+		uint64		resolvedLimit;
+		bool		isOverride;
+
+		LWLockAcquire(header->lock, LW_SHARED);
+		resolvedLimit = SvsMemoryResolveSearchWorkMem(VamanaWorkerShmemPtr);
+		isOverride = VamanaWorkerShmemPtr->searchWorkMemMbOverride > 0;
+		LWLockRelease(header->lock);
+
+		for (int i = 0; i < n; i++)
+		{
+			VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+
+			slot->numResults = 0;
+			snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+					 "vamana worker: batch against index %u exceeds this database's "
+					 "search-scratch budget of %llu bytes%s",
+					 relid, (unsigned long long) resolvedLimit,
+					 isOverride ? " (search_work_mem override)" : " (svs.default_search_work_mem)");
+			slot->errorCategory = VAMANA_ERR_OOM;
+			pg_write_barrier();
+			pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+		}
+		return;
+	}
+
+	if (scratchReserved > 0)
+		INJECTION_POINT("vamana-search-scratch-reserved", NULL);
+
 	/*
 	 * Acquire the per-index r/w lock in shared mode for the duration of all
 	 * searches in this batch.  This serializes against concurrent writes
@@ -180,8 +221,11 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 		PG_TRY();
 		{
 			/*
-			 * Apply this database's current search-thread grant to the handle
-			 * about to run, one number per database (dispatch is strictly
+			 * Runs after the search-scratch admission check above: a
+			 * rejected batch shouldn't pay for a thread-pool rebuild it
+			 * will never use. Apply this database's current search-thread
+			 * grant to the handle about to run, one number per database
+			 * (dispatch is strictly
 			 * serial, so there is nothing to sub-allocate per index), applied
 			 * fresh on every dispatch since the launcher can revise it at any
 			 * reconcile.  Skipped when unchanged: SVSSetIndexSearchThreads
@@ -362,6 +406,9 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 
 			if (rwlock != NULL)
 				LWLockRelease(rwlock);
+
+			if (scratchReserved > 0)
+				SvsMemoryReleaseSearchScratch(MyDatabaseId, scratchReserved);
 		}
 		PG_CATCH();
 		{
@@ -369,6 +416,9 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 
 			LWLockReleaseAll();
 			MemoryContextSwitchTo(oldcontext);
+
+			if (scratchReserved > 0)
+				SvsMemoryReleaseSearchScratch(MyDatabaseId, scratchReserved);
 
 			edata = CopyErrorData();
 			FlushErrorState();

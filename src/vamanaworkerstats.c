@@ -264,8 +264,8 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	/*
 	 * A second pass, header lock released: residencyBudget/residencyBytes-
 	 * Committed/buildBytesCommitted are memLock-guarded, and memLock must be
-	 * acquired before the header lock, never after (Section 5.5), so they
-	 * cannot be read from inside VamanaWorkerHydrateCb.
+	 * acquired before the header lock, never after, so they cannot be read
+	 * from inside VamanaWorkerHydrateCb.
 	 */
 	for (int i = 0; i < ctx.count; i++)
 	{

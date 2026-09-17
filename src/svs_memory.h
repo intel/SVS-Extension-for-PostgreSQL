@@ -13,9 +13,9 @@
  *
  * A successful build's reservation transfers ownership rather than
  * releasing outright: RESERVED(estimate, backend) -> CONFIRMED(measured,
- * backend) -> RESIDENT(measured, worker). The reservation is visible under
- * this module's accounting continuously across that lifecycle, so a
- * concurrent admission check never reads a gap.
+ * backend) -> HANDOFF(measured, backend) -> RESIDENT(measured, worker). The
+ * reservation is visible under this module's accounting continuously across
+ * that lifecycle, so a concurrent admission check never reads a gap.
  *
  * SvsMemReservation and SvsMemInsertReservation are declared here, not in
  * vamanaworkershmem.c, because this module owns their shape and every
@@ -51,14 +51,15 @@ typedef enum SvsMemReservationState
 {
 	SVS_MEM_RESERVED,
 	SVS_MEM_CONFIRMED,
+	SVS_MEM_HANDOFF,
 	SVS_MEM_RESIDENT,
 } SvsMemReservationState;
 
 /*
  * One index's build-to-residency lifecycle, keyed by relid within its
  * database's control block. ownerPid is the reserving backend while
- * RESERVED/CONFIRMED, and 0 once RESIDENT: residency then belongs to the
- * database, not to whichever process last touched it. relid == InvalidOid
+ * RESERVED/CONFIRMED/HANDOFF, and 0 once RESIDENT: residency then belongs to
+ * the database, not to whichever process last touched it. relid == InvalidOid
  * marks a free slot, the same "0 is free" convention VamanaIndexLockSlot
  * and VamanaWorkerReloadRequest already use.
  *
@@ -84,7 +85,7 @@ typedef struct SvsMemReservation
 
 	/*
 	 * The build peak reserved for this index, still outstanding. Zeroed by
-	 * SvsMemoryHandoffBuild once released; SvsMemoryAbortBuild releases it
+	 * SvsMemoryConfirmBuild once released; SvsMemoryAbortBuild releases it
 	 * too but drops the whole reservation via FreeReservation rather than
 	 * zeroing this field in place. Read by the reaper, which has no other
 	 * way to learn a dead backend's build peak.
@@ -114,12 +115,31 @@ extern uint64 SvsMemoryResidencyBudget(Oid dbOid);
 
 /*
  * Config-time admission. Admits dbOid at residencyBudget bytes, or updates
- * an already-admitted database to a new budget, only if the cluster-wide
- * sum of every admitted database's budget still fits svs.max_residency_memory.
- * Errors on rejection; on success, dbOid's admitted budget governs every
- * later build, load, and insert check for that database.
+ * an already-admitted database to a new budget, only if that budget is not
+ * below what dbOid already has committed, and the cluster-wide sum of every
+ * admitted database's budget still fits svs.max_residency_memory. Errors on
+ * rejection; on success, dbOid's admitted budget governs every later build,
+ * load, and insert check for that database.
+ *
+ * durableCommittedFloor is the caller's answer to "what does dbOid hold
+ * that this module's own live counter might not currently reflect" -- 0
+ * when the live counter (entry->residencyBytesCommitted) is already known
+ * to be the truth, or a durable figure (see svs_index_residency.h) when it
+ * might not be, e.g. a worker mid-restart briefly reporting zero. This
+ * module never resolves that question itself: it has no notion of a
+ * worker's liveness or a durable catalog record, only bytes given to it.
+ * The guard compares residencyBudget against whichever of the two
+ * (live counter or durableCommittedFloor) is larger.
  */
-extern void SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget);
+extern void SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget,
+									uint64 durableCommittedFloor);
+
+/*
+ * Backend, on transaction abort. Restores dbOid's budget to priorBudget,
+ * floored at what's currently committed so the restore strands nothing.
+ * Never errors; no-op if dbOid has no slot.
+ */
+extern void SvsMemoryRestoreResidencyBudget(Oid dbOid, uint64 priorBudget);
 
 /*
  * Backend build gate, at CREATE INDEX. Reserves buildPeak against the
@@ -133,31 +153,47 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
 /*
  * Backend, after a successful build and before serializing to disk.
  * Releases buildPeak unconditionally and reconciles the residency
- * reservation from estimate to measuredResidencyBytes. Returns false, and
- * drops the reservation entirely, if the measured bytes do not fit dbOid's
- * residency budget -- the caller must fail CREATE INDEX without serializing
- * or contacting the worker. Returns true once the reservation is confirmed
- * at the exact measured size.
+ * reservation from estimate to measuredResidencyBytes (RESERVED ->
+ * CONFIRMED). Returns false, and drops the reservation entirely, if the
+ * measured bytes do not fit dbOid's residency budget -- the caller must
+ * fail CREATE INDEX without serializing or contacting the worker. Returns
+ * true once the reservation is confirmed at the exact measured size.
  */
-extern bool SvsMemoryHandoffBuild(Oid dbOid, Oid relid,
+extern bool SvsMemoryConfirmBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 measuredResidencyBytes);
 
 /*
+ * Backend, after serializing a confirmed build to disk and before asking
+ * the worker to load it (CONFIRMED -> HANDOFF). Pure state transition, no
+ * byte accounting: the measured bytes ConfirmBuild already committed are
+ * unaffected, and ownership stays with the calling backend until the
+ * worker's own SvsMemoryReconcileLoad claims it.
+ */
+extern void SvsMemoryHandoffBuild(Oid dbOid, Oid relid);
+
+/*
  * Backend, on any build error, whether before or after a successful
- * handoff. Releases whatever relid's reservation still holds -- its build
- * peak if HandoffBuild hasn't already released it, and its estimate or its
+ * confirm. Releases whatever relid's reservation still holds -- its build
+ * peak if ConfirmBuild hasn't already released it, and its estimate or its
  * measured bytes, whichever the reservation's own state says is currently
  * committed -- then drops the reservation. Safe to call more than once or
- * after HandoffBuild already ran; there is nothing left to release once
+ * after ConfirmBuild already ran; there is nothing left to release once
  * relid has no reservation.
+ *
+ * A RESIDENT reservation is the one exception: ReconcileLoad already handed
+ * it to the database, so this leaves it untouched and only
+ * SvsMemoryAccountUnload can release it. Reachable when a build's
+ * synchronous warm-up load succeeds and a later statement in the same
+ * transaction still fails.
  */
 extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
 
 /*
- * Worker, at load. Reconciles a pending handoff to measuredBytes in place,
- * or -- for a reload or restart adopt with no pending reservation --
- * accounts measuredBytes directly. Returns false, committing nothing, if
- * measuredBytes does not fit dbOid's residency budget.
+ * Worker, at load. Reconciles a pending HANDOFF reservation to
+ * measuredBytes in place (HANDOFF -> RESIDENT), or -- for a reload or
+ * restart adopt with no pending reservation -- accounts measuredBytes
+ * directly. Returns false, committing nothing, if measuredBytes does not
+ * fit dbOid's residency budget.
  */
 extern bool SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes);
 
@@ -182,11 +218,36 @@ extern bool SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes);
 extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
 
 /*
+ * Worker, on the empty-table first-insert build path: relid's reservation
+ * comes from SvsMemoryReconcileLoad rather than pre-existing, so this closes
+ * the oldest pending insert reservation for relid without reanchoring one.
+ */
+extern void SvsMemoryCloseInsertReservation(Oid dbOid, Oid relid);
+
+/*
+ * Backend cleanup when a reserved insert never reaches the worker's
+ * reanchor. Releases the caller's own pending reservation for relid; a
+ * no-op if there is none.
+ */
+extern void SvsMemoryAbortInsert(Oid dbOid, Oid relid);
+
+/*
  * Reaps every reservation -- build or pending insert -- whose owning
  * backend is no longer alive. Called from the launcher's latch cycle and
  * its startup scan.
  */
 extern void SvsMemoryReapDeadReservations(void);
+
+/*
+ * Worker, at startup. Drops every RESIDENT reservation for dbOid not in
+ * liveRelids -- an index dropped while the worker was down. RESERVED/
+ * CONFIRMED reservations belong to a live backend; SvsMemoryReapDeadReservations
+ * covers those. droppedRelids needs VAMANA_MAX_INDEXES entries of room;
+ * caller clears each dropped relid's durable record.
+ */
+extern void SvsMemoryReconcileResidentReservations(Oid dbOid,
+													const Oid *liveRelids, int numLiveRelids,
+													Oid *droppedRelids, int *numDropped);
 
 typedef struct SvsMemoryStats
 {
@@ -226,6 +287,20 @@ extern uint64 SvsMemorySearchScratchBytesPerQuery(Oid dbOid, Oid relid);
 extern void SvsMemoryRecheckSearchScratchOptions(Oid dbOid, Oid relid,
 												  int searchWindowSize,
 												  bool useSearchHistory);
+
+/* Stores relid's just-computed per-query search-scratch cost. No-op if relid has no reservation. */
+extern void SvsMemorySetSearchScratchBytesPerQuery(Oid dbOid, Oid relid,
+													uint64 bytesPerQuery);
+
+/*
+ * Dispatch-time gate: atomically admits batchBytes against dbOid's
+ * search-scratch budget, adding to the in-flight total only if it fits.
+ * Lock-free against other databases and other indexes in the same database.
+ */
+extern bool SvsMemoryReserveSearchScratch(Oid dbOid, uint64 batchBytes);
+
+/* Releases batchBytes admitted by SvsMemoryReserveSearchScratch, floored at 0. */
+extern void SvsMemoryReleaseSearchScratch(Oid dbOid, uint64 batchBytes);
 
 /*
  * Tear down every accounting counter and reservation owned by entry, and

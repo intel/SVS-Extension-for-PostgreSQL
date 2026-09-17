@@ -28,6 +28,14 @@ CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
 
 INSERT INTO t (val) VALUES ('[0,0,0]');
+
+-- The first INSERT builds the dynamic index in-memory (VamanaWorkerBuildFirstInsert
+-- -> SVSBuildDynamicIndex) and measures that same handle directly, never touching
+-- SVSLoadDynamicIndex. A 1-vector index has to measure far below SVS's fixed 1 GiB
+-- block default, not at some size unrelated to its actual vector count.
+SELECT resident_bytes < 10 * 1024 * 1024 AS first_insert_build_is_small
+	FROM svs_index_residency WHERE index_relid = 't_val_idx'::regclass;
+
 INSERT INTO t (val) VALUES ('[1,1,1]'), ('[2,2,2]');
 SELECT * FROM t ORDER BY val <-> '[2,2,2]', id LIMIT 3;
 
@@ -329,6 +337,13 @@ REINDEX INDEX CONCURRENTLY t_loadwin_val_idx;
 
 -- Results must be unchanged after reload.
 SELECT count(*) FROM (SELECT * FROM t_loadwin ORDER BY val <-> '[1,0,0]' LIMIT 5) sub;
+
+-- REINDEX CONCURRENTLY rebuilds fresh (SVSBuildDynamicIndex) and the worker
+-- then loads that rebuild from disk (SVSLoadDynamicIndex) -- a separate
+-- blocksize_bytes argument from the build's. Both have to scale with the
+-- 5-vector table, not sit at SVS's fixed 1 GiB block default.
+SELECT resident_bytes < 10 * 1024 * 1024 AS rebuild_and_reload_is_small
+	FROM svs_index_residency WHERE index_relid = 't_loadwin_val_idx'::regclass;
 
 DROP TABLE t_loadwin;
 

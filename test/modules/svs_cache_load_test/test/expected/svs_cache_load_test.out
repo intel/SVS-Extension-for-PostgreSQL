@@ -1,0 +1,38 @@
+CREATE EXTENSION IF NOT EXISTS injection_points;
+CREATE EXTENSION svs_cache_load_test;
+SELECT injection_points_attach('vamana-cache-index-load-failure', 'error');
+ injection_points_attach 
+-------------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT before_failed_load;
+SELECT svs_cache_load_test_fake_load(680, (4 * 1024)::bigint);
+ERROR:  error triggered for injection point vamana-cache-index-load-failure
+ROLLBACK TO SAVEPOINT before_failed_load;
+COMMIT;
+SELECT injection_points_detach('vamana-cache-index-load-failure');
+ injection_points_detach 
+-------------------------
+ 
+(1 row)
+
+SELECT svs_cache_load_test_fake_load(680, (5 * 1024)::bigint);
+ svs_cache_load_test_fake_load 
+-------------------------------
+ 
+(1 row)
+
+SELECT svs_cache_load_test_committed_bytes(680) = (5 * 1024) AS retry_reservation_survives_stale_teardown;
+ retry_reservation_survives_stale_teardown 
+-------------------------------------------
+ t
+(1 row)
+
+SELECT svs_cache_load_test_reservation_exists(680) AS retry_reservation_still_tracked;
+ retry_reservation_still_tracked 
+---------------------------------
+ t
+(1 row)
+

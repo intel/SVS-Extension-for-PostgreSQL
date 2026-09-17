@@ -85,7 +85,7 @@ LoadIndexFromPages(Relation index)
 	opts = (VamanaOptions *) index->rd_options;
 	config.graph_degree = meta.graph_degree;
 	config.alpha = meta.alpha;
-	config.search_window_size = opts ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
+	config.search_window_size = VamanaResolveSearchWindowSize(opts);
 	config.build_window_size = (opts && opts->build_window_size > 0) ?
 		opts->build_window_size : 0;
 	config.compression_type = meta.compression_type;
@@ -94,6 +94,7 @@ LoadIndexFromPages(Relation index)
 	config.distance_type = VamanaGetDistanceMetric(index);
 	config.data_type = SVS_DTYPE_FLOAT32;
 	config.dimensions = (int) meta.dimensions;
+	config.numVectors = (int) meta.numVectors;
 	config.leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 	config.search_num_threads = SvsCurrentSearchGrant();
 
@@ -190,16 +191,8 @@ vamanabeginscan(Relation index, int nkeys, int norderbys)
 	so->results = NULL;
 	so->distances = NULL;
 
-	/*
-	 * Determine search window size: 1) GUC svs.search_window_size 2) index
-	 * reloption search_window_size
-	 */
 	opts = (VamanaOptions *) index->rd_options;
-	searchWindowSize = vamana_search_window_size;
-	if (searchWindowSize <= 0)
-		searchWindowSize = (opts != NULL) ? opts->search_window_size : VAMANA_DEFAULT_SEARCH_WINDOW;
-	if (searchWindowSize <= 0)
-		searchWindowSize = VAMANA_DEFAULT_SEARCH_WINDOW;
+	searchWindowSize = VamanaResolveSearchWindowSize(opts);
 
 	so->searchWindowSize = searchWindowSize;
 	/* Return at least search window size candidates instead of hard-capped 10 */
