@@ -142,7 +142,7 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	SVSBuilderSetStorage(builder, storage);
 
 	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1,
-									 cache->dimensions, &errorCode);
+									 cache->graph_degree, cache->dimensions, &errorCode);
 
 	SVSFreeBuilder(builder);
 	SVSFreeStorage(storage);

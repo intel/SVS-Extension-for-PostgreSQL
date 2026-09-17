@@ -98,8 +98,8 @@ uint64		SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, 
 int			SVSSaveIndex(SVSIndexHandle index, const char *path);
 
 SVSIndexHandle SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
-									const size_t *ids, int num_vectors, int dimensions,
-									int *error_code);
+									const size_t *ids, int num_vectors, int graph_degree,
+									int dimensions, int *error_code);
 SVSIndexHandle SVSLoadDynamicIndex(const char *path, const SVSBuildConfig *config);
 
 int			SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int num_vectors);

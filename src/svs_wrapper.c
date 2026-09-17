@@ -763,13 +763,22 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 
 SVSIndexHandle
 SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
-					 const size_t *ids, int num_vectors, int dimensions,
-					 int *error_code)
+					 const size_t *ids, int num_vectors, int graph_degree,
+					 int dimensions, int *error_code)
 {
 	svs_error_h error = svs_error_create();
 	svs_index_h index;
+
+	/*
+	 * A block sized for the literal vector count would collapse to a
+	 * single-element block on an empty-table's first insert (num_vectors ==
+	 * 1), forcing SVS to allocate a new block on almost every subsequent add
+	 * until this index is next loaded from disk with its real count. Floor
+	 * the sizing input at graph_degree so a block holds at least one full
+	 * neighbor list's worth of vectors.
+	 */
 	size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
-															num_vectors);
+															Max(num_vectors, graph_degree));
 
 	index = svs_index_build_dynamic(
 									(svs_index_builder_h) builder,
@@ -840,8 +849,9 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 		}
 
 		{
+			/* Same floor as SVSBuildDynamicIndex; see its comment. */
 			size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
-																	config->numVectors);
+																	Max(config->numVectors, config->graph_degree));
 
 			error = svs_error_create();
 			loaded = svs_index_load_dynamic((svs_index_builder_h) builder, path, blocksizeBytes, error);

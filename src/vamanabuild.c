@@ -294,6 +294,7 @@ typedef struct VamanaSVSBuildContext
 	SVSBuilderHandle builder;
 	const float *flatData;
 	int			numVectors;
+	int			graph_degree;
 	int			dimensions;
 
 	SVSIndexHandle result;
@@ -311,8 +312,8 @@ VamanaRunSVSBuild(int grantedThreads, void *context)
 
 	SVSBuilderSetThreadpool(ctx->builder, grantedThreads);
 	ctx->result = SVSBuildDynamicIndex(ctx->builder, ctx->flatData, ids,
-										ctx->numVectors, ctx->dimensions,
-										&ctx->errorCode);
+										ctx->numVectors, ctx->graph_degree,
+										ctx->dimensions, &ctx->errorCode);
 	pfree(ids);
 }
 
@@ -375,6 +376,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 		.builder = builder,
 		.flatData = flatData,
 		.numVectors = numVectors,
+		.graph_degree = params->graph_degree,
 		.dimensions = params->dimensions,
 	};
 
