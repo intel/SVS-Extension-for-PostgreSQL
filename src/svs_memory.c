@@ -478,10 +478,25 @@ SvsMemoryAbortBuild(Oid dbOid, Oid relid)
 	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
 
 	reservation = FindReservation(entry, relid);
-	if (reservation != NULL)
+
+	/*
+	 * A RESIDENT reservation already belongs to the database, handed off by
+	 * SvsMemoryReconcileLoad; only SvsMemoryAccountUnload may release it.
+	 * This function is reached in that state when a synchronous warm-up
+	 * load succeeds and a later statement in the same build transaction
+	 * still fails, so leave the reservation exactly as it is.
+	 */
+	if (reservation != NULL && reservation->state != SVS_MEM_RESIDENT)
 	{
 		uint64		residencyHeld = (reservation->state == SVS_MEM_RESERVED) ?
 			reservation->estimateBytes : reservation->measuredBytes;
+
+		/*
+		 * CREATE INDEX's relation lock keeps any other backend out of
+		 * RESERVED/CONFIRMED/HANDOFF for this relid, so only the reserving
+		 * backend can ever reach this branch for it.
+		 */
+		Assert(reservation->ownerPid == MyProcPid);
 
 		if (reservation->buildPeakBytes > 0)
 		{

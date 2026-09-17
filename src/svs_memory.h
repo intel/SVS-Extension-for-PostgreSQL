@@ -179,6 +179,12 @@ extern void SvsMemoryHandoffBuild(Oid dbOid, Oid relid);
  * committed -- then drops the reservation. Safe to call more than once or
  * after ConfirmBuild already ran; there is nothing left to release once
  * relid has no reservation.
+ *
+ * A RESIDENT reservation is the one exception: ReconcileLoad already handed
+ * it to the database, so this leaves it untouched and only
+ * SvsMemoryAccountUnload can release it. Reachable when a build's
+ * synchronous warm-up load succeeds and a later statement in the same
+ * transaction still fails.
  */
 extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
 

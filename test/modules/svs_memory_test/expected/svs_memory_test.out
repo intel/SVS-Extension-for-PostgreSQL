@@ -942,8 +942,12 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
--- Abort on a RESIDENT record releases its measured bytes, the amount the
--- committed counter actually holds by that point -- not its stale estimate.
+-- Abort on a RESIDENT record is a no-op: ReconcileLoad already handed the
+-- reservation to the database, so AbortBuild must not release it. Without
+-- this guard, a synchronous warm-up load that lands RESIDENT and is then
+-- followed by a later statement failing in the same CREATE INDEX
+-- transaction would have its cleanup path zero out a reservation for an
+-- index that is still fully resident and using real memory.
 SELECT svs_memory_admit_database(540, (10 * 1024 * 1024)::bigint);
  svs_memory_admit_database 
 ---------------------------
@@ -981,11 +985,28 @@ SELECT svs_memory_abort_build(540, 1);
  
 (1 row)
 
-SELECT residency_bytes_committed = 0 AS committed_back_to_zero_after_abort
+SELECT residency_bytes_committed = (7 * 1024 * 1024) AS committed_untouched_by_abort_on_resident
   FROM svs_memory_read_stats(540);
- committed_back_to_zero_after_abort 
-------------------------------------
+ committed_untouched_by_abort_on_resident 
+------------------------------------------
  t
+(1 row)
+
+SELECT state, measured_bytes FROM svs_memory_test_reservations(540);
+  state   | measured_bytes 
+----------+----------------
+ RESIDENT |        7340032
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+
+SELECT svs_memory_account_unload(540, 1);
+ svs_memory_account_unload 
+---------------------------
+ 
 (1 row)
 
 SELECT * FROM svs_memory_test_check_invariants();
@@ -1849,8 +1870,10 @@ SELECT * FROM svs_memory_test_check_invariants();
 (0 rows)
 
 -- Abort on a HANDOFF record releases its measured bytes, the same as abort
--- on a CONFIRMED or RESIDENT record: HANDOFF sits in the same
--- measured-bytes bucket, not the RESERVED estimate.
+-- on a CONFIRMED record: HANDOFF sits in the same measured-bytes bucket, not
+-- the RESERVED estimate. RESIDENT is the one state abort never releases
+-- (covered separately above), since by then ownership has already passed
+-- to the database.
 SELECT svs_memory_admit_database(671, (10 * 1024)::bigint);
  svs_memory_admit_database 
 ---------------------------
