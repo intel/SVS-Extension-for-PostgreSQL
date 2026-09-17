@@ -629,17 +629,12 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		}
 
 		/*
-		 * Protect this relid from eviction while populating its cache entry.
-		 * Any relcache invalidation that fires inside VamanaCacheIndex (e.g.
-		 * from a concurrent DROP) must not free the handle mid-populate.
-		 * Invalidations for other relids are not suppressed: DROP TABLE events
-		 * from earlier rounds may be pending, and allowing them to fire here
-		 * lets VamanaRelcacheCallback mark stale slots invalid so Branch 3 of
-		 * VamanaAllocCacheSlot can reclaim them.
-		 *
-		 * The guard is cleared only after DONE is written.  The next write
-		 * slot sets its own guard on entry, covering the window where the
-		 * CREATE INDEX commit's relcache invalidation arrives.
+		 * Protects relid's own cache entry from eviction while it's being
+		 * populated; see vamana_active_load_relid's declaration for why every
+		 * other cached relid is also protected for the same window. Cleared
+		 * only after DONE is written, so the next write slot's own guard
+		 * covers the window where the CREATE INDEX commit's invalidation
+		 * arrives.
 		 */
 		vamana_active_load_relid = relid;
 
@@ -699,8 +694,20 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 		vamana_active_load_relid = InvalidOid;
 
-		if (IsTransactionState())
-			AbortCurrentTransaction();
+		/*
+		 * VamanaReplicationCreate runs after the residency transaction already
+		 * committed, and can throw while holding ReplicationSlotAllocationLock
+		 * (e.g. "all replication slots are in use"). AbortCurrentTransaction
+		 * would be a no-op here since no transaction is open, leaking that lock
+		 * for the rest of the worker's life; unwind unconditionally instead, as
+		 * VamanaWorkerProcessWriteSlot's catch block does.
+		 */
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		AbortOutOfAnyTransaction();
+		RESUME_INTERRUPTS();
 
 		/* Leave ErrorContext before allocating anything; errfinish() left us in it. */
 		MemoryContextSwitchTo(oldcontext);
