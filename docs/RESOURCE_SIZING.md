@@ -23,7 +23,7 @@ shared_preload_libraries = 'svs'
 This is sufficient on its own. `svs.so` does not call into `vector.so` at runtime; the two
 extensions' preload order does not matter. `svs.control` declares `requires = 'vector'`, but that
 is a SQL-level dependency on the `vector` type, satisfied when you run `CREATE EXTENSION vector`
-(or let `CREATE EXTENSION svs` pull it in automatically) — it has no bearing on preload order.
+(or let `CREATE EXTENSION svs` pull it in automatically), and has no bearing on preload order.
 
 ### `max_worker_processes`
 
@@ -51,7 +51,7 @@ only on restart.
 ### `svs.max_databases`
 
 Sizes the per-database control-block array the extension keeps in shared memory. Default 8,
-range 1-128. If you plan to enroll more than 8 databases, raise this before you need it — it also
+range 1-128. If you plan to enroll more than 8 databases, raise this before you need it: it also
 takes effect only on restart.
 
 ## 2. Sizing `max_parallel_workers`
@@ -88,23 +88,23 @@ This is expected behavior, not a leak. If you see it, raise `max_parallel_worker
 actually need plus your usual core-parallel-query headroom.
 
 Unlike `max_worker_processes`, `max_parallel_workers` takes effect on `SIGHUP` (`pg_reload_conf()`
-or `SET` by a superuser) — no restart required.
+or `SET` by a superuser); no restart required.
 
 ## 3. The Per-Database Levers
 
 Per-database overrides live in the `vamana_databases` catalog table. `SELECT` on this table is
 not granted to `PUBLIC`; query it as the table owner or a superuser. All three levers below take
-effect live, on the next launcher reconciliation, with no restart:
+effect live, with no restart: promptly on a primary, and within 180 seconds on a standby.
 
-- **`search_num_threads`** — this database's search-thread request. `NULL` (the default) means
+- **`search_num_threads`**: this database's search-thread request. `NULL` (the default) means
   "use the cluster default," which today resolves to a 1-thread grant. A positive value requests
   that many threads instead, still bounded by the shared pool and by
   `svs.max_search_threads_per_db` if you have set that GUC.
-- **`search_threads_reserved`** — a floor for this database's grant. `NULL` (the default) means
+- **`search_threads_reserved`**: a floor for this database's grant. `NULL` (the default) means
   no floor: the database's request is pure best-effort against the shared pool and can be
   reduced when the pool is oversubscribed. A positive value guarantees that many threads are
   honored before anything else is distributed.
-- **`maintenance_num_threads`** — the thread count requested for this database's index builds
+- **`maintenance_num_threads`**: the thread count requested for this database's index builds
   (`CREATE INDEX`, and the equivalent maintenance paths). `NULL` (the default) means "follow the
   cluster build-thread default." `0` means serial.
 
@@ -128,7 +128,7 @@ Two distinct problems produce a shortfall, and they call for different fixes:
   oversubscribed. Raise `max_parallel_workers` (see §2).
 - **`search_slots_registered` below `search_threads_granted`:** the worker was granted threads
   it could not register, which points at the `max_worker_processes` slot array being exhausted.
-  Raise `max_worker_processes` (see §1) — note this is restart-only, unlike
+  Raise `max_worker_processes` (see §1); note this is restart-only, unlike
   `max_parallel_workers`.
 
 The view has more columns than the four above, including several from the memory-management
@@ -141,7 +141,11 @@ domain (residency and search-scratch memory); the full, current list is in
 |---|---|
 | `max_worker_processes` | Restart only |
 | `svs.max_databases` | Restart only |
-| `max_parallel_workers` | Reload (`SIGHUP`) — no restart |
-| `vamana_databases.search_num_threads` | Live, on the next launcher reconciliation |
-| `vamana_databases.search_threads_reserved` | Live, on the next launcher reconciliation |
-| `vamana_databases.maintenance_num_threads` | Live, on the next launcher reconciliation |
+| `max_parallel_workers` | Reload (`SIGHUP`), no restart |
+| `vamana_databases.search_num_threads` | Live, no restart |
+| `vamana_databases.search_threads_reserved` | Live, no restart |
+| `vamana_databases.maintenance_num_threads` | Live, no restart |
+
+**How quickly a change takes effect.** On a primary, a change to the `vamana_databases` table
+takes effect promptly. On a standby, the change arrives through replication and is picked up
+within 180 seconds. This interval is not configurable.
