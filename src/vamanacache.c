@@ -29,6 +29,7 @@
 #include "commands/defrem.h"
 #include "miscadmin.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -183,12 +184,14 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 	int			capacity = (tidMappingCapacity > numVectors) ? tidMappingCapacity : numVectors;
 	uint64		measuredBytes = (svsIndex != NULL) ? SVSGetIndexMemoryUsage(svsIndex) : 0;
 
+	entry = VamanaAllocCacheSlot(indexRelid);
+
 	/*
-	 * Reconcile against this database's residency budget before the cache is
-	 * touched at all, so a refusal here needs nothing unwound. Does not free
-	 * svsIndex: the caller still owns it exactly as if this function had
-	 * never been called, and frees it through their own existing cleanup
-	 * path.
+	 * Reconciled after any stale entry is torn down, so a refusal here
+	 * leaves this fresh entry empty rather than colliding with a
+	 * reservation the teardown above just released. Does not free svsIndex:
+	 * the caller still owns it exactly as if this function had never been
+	 * called, and frees it through their own existing cleanup path.
 	 */
 	if (!SvsMemoryReconcileLoad(MyDatabaseId, indexRelid, measuredBytes))
 		ereport(ERROR,
@@ -199,9 +202,10 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 				 errhint("Raise svs.max_residency_memory, this database's residency_memory override, "
 						 "or unload another index in this database.")));
 
-	entry = VamanaAllocCacheSlot(indexRelid);
 	entry->residentBytes = measuredBytes;
 	SvsIndexResidencyRecordLoad(indexRelid, MyDatabaseId, measuredBytes);
+
+	INJECTION_POINT("vamana-cache-index-load-failure", NULL);
 
 	if (tidMapping != NULL && capacity > 0)
 	{
