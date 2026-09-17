@@ -563,11 +563,12 @@ VamanaWorkerSeedIndexCount(void)
  * Deliberately does not reset every reservation to 0 and re-derive it by
  * measurement: a live index's RESIDENT reservation is a persistent fact
  * that survives the restart untouched. Resetting it would open a window,
- * between the reset and the first re-measure, where a decrease-validation
- * check (design doc Section 5.3a) reads zero committed bytes for an index
- * that is still fully resident, and could wave through a decrease the graph
- * cannot survive. Keeping the reservation means the counter never
- * understates what is actually loaded.
+ * between the reset and the first re-measure, where a concurrent check of
+ * a lowered residency_memory override (see the decrease-validation trigger
+ * on vamana_databases) reads zero committed bytes for an index that is
+ * still fully resident, and could wave through a decrease the graph cannot
+ * survive. Keeping the reservation means the counter never understates
+ * what is actually loaded.
  */
 static void
 VamanaWorkerReconcileResidencyOnStartup(void)
