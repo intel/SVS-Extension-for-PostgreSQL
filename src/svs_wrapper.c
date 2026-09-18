@@ -14,18 +14,7 @@
 #include "port/pg_bitutils.h"
 #include "utils/elog.h"
 
-#include <unistd.h>
-
 #include <svs/c/svs_c.h>
-
-/* Returns nproc-1, minimum 1, reserving one CPU for the PG backend. */
-static int
-OnlineCpusMinus1(void)
-{
-	long		online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-
-	return (online_cpus > 1) ? (int) (online_cpus - 1) : 1;
-}
 
 /*
  * Use max_parallel_maintenance_workers for build thread count.
@@ -42,20 +31,6 @@ SVSDefaultBuildThreads(void)
 		return 1;
 
 	return workers;
-}
-
-/*
- * Use svs.search_num_threads for search thread count.
- * Zero (default) falls back to nproc-1.  Not governed by
- * max_parallel_maintenance_workers, which is for maintenance only.
- */
-int
-SVSDefaultSearchThreads(void)
-{
-	if (vamana_search_num_threads > 0)
-		return vamana_search_num_threads;
-
-	return OnlineCpusMinus1();
 }
 
 typedef struct CompressionMapping
@@ -894,15 +869,10 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 
 		SVSBuilderSetStorage(builder, storage);
 		{
-			int			search_threads = (config->search_num_threads > 0) ?
-				config->search_num_threads : SVSDefaultSearchThreads();
-
-			SVSBuilderSetThreadpool(builder, search_threads);
+			SVSBuilderSetThreadpool(builder, config->search_num_threads);
 			ereport(DEBUG1,
-					(errmsg("loading SVS index with %d search threads "
-							"(svs.search_num_threads=%d, max_parallel_maintenance_workers=%d)",
-							search_threads, vamana_search_num_threads,
-							max_parallel_maintenance_workers)));
+					(errmsg("loading SVS index with %d search threads",
+							config->search_num_threads)));
 		}
 
 		{

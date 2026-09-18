@@ -73,10 +73,10 @@ ComputeSearchPool(const SvsCpuGucs *gucs)
 			   ResolveOrFallback(gucs->maxTotalSearchThreads, gucs->maxParallelWorkers));
 }
 
-static int32
-ComputePerDatabaseCeiling(const SvsCpuGucs *gucs)
+int32
+SvsSearchThreadsPerDbCeiling(int32 maxSearchThreadsPerDb, int32 maxParallelWorkers)
 {
-	return ResolveOrFallback(gucs->maxSearchThreadsPerDb, gucs->maxParallelWorkers);
+	return ResolveOrFallback(maxSearchThreadsPerDb, maxParallelWorkers);
 }
 
 static int32
@@ -333,7 +333,8 @@ SvsCpuBudget *
 SvsComputeCpuGrants(const SvsCpuBudgetInput *in, MemoryContext resultCtx)
 {
 	int32		pool = ComputeSearchPool(in->gucs);
-	int32		perDbCeiling = ComputePerDatabaseCeiling(in->gucs);
+	int32		perDbCeiling = SvsSearchThreadsPerDbCeiling(in->gucs->maxSearchThreadsPerDb,
+															 in->gucs->maxParallelWorkers);
 	SvsDbCpuWorking *dbWorking = BuildDbWorkingSet(in, perDbCeiling);
 	SvsBuildCpuWorking *buildWorking = BuildBuildWorkingSet(in);
 	bool		reservedFloorsExceedPool = ClampFloorsToPool(dbWorking, in->ndbs, pool);

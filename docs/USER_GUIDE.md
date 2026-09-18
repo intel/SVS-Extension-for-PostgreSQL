@@ -179,7 +179,7 @@ These parameters are specified in the `WITH (...)` clause of `CREATE INDEX` and 
 
 ### 4.3 Query-Time Parameters
 
-These are session-scoped GUC parameters that can be changed at any time without rebuilding the index. `svs.search_window_size` is settable by any role; `svs.search_num_threads` requires superuser (`PGC_SUSET`).
+`svs.search_window_size` is a session-scoped GUC, settable by any role, that can be changed at any time without rebuilding the index. (`svs.search_num_threads`, the other search-time knob, is a cluster-wide setting, not session-scoped — see §6.1.)
 
 ```sql
 -- Increase the search window for higher recall (at the cost of latency)
@@ -201,7 +201,6 @@ COMMIT;
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
 | `svs.search_window_size` | `100` | 10 – 10000 | Number of candidates examined during a search. Higher = better recall, higher latency. |
-| `svs.search_num_threads` | `0` | 0 – 1024 | Number of SVS threads used per search. `0` = auto (resolves to `nproc - 1`). Set to a lower value to reduce CPU oversubscription in concurrent workloads. Requires superuser to set (`PGC_SUSET`). |
 
 > The session GUC takes precedence over the `search_window_size` index reloption whenever it is set. There is currently no special "disable" value (such as `0`); to stop overriding and return to the default behavior, use `RESET svs.search_window_size`.
 
@@ -226,12 +225,12 @@ CREATE INDEX my_idx
     );
 ```
 
-**Parallel index build** — SVS manages its own internal thread pool. The number of threads is controlled by `max_parallel_maintenance_workers`:
-- When `max_parallel_maintenance_workers = 0` (the PostgreSQL default), SVS automatically uses `nproc - 1` threads, reserving one CPU for the PostgreSQL backend — this is optimal for most deployments.
+**Parallel index build** — SVS manages its own internal thread pool. The number of threads is controlled by `max_parallel_maintenance_workers`, matching core's own meaning of that GUC:
+- When `max_parallel_maintenance_workers = 0` (the PostgreSQL default), the build runs serially (1 thread).
 - When set to a positive value, that value is passed directly to SVS as its build thread count.
 
 ```sql
--- Default (0): SVS auto-selects nproc-1 threads — no action needed
+-- Default (0): build runs serially (1 thread) — no action needed
 CREATE INDEX my_idx ON my_table USING vamana (embedding vector_l2_ops);
 
 -- Explicitly limit threads (e.g. in a shared environment)
@@ -555,21 +554,21 @@ SET svs.search_window_size = 200;  -- slower, higher recall
 
 ### Parallel Builds
 
-SVS manages its own internal thread pool for index builds. The thread count is governed by `max_parallel_maintenance_workers`:
+SVS manages its own internal thread pool for index builds. The thread count is governed by `max_parallel_maintenance_workers`, matching core's own meaning of that GUC:
 
-- `0` (PostgreSQL default) → SVS uses `nproc - 1` threads automatically (one CPU reserved for the PG backend). This is already optimal for dedicated build hosts.
-- Positive value → passed directly to SVS as its build thread count. Use this to limit resource usage in shared environments.
+- `0` (PostgreSQL default) → the build runs serially (1 thread).
+- Positive value → passed directly to SVS as its build thread count. Use this to parallelize builds.
 
 ```sql
--- Let SVS auto-select threads (nproc-1) — recommended default
+-- Default (0): build runs serially (1 thread)
 CREATE INDEX … USING vamana (…);
 
--- Explicitly cap threads in a shared environment
+-- Parallelize the build
 SET max_parallel_maintenance_workers = 4;
 CREATE INDEX … USING vamana (…);
 ```
 
-> **Note:** Unlike HNSW, there is no separate PostgreSQL leader thread — the value is used directly as the SVS thread pool size. Search threads are always capped at `nproc - 1` regardless of this setting.
+> **Note:** Unlike HNSW, there is no separate PostgreSQL leader thread — the value is used directly as the SVS thread pool size. Search threads are governed separately by `svs.search_num_threads` (see §6.1), not by this setting.
 
 ### 6.1 Background Workers and Per-Database Enablement (Advanced)
 
@@ -675,6 +674,9 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
+| `svs.search_num_threads` | `0` | 0 – 1024 | Cluster-wide default search-thread count. `0` = auto (resolves to `1`). Overridable per database via the `vamana_databases.search_num_threads` catalog column. Superuser-only; no session `SET`. |
+| `svs.max_search_threads_per_db` | `0` | 0 – 1024 | Ceiling on one database's search-thread grant. `0` = follow `max_parallel_workers`. |
+| `svs.max_total_search_threads` | `0` | 0 – 1024 | Cluster-wide ceiling on search threads summed across all databases. `0` = follow `max_parallel_workers`; never exceeds it regardless of this setting. |
 | `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. |
 | `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. |
 | `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. |
@@ -1161,7 +1163,6 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
-| `svs.search_num_threads` | `0` | `0` | `1024` | SVS threads per search; 0 = auto (nproc-1). Superuser-only (`PGC_SUSET`) |
 | `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
 
 ### Server GUC Parameters (require restart — `postgresql.conf` only, `PGC_POSTMASTER`)
@@ -1176,6 +1177,9 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
+| `svs.search_num_threads` | `0` | `0` | `1024` | Cluster-wide default search-thread count; 0 = auto (resolves to 1). Overridable per database via `vamana_databases.search_num_threads`. Superuser-only; no session `SET` |
+| `svs.max_search_threads_per_db` | `0` | `0` | `1024` | Ceiling on one database's search-thread grant; 0 = follow `max_parallel_workers` |
+| `svs.max_total_search_threads` | `0` | `0` | `1024` | Cluster-wide ceiling on search threads summed across all databases; 0 = follow `max_parallel_workers`, and never exceeds it regardless of this setting |
 | `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker (ms); exceeded → error |
 | `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms); exceeded → error |
 | `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; escalates on repeated crashes |

@@ -81,4 +81,13 @@ typedef struct SvsCpuBudget
 extern SvsCpuBudget *SvsComputeCpuGrants(const SvsCpuBudgetInput *in,
 										  MemoryContext resultCtx);
 
+/*
+ * The same 0-means-follow-max_parallel_workers resolution SvsComputeCpuGrants
+ * applies to svs.max_search_threads_per_db, exposed for callers that only
+ * need the resolved ceiling (e.g. reporting) without building a full
+ * SvsCpuBudgetInput.
+ */
+extern int32 SvsSearchThreadsPerDbCeiling(int32 maxSearchThreadsPerDb,
+										   int32 maxParallelWorkers);
+
 #endif							/* SVS_CPU_BUDGET_H */

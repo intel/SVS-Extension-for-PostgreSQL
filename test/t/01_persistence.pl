@@ -484,13 +484,9 @@ use VamanaTestUtils qw(:all);
 
 # ===========================================================================
 # Search threads — SVSLoadIndex applies this database's published search
-# grant (SvsCurrentSearchGrant()), falling back to SVSDefaultSearchThreads()
-# only when no grant is available.  The database here is registered in
-# vamana_databases, so the catalog-driven grant is always in play, and
+# grant (SvsCurrentSearchGrant()), which always resolves to at least 1, so
 # unconfigured (search_num_threads NULL, svs.search_num_threads unset)
-# resolves to 1, not nproc-1: SVSDefaultSearchThreads() itself still defaults
-# to nproc-1, and that divergence is intentional (see the CPU search
-# management design note in svs_wrapper.c/vamanaworkersearch.c).
+# resolves to 1.
 #
 # A restart leaves the freshly restarted worker not yet "live" on the
 # launcher's very first post-restart reconcile pass, which floors this
@@ -539,12 +535,12 @@ use VamanaTestUtils qw(:all);
     my $new_log = substr($node->log_content(), $log_pos_before_restart);
 
     like($new_log,
-        qr/loading SVS index with \d+ search threads \(svs\.search_num_threads=\d+, max_parallel_maintenance_workers=2\)/,
+        qr/loading SVS index with \d+ search threads/,
         'DEBUG1 log confirms SVSLoadIndex logged its resolved search thread count');
 
     like($new_log,
         qr/loading SVS index with 1 search threads/,
-        'unconfigured search_num_threads resolves to 1 via the published grant, not nproc-1');
+        'unconfigured search_num_threads resolves to 1 via the published grant');
 
     $node->safe_psql("postgres",
         "ALTER SYSTEM SET svs.search_num_threads = 3;");
@@ -563,13 +559,12 @@ use VamanaTestUtils qw(:all);
     my $log_test4 = '';
     for (1 .. 20) {
         $log_test4 = substr($node->log_content(), $log_pos_before_test4);
-        last if $log_test4 =~
-            /loading SVS index with 3 search threads \(svs\.search_num_threads=3/;
+        last if $log_test4 =~ /loading SVS index with 3 search threads/;
         usleep(500_000);
     }
 
     like($log_test4,
-        qr/loading SVS index with 3 search threads \(svs\.search_num_threads=3/,
+        qr/loading SVS index with 3 search threads/,
         'svs.search_num_threads=3 becomes the cluster-wide default the published grant resolves to');
 
     $node->safe_psql("postgres",

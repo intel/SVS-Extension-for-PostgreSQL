@@ -178,7 +178,7 @@ sub run_search
 
 # ---------------------------------------------------------------------------
 # 5. The load path: a freshly loaded index (from a cold worker cache) picks
-# up the current grant rather than SVSDefaultSearchThreads()'s nproc-1.
+# up the current grant.
 # ---------------------------------------------------------------------------
 {
 	$node->safe_psql('postgres',

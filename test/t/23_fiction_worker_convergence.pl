@@ -610,7 +610,7 @@ assert_no_crash_since($node, $run_log_pos, 'case 6');
 #
 # svs.max_search_threads_per_db must be raised explicitly here. It defaults
 # to 0, which means "follow max_parallel_workers" (see
-# ComputePerDatabaseCeiling in svs_cpu_budget.c) -- so with the default left
+# SvsSearchThreadsPerDbCeiling in svs_cpu_budget.c) -- so with the default left
 # alone, lowering max_parallel_workers alone clamps *desired* itself down to
 # the same small number and no gap ever appears in the view. Confirmed by
 # hand against a scratch cluster: without this second GUC, desired reads 1,
