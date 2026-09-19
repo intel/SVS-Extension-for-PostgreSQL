@@ -119,7 +119,7 @@ SVS provides a high-level batch build API with internal parallelism management.
 **Implementation characteristics:**
 - **SVS manages parallelism internally** via threads
 - **No manual shared memory management** required for build
-- **Build thread count is launcher-governed:** the backend requests a thread count (`maintenance_num_threads` from `vamana_databases`, falling back to `max_parallel_maintenance_workers` when unset) and blocks until the launcher grants it from the database's CPU budget; search still passes `svs.search_num_threads` straight through
+- **Build and search thread counts are both launcher-governed, through the same grant calculator:** a build backend requests a thread count (`maintenance_num_threads` from `vamana_databases`, falling back to `max_parallel_maintenance_workers` when unset) and blocks until the launcher grants it from the database's CPU budget; search reads its last-published grant (derived from `svs.search_num_threads` and its per-database/cluster ceilings) non-blockingly instead of waiting on one
 - **Dynamic index:** Uses `svs_index_build_dynamic` to produce a mutable index; INSERT calls `SVSAddPoints` for incremental updates, DELETE + VACUUM calls `SVSDeletePoints` with consolidation and compaction
 - **Must buffer vectors:** All vectors loaded into memory before build
 
@@ -493,6 +493,14 @@ The BGW loads from the filesystem save directory (`$PGDATA/vamana_indexes/<relid
 
 `CREATE INDEX` gates on the state of the calling database's worker slot: a missing slot (database not enrolled) is a hard error, a reserved slot with no live worker is a bounded wait, and a live worker proceeds. Once the index is built and its save directory is durable, the worker loads it on first access. See the reservation handshake and three-state gate in [BGW_LAUNCHER.md](BGW_LAUNCHER.md). The first INSERT blocks on `VamanaWorkerWaitUntilAvailable` until the worker has loaded the index and marked it available, guaranteeing the cache is warm before any write is applied.
 
+#### Build Thread Grant
+
+Before the build itself runs, the backend negotiates its build thread count with the launcher, a separate protocol from the load IPC above. The backend resolves a requested count (`vamana_databases.maintenance_num_threads` for the current database, falling back to `max_parallel_maintenance_workers` when unset), claims one of a small fixed number of pending-build-request slots, and writes its request into shared memory. It then wakes the launcher and blocks on its own latch.
+
+The launcher's CPU grant pass (see [BGW_LAUNCHER.md §6](BGW_LAUNCHER.md#6-launcher-behavior)) folds this request into the same calculation it uses for search-thread grants, clamped against that database's CPU budget and `max_parallel_workers`, and writes a grant back into the backend's request slot. The backend reads the grant, caps its `ParallelContext`'s `nworkers` to it, and proceeds. On completion (success, error, or abort) the backend clears its own request slot and wakes the launcher so the capacity is reclaimed immediately rather than on the launcher's next unrelated wake.
+
+If no grant arrives before a timeout, the backend fails the `CREATE INDEX` with an error naming the launcher, rather than falling back to an uncoordinated thread count. If the backend itself dies before clearing its request slot, the launcher's reconcile pass detects the stale request by PID liveness and reclaims the slot.
+
 ### 5.8 Checkpoint and Atomicity
 
 #### What Is a Checkpoint
@@ -680,12 +688,18 @@ Nothing on this path raises an error — the transaction has already committed a
 
 ## 6. GUC Parameters
 
+The search-thread GUCs in §6.1 and the per-database `maintenance_num_threads` override are not applied directly; they are inputs to a launcher-side grant calculator that apportions threads across every enabled database once per reconcile pass, enforcing per-database and cluster-wide ceilings and a database's reserved floor before anything else. See [BGW_LAUNCHER.md §6, "The CPU grant pass"](BGW_LAUNCHER.md#6-launcher-behavior) for the algorithm.
+
 ### 6.1 Runtime Query Parameters
 
 | GUC | Type | Default | Range | Scope | Description |
 |---|---|---|---|---|---|
 | `svs.search_window_size` | int | 100 | 10–10000 | `PGC_USERSET` | Search window (L) for index scans. Higher values improve recall at the cost of latency. |
-| `svs.search_num_threads` | int | 0 | 0–1024 | `PGC_SUSET` | Threads SVS uses for search. `0` = auto (`nproc-1`). Lower values reduce oversubscription under concurrent load. |
+| `svs.search_num_threads` | int | 0 | 0–1024 | `PGC_SIGHUP` | Cluster-wide default search thread count, subject to the launcher's grant path (see note below the table). `0` = auto, resolves to `1`. Superuser-only; no session `SET`. |
+| `svs.max_search_threads_per_db` | int | 0 | 0–1024 | `PGC_SIGHUP` | Per-database ceiling on search threads. `0` = no cap (bounded only by `svs.max_total_search_threads` and `max_parallel_workers`). |
+| `svs.max_total_search_threads` | int | 0 | 0–1024 | `PGC_SIGHUP` | Cluster-wide ceiling on search threads across all databases. `0` = follow `max_parallel_workers`. |
+
+These three GUCs are inputs to the launcher's grant calculator, not values a worker uses directly: search reads its last-published grant non-blockingly at query time, while a build blocks on `SvsWaitForBuildGrant` until the launcher grants it. Both paths resolve through the same calculator and the same floor/ceiling logic; search does not bypass it.
 
 ### 6.2 Background Worker Parameters
 
@@ -802,7 +816,7 @@ svs.max_databases = 8                 # default: 8; concurrent workers
 ### 8.1 Optimization Strategies
 1. **AVX-512 SIMD:** SVS automatically uses Intel hardware optimizations when compiled with `-march=native`
 2. **Compression:** Enable LVQ (`compression_type=2`) for memory-constrained systems; LeanVec (`compression_type=1`) for two-level quantization
-3. **Thread count:** Tune `svs.search_num_threads` to match workload; `0` auto-selects `nproc-1`
+3. **Thread count:** Tune `svs.search_num_threads` to match workload; `0` resolves to `1`
 4. **Background worker:** The per-database worker holds the index in memory and amortizes load cost across all backends. Enroll the database and, for latency-sensitive deployments, warm indexes ahead of query traffic with `svs_warmup_index`/`svs_warmup_database` so the first query does not pay the demand-load cost. See [BGW_LAUNCHER.md](BGW_LAUNCHER.md)
 5. **Incremental writes:** Inserts update the graph incrementally; periodic `REINDEX` restores optimal graph quality after many mutations
 

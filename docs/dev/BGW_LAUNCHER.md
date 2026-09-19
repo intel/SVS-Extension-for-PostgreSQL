@@ -57,7 +57,7 @@ Conceptually the table records, per database:
 
 - The database name. This is the primary key. The table is keyed by name, not by database OID, deliberately. Storing an OID would duplicate state that is always derivable from the name, would create an ongoing obligation to keep the two in sync, and would open an OID-reuse hazard in which dropping and recreating a database could silently bind a worker to the wrong database. The launcher resolves each name to a live OID on every scan, so a worker always binds to whatever database currently bears that name.
 - Whether the database is currently enabled. Disabling is a reversible pause, not a removal (see [Pause vs. Permanent Removal](#10-pause-vs-permanent-removal)).
-- A set of reserved per-database resource columns (graph memory, total memory, search thread count). These exist in the schema so the table's shape is stable, but nothing reads or enforces them yet; they are placeholders for a future resource-management phase. A `NULL` value means "use the cluster-wide default."
+- A set of per-database resource columns: `search_num_threads`, `search_threads_reserved`, `maintenance_num_threads`, `residency_memory`, and `search_work_mem`. These are actively read and enforced: the CPU-grant pass (below) feeds the thread columns into the launcher's grant calculator, and the memory columns are enforced via triggers. A `NULL` value means "use the cluster-wide default." `graph_memory_mb` is the one column in this group that is not yet read anywhere; it remains a placeholder for a future resource-management phase.
 
 Two triggers are attached to this table. They do different jobs and both fire on the same change:
 
@@ -159,6 +159,21 @@ The two signals are kept distinct on purpose: the slot's worker-process-ID is th
 
 Both the ledger entries and the handles they point to must be allocated in a context that lives for the launcher's whole process lifetime, not in the per-pass scratch context that is freed at the end of each reconcile pass. A handle allocated in the scratch context would dangle after that context is freed, and the next wake would crash when it polled the handle's status.
 
+### The CPU grant pass
+
+Once per reconcile pass, after the liveness and spawn steps above, the launcher runs a separate pass that decides how many search and build threads each database gets. This is the mechanism behind `svs.search_num_threads`, `svs.max_search_threads_per_db`, `svs.max_total_search_threads`, and the `vamana_databases.search_num_threads`/`search_threads_reserved`/`maintenance_num_threads` overrides (see the [User Guide](../USER_GUIDE.md)).
+
+The pass has one pure entry point, `SvsComputeCpuGrants`, that takes the current GUC snapshot, each enabled database's resource row, the live-worker set, and any pending build-thread requests, and returns a grant for each. It does no catalog I/O, touches no shared memory, and reads no GUC directly; the launcher collects the inputs before calling it and applies the outputs afterward. This makes the calculator's output a pure function of its inputs: the same inputs always produce the same grants, whether the launcher computing them is running as a primary or a standby.
+
+The calculation runs in a fixed order:
+
+1. **Resolve each database's effective desired thread count** from its own override (or the cluster-wide default if unset).
+2. **Hold each database's reserved floor**, if one is set (`search_threads_reserved`), off the shared pool before anything else is apportioned.
+3. **Share the remaining, elastic capacity** across databases still wanting more, up to each database's own ceiling (`max_search_threads_per_db`) and the cluster-wide ceiling (`max_total_search_threads`), neither of which can push the total past `max_parallel_workers`.
+4. **Fold in pending build-thread requests** against the same `max_parallel_workers` clamp, so a build in one database cannot take capacity out of another database's reserved search floor.
+
+The launcher writes each changed grant back into its owning database's shared-memory control block and wakes that database's worker (for a search-grant change) or the requesting backend (for a build grant). Search reads its most recently published grant non-blockingly at query time; a build backend instead blocks on its own latch, waiting for the launcher to write a grant into its request slot, and fails `CREATE INDEX` if no grant arrives before a timeout rather than falling back to an ungoverned thread count.
+
 ---
 
 ## 7. Worker Crash Detection and Restart
@@ -205,6 +220,14 @@ sees "mydb" stopped, applies dwell-based reset or increments failures
         v
 new worker starts for "mydb", fresh, with no memory of the crash
 ```
+
+### Fiction-worker orphan self-termination
+
+A per-database worker realizes its granted search-thread count as a set of parked `BGWORKER_CLASS_PARALLEL` workers ("fiction workers"): registered but otherwise idle processes that exist so PostgreSQL's own parallel-worker accounting counts them, without doing any query work themselves. Search grants published by the CPU-grant pass (§6) are realized by growing or shrinking this parked pool to match.
+
+Normally a worker terminates its own fiction workers on exit, as part of the same cleanup its crash-detection above relies on. That cleanup path can itself be skipped or fail (an errored `before_shmem_exit` callback, for instance), which would otherwise leave fiction workers parked indefinitely, holding `max_parallel_workers` capacity that never gets reclaimed. The launcher cannot repair this by holding a handle to the worker's fiction workers directly and terminating them itself: `BackgroundWorkerHandle` is opaque outside core's own `bgworker.c`, so there is no way to serialize a fiction worker's handle out of its owning worker's memory for the launcher to act on later, and terminating by PID alone would reintroduce the PID-reuse race the opaque handle exists to prevent.
+
+Instead, each fiction worker detects its own owner's death using the same liveness ground truth the reconcile pass above already trusts: the per-database slot's `workerPid` field. Each fiction worker's park loop wakes on a bounded timeout (rather than blocking indefinitely on SIGTERM alone), looks up its owning database's slot, and compares the slot's current `workerPid` against the PID it recorded for its owner at registration time. A mismatch, whether the field was zeroed (the launcher's reconcile pass already confirmed the owner crashed) or now names a different PID (the owner crashed and was already respawned before this fiction worker's owner-side cleanup ran), means this fiction worker has no living owner, and it exits on its own. No launcher-side code or new shared state is needed; the launcher's role in this backstop is limited to keeping `workerPid` accurate, which it already does.
 
 ---
 

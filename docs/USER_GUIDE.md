@@ -225,17 +225,22 @@ CREATE INDEX my_idx
     );
 ```
 
-**Parallel index build** — SVS manages its own internal thread pool. The number of threads is controlled by `max_parallel_maintenance_workers`, matching core's own meaning of that GUC:
-- When `max_parallel_maintenance_workers = 0` (the PostgreSQL default), the build runs serially (1 thread).
-- When set to a positive value, that value is passed directly to SVS as its build thread count.
+**Parallel index build** — SVS manages its own internal thread pool. The requested thread count comes from the `vamana_databases.maintenance_num_threads` catalog column for the current database, falling back to `max_parallel_maintenance_workers` when that column is `NULL`:
+- With no override and `max_parallel_maintenance_workers = 0` (the PostgreSQL default), the build requests 1 thread.
+- With no override and `max_parallel_maintenance_workers` set to a positive value, that value is requested.
+
+The requested count is not used directly: the build blocks on a grant from the launcher, which caps it against the database's CPU budget alongside search's thread grants. If no grant arrives before the launcher's timeout, `CREATE INDEX` fails with an error naming the launcher rather than falling back to an ungoverned thread count.
 
 ```sql
--- Default (0): build runs serially (1 thread) — no action needed
+-- No override, max_parallel_maintenance_workers = 0: build requests 1 thread
 CREATE INDEX my_idx ON my_table USING vamana (embedding vector_l2_ops);
 
--- Explicitly limit threads (e.g. in a shared environment)
+-- Explicitly request more threads (e.g. in a shared environment)
 SET max_parallel_maintenance_workers = 4;
 CREATE INDEX my_idx ON my_table USING vamana (embedding vector_l2_ops);
+
+-- Per-database override, independent of the session GUC
+UPDATE vamana_databases SET maintenance_num_threads = 4 WHERE datname = current_database();
 ```
 
 > **Note (prototype limitation):** `maintenance_work_mem` does not currently affect Vamana index builds; SVS manages its own memory allocation internally. A future release will pass `maintenance_work_mem` to the SVS API so that builds respect the configured memory limit.
@@ -554,21 +559,26 @@ SET svs.search_window_size = 200;  -- slower, higher recall
 
 ### Parallel Builds
 
-SVS manages its own internal thread pool for index builds. The thread count is governed by `max_parallel_maintenance_workers`, matching core's own meaning of that GUC:
+SVS manages its own internal thread pool for index builds. The requested thread count comes from the `vamana_databases.maintenance_num_threads` catalog column for the current database, falling back to `max_parallel_maintenance_workers` when that column is `NULL`:
 
-- `0` (PostgreSQL default) → the build runs serially (1 thread).
-- Positive value → passed directly to SVS as its build thread count. Use this to parallelize builds.
+- With no override, `0` (PostgreSQL default) → the build requests 1 thread.
+- With no override, positive value → that value is requested.
+
+The request is not granted directly: it blocks until the launcher grants it from the database's CPU budget, alongside search's grants. If no grant arrives before the launcher's timeout, `CREATE INDEX` fails naming the launcher rather than degrading to an ungoverned thread count.
 
 ```sql
--- Default (0): build runs serially (1 thread)
+-- No override, default 0: build requests 1 thread
 CREATE INDEX … USING vamana (…);
 
--- Parallelize the build
+-- Request more threads
 SET max_parallel_maintenance_workers = 4;
 CREATE INDEX … USING vamana (…);
+
+-- Per-database override, independent of the session GUC
+UPDATE vamana_databases SET maintenance_num_threads = 4 WHERE datname = current_database();
 ```
 
-> **Note:** Unlike HNSW, there is no separate PostgreSQL leader thread — the value is used directly as the SVS thread pool size. Search threads are governed separately by `svs.search_num_threads` (see §6.1), not by this setting.
+> **Note:** Unlike HNSW, there is no separate PostgreSQL leader thread. Search threads are governed by the same launcher grant path but through `svs.search_num_threads` and its ceilings (see §6.1) instead of this setting.
 
 ### 6.1 Background Workers and Per-Database Enablement (Advanced)
 
@@ -675,8 +685,8 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
 | `svs.search_num_threads` | `0` | 0 – 1024 | Cluster-wide default search-thread count. `0` = auto (resolves to `1`). Overridable per database via the `vamana_databases.search_num_threads` catalog column. Superuser-only; no session `SET`. |
-| `svs.max_search_threads_per_db` | `0` | 0 – 1024 | Ceiling on one database's search-thread grant. `0` = follow `max_parallel_workers`. |
-| `svs.max_total_search_threads` | `0` | 0 – 1024 | Cluster-wide ceiling on search threads summed across all databases. `0` = follow `max_parallel_workers`; never exceeds it regardless of this setting. |
+| `svs.max_search_threads_per_db` | `0` | 0 – 1024 | Ceiling on one database's search-thread grant. `0` = follow `max_parallel_workers`. Superuser-only; no session `SET`. |
+| `svs.max_total_search_threads` | `0` | 0 – 1024 | Cluster-wide ceiling on search threads summed across all databases. `0` = follow `max_parallel_workers`; never exceeds it regardless of this setting. Superuser-only; no session `SET`. |
 | `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. |
 | `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. |
 | `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. |
@@ -687,6 +697,16 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 > `svs.worker_restart_time` and `svs.worker_restart_backoff` govern two different restart policies deliberately: a fixed interval for the launcher itself (via the postmaster's native mechanism), and escalating backoff for per-database workers (a worker crash-looping on a corrupted index or an out-of-memory condition should not be respawned every second forever). They are not interchangeable.
 
 **Crash handling:** If a per-database worker crashes, the launcher detects it near-instantly and respawns it, backing off exponentially on repeated crashes. If the launcher itself crashes, the postmaster restarts it, and it re-derives the full worker set from `vamana_databases`.
+
+**Per-database thread overrides** (`vamana_databases` columns, take effect immediately, no reload needed):
+
+| Column | Default | Range | Description |
+|--------|---------|-------|-------------|
+| `search_num_threads` | `NULL` | 1 – 1024 | This database's own search thread count, overriding `svs.search_num_threads`. `NULL` = use the cluster-wide default. |
+| `search_threads_reserved` | `NULL` | 0 – 1024 | A floor on this database's search-thread grant that the launcher's elastic-remainder sharing will not take below, even under cluster-wide contention. `NULL` = no floor; this database competes purely on a best-effort basis. |
+| `maintenance_num_threads` | `NULL` | 0 – 1024 | This database's own build thread request, overriding `max_parallel_maintenance_workers` for `CREATE INDEX`/`REINDEX` in this database. `NULL` = follow `max_parallel_maintenance_workers`; `0` = request 1 thread (serial), matching core's own `max_parallel_maintenance_workers = 0` semantics. |
+
+Both `search_num_threads` and `search_threads_reserved` feed the same launcher grant calculator as the cluster-wide GUCs; setting one does not bypass `svs.max_search_threads_per_db` or `svs.max_total_search_threads`.
 
 ---
 
@@ -923,6 +943,11 @@ FROM pg_stat_vamana_worker;
 | `residency_drift` | `residency_bytes_committed` minus the durable sum from `svs_index_residency`; nonzero briefly during a load/unload race, persistently nonzero is a bug |
 | `search_work_mem_limit` | The resolved per-query search-scratch budget in effect for this database |
 | `search_scratch_bytes_in_flight` | Shared-memory total of search-scratch bytes currently reserved for in-flight queries in this database; resets to `0` on worker restart |
+| `search_threads_desired` | The thread count this database's search would use with no contention, before any cluster-wide sharing is applied |
+| `search_threads_granted` | The thread count the launcher has actually granted this database's search, after floors and elastic-remainder sharing across all enabled databases; what search uses right now |
+| `search_threads_reserved` | This database's reserved search-thread floor (`vamana_databases.search_threads_reserved`, or `0`/no floor if unset) |
+| `search_slots_registered` | Number of parked search-thread slots currently registered for this database, used to realize `search_threads_granted` as real, PostgreSQL-visible parallel workers |
+| `max_search_threads_per_db` | The resolved per-database ceiling in effect (`svs.max_search_threads_per_db`, or the per-database override) |
 
 `pg_stat_vamana_worker_slot` reports one row per worker request slot per visible database — including idle (`empty`) slots, not just in-flight ones — for finer-grained diagnosis of what a worker is currently processing (`slot_status`, `slot_kind`, `index_relid`, `error_message`, `search_scratch_bytes_per_query`).
 
@@ -1178,8 +1203,8 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.search_num_threads` | `0` | `0` | `1024` | Cluster-wide default search-thread count; 0 = auto (resolves to 1). Overridable per database via `vamana_databases.search_num_threads`. Superuser-only; no session `SET` |
-| `svs.max_search_threads_per_db` | `0` | `0` | `1024` | Ceiling on one database's search-thread grant; 0 = follow `max_parallel_workers` |
-| `svs.max_total_search_threads` | `0` | `0` | `1024` | Cluster-wide ceiling on search threads summed across all databases; 0 = follow `max_parallel_workers`, and never exceeds it regardless of this setting |
+| `svs.max_search_threads_per_db` | `0` | `0` | `1024` | Ceiling on one database's search-thread grant; 0 = follow `max_parallel_workers`. Superuser-only; no session `SET` |
+| `svs.max_total_search_threads` | `0` | `0` | `1024` | Cluster-wide ceiling on search threads summed across all databases; 0 = follow `max_parallel_workers`, and never exceeds it regardless of this setting. Superuser-only; no session `SET` |
 | `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker (ms); exceeded → error |
 | `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms); exceeded → error |
 | `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; escalates on repeated crashes |
