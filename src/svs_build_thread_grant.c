@@ -20,6 +20,7 @@
 #include "svs_build_thread_grant.h"
 
 #include "svs_parallel_build.h"
+#include "svs_thread_count.h"
 #include "svs_wrapper.h"
 #include "vamana_databases.h"
 #include "vamanaworker.h"
@@ -29,20 +30,15 @@
 #include "miscadmin.h"
 #include "utils/injection_point.h"
 
-/*
- * maintenance_num_threads NULL means "follow the GUC"; an explicit 0 means
- * serial, matching core's max_parallel_maintenance_workers = 0 semantics --
- * a request of 0 must never fall through to the GUC's own auto-resolution.
- */
 static int32
 ResolveRequestedBuildThreads(void)
 {
-	int32		requested = SvsDatabasesGetMyMaintenanceNumThreads();
+	int32		catalogValue = SvsDatabasesGetMyMaintenanceNumThreads();
 
-	if (requested == -1)
-		requested = SVSDefaultBuildThreads();
+	if (catalogValue == -1)
+		return SVSDefaultBuildThreads();
 
-	return (requested <= 0) ? 1 : requested;
+	return SvsAtLeastOneThread(catalogValue);
 }
 
 void

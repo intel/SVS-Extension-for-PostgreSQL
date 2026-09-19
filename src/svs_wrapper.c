@@ -12,25 +12,15 @@
 #include "vamana.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
+#include "svs_thread_count.h"
 #include "utils/elog.h"
 
 #include <svs/c/svs_c.h>
 
-/*
- * Use max_parallel_maintenance_workers for build thread count.
- * Zero or negative means serial (1 thread), matching core's own meaning of
- * max_parallel_maintenance_workers = 0.  Non-zero is honored as-is; DBAs
- * may intentionally oversubscribe.
- */
 int
 SVSDefaultBuildThreads(void)
 {
-	int			workers = max_parallel_maintenance_workers;
-
-	if (workers <= 0)
-		return 1;
-
-	return workers;
+	return SvsAtLeastOneThread(max_parallel_maintenance_workers);
 }
 
 typedef struct CompressionMapping

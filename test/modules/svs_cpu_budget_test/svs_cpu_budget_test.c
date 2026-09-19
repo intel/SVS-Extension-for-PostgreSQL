@@ -126,26 +126,25 @@ svs_cpu_budget_test(PG_FUNCTION_ARGS)
 	gucs.maxParallelWorkers = PG_GETARG_INT32(0);
 	gucs.maxSearchThreadsPerDb = PG_GETARG_INT32(1);
 	gucs.maxTotalSearchThreads = PG_GETARG_INT32(2);
-	gucs.maxParallelMaintenanceWorkers = PG_GETARG_INT32(3);
-	gucs.searchNumThreadsDefault = PG_GETARG_INT32(4);
+	gucs.searchNumThreadsDefault = PG_GETARG_INT32(3);
 
-	dbOids = DeconstructOidArray(PG_GETARG_ARRAYTYPE_P(5), &ndbs);
+	dbOids = DeconstructOidArray(PG_GETARG_ARRAYTYPE_P(4), &ndbs);
 
-	dbLive = DeconstructBoolArray(PG_GETARG_ARRAYTYPE_P(6), &n);
+	dbLive = DeconstructBoolArray(PG_GETARG_ARRAYTYPE_P(5), &n);
 	CheckSameLength(ndbs, n, "db_live");
 
-	dbSearchNumThreads = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(7), &n);
+	dbSearchNumThreads = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(6), &n);
 	CheckSameLength(ndbs, n, "db_search_num_threads");
 
-	dbSearchThreadsReserved = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(8), &n);
+	dbSearchThreadsReserved = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(7), &n);
 	CheckSameLength(ndbs, n, "db_search_threads_reserved");
 
-	buildDbOids = DeconstructOidArray(PG_GETARG_ARRAYTYPE_P(9), &nbuilds);
+	buildDbOids = DeconstructOidArray(PG_GETARG_ARRAYTYPE_P(8), &nbuilds);
 
-	buildRequestPids = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(10), &n);
+	buildRequestPids = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(9), &n);
 	CheckSameLength(nbuilds, n, "build_request_pid");
 
-	buildMaintenanceNumThreads = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(11), &n);
+	buildMaintenanceNumThreads = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(10), &n);
 	CheckSameLength(nbuilds, n, "build_maintenance_num_threads");
 
 	dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);

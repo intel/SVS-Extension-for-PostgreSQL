@@ -28,6 +28,7 @@
 #include "postgres.h"
 
 #include "svs_cpu_budget.h"
+#include "svs_thread_count.h"
 
 typedef struct SvsDbCpuWorking
 {
@@ -92,7 +93,7 @@ ComputeEffectiveDesired(const SvsDbCpuRequest *req, const SvsCpuGucs *gucs,
 	clusterDefault = ResolveOrFallback(gucs->searchNumThreadsDefault, 1);
 	requested = (req->searchNumThreads == -1) ? clusterDefault : req->searchNumThreads;
 
-	return Min(Max(requested, 1), perDbCeiling);
+	return Min(SvsAtLeastOneThread(requested), perDbCeiling);
 }
 
 static SvsDbCpuWorking *
