@@ -35,7 +35,6 @@ typedef struct SvsCpuGucs
 	int32		maxSearchThreadsPerDb;			/* svs.max_search_threads_per_db; 0 = follow maxParallelWorkers */
 	int32		maxTotalSearchThreads;			/* svs.max_total_search_threads; 0 = follow maxParallelWorkers */
 	int32		maxParallelWorkers;				/* core max_parallel_workers: the hard pool */
-	int32		maxParallelMaintenanceWorkers;	/* core max_parallel_maintenance_workers: build fallback */
 } SvsCpuGucs;
 
 typedef struct SvsCpuBudgetInput

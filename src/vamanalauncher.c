@@ -777,7 +777,6 @@ PublishCpuGrants(List *rows)
 	gucs.maxSearchThreadsPerDb = svs_max_search_threads_per_db;
 	gucs.maxTotalSearchThreads = svs_max_total_search_threads;
 	gucs.maxParallelWorkers = max_parallel_workers;
-	gucs.maxParallelMaintenanceWorkers = max_parallel_maintenance_workers;
 
 	input.gucs = &gucs;
 	input.dbs = dbs;
