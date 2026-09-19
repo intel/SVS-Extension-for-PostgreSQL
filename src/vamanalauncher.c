@@ -733,7 +733,6 @@ PublishCpuGrants(List *rows)
 	List	   *enabledRows;
 	int			ndbs;
 	SvsDbCpuRequest *dbs;
-	VamanaWorkerShmem **entries;
 	SvsBuildCpuRequest *builds;
 	int			nbuilds = 0;
 	int			i = 0;
@@ -747,7 +746,6 @@ PublishCpuGrants(List *rows)
 	enabledRows = EnabledRowsOf(rows);
 	ndbs = list_length(enabledRows);
 	dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
-	entries = palloc(sizeof(VamanaWorkerShmem *) * ndbs);
 	builds = palloc(sizeof(SvsBuildCpuRequest) * ndbs * SVS_MAX_PENDING_BUILDS);
 
 	foreach(lc, enabledRows)
@@ -756,7 +754,6 @@ PublishCpuGrants(List *rows)
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
 		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
 
-		entries[i] = entry;
 		dbs[i].dbOid = db->dbOid;
 		dbs[i].live = live;
 		dbs[i].searchNumThreads = db->cpu.searchNumThreads;
@@ -788,8 +785,8 @@ PublishCpuGrants(List *rows)
 
 	for (i = 0; i < budget->ndbGrants; i++)
 	{
-		VamanaWorkerShmem *entry = entries[i];
 		const SvsDbCpuGrant *grant = &budget->dbGrants[i];
+		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(grant->dbOid);
 		uint32		previousGranted;
 
 		if (entry == NULL)

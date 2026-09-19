@@ -298,4 +298,47 @@ $node->stop;
 	$primary->stop;
 }
 
+# ---------------------------------------------------------------------------
+# 8. Multi-database grant identity: each database gets its own grant, not a
+# sibling's.
+# ---------------------------------------------------------------------------
+{
+	my $node2 = PostgreSQL::Test::Cluster->new('search_grant_identity');
+	$node2->init;
+	$node2->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+	$node2->append_conf('postgresql.conf', "wal_level = logical");
+	$node2->append_conf('postgresql.conf', "max_replication_slots = 10");
+	$node2->append_conf('postgresql.conf', "max_wal_senders = 10");
+	$node2->append_conf('postgresql.conf', "max_parallel_workers = 32");
+	$node2->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+	$node2->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+	$node2->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
+	$node2->start;
+
+	$node2->safe_psql('postgres', "CREATE EXTENSION vector;");
+	$node2->safe_psql('postgres', "CREATE EXTENSION svs;");
+	$node2->safe_psql('postgres', "CREATE DATABASE sgi_a;");
+	$node2->safe_psql('postgres', "CREATE DATABASE sgi_b;");
+	$node2->safe_psql('sgi_a', "CREATE EXTENSION vector;");
+	$node2->safe_psql('sgi_a', "CREATE EXTENSION svs;");
+	$node2->safe_psql('sgi_b', "CREATE EXTENSION vector;");
+	$node2->safe_psql('sgi_b', "CREATE EXTENSION svs;");
+
+	$node2->safe_psql('postgres', qq(
+		INSERT INTO vamana_databases (datname, enabled, search_num_threads) VALUES
+			('sgi_a', true, 3),
+			('sgi_b', true, 7);
+	));
+
+	wait_for_worker_db($node2, 'sgi_a', 30);
+	wait_for_worker_db($node2, 'sgi_b', 30);
+
+	is(wait_for_granted($node2, 'sgi_a', 3), '3',
+		'sgi_a gets its own grant (3), not its sibling\'s');
+	is(wait_for_granted($node2, 'sgi_b', 7), '7',
+		'sgi_b gets its own grant (7), not its sibling\'s');
+
+	$node2->stop;
+}
+
 done_testing();
