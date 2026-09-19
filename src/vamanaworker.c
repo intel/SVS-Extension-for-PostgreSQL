@@ -151,7 +151,22 @@ VamanaShutdownCancelPending(void)
 static void
 VamanaWorkerReleaseSearchSlotsOnExit(int code, Datum arg)
 {
+	INJECTION_POINT("vamana-search-slot-release-crash", NULL);
+
 	SvsSlotSetReleaseAll(VamanaWorkerSearchSlots);
+}
+
+/*
+ * SvsSlotOwnerAliveFn for search slot sets created with a valid dbOid; see
+ * SvsSlotSetCreate.  Resolved by name in the parked slot's own process, so it
+ * must stay PGDLLEXPORT.
+ */
+PGDLLEXPORT bool
+SvsSlotOwnerIsAlive(Oid dbOid, pid_t ownerPid)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+
+	return entry != NULL && entry->workerPid == ownerPid;
 }
 
 /* -----------------------------------------------------------------------
@@ -1080,7 +1095,8 @@ VamanaWorkerMain(Datum main_arg)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	VamanaWorkerSearchSlots = SvsSlotSetCreate(TopMemoryContext, "svs", datname);
+	VamanaWorkerSearchSlots = SvsSlotSetCreate(TopMemoryContext, "svs", datname,
+												MyDatabaseId);
 	before_shmem_exit(VamanaWorkerReleaseSearchSlotsOnExit, 0);
 
 	/*

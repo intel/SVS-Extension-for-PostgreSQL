@@ -76,6 +76,16 @@ sub search_slot_count
     return $c;
 }
 
+sub search_slot_pids
+{
+    my ($node, $db) = @_;
+    my $out = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity "
+      . "WHERE backend_type = 'vamana search slot' "
+      . "AND application_name LIKE '%db=$db' ORDER BY pid;");
+    return split(/\n/, $out);
+}
+
 sub granted_for_db
 {
     my ($node, $dboid) = @_;
@@ -830,6 +840,71 @@ if (($ENV{enable_injection_points} // 'no') eq 'yes')
     wait_for_search_slot_count($node, 'fresh_db', 2, 20);
 
     assert_rollup_matches($node, 'after case 12');
+
+    # -----------------------------------------------------------------------
+    # Case 13: release-on-exit itself fails.  Its slots must outlive the
+    # crash, then self-terminate once SvsSlotOwnerIsAlive notices workerPid
+    # no longer matches.  Placed last for the same reason as case 12.
+    # -----------------------------------------------------------------------
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 3 WHERE datname = 'postgres';");
+    my $pre13_granted = wait_for_granted($node, $pg_dboid, 3, 30);
+    is($pre13_granted, '3', "case 13 setup: grant settles at 3 before the crash");
+    my $pre13_held = wait_for_search_slot_count($node, 'postgres', 3, 20);
+    is($pre13_held, '3', "case 13 setup: 3 search slots held before the crash");
+
+    my $pid_before_13 = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity "
+      . "WHERE backend_type = 'vamana worker' AND datname = 'postgres' LIMIT 1;");
+    chomp $pid_before_13;
+    my %pre13_slot_pids = map { $_ => 1 } search_slot_pids($node, 'postgres');
+
+    my $log_pos13 = length($node->log_content());
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-search-slot-release-crash', 'error');");
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-worker-tick-crash', 'error');");
+    $node->wait_for_log(qr/error triggered for injection point vamana-worker-tick-crash/,
+        $log_pos13);
+    $node->wait_for_log(qr/error triggered for injection point vamana-search-slot-release-crash/,
+        $log_pos13);
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-worker-tick-crash');");
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-search-slot-release-crash');");
+
+    my @survivors_right_after_crash =
+        grep { $pre13_slot_pids{$_} } search_slot_pids($node, 'postgres');
+    ok(scalar(@survivors_right_after_crash) > 0,
+        "case 13: the crashed worker's search slots outlive it when its own "
+      . "release-on-exit callback fails");
+
+    my $all_pre13_gone = '';
+    for (1 .. 60)    # up to 30s: bounded by SVS_PARKED_SLOT_OWNER_POLL_MS
+    {
+        my @still_here = grep { $pre13_slot_pids{$_} } search_slot_pids($node, 'postgres');
+        if (scalar(@still_here) == 0)
+        {
+            $all_pre13_gone = 1;
+            last;
+        }
+        usleep(500_000);
+    }
+    ok($all_pre13_gone,
+        "case 13: orphaned search slots self-terminate once workerPid no "
+      . "longer matches their recorded owner");
+
+    my $new_pid13 = wait_for_new_worker_pid_db($node, 'postgres', $pid_before_13, 10);
+    ok($new_pid13 =~ /^\d+$/ && $new_pid13 ne $pid_before_13,
+        "case 13: worker restarted after the injected crash (pid=$new_pid13)");
+
+    my $settled13 = wait_for_search_slot_count($node, 'postgres', 3, 10);
+    is($settled13, '3',
+        "case 13: held search slots converge back to the grant once the "
+      . "orphans are gone");
+
+    assert_rollup_matches($node, 'after case 13');
 }
 else
 {

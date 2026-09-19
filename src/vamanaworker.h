@@ -562,6 +562,9 @@ int		VamanaWorkerSlotCapacity(void);
 /* vamanaworkershmem.c: this database's published search-thread grant. Worker-only. */
 int		SvsCurrentSearchGrant(void);
 
+/* vamanaworker.c: resolved by name from svs_cpu_slots.c; see SvsSlotOwnerAliveFn. */
+PGDLLEXPORT bool SvsSlotOwnerIsAlive(Oid dbOid, pid_t ownerPid);
+
 /* vamanaworkershmem.c */
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
