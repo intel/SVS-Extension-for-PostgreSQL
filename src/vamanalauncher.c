@@ -22,6 +22,7 @@
 
 #include "postgres.h"
 
+#include "svs_build_request_protocol.h"
 #include "svs_cpu_budget.h"
 #include "svs_index_residency.h"
 #include "svs_memory.h"

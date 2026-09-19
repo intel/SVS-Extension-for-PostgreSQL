@@ -8,17 +8,19 @@
  *
  * Ties three independent pieces together for one index build: the
  * request/grant protocol against the current database's worker entry
- * (vamanaworker.c), the parked-worker pool that makes the grant visible to
- * PostgreSQL's own accounting (svs_parallel_build.c), and the catalog value
- * that decides how many threads to ask for (vamana_databases.c).  None of
- * those three files depends on this one or on each other for this purpose;
- * this is the only place that composes them.
+ * (svs_build_request_protocol.c), the parked-worker pool that makes the
+ * grant visible to PostgreSQL's own accounting (svs_parallel_build.c), and
+ * the catalog value that decides how many threads to ask for
+ * (vamana_databases.c).  None of those three files depends on this one or
+ * on each other for this purpose; this is the only place that composes
+ * them.
  */
 
 #include "postgres.h"
 
 #include "svs_build_thread_grant.h"
 
+#include "svs_build_request_protocol.h"
 #include "svs_parallel_build.h"
 #include "svs_thread_count.h"
 #include "svs_wrapper.h"
