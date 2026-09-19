@@ -6,7 +6,6 @@ CREATE FUNCTION svs_cpu_budget_test(
     max_parallel_workers int4,
     max_search_threads_per_db int4,
     max_total_search_threads int4,
-    max_parallel_maintenance_workers int4,
     search_num_threads_default int4,
     db_oid oid[],
     db_live boolean[],

@@ -120,14 +120,15 @@ VamanaInit(void)
 
 	DefineCustomIntVariable("svs.search_num_threads",
 							"Sets the number of threads SVS uses for index search operations",
-							"0 = auto (nproc-1). Explicit values override auto. "
+							"0 = auto (resolves to 1). Explicit values override auto. "
 							"Lower values reduce oversubscription under concurrent query load; "
-							"higher values increase per-query search parallelism.",
+							"higher values increase per-query search parallelism. Cluster-wide: "
+							"reload-only, no per-session override.",
 							&vamana_search_num_threads,
-							0,	/* default: auto (resolves to nproc-1) */
+							0,	/* default: auto (resolves to 1) */
 							0,	/* min: 0 = auto */
 							1024,	/* max */
-							PGC_SUSET,
+							PGC_SIGHUP,
 							0,
 							NULL,
 							NULL,
@@ -136,12 +137,13 @@ VamanaInit(void)
 	DefineCustomIntVariable("svs.max_search_threads_per_db",
 							"Ceiling on one database's total search-thread grant",
 							"0 = follow max_parallel_workers. Bounds a single worker's share of "
-							"the shared pool independently of how many threads it requests.",
+							"the shared pool independently of how many threads it requests. "
+							"Cluster-wide: reload-only, no per-session override.",
 							&svs_max_search_threads_per_db,
 							0,	/* default: follow max_parallel_workers */
 							0,	/* min: 0 = follow max_parallel_workers */
 							1024,	/* max */
-							PGC_SUSET,
+							PGC_SIGHUP,
 							0,
 							NULL,
 							NULL,
@@ -150,12 +152,13 @@ VamanaInit(void)
 	DefineCustomIntVariable("svs.max_total_search_threads",
 							"Cluster-wide ceiling on SVS search threads summed across all workers",
 							"0 = follow max_parallel_workers. Never exceeds max_parallel_workers "
-							"regardless of this setting; only ever narrows the pool search draws from.",
+							"regardless of this setting; only ever narrows the pool search draws from. "
+							"Cluster-wide: reload-only, no per-session override.",
 							&svs_max_total_search_threads,
 							0,	/* default: follow max_parallel_workers */
 							0,	/* min: 0 = follow max_parallel_workers */
 							1024,	/* max */
-							PGC_SUSET,
+							PGC_SIGHUP,
 							0,
 							NULL,
 							NULL,

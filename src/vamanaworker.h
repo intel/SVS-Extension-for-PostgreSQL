@@ -562,6 +562,9 @@ int		VamanaWorkerSlotCapacity(void);
 /* vamanaworkershmem.c: this database's published search-thread grant. Worker-only. */
 int		SvsCurrentSearchGrant(void);
 
+/* vamanaworker.c: resolved by name from svs_cpu_slots.c; see SvsSlotOwnerAliveFn. */
+PGDLLEXPORT bool SvsSlotOwnerIsAlive(Oid dbOid, pid_t ownerPid);
+
 /* vamanaworkershmem.c */
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
@@ -681,28 +684,6 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 							   uint64 nextExternalId, int numDeleted,
 							   Oid heapRelid, int vectorAttNum);
 bool	VamanaWorkerSubmitWarmup(Oid indexRelid);
-
-typedef enum SvsBuildGrantOutcome
-{
-	SVS_BUILD_GRANT_OK,
-	SVS_BUILD_GRANT_TIMEOUT,
-} SvsBuildGrantOutcome;
-
-/*
- * Backend-side build-thread request protocol, the build-side analogue of
- * VamanaWorkerClaimSlot/VamanaWorkerFinishSubmit above: claim a request
- * against the current database's worker entry, wait for the launcher to
- * grant it, and release it once done.  Unlike a search/insert slot, a
- * granted request must stay claimed for the life of the build it authorizes
- * -- SvsReleaseBuildRequestSlot is the caller's job once the build itself
- * (not just the wait) has finished.  And unlike VamanaWorkerClaimSlot, the
- * claim does not require worker liveness: the worker's own startup path
- * requests build threads for itself before publishing that liveness.
- */
-SvsBuildRequest *SvsClaimBuildRequestSlot(int32 requested);
-SvsBuildGrantOutcome SvsWaitForBuildGrant(SvsBuildRequest *req, int timeout_ms,
-										   int32 *grantedOut);
-void	SvsReleaseBuildRequestSlot(SvsBuildRequest *req);
 
 void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
 void	VamanaWorkerSignalReload(Oid indexRelid);

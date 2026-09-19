@@ -31,6 +31,9 @@ typedef struct SvsSlotSet SvsSlotSet;
  * ctx must outlive the set.  libraryName names the .so holding
  * SvsParkedSlotMain, since that differs between the extension and a test module.
  *
+ * dbOid identifies the owning process to SvsSlotOwnerAliveFn below.
+ * InvalidOid opts out of that check entirely.
+ *
  * Search-only for now: every slot this module registers reports itself with
  * SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH) and SvsFormatSearchSlotAppName.
  * SvsSlotKind has a BUILD member, but nothing here builds or tests a
@@ -39,7 +42,16 @@ typedef struct SvsSlotSet SvsSlotSet;
  * SvsParkedSlotMain to branch on kind when that caller exists, not before.
  */
 extern SvsSlotSet *SvsSlotSetCreate(MemoryContext ctx, const char *libraryName,
-									 const char *datname);
+									 const char *datname, Oid dbOid);
+
+/*
+ * A slot resolves this by name via load_external_function() from its own
+ * process, the same way RegisterDynamicBackgroundWorker() resolves
+ * bgw_function_name -- a function pointer captured in one process is not
+ * valid in another.  libraryName must export exactly one symbol named
+ * "SvsSlotOwnerIsAlive" with this signature whenever dbOid is valid.
+ */
+typedef bool (*SvsSlotOwnerAliveFn) (Oid dbOid, pid_t ownerPid);
 
 /*
  * Converge on `target` live slots.  Returns the count actually held, which may be

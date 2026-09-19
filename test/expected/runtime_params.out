@@ -98,9 +98,22 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
 DROP TABLE t;
 RESET max_parallel_maintenance_workers;
 -- svs.search_num_threads GUC controls search thread count
--- 0 = auto (nproc-1); explicit value overrides auto.
--- Correctness must be preserved regardless of thread count.
-SET svs.search_num_threads = 1;
+-- 0 = auto (resolves to 1); explicit value overrides auto.
+-- Correctness must be preserved regardless of thread count.  PGC_SIGHUP:
+-- no session SET, so exercised via ALTER SYSTEM + reload.
+ALTER SYSTEM SET svs.search_num_threads = 1;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
@@ -115,7 +128,13 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
   1 | [0,0,0]
 (3 rows)
 
-RESET svs.search_num_threads;
+ALTER SYSTEM RESET svs.search_num_threads;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
 DROP TABLE t;
 -- svs.search_window_size GUC bounds: [10, 10000]
 -- Exact minimum is accepted
@@ -143,32 +162,68 @@ ERROR:  9 is outside the valid range for parameter "svs.search_window_size" (10 
 SET svs.search_window_size = 10001;
 ERROR:  10001 is outside the valid range for parameter "svs.search_window_size" (10 .. 10000)
 -- svs.search_num_threads GUC bounds: [0, 1024]
+-- PGC_SIGHUP: SET always errors "cannot be changed now", so bounds are
+-- exercised via ALTER SYSTEM instead, same as the checkpoint GUCs below.
 -- Exact minimum is accepted
-SET svs.search_num_threads = 0;
+ALTER SYSTEM SET svs.search_num_threads = 0;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
 SHOW svs.search_num_threads;
  svs.search_num_threads 
 ------------------------
  0
 (1 row)
 
-RESET svs.search_num_threads;
+ALTER SYSTEM RESET svs.search_num_threads;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
 -- Exact maximum is accepted
-SET svs.search_num_threads = 1024;
+ALTER SYSTEM SET svs.search_num_threads = 1024;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+SELECT pg_sleep(0.1);
+ pg_sleep 
+----------
+ 
+(1 row)
+
 SHOW svs.search_num_threads;
  svs.search_num_threads 
 ------------------------
  1024
 (1 row)
 
-RESET svs.search_num_threads;
+ALTER SYSTEM RESET svs.search_num_threads;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
 -- One above maximum is rejected
-SET svs.search_num_threads = 1025;
+ALTER SYSTEM SET svs.search_num_threads = 1025;
 ERROR:  1025 is outside the valid range for parameter "svs.search_num_threads" (0 .. 1024)
 -- One below minimum is rejected
-SET svs.search_num_threads = -1;
+ALTER SYSTEM SET svs.search_num_threads = -1;
 ERROR:  -1 is outside the valid range for parameter "svs.search_num_threads" (0 .. 1024)
--- Checkpoint GUCs are PGC_SIGHUP: SET always errors "cannot be changed now",
--- so bounds are exercised via ALTER SYSTEM instead.
 -- svs.checkpoint_debounce_window: [0, 86400] s
 -- Out-of-range: rejected at ALTER SYSTEM time
 ALTER SYSTEM SET svs.checkpoint_debounce_window = -1;

@@ -35,7 +35,6 @@ typedef struct SvsCpuGucs
 	int32		maxSearchThreadsPerDb;			/* svs.max_search_threads_per_db; 0 = follow maxParallelWorkers */
 	int32		maxTotalSearchThreads;			/* svs.max_total_search_threads; 0 = follow maxParallelWorkers */
 	int32		maxParallelWorkers;				/* core max_parallel_workers: the hard pool */
-	int32		maxParallelMaintenanceWorkers;	/* core max_parallel_maintenance_workers: build fallback */
 } SvsCpuGucs;
 
 typedef struct SvsCpuBudgetInput
@@ -80,5 +79,14 @@ typedef struct SvsCpuBudget
  */
 extern SvsCpuBudget *SvsComputeCpuGrants(const SvsCpuBudgetInput *in,
 										  MemoryContext resultCtx);
+
+/*
+ * The same 0-means-follow-max_parallel_workers resolution SvsComputeCpuGrants
+ * applies to svs.max_search_threads_per_db, exposed for callers that only
+ * need the resolved ceiling (e.g. reporting) without building a full
+ * SvsCpuBudgetInput.
+ */
+extern int32 SvsSearchThreadsPerDbCeiling(int32 maxSearchThreadsPerDb,
+										   int32 maxParallelWorkers);
 
 #endif							/* SVS_CPU_BUDGET_H */

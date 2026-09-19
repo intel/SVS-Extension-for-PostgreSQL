@@ -929,7 +929,7 @@ VamanaRebuildFromTable(Relation index)
 				 errdetail("SVS build failed with error code %d.", errorCode)));
 	}
 
-	SVSSetIndexSearchThreads(svsIndex, SVSDefaultSearchThreads());
+	SVSSetIndexSearchThreads(svsIndex, SvsCurrentSearchGrant());
 
 	/* tidMapping is still needed below, by VamanaCacheIndex. */
 	for (int i = 0; i < numVectors; i++)

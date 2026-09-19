@@ -27,6 +27,7 @@
 
 #include "svs_cpu_slots.h"
 
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -54,6 +55,9 @@
 #define SVS_SLOT_SHUTDOWN_TIMEOUT_MS	10000
 #define SVS_SLOT_SHUTDOWN_POLL_MS		1000
 
+/* How often a parked slot checks SvsSlotOwnerAliveFn, if it has one. */
+#define SVS_PARKED_SLOT_OWNER_POLL_MS	2000
+
 /*
  * What a parked slot needs to describe itself in pg_stat_activity, carried in
  * bgw_extra rather than bgw_main_arg.  bgw_extra is memcpy'd into the shared
@@ -68,6 +72,8 @@ typedef struct SvsParkedSlotArg
 	int32		slotTotal;
 	int32		reserved;
 	char		datname[NAMEDATALEN];
+	Oid			dbOid;
+	pid_t		ownerPid;
 } SvsParkedSlotArg;
 
 typedef struct SvsSlotEntry
@@ -82,6 +88,8 @@ struct SvsSlotSet
 	MemoryContext ctx;
 	char		libraryName[MAXPGPATH];
 	char		datname[NAMEDATALEN];
+	Oid			dbOid;
+	pid_t		ownerPid;
 
 	SvsSlotEntry *entries;		/* array in ctx, capacity slots */
 	int			capacity;
@@ -109,7 +117,7 @@ static int32 AllocateSlotIndex(SvsSlotSet *set);
 
 SvsSlotSet *
 SvsSlotSetCreate(MemoryContext ctx, const char *libraryName,
-				  const char *datname)
+				  const char *datname, Oid dbOid)
 {
 	MemoryContext oldCtx = MemoryContextSwitchTo(ctx);
 	SvsSlotSet *set = palloc0(sizeof(SvsSlotSet));
@@ -117,6 +125,8 @@ SvsSlotSetCreate(MemoryContext ctx, const char *libraryName,
 	set->ctx = ctx;
 	strlcpy(set->libraryName, libraryName, sizeof(set->libraryName));
 	strlcpy(set->datname, datname, sizeof(set->datname));
+	set->dbOid = dbOid;
+	set->ownerPid = MyProcPid;
 	set->entries = NULL;
 	set->capacity = 0;
 	set->count = 0;
@@ -194,6 +204,8 @@ SvsSlotSetResize(SvsSlotSet *set, int target)
 		arg.slotTotal = target;
 		arg.reserved = target;
 		strlcpy(arg.datname, set->datname, sizeof(arg.datname));
+		arg.dbOid = set->dbOid;
+		arg.ownerPid = set->ownerPid;
 		StaticAssertStmt(sizeof(SvsParkedSlotArg) <= BGW_EXTRALEN,
 						  "SvsParkedSlotArg must fit in bgw_extra");
 		memcpy(bgw.bgw_extra, &arg, sizeof(arg));
@@ -503,15 +515,34 @@ SvsParkedSlotBootstrap(const SvsParkedSlotArg *arg)
 	return WaitEventExtensionNew(SvsSearchSlotWaitEventName());
 }
 
+/*
+ * NULL when arg->dbOid is InvalidOid: this set opted out of the orphan
+ * self-check.  load_external_function()'s third argument means "error out
+ * if not found" -- a library that passes a valid dbOid to SvsSlotSetCreate
+ * must export SvsSlotOwnerIsAlive.
+ */
+static SvsSlotOwnerAliveFn
+SvsParkedSlotResolveOwnerAliveFn(const SvsParkedSlotArg *arg)
+{
+	if (!OidIsValid(arg->dbOid))
+		return NULL;
+
+	return (SvsSlotOwnerAliveFn)
+		load_external_function(MyBgworkerEntry->bgw_library_name,
+								"SvsSlotOwnerIsAlive", true, NULL);
+}
+
 void
 SvsParkedSlotMain(Datum main_arg)
 {
 	SvsParkedSlotArg arg;
 	uint32		waitEventSearchSlot;
+	SvsSlotOwnerAliveFn ownerIsAlive;
 
 	memcpy(&arg, MyBgworkerEntry->bgw_extra, sizeof(arg));
 
 	waitEventSearchSlot = SvsParkedSlotBootstrap(&arg);
+	ownerIsAlive = SvsParkedSlotResolveOwnerAliveFn(&arg);
 
 	for (;;)
 	{
@@ -522,8 +553,11 @@ SvsParkedSlotMain(Datum main_arg)
 		if (SvsParkedSlotGotSigterm)
 			break;
 
-		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, -1,
-						waitEventSearchSlot);
+		if (ownerIsAlive != NULL && !ownerIsAlive(arg.dbOid, arg.ownerPid))
+			break;
+
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						SVS_PARKED_SLOT_OWNER_POLL_MS, waitEventSearchSlot);
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
 	}

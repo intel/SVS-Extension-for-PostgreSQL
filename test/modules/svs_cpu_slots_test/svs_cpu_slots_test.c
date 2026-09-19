@@ -65,7 +65,8 @@ GetTestSlotSet(void)
 	{
 		TestSlotSet = SvsSlotSetCreate(TopMemoryContext,
 										"svs_cpu_slots_test",
-										get_database_name(MyDatabaseId));
+										get_database_name(MyDatabaseId),
+										InvalidOid);
 		before_shmem_exit(ReleaseTestSlotSetOnExit, 0);
 	}
 	return TestSlotSet;

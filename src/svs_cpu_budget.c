@@ -28,6 +28,7 @@
 #include "postgres.h"
 
 #include "svs_cpu_budget.h"
+#include "svs_thread_count.h"
 
 typedef struct SvsDbCpuWorking
 {
@@ -73,10 +74,10 @@ ComputeSearchPool(const SvsCpuGucs *gucs)
 			   ResolveOrFallback(gucs->maxTotalSearchThreads, gucs->maxParallelWorkers));
 }
 
-static int32
-ComputePerDatabaseCeiling(const SvsCpuGucs *gucs)
+int32
+SvsSearchThreadsPerDbCeiling(int32 maxSearchThreadsPerDb, int32 maxParallelWorkers)
 {
-	return ResolveOrFallback(gucs->maxSearchThreadsPerDb, gucs->maxParallelWorkers);
+	return ResolveOrFallback(maxSearchThreadsPerDb, maxParallelWorkers);
 }
 
 static int32
@@ -92,7 +93,7 @@ ComputeEffectiveDesired(const SvsDbCpuRequest *req, const SvsCpuGucs *gucs,
 	clusterDefault = ResolveOrFallback(gucs->searchNumThreadsDefault, 1);
 	requested = (req->searchNumThreads == -1) ? clusterDefault : req->searchNumThreads;
 
-	return Min(Max(requested, 1), perDbCeiling);
+	return Min(SvsAtLeastOneThread(requested), perDbCeiling);
 }
 
 static SvsDbCpuWorking *
@@ -333,7 +334,8 @@ SvsCpuBudget *
 SvsComputeCpuGrants(const SvsCpuBudgetInput *in, MemoryContext resultCtx)
 {
 	int32		pool = ComputeSearchPool(in->gucs);
-	int32		perDbCeiling = ComputePerDatabaseCeiling(in->gucs);
+	int32		perDbCeiling = SvsSearchThreadsPerDbCeiling(in->gucs->maxSearchThreadsPerDb,
+															 in->gucs->maxParallelWorkers);
 	SvsDbCpuWorking *dbWorking = BuildDbWorkingSet(in, perDbCeiling);
 	SvsBuildCpuWorking *buildWorking = BuildBuildWorkingSet(in);
 	bool		reservedFloorsExceedPool = ClampFloorsToPool(dbWorking, in->ndbs, pool);

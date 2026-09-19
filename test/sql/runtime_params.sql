@@ -71,14 +71,18 @@ DROP TABLE t;
 RESET max_parallel_maintenance_workers;
 
 -- svs.search_num_threads GUC controls search thread count
--- 0 = auto (nproc-1); explicit value overrides auto.
--- Correctness must be preserved regardless of thread count.
-SET svs.search_num_threads = 1;
+-- 0 = auto (resolves to 1); explicit value overrides auto.
+-- Correctness must be preserved regardless of thread count.  PGC_SIGHUP:
+-- no session SET, so exercised via ALTER SYSTEM + reload.
+ALTER SYSTEM SET svs.search_num_threads = 1;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
 CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]');
 CREATE INDEX ON t USING vamana (val vector_l2_ops);
 SELECT * FROM t ORDER BY val <-> '[3,3,3]', id;
-RESET svs.search_num_threads;
+ALTER SYSTEM RESET svs.search_num_threads;
+SELECT pg_reload_conf();
 DROP TABLE t;
 
 -- svs.search_window_size GUC bounds: [10, 10000]
@@ -100,25 +104,30 @@ SET svs.search_window_size = 9;
 SET svs.search_window_size = 10001;
 
 -- svs.search_num_threads GUC bounds: [0, 1024]
+-- PGC_SIGHUP: SET always errors "cannot be changed now", so bounds are
+-- exercised via ALTER SYSTEM instead, same as the checkpoint GUCs below.
 
 -- Exact minimum is accepted
-SET svs.search_num_threads = 0;
+ALTER SYSTEM SET svs.search_num_threads = 0;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
 SHOW svs.search_num_threads;
-RESET svs.search_num_threads;
+ALTER SYSTEM RESET svs.search_num_threads;
+SELECT pg_reload_conf();
 
 -- Exact maximum is accepted
-SET svs.search_num_threads = 1024;
+ALTER SYSTEM SET svs.search_num_threads = 1024;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
 SHOW svs.search_num_threads;
-RESET svs.search_num_threads;
+ALTER SYSTEM RESET svs.search_num_threads;
+SELECT pg_reload_conf();
 
 -- One above maximum is rejected
-SET svs.search_num_threads = 1025;
+ALTER SYSTEM SET svs.search_num_threads = 1025;
 
 -- One below minimum is rejected
-SET svs.search_num_threads = -1;
-
--- Checkpoint GUCs are PGC_SIGHUP: SET always errors "cannot be changed now",
--- so bounds are exercised via ALTER SYSTEM instead.
+ALTER SYSTEM SET svs.search_num_threads = -1;
 
 -- svs.checkpoint_debounce_window: [0, 86400] s
 

@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 22_search_grant_applied.pl — the search-thread grant the launcher publishes
+# 22_search_grant_parity.pl — the search-thread grant the launcher publishes
 # to pg_stat_vamana_worker actually reaches SVS at search dispatch and at
 # index load, not just the shared-memory control block.
 #
@@ -178,7 +178,7 @@ sub run_search
 
 # ---------------------------------------------------------------------------
 # 5. The load path: a freshly loaded index (from a cold worker cache) picks
-# up the current grant rather than SVSDefaultSearchThreads()'s nproc-1.
+# up the current grant.
 # ---------------------------------------------------------------------------
 {
 	$node->safe_psql('postgres',
@@ -237,5 +237,108 @@ sub run_search
 }
 
 $node->stop;
+
+# ---------------------------------------------------------------------------
+# 7. Role parity: SvsComputeCpuGrants is pure, so reconcile must produce
+# identical desired/granted/reserved search-thread grants on a standby as on
+# a primary for the same enabled-database row.
+# ---------------------------------------------------------------------------
+{
+	my $primary = PostgreSQL::Test::Cluster->new('search_grant_parity_primary');
+	$primary->init(allows_streaming => 1);
+	$primary->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+	$primary->append_conf('postgresql.conf', "wal_level = logical");
+	$primary->append_conf('postgresql.conf', "max_replication_slots = 10");
+	$primary->append_conf('postgresql.conf', "max_wal_senders = 10");
+	$primary->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+	$primary->start;
+
+	$primary->safe_psql('postgres', "CREATE EXTENSION vector;");
+	$primary->safe_psql('postgres', "CREATE EXTENSION svs;");
+	$primary->safe_psql('postgres', qq(
+		INSERT INTO vamana_databases (datname, enabled, search_num_threads, search_threads_reserved)
+			VALUES ('postgres', true, 5, 2);
+	));
+	wait_for_worker($primary);
+	is(wait_for_granted($primary, 'postgres', 5), '5',
+		'primary reaches the expected grant before comparing to the standby');
+
+	$primary->safe_psql('postgres',
+		"SELECT pg_create_physical_replication_slot('parity_phys');");
+
+	my $backup_name = 'parity_backup';
+	$primary->backup($backup_name);
+
+	my $standby = PostgreSQL::Test::Cluster->new('search_grant_parity_standby');
+	$standby->init_from_backup($primary, $backup_name, has_streaming => 1);
+	$standby->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+	$standby->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+	$standby->append_conf('postgresql.conf', "hot_standby = on");
+	$standby->append_conf('postgresql.conf', "hot_standby_feedback = on");
+	$standby->append_conf('postgresql.conf', "primary_slot_name = 'parity_phys'");
+	$standby->start;
+
+	$primary->wait_for_replay_catchup($standby);
+	is(wait_for_granted($standby, 'postgres', 5), '5',
+		'standby reaches the same grant as the primary');
+
+	my $primary_row = $primary->safe_psql('postgres',
+		"SELECT search_threads_desired, search_threads_granted, search_threads_reserved "
+	  . "FROM pg_stat_vamana_worker "
+	  . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+	my $standby_row = $standby->safe_psql('postgres',
+		"SELECT search_threads_desired, search_threads_granted, search_threads_reserved "
+	  . "FROM pg_stat_vamana_worker "
+	  . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+
+	is($standby_row, $primary_row,
+		'reconcile gives identical desired/granted/reserved grants on standby and primary');
+
+	$standby->stop;
+	$primary->stop;
+}
+
+# ---------------------------------------------------------------------------
+# 8. Multi-database grant identity: each database gets its own grant, not a
+# sibling's.
+# ---------------------------------------------------------------------------
+{
+	my $node2 = PostgreSQL::Test::Cluster->new('search_grant_identity');
+	$node2->init;
+	$node2->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+	$node2->append_conf('postgresql.conf', "wal_level = logical");
+	$node2->append_conf('postgresql.conf', "max_replication_slots = 10");
+	$node2->append_conf('postgresql.conf', "max_wal_senders = 10");
+	$node2->append_conf('postgresql.conf', "max_parallel_workers = 32");
+	$node2->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+	$node2->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+	$node2->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
+	$node2->start;
+
+	$node2->safe_psql('postgres', "CREATE EXTENSION vector;");
+	$node2->safe_psql('postgres', "CREATE EXTENSION svs;");
+	$node2->safe_psql('postgres', "CREATE DATABASE sgi_a;");
+	$node2->safe_psql('postgres', "CREATE DATABASE sgi_b;");
+	$node2->safe_psql('sgi_a', "CREATE EXTENSION vector;");
+	$node2->safe_psql('sgi_a', "CREATE EXTENSION svs;");
+	$node2->safe_psql('sgi_b', "CREATE EXTENSION vector;");
+	$node2->safe_psql('sgi_b', "CREATE EXTENSION svs;");
+
+	$node2->safe_psql('postgres', qq(
+		INSERT INTO vamana_databases (datname, enabled, search_num_threads) VALUES
+			('sgi_a', true, 3),
+			('sgi_b', true, 7);
+	));
+
+	wait_for_worker_db($node2, 'sgi_a', 30);
+	wait_for_worker_db($node2, 'sgi_b', 30);
+
+	is(wait_for_granted($node2, 'sgi_a', 3), '3',
+		'sgi_a gets its own grant (3), not its sibling\'s');
+	is(wait_for_granted($node2, 'sgi_b', 7), '7',
+		'sgi_b gets its own grant (7), not its sibling\'s');
+
+	$node2->stop;
+}
 
 done_testing();
