@@ -17,6 +17,16 @@
  * reservation is visible under this module's accounting continuously across
  * that lifecycle, so a concurrent admission check never reads a gap.
  *
+ * A rebuild of an already-resident index (REINDEX, or a worker-restart
+ * rebuild of an index whose RESIDENT reservation survived the restart)
+ * instead starts from RESIDENT(measured, database) -> REBUILDING(new
+ * estimate, backend), then rejoins the same CONFIRMED -> HANDOFF -> RESIDENT
+ * path a fresh build takes. The old graph's bytes stay committed under
+ * priorResidentBytes for the whole rebuild, since it is still genuinely
+ * resident on disk and in the worker; every path off of REBUILDING other
+ * than a successful confirm restores the reservation to RESIDENT at exactly
+ * that prior size rather than dropping it.
+ *
  * SvsMemReservation and SvsMemInsertReservation are declared here, not in
  * vamanaworkershmem.c, because this module owns their shape and every
  * transition between their states; vamanaworker.h only embeds them as
@@ -53,6 +63,7 @@ typedef enum SvsMemReservationState
 	SVS_MEM_CONFIRMED,
 	SVS_MEM_HANDOFF,
 	SVS_MEM_RESIDENT,
+	SVS_MEM_REBUILDING,
 } SvsMemReservationState;
 
 /*
@@ -91,6 +102,19 @@ typedef struct SvsMemReservation
 	 * way to learn a dead backend's build peak.
 	 */
 	uint64		buildPeakBytes;
+
+	/*
+	 * The measured bytes this reservation held as RESIDENT just before a
+	 * rebuild began. Set only on the RESIDENT -> REBUILDING transition;
+	 * zero otherwise. residencyBytesCommitted keeps counting these bytes as
+	 * resident for the whole rebuild, so this field never itself
+	 * contributes to that counter; it exists only so RestorePriorResidency
+	 * can put the reservation back exactly as it was if the rebuild does
+	 * not reach a successful confirm. Cleared back to zero by
+	 * RestorePriorResidency, and consumed (dropped, not added) by
+	 * SvsMemoryConfirmBuild once a rebuild confirms.
+	 */
+	uint64		priorResidentBytes;
 } SvsMemReservation;
 
 /*
@@ -146,6 +170,16 @@ extern void SvsMemoryRestoreResidencyBudget(Oid dbOid, uint64 priorBudget);
  * global build ceiling and residencyEstimate against dbOid's residency
  * budget, keyed by relid, owned by the calling backend. Errors on either
  * axis's rejection; neither counter changes on a rejected reservation.
+ *
+ * If relid already holds a RESIDENT reservation, this is a rebuild (REINDEX,
+ * or a worker-restart rebuild of an index whose reservation survived the
+ * restart), not a fresh build: it reuses the existing slot, moves it to
+ * REBUILDING, and holds its prior measured bytes in priorResidentBytes
+ * without adding residencyEstimate to residencyBytesCommitted, since the old
+ * graph is still genuinely resident for as long as the rebuild is in
+ * progress. An existing reservation in any other state still errors, the
+ * same as today: two concurrent builds of one relid is not a case this
+ * module accommodates.
  */
 extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 residencyEstimate);
@@ -154,10 +188,13 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
  * Backend, after a successful build and before serializing to disk.
  * Releases buildPeak unconditionally and reconciles the residency
  * reservation from estimate to measuredResidencyBytes (RESERVED ->
- * CONFIRMED). Returns false, and drops the reservation entirely, if the
- * measured bytes do not fit dbOid's residency budget -- the caller must
- * fail CREATE INDEX without serializing or contacting the worker. Returns
- * true once the reservation is confirmed at the exact measured size.
+ * CONFIRMED, or REBUILDING -> CONFIRMED for a rebuild). Returns false if the
+ * measured bytes do not fit dbOid's residency budget -- the caller must fail
+ * CREATE INDEX without serializing or contacting the worker. On that
+ * rejection a fresh build's reservation is dropped entirely; a rebuild's
+ * instead returns to RESIDENT at its pre-rebuild measured size, since that
+ * graph is still genuinely resident. Returns true once the reservation is
+ * confirmed at the exact measured size.
  */
 extern bool SvsMemoryConfirmBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 measuredResidencyBytes);
@@ -180,11 +217,17 @@ extern void SvsMemoryHandoffBuild(Oid dbOid, Oid relid);
  * after ConfirmBuild already ran; there is nothing left to release once
  * relid has no reservation.
  *
- * A RESIDENT reservation is the one exception: ReconcileLoad already handed
- * it to the database, so this leaves it untouched and only
+ * A RESIDENT reservation is one exception: ReconcileLoad already handed it
+ * to the database, so this leaves it untouched and only
  * SvsMemoryAccountUnload can release it. Reachable when a build's
  * synchronous warm-up load succeeds and a later statement in the same
  * transaction still fails.
+ *
+ * A REBUILDING reservation is the other: its committed bytes are the old
+ * graph's, still genuinely resident, never the failed rebuild's own
+ * estimate, so this releases only the build peak and returns the
+ * reservation to RESIDENT at its pre-rebuild measured size rather than
+ * dropping it.
  */
 extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
 

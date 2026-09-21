@@ -22,7 +22,8 @@ CREATE FUNCTION svs_memory_test_reservations(
     OUT estimate_bytes bigint,
     OUT measured_bytes bigint,
     OUT build_peak_bytes bigint,
-    OUT search_scratch_bytes_per_query bigint
+    OUT search_scratch_bytes_per_query bigint,
+    OUT prior_resident_bytes bigint
 ) RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 

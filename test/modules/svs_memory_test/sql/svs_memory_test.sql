@@ -612,3 +612,116 @@ SELECT count(*) = 0 AS pending_insert_reservation_closed
 SELECT residency_bytes_committed = 100 AS committed_not_double_counted
   FROM svs_memory_read_stats(671);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- Rebuild-aware ReserveBuild. Fake shmem has a fixed number of distinct
+-- dbOid slots and every one is already in use above, so each case below
+-- resets an already-used dbOid to a clean slate before reusing it, the same
+-- way db 671 was reused just above.
+
+-- A fresh build (no existing reservation) is unaffected: it still lands in
+-- RESERVED, and confirms normally.
+SELECT svs_memory_test_reset_database_accounting(601);
+SELECT svs_memory_admit_database(601, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(601, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT state FROM svs_memory_test_reservations(601);
+SELECT svs_memory_confirm_build(601, 1, 0::bigint, (4 * 1024)::bigint) AS fits;
+SELECT state, prior_resident_bytes FROM svs_memory_test_reservations(601);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_abort_build(601, 1);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- RESIDENT -> REBUILDING -> CONFIRMED lands on the new measured size, not
+-- the sum of the old and new sizes: the prior resident bytes are held aside
+-- in priorResidentBytes, not added to residencyBytesCommitted, for the
+-- whole rebuild.
+SELECT svs_memory_test_reset_database_accounting(605);
+SELECT svs_memory_admit_database(605, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(605, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(605, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(605, 1);
+SELECT svs_memory_reconcile_load(605, 1, (4 * 1024)::bigint);
+SELECT residency_bytes_committed = (4 * 1024) AS resident_at_4k
+  FROM svs_memory_read_stats(605);
+SELECT svs_memory_reserve_build(605, 1, 0::bigint, (5 * 1024)::bigint);
+SELECT state, prior_resident_bytes, estimate_bytes FROM svs_memory_test_reservations(605);
+SELECT residency_bytes_committed = (4 * 1024) AS committed_unchanged_by_rebuild_reserve
+  FROM svs_memory_read_stats(605);
+SELECT svs_memory_confirm_build(605, 1, 0::bigint, (6 * 1024)::bigint) AS fits;
+SELECT state, prior_resident_bytes, measured_bytes FROM svs_memory_test_reservations(605);
+SELECT residency_bytes_committed = (6 * 1024) AS committed_lands_on_new_measurement_not_sum
+  FROM svs_memory_read_stats(605);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_abort_build(605, 1);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- REBUILDING, then a confirm rejected for not fitting the budget: the prior
+-- resident bytes are restored exactly, not dropped, since the old graph is
+-- still fully resident.
+SELECT svs_memory_test_reset_database_accounting(609);
+SELECT svs_memory_admit_database(609, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(609, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(609, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(609, 1);
+SELECT svs_memory_reconcile_load(609, 1, (4 * 1024)::bigint);
+SELECT svs_memory_reserve_build(609, 1, 0::bigint, (5 * 1024)::bigint);
+SELECT svs_memory_confirm_build(609, 1, 0::bigint, (11 * 1024)::bigint) AS fits_expect_false;
+SELECT state, measured_bytes, prior_resident_bytes FROM svs_memory_test_reservations(609);
+SELECT residency_bytes_committed = (4 * 1024) AS committed_restored_exactly_to_pre_rebuild_value
+  FROM svs_memory_read_stats(609);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(609, 1);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- REBUILDING, then an abort: the prior resident bytes are restored exactly,
+-- and the rebuild's own build peak releases like any other abort.
+SELECT svs_memory_test_reset_database_accounting(610);
+SELECT svs_memory_admit_database(610, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(610, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(610, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(610, 1);
+SELECT svs_memory_reconcile_load(610, 1, (4 * 1024)::bigint);
+SELECT svs_memory_reserve_build(610, 1, (2 * 1024)::bigint, (3 * 1024)::bigint);
+SELECT svs_memory_abort_build(610, 1);
+SELECT state, measured_bytes, prior_resident_bytes, owner_pid FROM svs_memory_test_reservations(610);
+SELECT residency_bytes_committed = (4 * 1024) AND build_bytes_committed = 0
+       AS restored_exactly_and_build_peak_released
+  FROM svs_memory_read_stats(610);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(610, 1);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- A dead owner mid-REBUILDING is reaped the same way a live abort would
+-- handle it: the build peak releases, and the reservation returns to
+-- RESIDENT at its pre-rebuild measured size with no owner, rather than
+-- being deleted or leaked.
+SELECT svs_memory_test_reset_database_accounting(611);
+SELECT svs_memory_admit_database(611, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(611, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(611, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(611, 1);
+SELECT svs_memory_reconcile_load(611, 1, (4 * 1024)::bigint);
+SELECT svs_memory_reserve_build(611, 1, (1 * 1024)::bigint, (3 * 1024)::bigint);
+SELECT svs_memory_test_set_owner_pid(611, 1, 2147483647);
+SELECT svs_memory_reap_dead_reservations();
+SELECT state, measured_bytes, prior_resident_bytes, owner_pid FROM svs_memory_test_reservations(611);
+SELECT residency_bytes_committed = (4 * 1024) AND build_bytes_committed = 0
+       AS reaper_restored_prior_residency_and_released_build_peak
+  FROM svs_memory_read_stats(611);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(611, 1);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- An existing reservation in any state other than RESIDENT still errors,
+-- exactly as before: a CONFIRMED reservation (not just the RESERVED case
+-- covered above in the "two live reservations" guard) must not be
+-- reinterpreted as a rebuild.
+SELECT svs_memory_test_reset_database_accounting(612);
+SELECT svs_memory_admit_database(612, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(612, 1, 0::bigint, (1 * 1024)::bigint);
+SELECT svs_memory_confirm_build(612, 1, 0::bigint, (1 * 1024)::bigint);
+SELECT svs_memory_reserve_build(612, 1, 0::bigint, (1 * 1024)::bigint);
+SELECT count(*) = 1 AS exactly_one_reservation_survives FROM svs_memory_test_reservations(612);
+SELECT state FROM svs_memory_test_reservations(612);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_abort_build(612, 1);
+SELECT * FROM svs_memory_test_check_invariants();
