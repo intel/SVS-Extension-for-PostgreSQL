@@ -34,8 +34,6 @@ $node->safe_psql('postgres',
     "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 wait_for_worker($node);
 
-my $test_dim = 32;
-
 # resident_bytes for a built-and-loaded index of the given storage type and
 # row count. random() vectors are sufficient: the resident footprint depends
 # on count, dimensions, graph degree and storage type, not vector content.
@@ -46,10 +44,9 @@ sub resident_bytes_for
     my $index = "calib_idx_$suffix";
 
     $node->safe_psql('postgres', qq(
-        CREATE TABLE $table (id serial PRIMARY KEY, val vector($test_dim));
+        CREATE TABLE $table (id serial PRIMARY KEY, val vector($dim));
         INSERT INTO $table (val)
-            SELECT ARRAY(SELECT random() FROM generate_series(1, $test_dim))::vector
-            FROM generate_series(1, $rows);
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, $rows);
         CREATE INDEX $index ON $table USING vamana (val vector_l2_ops)
             WITH (graph_degree = 32, compression_type = $compression_type);
     ));
@@ -68,8 +65,8 @@ sub resident_bytes_for
     my $small = resident_bytes_for(0, 500, 'none_small');
     my $large = resident_bytes_for(0, 2000, 'none_large');
 
-    ok($small > 0, 'compression_type=0: small build reports non-zero resident_bytes');
-    ok($large > $small,
+    cmp_ok($small, '>', 0, 'compression_type=0: small build reports non-zero resident_bytes');
+    cmp_ok($large, '>', $small,
         'compression_type=0: resident_bytes grows with row count');
 }
 
@@ -80,8 +77,8 @@ sub resident_bytes_for
     my $small = resident_bytes_for(1, 500, 'leanvec_small');
     my $large = resident_bytes_for(1, 2000, 'leanvec_large');
 
-    ok($small > 0, 'compression_type=1 (LeanVec): small build reports non-zero resident_bytes');
-    ok($large > $small,
+    cmp_ok($small, '>', 0, 'compression_type=1 (LeanVec): small build reports non-zero resident_bytes');
+    cmp_ok($large, '>', $small,
         'compression_type=1 (LeanVec): resident_bytes grows with row count');
 }
 
@@ -90,8 +87,8 @@ sub resident_bytes_for
     my $small = resident_bytes_for(2, 500, 'lvq_small');
     my $large = resident_bytes_for(2, 2000, 'lvq_large');
 
-    ok($small > 0, 'compression_type=2 (LVQ): small build reports non-zero resident_bytes');
-    ok($large > $small,
+    cmp_ok($small, '>', 0, 'compression_type=2 (LVQ): small build reports non-zero resident_bytes');
+    cmp_ok($large, '>', $small,
         'compression_type=2 (LVQ): resident_bytes grows with row count');
 }
 
