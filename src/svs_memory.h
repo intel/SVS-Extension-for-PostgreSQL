@@ -112,7 +112,10 @@ typedef struct SvsMemReservation
 	 * can put the reservation back exactly as it was if the rebuild does
 	 * not reach a successful confirm. Cleared back to zero by
 	 * RestorePriorResidency, and consumed (dropped, not added) by
-	 * SvsMemoryConfirmBuild once a rebuild confirms.
+	 * SvsMemoryConfirmBuild once a rebuild confirms. SvsMemoryReconcileLoad
+	 * and SvsMemoryAccountUnload also read it in place of measuredBytes for
+	 * as long as the state is REBUILDING, since measuredBytes itself stays
+	 * zero until that confirm.
 	 */
 	uint64		priorResidentBytes;
 } SvsMemReservation;
@@ -237,12 +240,24 @@ extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
  * restart adopt with no pending reservation -- accounts measuredBytes
  * directly. Returns false, committing nothing, if measuredBytes does not
  * fit dbOid's residency budget.
+ *
+ * A REBUILDING reservation reaching here ahead of its own ConfirmBuild is
+ * folded out by priorResidentBytes rather than measuredBytes, since a
+ * rebuild's committed contribution is the old graph's prior size for as
+ * long as it has not yet confirmed; any outstanding build peak is released
+ * the same way ConfirmBuild would, and the resulting RESIDENT record leaves
+ * no leftover priorResidentBytes or buildPeakBytes behind.
  */
 extern bool SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes);
 
 /*
  * Worker, at unload. Subtracts relid's committed resident bytes and drops
  * its reservation.
+ *
+ * A REBUILDING reservation's committed bytes are priorResidentBytes, not
+ * measuredBytes, which stays 0 until a rebuild confirms; its outstanding
+ * build peak, if any, is released here too, since dropping the index takes
+ * an in-flight rebuild down with it.
  */
 extern void SvsMemoryAccountUnload(Oid dbOid, Oid relid);
 

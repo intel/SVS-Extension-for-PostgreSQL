@@ -725,3 +725,66 @@ SELECT state FROM svs_memory_test_reservations(612);
 SELECT * FROM svs_memory_test_check_invariants();
 SELECT svs_memory_abort_build(612, 1);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- A rebuild that would exceed the global build-memory ceiling errors without
+-- disturbing the existing RESIDENT reservation: TryAddGlobalBuildCommitted's
+-- failure path skips FreeReservation for a rebuild, so the old graph's
+-- record, still fully resident, must survive exactly as it was.
+SELECT svs_memory_test_reset_database_accounting(602);
+SELECT svs_memory_admit_database(602, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(602, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(602, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(602, 1);
+SELECT svs_memory_reconcile_load(602, 1, (4 * 1024)::bigint);
+SELECT svs_memory_test_global_build_committed_bytes() AS build_committed_602 \gset
+SELECT svs_memory_reserve_build(602, 1, (:build_ceiling - :build_committed_602 + 1)::bigint, (1 * 1024)::bigint);
+SELECT state, measured_bytes, prior_resident_bytes, owner_pid, build_peak_bytes
+  FROM svs_memory_test_reservations(602);
+SELECT residency_bytes_committed = (4 * 1024) AS committed_untouched_by_failed_rebuild_reserve
+  FROM svs_memory_read_stats(602);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(602, 1);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- A REBUILDING record reaching SvsMemoryAccountUnload directly (relid
+-- dropped while a rebuild is still in flight, bypassing Confirm/Abort
+-- entirely): its committed contribution is priorResidentBytes, not
+-- measuredBytes (which stays 0 mid-rebuild), and its outstanding build peak
+-- releases the same way an abort would.
+SELECT svs_memory_test_reset_database_accounting(603);
+SELECT svs_memory_admit_database(603, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(603, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(603, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(603, 1);
+SELECT svs_memory_reconcile_load(603, 1, (4 * 1024)::bigint);
+SELECT svs_memory_reserve_build(603, 1, (2 * 1024)::bigint, (5 * 1024)::bigint);
+SELECT svs_memory_account_unload(603, 1);
+SELECT count(*) = 0 AS reservation_dropped FROM svs_memory_test_reservations(603);
+SELECT residency_bytes_committed = 0 AND build_bytes_committed = 0
+       AS prior_residency_and_build_peak_both_released
+  FROM svs_memory_read_stats(603);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- A REBUILDING record reaching SvsMemoryReconcileLoad directly, ahead of its
+-- own ConfirmBuild (the worker's independent cold-load path racing a
+-- backend's in-flight rebuild of the same relid): the fits check folds out
+-- priorResidentBytes, not measuredBytes, and a successful reconcile leaves a
+-- clean RESIDENT record behind -- no leftover priorResidentBytes, no
+-- leftover build peak, ownership released -- exactly as if the rebuild had
+-- gone through Confirm and Handoff first.
+SELECT svs_memory_test_reset_database_accounting(604);
+SELECT svs_memory_admit_database(604, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(604, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(604, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(604, 1);
+SELECT svs_memory_reconcile_load(604, 1, (4 * 1024)::bigint);
+SELECT svs_memory_reserve_build(604, 1, (2 * 1024)::bigint, (5 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(604, 1, (6 * 1024)::bigint) AS fits;
+SELECT state, measured_bytes, prior_resident_bytes, owner_pid, build_peak_bytes
+  FROM svs_memory_test_reservations(604);
+SELECT residency_bytes_committed = (6 * 1024) AND build_bytes_committed = 0
+       AS lands_on_new_measurement_with_no_leftover_build_peak
+  FROM svs_memory_read_stats(604);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(604, 1);
+SELECT * FROM svs_memory_test_check_invariants();
