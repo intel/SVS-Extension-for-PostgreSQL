@@ -32,6 +32,7 @@
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -458,6 +459,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 		 * The admission gate belongs here: the builder above exists for it
 		 * to estimate against, and nothing below it has allocated yet.
 		 */
+		INJECTION_POINT("vamana-build-governed-pre-allocation", NULL);
 
 		/*
 		 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM
@@ -506,16 +508,13 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 }
 
 /*
- * No-op placeholder for the abort-cleanup callback PG_ENSURE_ERROR_CLEANUP
- * requires below.  A future admission gate replaces this with
- * SvsMemoryAbortBuild, which releases the memory reservation the gate takes
- * out inside VamanaBuildSVSIndexGoverned.  That reservation is created
- * inside the governed build but released out here, by the caller, after
- * the function returns: the caller is the one that knows when hand-off to
- * the worker (warm-up submission or VamanaCacheIndex) has completed, which
- * is the point at which the reservation is no longer needed.  Being a
- * no-op today, with nothing yet to release, is what makes wrapping that
- * wider span safe.
+ * Abort-cleanup callback for PG_ENSURE_ERROR_CLEANUP below.  Its purpose is
+ * to release whatever memory reservation the caller of
+ * VamanaBuildSVSIndexGoverned holds, on every error unwind.
+ * VamanaBuildSVSIndexGoverned reserves nothing, so this callback has
+ * nothing to release and does nothing; that emptiness is what makes it
+ * safe to wrap the wider span in each caller below, past the build call
+ * itself and through the worker hand-off.
  */
 static void
 SvsBuildAbortCleanup(int code, Datum arg)
@@ -591,12 +590,12 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					buildstate.numVectors, buildstate.dimensions)));
 
 	/*
-	 * The abort-cleanup callback will release the memory reservation the
-	 * admission gate takes out inside VamanaBuildSVSIndexGoverned, so this
-	 * must span through the warm-up hand-off below: the reservation is
-	 * caller-owned state PG_TRY alone would not release on a FATAL exit,
-	 * and the worker never learns of it independently.  cleanup_function is
-	 * a no-op for now; see SvsBuildAbortCleanup.
+	 * SvsBuildAbortCleanup releases whatever memory reservation this build
+	 * holds, on an error unwind; it must span through the warm-up hand-off
+	 * below because PG_TRY alone does not run on a FATAL exit, and the
+	 * worker never independently learns of a caller-owned reservation.
+	 * VamanaBuildSVSIndexGoverned reserves nothing, so the callback has
+	 * nothing to release and does nothing.
 	 */
 	PG_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, (Datum) 0);
 	{
@@ -916,13 +915,14 @@ VamanaRebuildFromTable(Relation index)
 	}
 
 	/*
-	 * The abort-cleanup callback will release the memory reservation the
-	 * admission gate takes out inside VamanaBuildSVSIndexGoverned, so this
-	 * must span through VamanaCacheIndex below: that is the point at which
-	 * the index is durably tracked and hand-off to the worker is complete,
-	 * matching the caller-releases-what-the-callee-reserved asymmetry in
-	 * vamanabuild().  cleanup_function is a no-op for now; see
-	 * SvsBuildAbortCleanup.
+	 * SvsBuildAbortCleanup releases whatever memory reservation this build
+	 * holds, on an error unwind; it must span through VamanaCacheIndex
+	 * below, the point at which the index is durably tracked and hand-off
+	 * to the worker is complete, mirroring vamanabuild()'s own span.  The
+	 * release happens here, in the caller, rather than inside
+	 * VamanaBuildSVSIndexGoverned, because only the caller knows when
+	 * hand-off has completed.  VamanaBuildSVSIndexGoverned reserves
+	 * nothing, so the callback has nothing to release and does nothing.
 	 */
 	PG_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, (Datum) 0);
 	{
