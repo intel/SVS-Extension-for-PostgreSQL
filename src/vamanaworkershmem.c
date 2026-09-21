@@ -16,6 +16,7 @@
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
 #include "svs_memory.h"
+#include "svs_thread_count.h"
 
 #include "access/xact.h"
 #include "miscadmin.h"
@@ -443,7 +444,7 @@ SvsCurrentSearchGrant(void)
 
 	grant = pg_atomic_read_u32(&VamanaWorkerShmemPtr->grantedSearchThreads);
 
-	return (grant == 0) ? 1 : (int) grant;
+	return SvsAtLeastOneThread((int32) grant);
 }
 
 /*

@@ -21,6 +21,7 @@ OBJS = src/svs.o \
        src/vamanabuild.o \
        src/svs_parallel_build.o \
        src/svs_build_thread_grant.o \
+       src/svs_build_request_protocol.o \
        src/svs_cpu_slots.o \
        src/vamanacache.o \
        src/vamanaio.o \

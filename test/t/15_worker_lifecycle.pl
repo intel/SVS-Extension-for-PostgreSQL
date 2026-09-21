@@ -228,11 +228,9 @@ sub count_distinct_worker_pids
         ));
     }
 
-    # Warm every index into the worker cache and record baseline results.
-    my %baseline;
     for my $n (@idx)
     {
-        $baseline{$n} = $node->safe_psql("postgres", qq(
+        $node->safe_psql("postgres", qq(
             SET enable_seqscan = off;
             SELECT id FROM ckpt_tbl$n ORDER BY val <-> '[$query_sql]' LIMIT 5;
         ));
@@ -247,6 +245,15 @@ sub count_distinct_worker_pids
     }
     my $pre_lsn = $node->safe_psql("postgres", "SELECT pg_current_wal_lsn();");
     chomp $pre_lsn;
+
+    my %baseline;
+    for my $n (@idx)
+    {
+        $baseline{$n} = $node->safe_psql("postgres", qq(
+            SET enable_seqscan = off;
+            SELECT id FROM ckpt_tbl$n ORDER BY val <-> '[$query_sql]' LIMIT 5;
+        ));
+    }
 
     my %slot;
     for my $n (@idx)

@@ -300,14 +300,17 @@ SELECT (SELECT max_search_threads_per_db FROM pg_stat_vamana_worker
 	   = (SELECT setting::int FROM pg_settings WHERE name = 'max_parallel_workers') AS ceiling_follows_max_parallel_workers;
 
 -- The explicit override path: svs.max_search_threads_per_db is read directly
--- by the querying backend (vamanaworkerstats.c), not through the launcher, so
--- a session-level SET takes effect immediately with no reload needed, unlike
--- svs.search_num_threads above.
-SET svs.max_search_threads_per_db = 4;
+-- by the querying backend (vamanaworkerstats.c), not through the launcher, but
+-- is still PGC_SIGHUP like svs.search_num_threads above, so it takes reload,
+-- not a session SET, to change.
+ALTER SYSTEM SET svs.max_search_threads_per_db = 4;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.1);
 SELECT max_search_threads_per_db = 4 AS ceiling_reports_configured_value
 	FROM pg_stat_vamana_worker
 	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
-RESET svs.max_search_threads_per_db;
+ALTER SYSTEM RESET svs.max_search_threads_per_db;
+SELECT pg_reload_conf();
 
 -- Visibility gate: an unprivileged caller sees only its own database's row;
 -- a pg_read_all_stats member sees every reserved database.  Reuses the

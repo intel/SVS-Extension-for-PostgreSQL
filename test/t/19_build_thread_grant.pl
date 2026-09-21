@@ -33,8 +33,9 @@ $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
 $node->append_conf('postgresql.conf', "wal_level = logical");
 $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
-$node->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
-$node->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
+$node->append_conf('postgresql.conf', "svs.max_residency_memory = '800MB'");
+$node->append_conf('postgresql.conf', "svs.max_search_work_mem = '800MB'");
+$node->append_conf('postgresql.conf', "max_parallel_workers = 4");
 $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION vector;");
@@ -369,6 +370,72 @@ sub check_adversarial_build_appname
 		"SELECT injection_points_detach('svs-build-thread-grant-publish');");
 	$node->safe_psql('postgres', "ALTER SYSTEM RESET svs.worker_timeout_ms;");
 	$node->safe_psql('postgres', "SELECT pg_reload_conf();");
+}
+
+# ---------------------------------------------------------------------------
+# A build's thread grant is capped by the elastic remainder left after every
+# database's reserved search-thread floor is honored: a large build request
+# in one database must not eat another database's floor.
+# ---------------------------------------------------------------------------
+{
+	$node->safe_psql('postgres', qq(CREATE DATABASE cold_db;));
+	$node->safe_psql('cold_db', "CREATE EXTENSION vector;");
+	$node->safe_psql('cold_db', "CREATE EXTENSION svs;");
+	$node->safe_psql('postgres', qq(
+		UPDATE vamana_databases
+			SET search_num_threads = 2, search_threads_reserved = 2
+			WHERE datname = 'postgres';
+		INSERT INTO vamana_databases (datname, enabled)
+			VALUES ('cold_db', true);
+	));
+	wait_for_worker_db($node, 'cold_db');
+
+	my $hot_granted = '';
+	for (1 .. 30)
+	{
+		$hot_granted = $node->safe_psql('postgres',
+			"SELECT search_threads_granted FROM pg_stat_vamana_worker "
+		  . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+		chomp $hot_granted;
+		last if $hot_granted eq '2';
+		usleep(500_000);
+	}
+	is($hot_granted, '2', 'hot_db reaches its reserved floor before any contending build');
+
+	$node->safe_psql('cold_db',
+		"UPDATE vamana_databases SET maintenance_num_threads = 10 WHERE datname = 'cold_db';"
+	);
+	$node->safe_psql('postgres',
+		"SELECT injection_points_attach('svs-build-thread-grant-acquired', 'wait');"
+	);
+
+	my $build = $node->background_psql('cold_db', on_error_stop => 1);
+	$build->query_until(qr/build_started/, qq(
+		\\echo build_started
+		CREATE TABLE cc_tbl (id serial PRIMARY KEY, val vector(8));
+		INSERT INTO cc_tbl (val)
+			SELECT ARRAY[random(),random(),random(),random(),
+						 random(),random(),random(),random()]::vector(8)
+			FROM generate_series(1, 50);
+		CREATE INDEX cc_idx ON cc_tbl USING vamana (val vector_l2_ops);
+	));
+
+	$node->wait_for_event('client backend', 'svs-build-thread-grant-acquired');
+
+	my $hot_granted_during_build = $node->safe_psql('postgres',
+		"SELECT search_threads_granted FROM pg_stat_vamana_worker "
+	  . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+	chomp $hot_granted_during_build;
+	is($hot_granted_during_build, '2',
+		'hot_db keeps its reserved floor while a large build runs in cold_db');
+
+	$node->safe_psql('postgres',
+		"SELECT injection_points_wakeup('svs-build-thread-grant-acquired');");
+	$build->query('SELECT 1');
+	$build->quit;
+
+	$node->safe_psql('postgres',
+		"SELECT injection_points_detach('svs-build-thread-grant-acquired');");
 }
 
 $node->stop;

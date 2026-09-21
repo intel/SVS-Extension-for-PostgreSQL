@@ -45,7 +45,7 @@ typedef struct SVSBuildConfig
 	int			dimensions;				/* Vector dimensionality (needed for LeanVec load) */
 	int			leanvec_dims;			/* LeanVec reduced dims (-1 = dimensions/2; unused by LVQ) */
 	int			build_window_size;		/* Build window size from reloptions (0 = use default) */
-	int			search_num_threads;		/* 0 = use SVSDefaultSearchThreads() */
+	int			search_num_threads;		/* the caller's governed search-thread grant */
 	int			numVectors;				/* Vector count on disk (sizes the load-time block) */
 }			SVSBuildConfig;
 
@@ -73,7 +73,6 @@ void		SVSFreeBuilder(SVSBuilderHandle builder);
 void		SVSBuilderSetStorage(SVSBuilderHandle builder, SVSStorageHandle storage);
 void		SVSBuilderSetThreadpool(SVSBuilderHandle builder, int num_threads);
 int			SVSDefaultBuildThreads(void);
-int			SVSDefaultSearchThreads(void);
 
 void		SVSSetIndexSearchThreads(SVSIndexHandle index, int num_threads);
 void		SVSFreeIndex(SVSIndexHandle index);

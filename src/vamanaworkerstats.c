@@ -23,6 +23,7 @@
 
 #include "postgres.h"
 
+#include "svs_cpu_budget.h"
 #include "svs_memory.h"
 #include "vamana.h"
 #include "vamana_replication.h"
@@ -288,13 +289,11 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 	/*
 	 * A GUC, not per-entry shmem: one cluster-wide value for every row, so it
 	 * is read once here rather than under the header lock in the callback.
-	 * Mirrors ComputePerDatabaseCeiling() in svs_cpu_budget.c, which resolves
-	 * the same GUC against the same fallback when computing grants; reported
-	 * here as the resolved ceiling (not the raw 0-means-follow GUC value) so a
-	 * DBA can compare a grant directly against what it was capped by.
+	 * Reported as the resolved ceiling (not the raw 0-means-follow GUC value)
+	 * so a DBA can compare a grant directly against what it was capped by.
 	 */
-	maxSearchThreadsPerDb = (svs_max_search_threads_per_db == 0) ?
-		max_parallel_workers : svs_max_search_threads_per_db;
+	maxSearchThreadsPerDb = SvsSearchThreadsPerDbCeiling(svs_max_search_threads_per_db,
+														  max_parallel_workers);
 
 	for (int i = 0; i < ctx.count; i++)
 	{
