@@ -723,6 +723,27 @@ PublishBuildGrant(VamanaWorkerShmem *entry, const SvsBuildCpuGrant *grant)
 	}
 }
 
+/* One enabled database's control-block pointer, as resolved while gathering
+ * this reconcile's requests. Grant application below matches on dbOid, not
+ * position: nothing guarantees budget->dbGrants/buildGrants track
+ * enabledRows' order or count.
+ */
+typedef struct GatheredDbEntry
+{
+	Oid					dbOid;
+	VamanaWorkerShmem  *entry;
+} GatheredDbEntry;
+
+static VamanaWorkerShmem *
+FindGatheredEntry(const GatheredDbEntry *entries, int nentries, Oid dbOid)
+{
+	for (int i = 0; i < nentries; i++)
+		if (entries[i].dbOid == dbOid)
+			return entries[i].entry;
+
+	return NULL;
+}
+
 /*
  * Publish this reconcile's CPU grants: gather the projected catalog columns,
  * the GUC snapshot, and every live database's pending build requests; call
@@ -734,6 +755,7 @@ PublishCpuGrants(List *rows)
 	List	   *enabledRows;
 	int			ndbs;
 	SvsDbCpuRequest *dbs;
+	GatheredDbEntry *entries;
 	SvsBuildCpuRequest *builds;
 	int			nbuilds = 0;
 	int			i = 0;
@@ -747,6 +769,7 @@ PublishCpuGrants(List *rows)
 	enabledRows = EnabledRowsOf(rows);
 	ndbs = list_length(enabledRows);
 	dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
+	entries = palloc(sizeof(GatheredDbEntry) * ndbs);
 	builds = palloc(sizeof(SvsBuildCpuRequest) * ndbs * SVS_MAX_PENDING_BUILDS);
 
 	foreach(lc, enabledRows)
@@ -754,6 +777,9 @@ PublishCpuGrants(List *rows)
 		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
 		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
+
+		entries[i].dbOid = db->dbOid;
+		entries[i].entry = entry;
 
 		dbs[i].dbOid = db->dbOid;
 		dbs[i].live = live;
@@ -787,10 +813,10 @@ PublishCpuGrants(List *rows)
 	for (i = 0; i < budget->ndbGrants; i++)
 	{
 		const SvsDbCpuGrant *grant = &budget->dbGrants[i];
-		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(grant->dbOid);
+		VamanaWorkerShmem *entry = FindGatheredEntry(entries, ndbs, grant->dbOid);
 		uint32		previousGranted;
 
-		if (entry == NULL)
+		if (entry == NULL || entry->dbOid != grant->dbOid)
 			continue;
 
 		previousGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
@@ -808,9 +834,9 @@ PublishCpuGrants(List *rows)
 	for (i = 0; i < budget->nbuildGrants; i++)
 	{
 		const SvsBuildCpuGrant *grant = &budget->buildGrants[i];
-		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(grant->dbOid);
+		VamanaWorkerShmem *entry = FindGatheredEntry(entries, ndbs, grant->dbOid);
 
-		if (entry != NULL)
+		if (entry != NULL && entry->dbOid == grant->dbOid)
 			PublishBuildGrant(entry, grant);
 	}
 

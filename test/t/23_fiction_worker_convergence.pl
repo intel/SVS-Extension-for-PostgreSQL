@@ -162,10 +162,6 @@ sub assert_rollup_matches
 {
     my ($node, $label) = @_;
     my ($sum, $slots) = rollup_snapshot($node);
-    my $breakdown = $node->safe_psql('postgres',
-        "SELECT db_oid, worker_pid, search_threads_desired, "
-      . "search_threads_granted, search_threads_reserved FROM pg_stat_vamana_worker;");
-    diag("pg_stat_vamana_worker at '$label':\n$breakdown");
     is($sum, $slots,
         "rollup invariant ($label): sum(search_threads_granted)=$sum "
       . "matches held 'vamana search slot' rows=$slots");
