@@ -1,0 +1,5 @@
+# svs_residency_reconcile_test extension
+comment = 'Standalone test harness for SvsIndexResidencyReconcileOrphans'
+default_version = '1.0'
+module_pathname = '$libdir/svs_residency_reconcile_test'
+relocatable = true
