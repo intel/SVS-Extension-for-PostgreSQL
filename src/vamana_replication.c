@@ -163,6 +163,7 @@ TryDropSlot(const char *slotName)
 
 	PG_TRY();
 	{
+		INJECTION_POINT("vamana-drop-slot-error", NULL);
 		ReplicationSlotDrop(slotName, /*nowait=*/ true);
 	}
 	PG_CATCH();
