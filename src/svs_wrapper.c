@@ -38,6 +38,7 @@ static const CompressionMapping compression_mappings[] = {
 
 #define NUM_COMPRESSION_MAPPINGS (sizeof(compression_mappings) / sizeof(compression_mappings[0]))
 
+/* Takes ownership of error and frees it; callers must not free it again. */
 static char *
 SVSConsumeErrorMessage(svs_error_h error)
 {
