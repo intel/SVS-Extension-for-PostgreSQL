@@ -37,6 +37,16 @@ extern void SvsIndexResidencyRecordLoad(Oid indexRelid, Oid dbOid, uint64 reside
 extern void SvsIndexResidencyRecordUnload(Oid indexRelid);
 
 /*
+ * Delete every durable row for dbOid whose index_relid is not in liveRelids
+ * (numLive entries), the caller's own authoritative enumeration of that
+ * database's current vamana indexes. A no-op, deliberately, when numLive is
+ * 0: an empty live set is indistinguishable from a failed enumeration, and
+ * this sweep must never risk lowering the durable floor for indexes that
+ * are, in fact, still resident. Best-effort like the two functions above.
+ */
+extern void SvsIndexResidencyReconcileOrphans(Oid dbOid, Oid *liveRelids, int numLive);
+
+/*
  * The durable floor a residency budget must respect on top of whatever the
  * caller's own live counter says: 0 if entry's worker is confirmed live
  * (the live counter is already the truth), otherwise the sum of every

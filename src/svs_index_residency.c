@@ -21,6 +21,7 @@
 #include "commands/dbcommands.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 
 typedef struct RecordLoadArgs
@@ -29,6 +30,13 @@ typedef struct RecordLoadArgs
 	Oid			dbOid;
 	uint64		residentBytes;
 } RecordLoadArgs;
+
+typedef struct ReconcileOrphansArgs
+{
+	Oid			dbOid;
+	Oid		   *liveRelids;
+	int			numLive;
+} ReconcileOrphansArgs;
 
 static void
 ConnectOrError(const char *callerName)
@@ -150,6 +158,82 @@ SvsIndexResidencyRecordUnload(Oid indexRelid)
 	ereport(LOG,
 			(errmsg("vamana index %u: could not remove durable residency record; "
 					"will be corrected at the next load or unload", indexRelid)));
+}
+
+static void
+ReconcileOrphansBody(void *arg)
+{
+	ReconcileOrphansArgs *args = (ReconcileOrphansArgs *) arg;
+	char	   *qualifiedName = SvsExtensionQualifiedRelationName("svs_index_residency");
+	char	   *datname = get_database_name(args->dbOid);
+	Datum	   *elems;
+	ArrayType  *liveArray;
+	Oid			argTypes[2] = {OIDOID, OIDARRAYOID};
+	Datum		argValues[2];
+
+	if (qualifiedName == NULL || datname == NULL)
+		return;
+
+	elems = (Datum *) palloc(sizeof(Datum) * args->numLive);
+	for (int i = 0; i < args->numLive; i++)
+		elems[i] = ObjectIdGetDatum(args->liveRelids[i]);
+	liveArray = construct_array(elems, args->numLive, OIDOID,
+								 sizeof(Oid), true, TYPALIGN_INT);
+
+	argValues[0] = ObjectIdGetDatum(args->dbOid);
+	argValues[1] = PointerGetDatum(liveArray);
+
+	ConnectOrError("SvsIndexResidencyReconcileOrphans");
+	LockDatabaseRow(datname);
+	SPI_execute_with_args(psprintf("DELETE FROM %s WHERE db_oid = $1 AND index_relid <> ALL($2)",
+									qualifiedName),
+						   2, argTypes, argValues, NULL, false, 0);
+	SPI_finish();
+}
+
+/*
+ * Sweep every durable row for dbOid whose index_relid is not in liveRelids,
+ * the complete set of vamana indexes the catalog currently reports for this
+ * database. A row survives here only as long as some catalog access, load,
+ * or unload eventually revisits it -- this pass exists so a row orphaned by
+ * a path that skips that revisit (a dropped index whose paired durable
+ * delete never ran) does not survive forever.
+ *
+ * numLive == 0 is refused rather than treated as "nothing is live": the
+ * enumeration this relies on returns the same empty result on a genuine
+ * empty database and on its own SPI failure, and this sweep can only ever
+ * narrow the durable floor, never raise it. Proceeding on an empty set it
+ * cannot trust would risk deleting every row for a database that still has
+ * resident indexes, understating the floor in the one direction that lets
+ * through a residency_memory decrease a resident graph cannot survive. A
+ * database with no orphans and no live indexes leaves nothing to clean
+ * either way.
+ *
+ * Best-effort like the two functions above: a failure here must not prevent
+ * the worker from starting, so it is caught, logged, and left for the next
+ * startup rather than propagated.
+ */
+void
+SvsIndexResidencyReconcileOrphans(Oid dbOid, Oid *liveRelids, int numLive)
+{
+	ReconcileOrphansArgs args = {dbOid, liveRelids, numLive};
+	VamanaSubXactResult result;
+
+	if (numLive == 0)
+		return;
+
+	if (!IsTransactionState() || RecoveryInProgress())
+		return;
+
+	result = VamanaRunInSubXact(ReconcileOrphansBody, &args, NULL);
+
+	if (result.succeeded)
+		return;
+
+	FreeErrorData(result.edata);
+	ereport(LOG,
+			(errmsg("vamana database %u: could not reconcile orphaned residency records; "
+					"will retry at the next worker startup", dbOid)));
 }
 
 static uint64

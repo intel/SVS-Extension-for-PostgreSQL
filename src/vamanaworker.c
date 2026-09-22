@@ -605,6 +605,15 @@ VamanaWorkerReconcileResidencyOnStartup(void)
 	for (i = 0; i < numDropped; i++)
 		SvsIndexResidencyRecordUnload(droppedRelids[i]);
 
+	/*
+	 * The pass above only catches an index whose reservation was dropped
+	 * just now; it never revisits a durable row whose index was already
+	 * evicted before this startup. Sweep the durable table directly
+	 * against the same live enumeration so a row like that does not
+	 * survive indefinitely.
+	 */
+	SvsIndexResidencyReconcileOrphans(VamanaWorkerShmemPtr->dbOid, liveRelids, numLive);
+
 	list_free(liveRelidsList);
 	pfree(liveRelids);
 }
