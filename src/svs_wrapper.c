@@ -38,24 +38,29 @@ static const CompressionMapping compression_mappings[] = {
 
 #define NUM_COMPRESSION_MAPPINGS (sizeof(compression_mappings) / sizeof(compression_mappings[0]))
 
+/* Takes ownership of error and frees it; callers must not free it again. */
+static char *
+SVSConsumeErrorMessage(svs_error_h error)
+{
+	const char *msg = svs_error_get_message(error);
+	char	   *copy = pstrdup(msg ? msg : "unknown error");
+
+	svs_error_free(error);
+	return copy;
+}
+
 static void
 CheckSVSError(svs_error_h error, const char *operation)
 {
 	if (error && !svs_error_ok(error))
 	{
-		char	   *msg = pstrdup(svs_error_get_message(error)
-								   ? svs_error_get_message(error) : "unknown error");
 		svs_error_code_t code = svs_error_get_code(error);
-
-		/* Every caller's own error-object cleanup is unreachable once this
-		 * throws, so free it here before doing so. */
-		svs_error_free(error);
+		char	   *msg = SVSConsumeErrorMessage(error);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS operation failed: %s", operation),
-				 errdetail_log("SVS error: %s (code %d).",
-							   msg ? msg : "unknown error", code)));
+				 errdetail_log("SVS error: %s (code %d).", msg, code)));
 	}
 }
 
@@ -768,14 +773,12 @@ SVSSaveIndex(SVSIndexHandle index, const char *path)
 
 	if (!ok || !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
-		char	   *saved = pstrdup(msg ? msg : "unknown error");
+		char	   *msg = SVSConsumeErrorMessage(error);
 
-		svs_error_free(error);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to save SVS index"),
-				 errdetail_log("Path: \"%s\". SVS error: %s.", path, saved)));
+				 errdetail_log("Path: \"%s\". SVS error: %s.", path, msg)));
 		return -1;				/* unreachable */
 	}
 
@@ -892,14 +895,12 @@ SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 
 	if (loaded == NULL || !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
+		char	   *msg = SVSConsumeErrorMessage(error);
 
-		svs_error_free(error);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to load SVS index"),
-				 errdetail_log("Path: \"%s\". SVS error: %s.",
-							   path, msg ? msg : "unknown error")));
+				 errdetail_log("Path: \"%s\". SVS error: %s.", path, msg)));
 		return NULL;
 	}
 
@@ -924,13 +925,12 @@ SVSAddPoints(SVSIndexHandle index, const float *points, const size_t *ids, int n
 
 	if (!ok || !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
+		char	   *msg = SVSConsumeErrorMessage(error);
 
-		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic add points failed"),
-				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg)));
 		return -1;
 	}
 
@@ -954,13 +954,12 @@ SVSDeletePoints(SVSIndexHandle index, const size_t *ids, int num_ids)
 
 	if (!ok || !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
+		char	   *msg = SVSConsumeErrorMessage(error);
 
-		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic delete points failed"),
-				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg)));
 		return -1;
 	}
 
@@ -978,13 +977,12 @@ SVSConsolidate(SVSIndexHandle index)
 
 	if (!ok || !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
+		char	   *msg = SVSConsumeErrorMessage(error);
 
-		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic consolidate failed"),
-				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg)));
 		return false;
 	}
 
@@ -1002,13 +1000,12 @@ SVSCompact(SVSIndexHandle index, size_t batchsize)
 
 	if (!ok || !svs_error_ok(error))
 	{
-		const char *msg = svs_error_get_message(error);
+		char	   *msg = SVSConsumeErrorMessage(error);
 
-		svs_error_free(error);
 		ereport(WARNING,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("SVS dynamic compact failed"),
-				 errdetail_log("SVS error: %s.", msg ? msg : "unknown error")));
+				 errdetail_log("SVS error: %s.", msg)));
 		return false;
 	}
 
