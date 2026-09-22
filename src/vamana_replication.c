@@ -146,7 +146,12 @@ VamanaNodeIsPrimary(void)
 static VamanaSlotDropResult
 TryDropSlot(const char *slotName)
 {
-	VamanaSlotDropResult result = VAMANA_SLOT_DROP_DONE;
+	/*
+	 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(), so
+	 * it must survive the longjmp back to the PG_TRY() setjmp point
+	 * (-Wclobbered).
+	 */
+	volatile VamanaSlotDropResult result = VAMANA_SLOT_DROP_DONE;
 	MemoryContext callerContext = CurrentMemoryContext;
 	uint32		savedInterruptHoldoffCount = InterruptHoldoffCount;
 	uint32		savedQueryCancelHoldoffCount = QueryCancelHoldoffCount;
@@ -661,7 +666,12 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 static bool
 VamanaTryAcquireSlotNoWait(const char *slotName)
 {
-	bool		acquired = true;
+	/*
+	 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(), so
+	 * it must survive the longjmp back to the PG_TRY() setjmp point
+	 * (-Wclobbered).
+	 */
+	volatile bool acquired = true;
 
 	PG_TRY();
 	{
