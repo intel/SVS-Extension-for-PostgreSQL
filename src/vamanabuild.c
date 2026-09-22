@@ -29,8 +29,10 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "tcop/tcopprot.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -391,10 +393,13 @@ VamanaRunSVSBuild(int grantedThreads, void *context)
  * builder triple.  Deliberately narrower than VamanaBuildState: the only
  * callers building fresh (vamanabuild, VamanaRebuildFromTable) source these
  * from different places (reloptions vs. a live scan), and this keeps the
- * builder lifecycle below decoupled from either caller's own state.
+ * builder lifecycle below decoupled from either caller's own state.  relid
+ * is identity rather than shape, but both callers have it on hand and an
+ * admission check needs it to size an estimate against the right index.
  */
 typedef struct VamanaSVSIndexParams
 {
+	Oid				relid;
 	int				dimensions;
 	int				graph_degree;
 	int				alpha;
@@ -409,21 +414,28 @@ typedef struct VamanaSVSIndexParams
 } VamanaSVSIndexParams;
 
 /*
- * Builds an SVS index under a launcher-granted thread count.  Owns the
- * builder/storage/algorithm handles it creates and frees them on every exit
- * path, including an ERROR raised while waiting for or running under the
- * grant -- those handles are native SVS objects that PostgreSQL's own
- * memory-context cleanup does not know how to reclaim.
+ * Builds an SVS index under a launcher-granted thread count.  Takes the
+ * caller's raw per-vector buffer and flattens it internally rather than
+ * requiring an already-flattened one, so that an admission check needing a
+ * live builder handle can sit between builder creation and the flatten,
+ * ahead of the large allocation it would exist to refuse.  Owns the
+ * builder/storage/algorithm handles it creates and the flattened buffer it
+ * allocates, and frees all of them on every exit path, including an ERROR
+ * raised while waiting for or running under the grant -- the SVS handles
+ * are native objects that PostgreSQL's own memory-context cleanup does not
+ * know how to reclaim.  The caller retains ownership of vectorBuffer.
  */
 static SVSIndexHandle
 VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
-							 const float *flatData, int numVectors,
+							 float **vectorBuffer, int numVectors,
 							 int *errorCodeOut)
 {
 	SVSAlgorithmHandle algorithm;
 	SVSStorageHandle storage;
 	SVSBuilderHandle builder;
 	VamanaSVSBuildContext buildCtx;
+	float	   *volatile flatData = NULL;
+	Size		dataSize;
 	int			buildWindow = params->build_window_size > 0 ?
 		params->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(params->graph_degree);
 
@@ -441,20 +453,50 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 	builder = SVSCreateBuilder(params->distance_type, params->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
 
-	buildCtx = (VamanaSVSBuildContext) {
-		.builder = builder,
-		.flatData = flatData,
-		.numVectors = numVectors,
-		.graph_degree = params->graph_degree,
-		.dimensions = params->dimensions,
-	};
-
 	PG_TRY();
 	{
+		/*
+		 * The admission gate belongs here: the builder above exists for it
+		 * to estimate against, and nothing below it has allocated yet.
+		 */
+		INJECTION_POINT("vamana-build-governed-pre-allocation", NULL);
+
+		/*
+		 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM
+		 * (2000) by both callers, so firing needs more than ~2.3e15 vectors
+		 * on a 64-bit system.  Guards the multiplication as belt-and-braces.
+		 */
+		if ((size_t) numVectors > 0 &&
+			(size_t) params->dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("vector dataset too large to index "
+							"(%d vectors x %d dimensions exceeds memory limit)",
+							numVectors, params->dimensions)));
+
+		dataSize = (Size) numVectors * params->dimensions * sizeof(float);
+		flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
+		for (int i = 0; i < numVectors; i++)
+		{
+			memcpy(flatData + (Size) i * params->dimensions,
+				   vectorBuffer[i],
+				   params->dimensions * sizeof(float));
+		}
+
+		buildCtx = (VamanaSVSBuildContext) {
+			.builder = builder,
+			.flatData = flatData,
+			.numVectors = numVectors,
+			.graph_degree = params->graph_degree,
+			.dimensions = params->dimensions,
+		};
+
 		SvsRunGovernedBuild(VamanaRunSVSBuild, &buildCtx);
 	}
 	PG_FINALLY();
 	{
+		if (flatData)
+			pfree(flatData);
 		SVSFreeBuilder(builder);
 		SVSFreeStorage(storage);
 		SVSFreeAlgorithm(algorithm);
@@ -466,6 +508,20 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 }
 
 /*
+ * Abort-cleanup callback for PG_ENSURE_ERROR_CLEANUP below.  Its purpose is
+ * to release whatever memory reservation the caller of
+ * VamanaBuildSVSIndexGoverned holds, on every error unwind.
+ * VamanaBuildSVSIndexGoverned reserves nothing, so this callback has
+ * nothing to release and does nothing; that emptiness is what makes it
+ * safe to wrap the wider span in each caller below, past the build call
+ * itself and through the worker hand-off.
+ */
+static void
+SvsBuildAbortCleanup(int code, Datum arg)
+{
+}
+
+/*
  * Build the index
  */
 IndexBuildResult *
@@ -474,8 +530,6 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	IndexBuildResult *result;
 	VamanaBuildState buildstate;
 	SVSIndexHandle svsIndex = NULL;
-	float	   *flatData = NULL;
-	Size		dataSize;
 	int			error_code;
 
 	/*
@@ -531,33 +585,22 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		goto cleanup;
 	}
 
-	/*
-	 * Unreachable in practice: dimensions is capped at VAMANA_MAX_DIM (2000)
-	 * above, so firing needs more than ~2.3e15 vectors on a 64-bit system.
-	 * Guards the multiplication as belt-and-braces.
-	 */
-	if ((size_t) buildstate.numVectors > 0 &&
-		(size_t) buildstate.dimensions > SIZE_MAX / sizeof(float) / (size_t) buildstate.numVectors)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("vector dataset too large to index "
-						"(%d vectors x %d dimensions exceeds memory limit)",
-						buildstate.numVectors, buildstate.dimensions)));
-	dataSize = (Size) buildstate.numVectors * buildstate.dimensions * sizeof(float);
-	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
-	for (int i = 0; i < buildstate.numVectors; i++)
-	{
-		memcpy(flatData + (Size) i * buildstate.dimensions,
-			   buildstate.vectorBuffer[i],
-			   buildstate.dimensions * sizeof(float));
-	}
-
 	ereport(NOTICE,
 			(errmsg("building SVS index with %d vectors of dimension %d",
 					buildstate.numVectors, buildstate.dimensions)));
 
+	/*
+	 * SvsBuildAbortCleanup releases whatever memory reservation this build
+	 * holds, on an error unwind; it must span through the warm-up hand-off
+	 * below because PG_TRY alone does not run on a FATAL exit, and the
+	 * worker never independently learns of a caller-owned reservation.
+	 * VamanaBuildSVSIndexGoverned reserves nothing, so the callback has
+	 * nothing to release and does nothing.
+	 */
+	PG_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, (Datum) 0);
 	{
 		VamanaSVSIndexParams params = {
+			.relid = RelationGetRelid(index),
 			.dimensions = buildstate.dimensions,
 			.graph_degree = buildstate.graph_degree,
 			.alpha = buildstate.alpha,
@@ -571,83 +614,83 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			.distance_type = buildstate.distance_type,
 		};
 
-		svsIndex = VamanaBuildSVSIndexGoverned(&params, flatData,
+		svsIndex = VamanaBuildSVSIndexGoverned(&params, buildstate.vectorBuffer,
 											   buildstate.numVectors, &error_code);
-	}
 
-	if (svsIndex == NULL)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to build SVS index"),
-				 errdetail_log("SVS error code: %d.", error_code),
-				 errhint("Try increasing maintenance_work_mem or reducing vector dimensions.")));
-	}
-
-	ereport(NOTICE,
-			(errmsg("SVS index built successfully")));
-
-	/* Serialize index to disk so the BGW can adopt it. */
-	SerializeIndexToPages(&buildstate, svsIndex);
-
-	/*
-	 * Synchronous warm-up: send a LOAD slot to the BGW so the index is in
-	 * the worker cache before this transaction commits.  We read the
-	 * authoritative values back from the metapage rather than using
-	 * buildstate fields directly, because
-	 * SerializeIndexToPages may have adjusted counters.
-	 *
-	 * leanvec_dims and distance_type are not stored on the metapage; read
-	 * them from storage options / the AM support function.
-	 */
-	{
-		Oid				relid = RelationGetRelid(index);
-		VamanaMetaPageData meta;
-		VamanaOptions  *opts = (VamanaOptions *) index->rd_options;
-
-		VamanaReadMetaPage(index, &meta);
-
-		if (VamanaWorkerIsAvailable())
+		if (svsIndex == NULL)
 		{
-			if (!VamanaWorkerSubmitLoad(
-					relid,
-					(int) meta.dimensions,
-					(int) meta.graph_degree,
-					(int) meta.alpha,
-					VamanaResolveSearchWindowSize(opts),
-					(opts && opts->build_window_size > 0) ? opts->build_window_size : 0,
-					(int) meta.compression_type,
-					(int) meta.compression_primary,
-					(int) meta.compression_secondary,
-					opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS,
-					(int) VamanaGetDistanceMetric(index),
-					(int) meta.numVectors,
-					(int) meta.tidMappingCapacity,
-					meta.nextExternalId,
-					(int) meta.numDeleted,
-					RelationGetRelid(heap),
-					index->rd_index->indkey.values[0] - 1))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("failed to build SVS index"),
+					 errdetail_log("SVS error code: %d.", error_code),
+					 errhint("Try increasing maintenance_work_mem or reducing vector dimensions.")));
+		}
+
+		ereport(NOTICE,
+				(errmsg("SVS index built successfully")));
+
+		/* Serialize index to disk so the BGW can adopt it. */
+		SerializeIndexToPages(&buildstate, svsIndex);
+
+		/*
+		 * Synchronous warm-up: send a LOAD slot to the BGW so the index is in
+		 * the worker cache before this transaction commits.  We read the
+		 * authoritative values back from the metapage rather than using
+		 * buildstate fields directly, because
+		 * SerializeIndexToPages may have adjusted counters.
+		 *
+		 * leanvec_dims and distance_type are not stored on the metapage; read
+		 * them from storage options / the AM support function.
+		 */
+		{
+			Oid				relid = RelationGetRelid(index);
+			VamanaMetaPageData meta;
+			VamanaOptions  *opts = (VamanaOptions *) index->rd_options;
+
+			VamanaReadMetaPage(index, &meta);
+
+			if (VamanaWorkerIsAvailable())
+			{
+				INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
+				if (!VamanaWorkerSubmitLoad(
+						relid,
+						(int) meta.dimensions,
+						(int) meta.graph_degree,
+						(int) meta.alpha,
+						VamanaResolveSearchWindowSize(opts),
+						(opts && opts->build_window_size > 0) ? opts->build_window_size : 0,
+						(int) meta.compression_type,
+						(int) meta.compression_primary,
+						(int) meta.compression_secondary,
+						opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS,
+						(int) VamanaGetDistanceMetric(index),
+						(int) meta.numVectors,
+						(int) meta.tidMappingCapacity,
+						meta.nextExternalId,
+						(int) meta.numDeleted,
+						RelationGetRelid(heap),
+						index->rd_index->indkey.values[0] - 1))
+				{
+					ereport(WARNING,
+							(errmsg("vamana index \"%s\": background worker load failed; "
+									"index will be adopted by the worker on startup",
+									RelationGetRelationName(index))));
+				}
+			}
+			else
 			{
 				ereport(WARNING,
-						(errmsg("vamana index \"%s\": background worker load failed; "
+						(errmsg("vamana index \"%s\": background worker not yet available; "
 								"index will be adopted by the worker on startup",
 								RelationGetRelationName(index))));
 			}
 		}
-		else
-		{
-			ereport(WARNING,
-					(errmsg("vamana index \"%s\": background worker not yet available; "
-							"index will be adopted by the worker on startup",
-							RelationGetRelationName(index))));
-		}
 	}
+	PG_END_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, (Datum) 0);
 
 cleanup:
 	if (svsIndex)
 		SVSFreeIndex(svsIndex);
-	if (flatData)
-		pfree(flatData);
 
 	FreeBuildState(&buildstate);
 
@@ -719,8 +762,6 @@ VamanaRebuildFromTable(Relation index)
 	int			numVectors = 0;
 	int			bufferCapacity = VAMANA_INITIAL_BUFFER_CAPACITY;
 	int			errorCode = 0;
-	Size		dataSize;
-	float	   *flatData;
 
 	ereport(LOG,
 			(errmsg("rebuilding vamana index from table data")));
@@ -874,32 +915,20 @@ VamanaRebuildFromTable(Relation index)
 						numVectors)));
 	}
 
-	/* Flatten vector data for SVS */
 	/*
-	 * Unreachable in practice: the index could not have been created unless its
-	 * dimensions passed the VAMANA_MAX_DIM (2000) cap in vamanabuild(), so
-	 * firing needs more than ~2.3e15 vectors on a 64-bit system.  Guards the
-	 * multiplication as belt-and-braces.
+	 * SvsBuildAbortCleanup releases whatever memory reservation this build
+	 * holds, on an error unwind; it must span through VamanaCacheIndex
+	 * below, the point at which the index is durably tracked and hand-off
+	 * to the worker is complete, mirroring vamanabuild()'s own span.  The
+	 * release happens here, in the caller, rather than inside
+	 * VamanaBuildSVSIndexGoverned, because only the caller knows when
+	 * hand-off has completed.  VamanaBuildSVSIndexGoverned reserves
+	 * nothing, so the callback has nothing to release and does nothing.
 	 */
-	if ((size_t) numVectors > 0 &&
-		(size_t) dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("vector dataset too large to index "
-						"(%d vectors x %d dimensions exceeds memory limit)",
-						numVectors, dimensions)));
-	dataSize = (Size) numVectors * dimensions * sizeof(float);
-	flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
-
-	for (int i = 0; i < numVectors; i++)
-	{
-		memcpy(flatData + (Size) i * dimensions,
-			   vectorBuffer[i],
-			   dimensions * sizeof(float));
-	}
-
+	PG_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, (Datum) 0);
 	{
 		VamanaSVSIndexParams params = {
+			.relid = RelationGetRelid(index),
 			.dimensions = dimensions,
 			.graph_degree = graph_degree,
 			.alpha = alpha,
@@ -913,40 +942,40 @@ VamanaRebuildFromTable(Relation index)
 			.distance_type = distanceType,
 		};
 
-		svsIndex = VamanaBuildSVSIndexGoverned(&params, flatData, numVectors, &errorCode);
-	}
+		svsIndex = VamanaBuildSVSIndexGoverned(&params, vectorBuffer, numVectors, &errorCode);
 
-	if (svsIndex == NULL || errorCode != 0)
-	{
+		if (svsIndex == NULL || errorCode != 0)
+		{
+			for (int i = 0; i < numVectors; i++)
+				pfree(vectorBuffer[i]);
+			pfree(vectorBuffer);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("failed to rebuild vamana index from table"),
+					 errdetail("SVS build failed with error code %d.", errorCode)));
+		}
+
+		SVSSetIndexSearchThreads(svsIndex, SvsCurrentSearchGrant());
+
+		/* tidMapping is still needed below, by VamanaCacheIndex. */
 		for (int i = 0; i < numVectors; i++)
 			pfree(vectorBuffer[i]);
 		pfree(vectorBuffer);
-		pfree(flatData);
 
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to rebuild vamana index from table"),
-				 errdetail("SVS build failed with error code %d.", errorCode)));
+		ereport(NOTICE,
+				(errmsg("successfully rebuilt vamana index with %d vectors", numVectors)));
+
+		/* Cache the rebuilt index with TID mapping and dynamic fields */
+		INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
+		VamanaCacheIndex(RelationGetRelid(index), svsIndex, dimensions,
+						 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
+						 numVectors,	/* tidMappingCapacity (fresh rebuild, no
+										 * holes) */
+						 (uint64) numVectors,	/* nextExternalId */
+						 0);		/* numDeleted */
 	}
-
-	SVSSetIndexSearchThreads(svsIndex, SvsCurrentSearchGrant());
-
-	/* tidMapping is still needed below, by VamanaCacheIndex. */
-	for (int i = 0; i < numVectors; i++)
-		pfree(vectorBuffer[i]);
-	pfree(vectorBuffer);
-	pfree(flatData);
-
-	ereport(NOTICE,
-			(errmsg("successfully rebuilt vamana index with %d vectors", numVectors)));
-
-	/* Cache the rebuilt index with TID mapping and dynamic fields */
-	VamanaCacheIndex(RelationGetRelid(index), svsIndex, dimensions,
-					 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
-					 numVectors,	/* tidMappingCapacity (fresh rebuild, no
-									 * holes) */
-					 (uint64) numVectors,	/* nextExternalId */
-					 0);		/* numDeleted */
+	PG_END_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, (Datum) 0);
 
 	return svsIndex;
 }
