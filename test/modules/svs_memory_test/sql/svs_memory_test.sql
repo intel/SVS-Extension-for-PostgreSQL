@@ -788,3 +788,24 @@ SELECT residency_bytes_committed = (6 * 1024) AND build_bytes_committed = 0
 SELECT * FROM svs_memory_test_check_invariants();
 SELECT svs_memory_account_unload(604, 1);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- ConfirmBuild guards against a REBUILDING record that ReconcileLoad's own
+-- independent load already claimed straight to RESIDENT ahead of it: the
+-- original backend's confirm, arriving after losing that race, must error
+-- rather than fold out the stale estimate and land on CONFIRMED with no
+-- owner.
+SELECT svs_memory_test_reset_database_accounting(605);
+SELECT svs_memory_admit_database(605, (10 * 1024)::bigint);
+SELECT svs_memory_reserve_build(605, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_confirm_build(605, 1, 0::bigint, (4 * 1024)::bigint);
+SELECT svs_memory_handoff_build(605, 1);
+SELECT svs_memory_reconcile_load(605, 1, (4 * 1024)::bigint);
+SELECT svs_memory_reserve_build(605, 1, (2 * 1024)::bigint, (5 * 1024)::bigint);
+SELECT svs_memory_reconcile_load(605, 1, (6 * 1024)::bigint) AS fits;
+SELECT svs_memory_confirm_build(605, 1, 0::bigint, (7 * 1024)::bigint);
+SELECT state, measured_bytes, owner_pid FROM svs_memory_test_reservations(605);
+SELECT residency_bytes_committed = (6 * 1024) AS committed_untouched_by_rejected_confirm
+  FROM svs_memory_read_stats(605);
+SELECT * FROM svs_memory_test_check_invariants();
+SELECT svs_memory_account_unload(605, 1);
+SELECT * FROM svs_memory_test_check_invariants();

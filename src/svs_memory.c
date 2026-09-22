@@ -477,6 +477,24 @@ SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredRes
 				 errmsg("no pending build reservation for index %u in database %u", relid, dbOid)));
 	}
 
+	/*
+	 * A reservation can only be pending confirmation in RESERVED (a fresh
+	 * build) or REBUILDING (a rebuild). Any other state means something
+	 * else already finished it -- most notably, ReconcileLoad's own
+	 * independent load can claim a REBUILDING record straight to RESIDENT
+	 * ahead of this call. Confirming against that record would fold out
+	 * its stale estimateBytes instead of its real committed measuredBytes,
+	 * and stamp it CONFIRMED with no owner. Error instead of guessing.
+	 */
+	if (reservation->state != SVS_MEM_RESERVED && reservation->state != SVS_MEM_REBUILDING)
+	{
+		LWLockRelease(&entry->memLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("build reservation for index %u in database %u is not pending confirmation",
+						relid, dbOid)));
+	}
+
 	isRebuild = reservation->state == SVS_MEM_REBUILDING;
 
 	SubtractFloored(&entry->buildBytesCommitted, buildPeak, "a build peak");

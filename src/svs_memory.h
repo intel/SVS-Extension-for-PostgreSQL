@@ -198,6 +198,13 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
  * instead returns to RESIDENT at its pre-rebuild measured size, since that
  * graph is still genuinely resident. Returns true once the reservation is
  * confirmed at the exact measured size.
+ *
+ * Errors if relid's reservation is in any state other than RESERVED or
+ * REBUILDING -- in particular, a REBUILDING record that ReconcileLoad's own
+ * independent load already claimed straight to RESIDENT ahead of this call.
+ * Confirming against that record would fold out its stale estimateBytes
+ * instead of its real committed measuredBytes and land on CONFIRMED with no
+ * owner, so this refuses rather than guessing.
  */
 extern bool SvsMemoryConfirmBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 measuredResidencyBytes);
