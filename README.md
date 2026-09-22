@@ -7,7 +7,7 @@ A PostgreSQL extension that adds the **Vamana** approximate nearest neighbor (AN
 ## Features
 
 - Graph-based ANN index using the Vamana algorithm
-- Supports `vector` (float32) and `halfvec` (float16) types from pgvector
+- Supports `vector` (float32) and `halfvec` (float16) types from pgvector, each stored in its own element format
 - Three distance metrics: L2 (`<->`), inner product (`<#>`), cosine (`<=>`)
 - LeanVec and LVQ compression to reduce memory usage by 50–75%
 - Dynamic index: incremental `INSERT` and `DELETE` without full rebuilds

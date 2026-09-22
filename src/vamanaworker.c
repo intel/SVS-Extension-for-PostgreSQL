@@ -1877,7 +1877,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 					   int search_window_size, int build_window_size,
 					   int compression_type, int compression_primary,
 					   int compression_secondary, int leanvec_dims,
-					   int distance_type,
+					   int distance_type, int data_type,
 					   int numVectors, int tidMappingCapacity,
 					   uint64 nextExternalId, int numDeleted,
 					   Oid heapRelid, int vectorAttNum)
@@ -1905,6 +1905,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 	params->compression_secondary = compression_secondary;
 	params->leanvec_dims		= leanvec_dims;
 	params->distance_type		= distance_type;
+	params->data_type			= data_type;
 	params->numVectors			= numVectors;
 	params->tidMappingCapacity	= tidMappingCapacity;
 	params->nextExternalId		= nextExternalId;

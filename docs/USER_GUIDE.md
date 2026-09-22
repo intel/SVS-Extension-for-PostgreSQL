@@ -157,6 +157,10 @@ LIMIT 5;
 
 > **Maximum dimensions:** 2000 for the Vamana index.
 
+> **Storage format:** An uncompressed `halfvec` index is stored as float16, so it occupies roughly half the resident bytes of the same data in a `vector` column. Under `compression_type` 1 or 2 the compressed format governs the stored size for both column types.
+
+> **Upgrading:** A `halfvec` index built before this release was stored as float32. It will not load under the float16 format and will be rebuilt from the table on first use — correctly, but with a warning in the log and the cost of a full rebuild. `REINDEX` such indexes to avoid that, and re-run any query whose results were recorded from one, as the answers may have changed.
+
 > **NULL vectors:** Rows with a `NULL` value in the indexed column are silently skipped at index build and insert time — they are not added to the graph. A `NULL` query vector returns zero results immediately without scanning the index.
 
 > **Zero vectors and cosine distance:** A zero vector has no direction, so cosine distance (which normalizes by the vector's magnitude) produces `NaN` when either the stored or query vector is all zeros. Avoid storing or querying with zero vectors when using `vector_cosine_ops` or `halfvec_cosine_ops`.
