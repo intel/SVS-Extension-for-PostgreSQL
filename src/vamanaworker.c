@@ -642,10 +642,16 @@ VamanaWorkerStopAccepting(void)
 static bool
 VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
 {
-	bool		succeeded;
+	/*
+	 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(), so
+	 * it must survive the longjmp back to the PG_TRY() setjmp point
+	 * (-Wclobbered).
+	 */
+	volatile bool succeeded;
 
 	PG_TRY();
 	{
+		INJECTION_POINT("vamana-checkpoint-cached-index-error", NULL);
 		succeeded = VamanaCheckpointCachedIndex(cache);
 	}
 	PG_CATCH();
