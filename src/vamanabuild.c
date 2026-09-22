@@ -651,6 +651,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			if (VamanaWorkerIsAvailable())
 			{
+				INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
 				if (!VamanaWorkerSubmitLoad(
 						relid,
 						(int) meta.dimensions,
@@ -966,6 +967,7 @@ VamanaRebuildFromTable(Relation index)
 				(errmsg("successfully rebuilt vamana index with %d vectors", numVectors)));
 
 		/* Cache the rebuilt index with TID mapping and dynamic fields */
+		INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
 		VamanaCacheIndex(RelationGetRelid(index), svsIndex, dimensions,
 						 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
 						 numVectors,	/* tidMappingCapacity (fresh rebuild, no
