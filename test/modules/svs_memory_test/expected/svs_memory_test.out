@@ -1293,7 +1293,8 @@ SELECT * FROM svs_memory_test_check_invariants();
 -- never admitted refuses cleanly.
 SELECT svs_memory_reserve_build(605, 1, 0::bigint, 100::bigint);
 ERROR:  database 605 has not completed SVS memory admission yet
-HINT:  Retry once the enrolling transaction has committed. If the wait does not clear, confirm the enrolling INSERT into vamana_databases, or svs_restart_worker(), ran while connected to svs.launcher_database (currently "postgres"), not database 605; enrolling from any other database is admitted but never gets a worker.
+DETAIL:  The enrolling INSERT into vamana_databases, or svs_restart_worker(), must run while connected to svs.launcher_database (currently "postgres"), not database 605; enrolling from any other database is admitted but never gets a worker.
+HINT:  Retry once the enrolling transaction has committed. If the wait does not clear, re-run the enrolment from svs.launcher_database.
 -- The reservation table is finite: a 65th distinct index for one database
 -- is refused outright, and the 64 already tracked stay tracked.
 SELECT svs_memory_admit_database(606, 1000::bigint);
@@ -3059,7 +3060,8 @@ SELECT * FROM svs_memory_test_check_invariants();
 -- takes this branch regardless of svs.launcher_database's value.
 SELECT svs_memory_reserve_build(705, 1, 0::bigint, 100::bigint);
 ERROR:  database 705 has not completed SVS memory admission yet
-HINT:  Retry once the enrolling transaction has committed. If the wait does not clear, confirm the enrolling INSERT into vamana_databases, or svs_restart_worker(), ran while connected to svs.launcher_database (currently "postgres"), not database 705; enrolling from any other database is admitted but never gets a worker.
+DETAIL:  The enrolling INSERT into vamana_databases, or svs_restart_worker(), must run while connected to svs.launcher_database (currently "postgres"), not database 705; enrolling from any other database is admitted but never gets a worker.
+HINT:  Retry once the enrolling transaction has committed. If the wait does not clear, re-run the enrolment from svs.launcher_database.
 -- RequireAdmitted's other branch: dbOid names the current
 -- svs.launcher_database exactly, the ordinary shape for a genuinely
 -- transient admission race. The numeric dbOid is redacted below, and the
@@ -3072,20 +3074,23 @@ SELECT oid AS curdb_oid FROM pg_database WHERE datname = :'curdb' \gset
 SELECT format('DO $do$
 DECLARE
     message text;
+    detail text;
     hint text;
 BEGIN
     BEGIN
         PERFORM svs_memory_reserve_build(%s, 1, 0::bigint, 100::bigint);
     EXCEPTION WHEN OTHERS THEN
-        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, hint = PG_EXCEPTION_HINT;
+        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL, hint = PG_EXCEPTION_HINT;
         RAISE NOTICE ''message: %%'', regexp_replace(message, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''detail: %%'', regexp_replace(detail, ''[0-9]+'', ''<oid>'', ''g'');
         RAISE NOTICE ''hint: %%'', regexp_replace(hint, ''[0-9]+'', ''<oid>'', ''g'');
     END;
 END
 $do$;', :curdb_oid) AS not_launcher_probe \gset
 :not_launcher_probe
 NOTICE:  message: database <oid> has not completed SVS memory admission yet
-NOTICE:  hint: Retry once the enrolling transaction has committed. If the wait does not clear, confirm the enrolling INSERT into vamana_databases, or svs_restart_worker(), ran while connected to svs.launcher_database (currently "postgres"), not database <oid>; enrolling from any other database is admitted but never gets a worker.
+NOTICE:  detail: The enrolling INSERT into vamana_databases, or svs_restart_worker(), must run while connected to svs.launcher_database (currently "postgres"), not database <oid>; enrolling from any other database is admitted but never gets a worker.
+NOTICE:  hint: Retry once the enrolling transaction has committed. If the wait does not clear, re-run the enrolment from svs.launcher_database.
 SELECT svs_memory_test_set_launcher_database(:'curdb');
  svs_memory_test_set_launcher_database 
 ---------------------------------------
@@ -3095,20 +3100,23 @@ SELECT svs_memory_test_set_launcher_database(:'curdb');
 SELECT format('DO $do$
 DECLARE
     message text;
+    detail text;
     hint text;
 BEGIN
     BEGIN
         PERFORM svs_memory_reserve_build(%s, 2, 0::bigint, 100::bigint);
     EXCEPTION WHEN OTHERS THEN
-        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, hint = PG_EXCEPTION_HINT;
+        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL, hint = PG_EXCEPTION_HINT;
         RAISE NOTICE ''message: %%'', regexp_replace(message, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''detail: %%'', regexp_replace(detail, ''[0-9]+'', ''<oid>'', ''g'');
         RAISE NOTICE ''hint: %%'', regexp_replace(hint, ''[0-9]+'', ''<oid>'', ''g'');
     END;
 END
 $do$;', :curdb_oid) AS is_launcher_probe \gset
 :is_launcher_probe
 NOTICE:  message: database <oid> has not completed SVS memory admission yet
-NOTICE:  hint: Admission runs synchronously when the enrolling transaction commits; retry once it has.
+NOTICE:  detail: Admission runs synchronously when the enrolling transaction commits.
+NOTICE:  hint: Retry once it has.
 SELECT svs_memory_test_set_launcher_database('postgres');
  svs_memory_test_set_launcher_database 
 ---------------------------------------

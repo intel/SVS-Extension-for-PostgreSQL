@@ -107,13 +107,15 @@ RequireAdmitted(VamanaWorkerShmem *entry, Oid dbOid)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("database %u has not completed SVS memory admission yet", dbOid),
-				 errhint("Admission runs synchronously when the enrolling transaction commits; retry once it has.")));
+				 errdetail("Admission runs synchronously when the enrolling transaction commits."),
+				 errhint("Retry once it has.")));
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("database %u has not completed SVS memory admission yet", dbOid),
-				 errhint("Retry once the enrolling transaction has committed. If the wait does not clear, confirm the enrolling INSERT into vamana_databases, or svs_restart_worker(), ran while connected to svs.launcher_database (currently \"%s\"), not database %u; enrolling from any other database is admitted but never gets a worker.",
-						 vamana_launcher_database, dbOid)));
+				 errdetail("The enrolling INSERT into vamana_databases, or svs_restart_worker(), must run while connected to svs.launcher_database (currently \"%s\"), not database %u; enrolling from any other database is admitted but never gets a worker.",
+						   vamana_launcher_database, dbOid),
+				 errhint("Retry once the enrolling transaction has committed. If the wait does not clear, re-run the enrolment from svs.launcher_database.")));
 }
 
 static SvsMemReservation *

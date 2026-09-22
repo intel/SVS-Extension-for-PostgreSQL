@@ -915,13 +915,15 @@ SELECT oid AS curdb_oid FROM pg_database WHERE datname = :'curdb' \gset
 SELECT format('DO $do$
 DECLARE
     message text;
+    detail text;
     hint text;
 BEGIN
     BEGIN
         PERFORM svs_memory_reserve_build(%s, 1, 0::bigint, 100::bigint);
     EXCEPTION WHEN OTHERS THEN
-        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, hint = PG_EXCEPTION_HINT;
+        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL, hint = PG_EXCEPTION_HINT;
         RAISE NOTICE ''message: %%'', regexp_replace(message, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''detail: %%'', regexp_replace(detail, ''[0-9]+'', ''<oid>'', ''g'');
         RAISE NOTICE ''hint: %%'', regexp_replace(hint, ''[0-9]+'', ''<oid>'', ''g'');
     END;
 END
@@ -931,13 +933,15 @@ SELECT svs_memory_test_set_launcher_database(:'curdb');
 SELECT format('DO $do$
 DECLARE
     message text;
+    detail text;
     hint text;
 BEGIN
     BEGIN
         PERFORM svs_memory_reserve_build(%s, 2, 0::bigint, 100::bigint);
     EXCEPTION WHEN OTHERS THEN
-        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, hint = PG_EXCEPTION_HINT;
+        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL, hint = PG_EXCEPTION_HINT;
         RAISE NOTICE ''message: %%'', regexp_replace(message, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''detail: %%'', regexp_replace(detail, ''[0-9]+'', ''<oid>'', ''g'');
         RAISE NOTICE ''hint: %%'', regexp_replace(hint, ''[0-9]+'', ''<oid>'', ''g'');
     END;
 END
