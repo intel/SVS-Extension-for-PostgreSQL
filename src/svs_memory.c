@@ -112,6 +112,31 @@ FreeReservation(SvsMemReservation *reservation)
 	reservation->relid = InvalidOid;
 }
 
+/*
+ * Returns a REBUILDING reservation to RESIDENT at exactly the size it held
+ * before the rebuild began, on every path off of REBUILDING other than a
+ * successful confirm. residencyBytesCommitted already counts these bytes as
+ * resident, and has done so continuously since the RESIDENT -> REBUILDING
+ * transition, so this touches only the reservation's own fields, never the
+ * counter. Callers release buildPeakBytes against the build counters
+ * themselves, immediately before calling this, so this only zeroes the
+ * field in place -- a RESIDENT reservation never holds an outstanding build
+ * peak, and the reaper must not release the same bytes again on a later
+ * cycle.
+ */
+static void
+RestorePriorResidency(VamanaWorkerShmem *entry, SvsMemReservation *reservation)
+{
+	Assert(reservation->state == SVS_MEM_REBUILDING);
+	Assert(reservation->priorResidentBytes <= entry->residencyBytesCommitted);
+
+	reservation->measuredBytes = reservation->priorResidentBytes;
+	reservation->priorResidentBytes = 0;
+	reservation->ownerPid = 0;
+	reservation->buildPeakBytes = 0;
+	reservation->state = SVS_MEM_RESIDENT;
+}
+
 static SvsMemInsertReservation *
 FindFreeInsertReservation(VamanaWorkerShmem *entry)
 {
@@ -327,7 +352,12 @@ void
 SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEstimate)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	SvsMemReservation *existing;
 	SvsMemReservation *reservation;
+	bool		isRebuild;
+	uint64		priorResidentBytes = 0;
+	uint64		residencyBaseline;
+	bool		fits;
 
 	Assert(OidIsValid(relid));
 
@@ -335,7 +365,10 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 
 	RequireAdmitted(entry, dbOid);
 
-	if (FindReservation(entry, relid) != NULL)
+	existing = FindReservation(entry, relid);
+	isRebuild = existing != NULL && existing->state == SVS_MEM_RESIDENT;
+
+	if (existing != NULL && !isRebuild)
 	{
 		LWLockRelease(&entry->memLock);
 		ereport(ERROR,
@@ -344,9 +377,33 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 						relid, dbOid)));
 	}
 
-	if (entry->residencyBytesCommitted + residencyEstimate > entry->residencyBudget)
+	/*
+	 * A RESIDENT reservation for relid means a rebuild (REINDEX, or a
+	 * worker-restart rebuild of an index whose reservation survived the
+	 * restart), not a fresh build: the same relid's earlier load is still
+	 * fully resident. Hold its prior bytes aside rather than folding them
+	 * out of residencyBytesCommitted here, so the counter never understates
+	 * what is genuinely resident for as long as the rebuild is in progress;
+	 * a concurrent load elsewhere in the database can therefore consume the
+	 * headroom this rebuild is counting on, and the rebuild then fails at
+	 * confirm rather than here. That is the correct trade, since the
+	 * alternative is a counter that understates live residency for the
+	 * whole duration of a long rebuild.
+	 */
+	if (isRebuild)
 	{
-		uint64		committed = entry->residencyBytesCommitted;
+		residencyBaseline = entry->residencyBytesCommitted;
+		priorResidentBytes = existing->measuredBytes;
+		SubtractFloored(&residencyBaseline, priorResidentBytes,
+						 "a rebuild's prior resident bytes");
+	}
+	else
+		residencyBaseline = entry->residencyBytesCommitted;
+
+	fits = residencyBaseline + residencyEstimate <= entry->residencyBudget;
+
+	if (!fits)
+	{
 		uint64		budget = entry->residencyBudget;
 
 		LWLockRelease(&entry->memLock);
@@ -355,17 +412,22 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 				 errmsg("build of index %u would exceed database %u's residency budget", relid, dbOid),
 				 errdetail("Requested %llu bytes, %llu already committed, %llu byte budget.",
 						   (unsigned long long) residencyEstimate,
-						   (unsigned long long) committed,
+						   (unsigned long long) residencyBaseline,
 						   (unsigned long long) budget)));
 	}
 
-	/* Claim the reservation slot before touching any counter, so a full
-	 * reservation table leaves every counter untouched. */
-	reservation = AllocateReservation(entry, relid);
+	/*
+	 * Claim the reservation slot before touching any counter, so a full
+	 * reservation table leaves every counter untouched. A rebuild reuses its
+	 * existing slot instead of claiming a new one, so the table can never be
+	 * full on that path.
+	 */
+	reservation = isRebuild ? existing : AllocateReservation(entry, relid);
 
 	if (!TryAddGlobalBuildCommitted(buildPeak))
 	{
-		FreeReservation(reservation);
+		if (!isRebuild)
+			FreeReservation(reservation);
 		LWLockRelease(&entry->memLock);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
@@ -376,14 +438,18 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 	}
 
 	entry->buildBytesCommitted += buildPeak;
-	entry->residencyBytesCommitted += residencyEstimate;
+	/* A rebuild's prior resident bytes stay committed; nothing new is added
+	 * here for that case, only for a fresh build's estimate. */
+	if (!isRebuild)
+		entry->residencyBytesCommitted += residencyEstimate;
 
-	reservation->state = SVS_MEM_RESERVED;
 	reservation->ownerPid = MyProcPid;
 	reservation->reservedAt = GetCurrentTimestamp();
 	reservation->estimateBytes = residencyEstimate;
 	reservation->measuredBytes = 0;
 	reservation->buildPeakBytes = buildPeak;
+	reservation->priorResidentBytes = priorResidentBytes;
+	reservation->state = isRebuild ? SVS_MEM_REBUILDING : SVS_MEM_RESERVED;
 
 	LWLockRelease(&entry->memLock);
 }
@@ -393,7 +459,9 @@ SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredRes
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
-	uint64		residencyWithoutEstimate;
+	uint64		residencyWithoutPrior;
+	uint64		priorContribution;
+	bool		isRebuild;
 	bool		fits;
 
 	Assert(OidIsValid(relid));
@@ -409,25 +477,64 @@ SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredRes
 				 errmsg("no pending build reservation for index %u in database %u", relid, dbOid)));
 	}
 
+	/*
+	 * A reservation can only be pending confirmation in RESERVED (a fresh
+	 * build) or REBUILDING (a rebuild). Any other state means something
+	 * else already finished it -- most notably, ReconcileLoad's own
+	 * independent load can claim a REBUILDING record straight to RESIDENT
+	 * ahead of this call. Confirming against that record would fold out
+	 * its stale estimateBytes instead of its real committed measuredBytes,
+	 * and stamp it CONFIRMED with no owner. Error instead of guessing.
+	 */
+	if (reservation->state != SVS_MEM_RESERVED && reservation->state != SVS_MEM_REBUILDING)
+	{
+		LWLockRelease(&entry->memLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("build reservation for index %u in database %u is not pending confirmation",
+						relid, dbOid)));
+	}
+
+	isRebuild = reservation->state == SVS_MEM_REBUILDING;
+
 	SubtractFloored(&entry->buildBytesCommitted, buildPeak, "a build peak");
 	SubtractGlobalBuildCommitted(buildPeak);
 
 	/* The build peak above is now released; the reaper must not release it again. */
 	reservation->buildPeakBytes = 0;
 
-	residencyWithoutEstimate = entry->residencyBytesCommitted;
-	SubtractFloored(&residencyWithoutEstimate, reservation->estimateBytes, "a build handoff's residency estimate");
-	fits = residencyWithoutEstimate + measuredResidencyBytes <= entry->residencyBudget;
+	/*
+	 * A fresh build's committed bytes include its estimate, added by
+	 * ReserveBuild; a rebuild's committed bytes never got its estimate
+	 * added at all and instead still hold its prior resident measurement,
+	 * left there by ReserveBuild on purpose. Either way, this is the
+	 * contribution to fold out before testing the newly measured size.
+	 */
+	priorContribution = isRebuild ? reservation->priorResidentBytes : reservation->estimateBytes;
+
+	residencyWithoutPrior = entry->residencyBytesCommitted;
+	SubtractFloored(&residencyWithoutPrior, priorContribution, "a build handoff's prior residency contribution");
+	fits = residencyWithoutPrior + measuredResidencyBytes <= entry->residencyBudget;
 
 	if (fits)
 	{
-		entry->residencyBytesCommitted = residencyWithoutEstimate + measuredResidencyBytes;
+		entry->residencyBytesCommitted = residencyWithoutPrior + measuredResidencyBytes;
 		reservation->state = SVS_MEM_CONFIRMED;
 		reservation->measuredBytes = measuredResidencyBytes;
+		reservation->priorResidentBytes = 0;
+	}
+	else if (isRebuild)
+	{
+		/*
+		 * The old graph is still fully resident and on disk; the failed
+		 * rebuild attempt must not strip its accounting, only give up its
+		 * own new estimate.
+		 */
+		RestorePriorResidency(entry, reservation);
 	}
 	else
 	{
-		entry->residencyBytesCommitted = residencyWithoutEstimate;
+		entry->residencyBytesCommitted = residencyWithoutPrior;
 		FreeReservation(reservation);
 	}
 
@@ -488,13 +595,10 @@ SvsMemoryAbortBuild(Oid dbOid, Oid relid)
 	 */
 	if (reservation != NULL && reservation->state != SVS_MEM_RESIDENT)
 	{
-		uint64		residencyHeld = (reservation->state == SVS_MEM_RESERVED) ?
-			reservation->estimateBytes : reservation->measuredBytes;
-
 		/*
 		 * CREATE INDEX's relation lock keeps any other backend out of
-		 * RESERVED/CONFIRMED/HANDOFF for this relid, so only the reserving
-		 * backend can ever reach this branch for it.
+		 * RESERVED/CONFIRMED/HANDOFF/REBUILDING for this relid, so only the
+		 * reserving backend can ever reach this branch for it.
 		 */
 		Assert(reservation->ownerPid == MyProcPid);
 
@@ -505,9 +609,24 @@ SvsMemoryAbortBuild(Oid dbOid, Oid relid)
 			SubtractGlobalBuildCommitted(reservation->buildPeakBytes);
 		}
 
-		SubtractFloored(&entry->residencyBytesCommitted, residencyHeld,
-						 "an aborted build's residency reservation");
-		FreeReservation(reservation);
+		if (reservation->state == SVS_MEM_REBUILDING)
+		{
+			/*
+			 * The old graph is still fully resident and on disk; an
+			 * aborted rebuild must give back only its own new estimate,
+			 * never the bytes the database already held before it started.
+			 */
+			RestorePriorResidency(entry, reservation);
+		}
+		else
+		{
+			uint64		residencyHeld = (reservation->state == SVS_MEM_RESERVED) ?
+				reservation->estimateBytes : reservation->measuredBytes;
+
+			SubtractFloored(&entry->residencyBytesCommitted, residencyHeld,
+							 "an aborted build's residency reservation");
+			FreeReservation(reservation);
+		}
 	}
 
 	LWLockRelease(&entry->memLock);
@@ -529,9 +648,23 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
 	reservation = FindReservation(entry, relid);
 	if (reservation != NULL)
 	{
-		uint64		priorContribution = (reservation->state == SVS_MEM_RESERVED) ?
-			reservation->estimateBytes : reservation->measuredBytes;
-		uint64		residencyWithoutPrior = entry->residencyBytesCommitted;
+		uint64		priorContribution;
+		uint64		residencyWithoutPrior;
+
+		/*
+		 * RESERVED's committed contribution is its estimate; REBUILDING's is
+		 * priorResidentBytes, since ReserveBuild never adds a rebuild's
+		 * estimate to residencyBytesCommitted at all; every other state's is
+		 * its measured size.
+		 */
+		if (reservation->state == SVS_MEM_RESERVED)
+			priorContribution = reservation->estimateBytes;
+		else if (reservation->state == SVS_MEM_REBUILDING)
+			priorContribution = reservation->priorResidentBytes;
+		else
+			priorContribution = reservation->measuredBytes;
+
+		residencyWithoutPrior = entry->residencyBytesCommitted;
 
 		SubtractFloored(&residencyWithoutPrior, priorContribution,
 						 "a load reconcile's prior contribution");
@@ -539,10 +672,24 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
 
 		if (fits)
 		{
+			/*
+			 * A REBUILDING record reaching here ahead of its own Confirm
+			 * still owes the RESIDENT convention: no outstanding build peak,
+			 * no leftover prior-residency figure.
+			 */
+			if (reservation->state == SVS_MEM_REBUILDING && reservation->buildPeakBytes > 0)
+			{
+				SubtractFloored(&entry->buildBytesCommitted, reservation->buildPeakBytes,
+								 "a build peak");
+				SubtractGlobalBuildCommitted(reservation->buildPeakBytes);
+			}
+
 			entry->residencyBytesCommitted = residencyWithoutPrior + measuredBytes;
 			reservation->state = SVS_MEM_RESIDENT;
 			reservation->ownerPid = 0;
 			reservation->measuredBytes = measuredBytes;
+			reservation->priorResidentBytes = 0;
+			reservation->buildPeakBytes = 0;
 		}
 	}
 	else
@@ -572,6 +719,7 @@ SvsMemoryAccountUnload(Oid dbOid, Oid relid)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
+	uint64		residencyHeld;
 
 	Assert(OidIsValid(relid));
 
@@ -587,7 +735,27 @@ SvsMemoryAccountUnload(Oid dbOid, Oid relid)
 		return;
 	}
 
-	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
+	/*
+	 * A REBUILDING record's committed contribution is priorResidentBytes,
+	 * not measuredBytes -- measuredBytes stays 0 until a rebuild confirms.
+	 * Its build peak, otherwise only released by
+	 * ConfirmBuild/AbortBuild/the reaper, must be released here too, since
+	 * dropping the index takes the in-flight rebuild down with it.
+	 */
+	if (reservation->state == SVS_MEM_REBUILDING)
+	{
+		residencyHeld = reservation->priorResidentBytes;
+		if (reservation->buildPeakBytes > 0)
+		{
+			SubtractFloored(&entry->buildBytesCommitted, reservation->buildPeakBytes,
+							 "a build peak");
+			SubtractGlobalBuildCommitted(reservation->buildPeakBytes);
+		}
+	}
+	else
+		residencyHeld = reservation->measuredBytes;
+
+	SubtractFloored(&entry->residencyBytesCommitted, residencyHeld,
 					"an unloaded index's residency");
 	FreeReservation(reservation);
 
@@ -736,15 +904,16 @@ OwnerPidIsDead(int ownerPid, TimestampTz reservedAt)
 }
 
 /*
- * Reclaims only RESERVED reservations -- a build a backend started but
- * never finished. CONFIRMED, HANDOFF, and RESIDENT all mean the build
- * succeeded; a dead owner there is never an abandoned build, since every
- * path off of CONFIRMED already releases it elsewhere: a clean error
- * unwinds through SvsMemoryAbortBuild before commit, and a backend crash
- * forces a full postmaster restart that wipes this shared memory outright.
- * Reaping CONFIRMED or HANDOFF would instead delete a committed, on-disk
- * index's reservation the moment its building backend's ordinary
- * post-commit disconnect makes that stale PID look dead.
+ * Reclaims only RESERVED and REBUILDING reservations -- a build, or a
+ * rebuild, a backend started but never finished. CONFIRMED, HANDOFF, and
+ * RESIDENT all mean the build (or rebuild) succeeded; a dead owner there is
+ * never an abandoned build, since every path off of CONFIRMED already
+ * releases it elsewhere: a clean error unwinds through SvsMemoryAbortBuild
+ * before commit, and a backend crash forces a full postmaster restart that
+ * wipes this shared memory outright. Reaping CONFIRMED or HANDOFF would
+ * instead delete a committed, on-disk index's reservation the moment its
+ * building backend's ordinary post-commit disconnect makes that stale PID
+ * look dead.
  *
  * For a RESERVED record, buildPeakBytes is always still outstanding --
  * only ConfirmBuild/AbortBuild ever zero it -- so it is released here too,
@@ -753,6 +922,15 @@ OwnerPidIsDead(int ownerPid, TimestampTz reservedAt)
  * ConfirmBuild would leak its build peak against svs.max_build_memory
  * forever, since neither the crashed backend nor anything else ever calls
  * SvsMemoryAbortBuild for it.
+ *
+ * A REBUILDING record's buildPeakBytes is released the same way, but its
+ * residency bytes are not touched at all: ReserveBuild never added anything
+ * to residencyBytesCommitted for a rebuild, so there is nothing to give
+ * back. RestorePriorResidency instead just returns the reservation to
+ * RESIDENT at its pre-rebuild measured size, the same restoration a live
+ * backend's own AbortBuild would have performed; a dead owner mid-rebuild
+ * must leave the old, still-resident graph's bytes correctly committed, not
+ * leaked and not deleted.
  */
 static void
 ReapEntryReservations(VamanaWorkerShmem *entry)
@@ -765,13 +943,11 @@ ReapEntryReservations(VamanaWorkerShmem *entry)
 
 		if (reservation->relid == InvalidOid)
 			continue;
-		if (reservation->state != SVS_MEM_RESERVED)
+		if (reservation->state != SVS_MEM_RESERVED &&
+			reservation->state != SVS_MEM_REBUILDING)
 			continue;
 		if (!OwnerPidIsDead(reservation->ownerPid, reservation->reservedAt))
 			continue;
-
-		SubtractFloored(&entry->residencyBytesCommitted, reservation->estimateBytes,
-						 "a dead backend's build reservation");
 
 		if (reservation->buildPeakBytes > 0)
 		{
@@ -780,7 +956,14 @@ ReapEntryReservations(VamanaWorkerShmem *entry)
 			SubtractGlobalBuildCommitted(reservation->buildPeakBytes);
 		}
 
-		FreeReservation(reservation);
+		if (reservation->state == SVS_MEM_REBUILDING)
+			RestorePriorResidency(entry, reservation);
+		else
+		{
+			SubtractFloored(&entry->residencyBytesCommitted, reservation->estimateBytes,
+							 "a dead backend's build reservation");
+			FreeReservation(reservation);
+		}
 	}
 
 	for (int i = 0; i < SVS_MAX_PENDING_INSERT_RESERVATIONS; i++)

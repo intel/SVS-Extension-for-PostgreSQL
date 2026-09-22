@@ -47,6 +47,8 @@ ReservationStateName(SvsMemReservationState state)
 			return "HANDOFF";
 		case SVS_MEM_RESIDENT:
 			return "RESIDENT";
+		case SVS_MEM_REBUILDING:
+			return "REBUILDING";
 	}
 	return "UNKNOWN";
 }
@@ -118,8 +120,8 @@ svs_memory_test_reservations(PG_FUNCTION_ARGS)
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 	{
 		SvsMemReservation *r = &entry->reservations[i];
-		Datum		values[7];
-		bool		nulls[7] = {false, false, false, false, false, false, false};
+		Datum		values[8];
+		bool		nulls[8] = {false, false, false, false, false, false, false, false};
 
 		if (r->relid == InvalidOid)
 			continue;
@@ -134,6 +136,7 @@ svs_memory_test_reservations(PG_FUNCTION_ARGS)
 			values[6] = Int64GetDatum((int64) r->searchScratchBytesPerQuery);
 		else
 			nulls[6] = true;
+		values[7] = Int64GetDatum((int64) r->priorResidentBytes);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -474,8 +477,12 @@ svs_memory_test_check_invariants(PG_FUNCTION_ARGS)
 			if (r->relid == InvalidOid)
 				continue;
 
-			expectedResidency += (r->state == SVS_MEM_RESERVED) ?
-				r->estimateBytes : r->measuredBytes;
+			if (r->state == SVS_MEM_RESERVED)
+				expectedResidency += r->estimateBytes;
+			else if (r->state == SVS_MEM_REBUILDING)
+				expectedResidency += r->priorResidentBytes;
+			else
+				expectedResidency += r->measuredBytes;
 			expectedBuild += r->buildPeakBytes;
 		}
 
