@@ -21,6 +21,7 @@
 
 #include "postgres.h"
 
+#include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -62,18 +63,57 @@ LookupEntryOrError(Oid dbOid)
 	return entry;
 }
 
-/* Call under entry->memLock; releases it and errors if dbOid was never admitted. */
+/*
+ * Call under entry->memLock; releases it and errors if dbOid was never
+ * admitted.
+ *
+ * residencyBudget stays at exactly 0 for two reasons that call for opposite
+ * responses. One is genuinely transient: admission runs as a backend-local
+ * pre-commit callback keyed off the enrolling INSERT into vamana_databases,
+ * so a slot can exist for a handful of statements, in the enrolling
+ * backend's own transaction, before that callback lands. The other is a
+ * standing misconfiguration: enrolling (an INSERT into vamana_databases, or
+ * svs_restart_worker()) while connected to a database other than
+ * svs.launcher_database still runs that same pre-commit callback and still
+ * sets residencyBudget, from the enrolling backend's own connection, so it
+ * does not actually leave this check at 0 -- the enrolled database's worker
+ * simply never spawns, because the launcher only ever reads vamana_databases
+ * from svs.launcher_database's copy of that table, and the enrolling row
+ * lands in a different database's copy instead. dbOid carries no record of
+ * which database its own enrolment ran from, so this function cannot detect
+ * that failure; it can only warn about it. The warning is keyed on dbOid
+ * itself not being svs.launcher_database, which is also the ordinary,
+ * healthy shape of most enrolled databases, so it fires on both the rare
+ * misconfiguration and the common transient window whenever dbOid is not
+ * the launcher database. It is phrased as a follow-up to try if retrying
+ * does not resolve the wait, not as a diagnosis.
+ */
 static void
 RequireAdmitted(VamanaWorkerShmem *entry, Oid dbOid)
 {
+	char	   *dbname;
+	bool		isLauncherDatabase;
+
 	if (entry->residencyBudget != 0)
 		return;
 
+	dbname = get_database_name(dbOid);
+	isLauncherDatabase = dbname != NULL &&
+		strcmp(dbname, vamana_launcher_database) == 0;
+
 	LWLockRelease(&entry->memLock);
-	ereport(ERROR,
-			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			 errmsg("database %u has no SVS memory accounting entry", dbOid),
-			 errhint("SvsMemoryAdmitDatabase must run before any build, load, or insert accounting for this database.")));
+
+	if (isLauncherDatabase)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("database %u has not completed SVS memory admission yet", dbOid),
+				 errhint("Admission runs synchronously when the enrolling transaction commits; retry once it has.")));
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("database %u has not completed SVS memory admission yet", dbOid),
+				 errhint("Retry once the enrolling transaction has committed. If the wait does not clear, confirm the enrolling INSERT into vamana_databases, or svs_restart_worker(), ran while connected to svs.launcher_database (currently \"%s\"), not database %u; enrolling from any other database is admitted but never gets a worker.",
+						 vamana_launcher_database, dbOid)));
 }
 
 static SvsMemReservation *
@@ -85,20 +125,87 @@ FindReservation(VamanaWorkerShmem *entry, Oid relid)
 	return NULL;
 }
 
-/* Call under entry->memLock; releases it and errors if no slot is free. */
+/*
+ * Which operation is asking AllocateReservation for a fresh slot, purely to
+ * pick the right exhaustion message: a build failing to reserve is the
+ * build's own failure, but a load failing to reserve is a read hitting a
+ * limit someone else's build (or this database's own resident indexes) is
+ * responsible for, and the two must not read as the same failure.
+ */
+typedef enum SvsAllocationContext
+{
+	SVS_ALLOC_FOR_BUILD,
+	SVS_ALLOC_FOR_LOAD,
+} SvsAllocationContext;
+
+/*
+ * Call under entry->memLock; releases it and errors if no slot is free.
+ *
+ * On exhaustion, counts reservations in RESERVED/CONFIRMED/HANDOFF as
+ * builds in progress: each is a not-yet-resident reservation that either
+ * finishes into RESIDENT or aborts and frees its slot, so waiting on one is
+ * a real, if not guaranteed, path to a free slot. RESIDENT and REBUILDING
+ * both count on the other side, "steady-state occupancy": a RESIDENT
+ * reservation already reached the table's real limit, and a REBUILDING one
+ * reused its own already-RESIDENT slot to get there (SvsMemoryReserveBuild
+ * never calls this function for a rebuild), so it does not free that slot
+ * either way its rebuild ends. The two counts drive the errhint, not the
+ * decision to error, which is unconditional on the table being full.
+ */
 static SvsMemReservation *
-AllocateReservation(VamanaWorkerShmem *entry, Oid relid)
+AllocateReservation(VamanaWorkerShmem *entry, Oid relid, SvsAllocationContext context)
 {
 	SvsMemReservation *freeSlot = FindReservation(entry, InvalidOid);
 
 	if (freeSlot == NULL)
 	{
+		int			buildsInProgress = 0;
+
+		for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
+		{
+			SvsMemReservationState state = entry->reservations[i].state;
+
+			if (state == SVS_MEM_RESERVED || state == SVS_MEM_CONFIRMED ||
+				state == SVS_MEM_HANDOFF)
+				buildsInProgress++;
+		}
+
 		LWLockRelease(&entry->memLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("too many concurrently tracked SVS indexes for this database"),
-				 errdetail("VAMANA_MAX_INDEXES (%d) reservation slots are all in use.",
-						   VAMANA_MAX_INDEXES)));
+
+		if (context == SVS_ALLOC_FOR_LOAD)
+		{
+			if (buildsInProgress > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("cannot track index %u for load: too many concurrently tracked SVS indexes in this database", relid),
+						 errdetail("VAMANA_MAX_INDEXES (%d) reservation slots are all in use, %d of them by in-progress builds.",
+								   VAMANA_MAX_INDEXES, buildsInProgress),
+						 errhint("This load did not fail on its own account. Wait for the in-progress builds to finish, or find out who is running them.")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("cannot track index %u for load: too many concurrently tracked SVS indexes in this database", relid),
+						 errdetail("VAMANA_MAX_INDEXES (%d) reservation slots are all in use, all of them by resident indexes.",
+								   VAMANA_MAX_INDEXES),
+						 errhint("This load did not fail on its own account. Reduce the number of indexes on this database, or accept the limit.")));
+		}
+		else
+		{
+			if (buildsInProgress > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("too many concurrently tracked SVS indexes for this database"),
+						 errdetail("VAMANA_MAX_INDEXES (%d) reservation slots are all in use, %d of them by in-progress builds.",
+								   VAMANA_MAX_INDEXES, buildsInProgress),
+						 errhint("Wait for the in-progress builds to finish, or find out who is running them.")));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("too many concurrently tracked SVS indexes for this database"),
+						 errdetail("VAMANA_MAX_INDEXES (%d) reservation slots are all in use, all of them by resident indexes.",
+								   VAMANA_MAX_INDEXES),
+						 errhint("Reduce the number of indexes on this database, or accept the limit.")));
+		}
 	}
 
 	*freeSlot = (SvsMemReservation) {0};
@@ -422,7 +529,7 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 	 * existing slot instead of claiming a new one, so the table can never be
 	 * full on that path.
 	 */
-	reservation = isRebuild ? existing : AllocateReservation(entry, relid);
+	reservation = isRebuild ? existing : AllocateReservation(entry, relid, SVS_ALLOC_FOR_BUILD);
 
 	if (!TryAddGlobalBuildCommitted(buildPeak))
 	{
@@ -698,7 +805,7 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
 
 		if (fits)
 		{
-			reservation = AllocateReservation(entry, relid);
+			reservation = AllocateReservation(entry, relid, SVS_ALLOC_FOR_LOAD);
 			reservation->state = SVS_MEM_RESIDENT;
 			reservation->ownerPid = 0;
 			reservation->reservedAt = GetCurrentTimestamp();

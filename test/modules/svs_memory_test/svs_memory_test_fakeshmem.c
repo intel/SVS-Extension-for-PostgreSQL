@@ -24,10 +24,19 @@
 
 #include "vamanaworker.h"
 
-#define SVS_MEMORY_TEST_MAX_DATABASES 40
+#define SVS_MEMORY_TEST_MAX_DATABASES 60
 
 static VamanaWorkerShmemHeader *fakeHeader = NULL;
 static LWLock fakeHeaderLock;
+
+/*
+ * svs_memory.c reads this GUC-backed variable directly (RequireAdmitted's
+ * launcher-database discriminator); its real definition and registration
+ * live in vamana.c, which this standalone module never links. "postgres"
+ * matches the GUC's own compiled-in default, so a test that wants the
+ * non-default branch sets it explicitly.
+ */
+char	   *vamana_launcher_database = "postgres";
 
 static void
 InitFakeEntry(VamanaWorkerShmem *entry)
