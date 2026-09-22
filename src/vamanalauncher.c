@@ -816,7 +816,7 @@ PublishCpuGrants(List *rows)
 		VamanaWorkerShmem *entry = FindGatheredEntry(entries, ndbs, grant->dbOid);
 		uint32		previousGranted;
 
-		if (entry == NULL)
+		if (entry == NULL || entry->dbOid != grant->dbOid)
 			continue;
 
 		previousGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
@@ -836,7 +836,7 @@ PublishCpuGrants(List *rows)
 		const SvsBuildCpuGrant *grant = &budget->buildGrants[i];
 		VamanaWorkerShmem *entry = FindGatheredEntry(entries, ndbs, grant->dbOid);
 
-		if (entry != NULL)
+		if (entry != NULL && entry->dbOid == grant->dbOid)
 			PublishBuildGrant(entry, grant);
 	}
 
