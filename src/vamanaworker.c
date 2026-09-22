@@ -396,6 +396,9 @@ VamanaWorkerProcessReloads(void)
 		 */
 		VamanaEvictCacheEntry(relid);
 		vamana_active_load_relid = relid;
+
+		INJECTION_POINT("vamana-reload-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
