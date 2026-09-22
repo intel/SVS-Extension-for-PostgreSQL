@@ -47,6 +47,10 @@ CREATE FUNCTION svs_memory_test_reset_database_accounting(db_oid oid)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_test_set_launcher_database(launcher_database text)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_test_resolve_residency_budget(db_oid oid) RETURNS bigint
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
