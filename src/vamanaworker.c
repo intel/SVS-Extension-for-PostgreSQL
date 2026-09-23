@@ -395,16 +395,19 @@ VamanaWorkerProcessReloads(void)
 		 * (causing a reload loop).
 		 */
 		VamanaEvictCacheEntry(relid);
+		vamana_active_load_relid = relid;
+
+		INJECTION_POINT("vamana-reload-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
-		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+		vamana_active_load_relid = InvalidOid;
 
 		anyReload = true;
 	}
