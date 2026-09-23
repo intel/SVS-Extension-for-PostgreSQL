@@ -1300,4 +1300,248 @@ use VamanaTestUtils qw(:all);
     $node->stop;
 }
 
+# ===========================================================================
+# halfvec persistence — correct answers, and a saved file that reloads
+#
+# Two separate things are checked here, because each is invisible to the other.
+#
+# Correctness: a halfvec element is narrower than a vector one, so reading a
+# halfvec column at vector width mismeasures every distance.  It does so
+# without any error, and the wrong answers are self-consistent across a
+# restart, which is why the comparison below is against the exact ordering from
+# a sequential scan rather than against an earlier index result.  Asking for
+# the neighbours of a row that is itself in the table makes the weakest form of
+# this check independent of recall: a row is its own nearest neighbour at
+# distance zero, whatever the graph search does.
+#
+# Persistence: the saved file has to reload under the same element format it
+# was built with.  A mismatch there is quiet too -- the worker logs "failed to
+# load SVS index" and rebuilds from the table, answering correctly -- so the
+# load-from-disk assertions are what pin it down.
+#
+# Both an uncompressed and an LVQ-compressed halfvec index get a round trip,
+# because compression and the element format are chosen at the same point and
+# a mistake in either is invisible in the other's case.
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_halfvec_persist');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+    $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    # label => reloptions clause; one table each so the two indexes cannot
+    # share a load path by accident.
+    my @hv_cases = (
+        ['plain', ''],
+        ['lvq',   'WITH (compression_type = 2, compression_primary = 4, compression_secondary = 8)'],
+    );
+
+    my %hv_baseline;
+    my %hv_exact;
+    my %hv_index_dir;
+
+    # Neighbours of a row that is in the table, so the query vector is one of
+    # the stored ones.
+    my $hv_query = sub {
+        my ($label, $indexed) = @_;
+        my $scans = $indexed
+          ? "SET enable_seqscan = off;"
+          : "SET enable_indexscan = off; SET enable_seqscan = on;";
+        return $node->safe_psql("postgres", qq(
+            $scans
+            SELECT id FROM hv_$label
+              ORDER BY val <-> (SELECT val FROM hv_$label WHERE id = 7)
+              LIMIT 5;
+        ));
+    };
+
+    for my $case (@hv_cases) {
+        my ($label, $opts) = @$case;
+
+        $node->safe_psql("postgres", qq(
+            CREATE TABLE hv_$label (id serial PRIMARY KEY, val halfvec($dim));
+            INSERT INTO hv_$label (val)
+                SELECT ARRAY[$array_sql]::halfvec
+                FROM generate_series(1, 200) i;
+            CREATE INDEX hv_${label}_idx ON hv_$label USING vamana (val halfvec_l2_ops)
+                $opts;
+        ));
+
+        my $index_oid = $node->safe_psql("postgres",
+            "SELECT oid FROM pg_class WHERE relname = 'hv_${label}_idx';");
+        chomp $index_oid;
+        $hv_index_dir{$label} = vamana_save_dir($node, 'postgres', $index_oid);
+
+        ok(-d $hv_index_dir{$label},
+            "on-disk index directory exists after halfvec CREATE INDEX ($label)");
+        ok(dir_size($hv_index_dir{$label}) > 0,
+            "on-disk halfvec index directory non-empty ($label)");
+
+        $hv_baseline{$label} = $hv_query->($label, 1);
+        $hv_exact{$label}    = $hv_query->($label, 0);
+
+        isnt($hv_baseline{$label}, '',
+            "pre-restart halfvec query returns results ($label)");
+
+        # Uncompressed, the index has to reproduce the exact ordering; under
+        # LVQ the quantized distances may reorder the tail, so only the
+        # zero-distance row itself is required to stay in front.
+        if ($label eq 'plain') {
+            is($hv_baseline{$label}, $hv_exact{$label},
+                'halfvec index ordering matches the exact ordering (plain)');
+        }
+        else {
+            is((split /\n/, $hv_baseline{$label})[0], '7',
+                "halfvec query row is its own nearest neighbour ($label)");
+        }
+    }
+
+    my $log_pos_before_restart = length($node->log_content());
+    $node->restart;
+
+    for my $case (@hv_cases) {
+        my ($label) = @$case;
+
+        my $after_restart = $hv_query->($label, 1);
+
+        is($after_restart, $hv_baseline{$label},
+            "halfvec results after restart match baseline ($label)");
+
+        if ($label eq 'plain') {
+            is($after_restart, $hv_exact{$label},
+                'reloaded halfvec index ordering still matches the exact ordering (plain)');
+        }
+        else {
+            is((split /\n/, $after_restart)[0], '7',
+                "reloaded halfvec index keeps the query row in front ($label)");
+        }
+    }
+
+    my $hv_log = substr($node->log_content(), $log_pos_before_restart);
+
+    unlike($hv_log, qr/rebuilding vamana index from table data/,
+        'no table rebuild on post-restart halfvec query');
+    unlike($hv_log, qr/vamana index not in memory, rebuilding from table/,
+        'no rebuild NOTICE on post-restart halfvec query');
+    unlike($hv_log, qr/failed to load SVS index/,
+        'no load failure on post-restart halfvec query — element format matched');
+
+    # One "loaded from disk" line per index, so a single successful load cannot
+    # cover for the other case silently rebuilding.
+    my @hv_loaded = ($hv_log =~ /vamana index \d+ loaded from disk/g);
+    is(scalar @hv_loaded, scalar @hv_cases,
+        'both halfvec indexes loaded from disk after restart')
+      or diag("loaded-from-disk lines: ", scalar @hv_loaded);
+
+    $node->stop;
+}
+
+# ===========================================================================
+# Empty-table CREATE INDEX, then INSERT — the lazily built index must reload
+#
+# CREATE INDEX on an empty table caches an entry with no SVS index behind it;
+# the real one is built by the worker on the first INSERT.  That build has to
+# reach the same storage spec CREATE INDEX would have used, because the load
+# after a restart is driven by what the index was declared as, not by what
+# the first INSERT happened to build.  A mismatch is silent: "failed to load
+# SVS index" in the log, then a correct rebuild from the table.
+#
+# Two cases, so a failure says which half is wrong: a compressed vector index
+# (the spec comes from the compression options) and an uncompressed halfvec
+# one (the spec comes from the element format).
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_empty_first_insert');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', 'CREATE EXTENSION vector');
+    $node->safe_psql('postgres', 'CREATE EXTENSION svs');
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    # label => [column type, opclass, reloptions clause]
+    my @ef_cases = (
+        ['lvq_vector',  'vector',  'vector_l2_ops',
+         'WITH (compression_type = 2, compression_primary = 4, compression_secondary = 8)'],
+        ['plain_halfvec', 'halfvec', 'halfvec_l2_ops', ''],
+    );
+
+    my %ef_baseline;
+
+    for my $case (@ef_cases) {
+        my ($label, $type, $opclass, $opts) = @$case;
+
+        # Empty-table CREATE INDEX: nothing is built yet.
+        $node->safe_psql('postgres', qq(
+            CREATE TABLE ef_$label (id serial PRIMARY KEY, val $type($dim));
+            CREATE INDEX ef_${label}_idx ON ef_$label USING vamana (val $opclass)
+                $opts;
+        ));
+
+        # Warm it so the first INSERT takes the empty-table build path.
+        $node->safe_psql('postgres', qq(
+            SET enable_seqscan = off;
+            SELECT id FROM ef_$label ORDER BY val <-> '[$query_sql]' LIMIT 1;
+        ));
+
+        $node->safe_psql('postgres', qq(
+            INSERT INTO ef_$label (val)
+                SELECT ARRAY[$array_sql]::$type FROM generate_series(1, 200) i;
+        ));
+
+        $ef_baseline{$label} = $node->safe_psql('postgres', qq(
+            SET enable_seqscan = off;
+            SELECT id FROM ef_$label ORDER BY val <-> '[$query_sql]' LIMIT 5;
+        ));
+        isnt($ef_baseline{$label}, '',
+            "pre-restart query returns results on lazily built index ($label)");
+    }
+
+    my $ef_log_pos = length($node->log_content());
+    $node->restart;
+
+    for my $case (@ef_cases) {
+        my ($label) = @$case;
+
+        my $after_restart = $node->safe_psql('postgres', qq(
+            SET enable_seqscan = off;
+            SELECT id FROM ef_$label ORDER BY val <-> '[$query_sql]' LIMIT 5;
+        ));
+        is($after_restart, $ef_baseline{$label},
+            "results after restart match baseline on lazily built index ($label)");
+    }
+
+    my $ef_log = substr($node->log_content(), $ef_log_pos);
+
+    unlike($ef_log, qr/failed to load SVS index/,
+        'no load failure after restart — first-INSERT build used the declared spec');
+    unlike($ef_log, qr/rebuilding vamana index from table data/,
+        'no table rebuild after restart of a lazily built index');
+    unlike($ef_log, qr/vamana index not in memory, rebuilding from table/,
+        'no rebuild NOTICE after restart of a lazily built index');
+
+    my @ef_loaded = ($ef_log =~ /vamana index \d+ loaded from disk/g);
+    is(scalar @ef_loaded, scalar @ef_cases,
+        'both lazily built indexes loaded from disk after restart')
+      or diag("loaded-from-disk lines: ", scalar @ef_loaded);
+
+    $node->stop;
+}
+
 done_testing();

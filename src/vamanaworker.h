@@ -680,7 +680,7 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 							   int search_window_size, int build_window_size,
 							   int compression_type, int compression_primary,
 							   int compression_secondary, int leanvec_dims,
-							   int distance_type,
+							   int distance_type, int data_type,
 							   int numVectors, int tidMappingCapacity,
 							   uint64 nextExternalId, int numDeleted,
 							   Oid heapRelid, int vectorAttNum);
@@ -727,6 +727,7 @@ typedef struct VamanaLoadParams
 	int			compression_secondary;
 	int			leanvec_dims;
 	int			distance_type;		/* cast to SVSDistanceType in the BGW */
+	int			data_type;			/* cast to SVSDType; must match the build's */
 	int			numVectors;
 	int			tidMappingCapacity;
 	uint64		nextExternalId;

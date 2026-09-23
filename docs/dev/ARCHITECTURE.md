@@ -164,6 +164,10 @@ Workers require the extension to be loaded via `shared_preload_libraries = 'svs'
 
 Vamana indexes support `vector` (float32) and `halfvec` (float16) types. `sparsevec` and `bit` are not supported.
 
+The indexed column's type is resolved from the relation (`VamanaGetTypeInfo`, `src/vamanautils.c`), which yields both the element width to read a heap datum at and the SVS storage element type to build and load with — float32 for `vector`, float16 for `halfvec`. The SVS C API only accepts `float` arrays, so a `halfvec` datum is widened on the way in and stored back down to float16 by SVS; the storage type is therefore a separate choice from the datum width. Build and load must name the same storage type or the saved index will not reload, so every storage site takes it from this one source. Under `compression_type` 1 or 2 the compressed spec owns the stored format and the storage element type is not consulted.
+
+Because the type is derived from the relation rather than recorded on the metapage, a `halfvec` index built before float16 storage was introduced fails to load and is rebuilt from the table; `REINDEX` resolves it.
+
 | Operator Class | Type | Distance Operator | Metric |
 |---|---|---|---|
 | `vector_l2_ops` | `vector` | `<->` | L2 (Euclidean) |
