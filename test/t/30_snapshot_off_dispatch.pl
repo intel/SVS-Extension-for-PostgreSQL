@@ -34,8 +34,9 @@ use VamanaTestUtils qw(:all);
 
 # Long enough that the old synchronous BuildSnapshot call, which waits for
 # this transaction's XactLockTableWait to release, would blow well past
-# svs.worker_timeout_ms below; short enough to keep the suite fast.
-my $UNRELATED_TXN_SECONDS = 6;
+# svs.worker_timeout_ms below, and to leave headroom for the repeated-defer
+# samples taken later in this window; short enough to keep the suite fast.
+my $UNRELATED_TXN_SECONDS = 8;
 
 my $node = PostgreSQL::Test::Cluster->new('snapshot_off_dispatch');
 $node->init;
@@ -148,6 +149,39 @@ my ($ret2, $stdout2, $stderr2) = $node->psql('postgres',
 is($ret2, 0,
     'a second unrelated write, issued partway through the open window, also succeeds')
     or diag("stderr: $stderr2");
+
+# The repeated-defer path: session A's xid is still listed as running in
+# every xl_running_xacts record the worker reads for the rest of this window,
+# so VamanaWorkerActivatePendingSnapshots must keep deferring dispatch_idx's
+# slot activation on each of its 200 ms-spaced retries rather than reaching a
+# wrong CONSISTENT verdict on a stale or partial scan.  Sampling several
+# times across the remainder of session A's open window, each sample well
+# past the previous one's retry interval, exercises that repeatedly, not just
+# the single defer-then-converge transition covered once session A commits
+# below.
+{
+    my $dboid_mid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'postgres';");
+    chomp $dboid_mid;
+    my $indexoid_mid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'dispatch_idx';");
+    chomp $indexoid_mid;
+    my $slot_name_mid = "vamana_${dboid_mid}_${indexoid_mid}";
+
+    for my $sample (1 .. 3)
+    {
+        usleep(700_000);    # > the 200 ms retry cadence, so each sample lands
+                             # on a fresh retry attempt rather than the same one
+        my $confirmed_mid = $node->safe_psql('postgres', qq{
+            SELECT confirmed_flush_lsn IS NOT NULL
+            FROM pg_replication_slots WHERE slot_name = '$slot_name_mid';
+        });
+        chomp $confirmed_mid;
+        is($confirmed_mid, 'f',
+            "dispatch_idx still correctly deferred on retry sample $sample "
+          . "while session A's transaction remains open");
+    }
+}
 
 # Let session A finish, so the snapshot build the fix deferred can actually
 # converge; confirm it does -- deferred, not abandoned.

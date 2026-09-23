@@ -273,9 +273,11 @@ sub hold_slot_externally
         my $sname = "vamana_${dboid}_${ioid}";
         # Wait for the slot to reach its first snapshot consistency, not merely
         # to exist: existence is immediate, but consistency is now driven by the
-        # worker's main loop rather than by CREATE INDEX's own dispatch.
+        # worker's main loop rather than by CREATE INDEX's own dispatch.  40
+        # iterations (20 s) gives several multiples of the 200 ms retry cadence
+        # of margin against main-loop contention from earlier cases' checkpoints.
         my $baseline = '';
-        for (1 .. 20)
+        for (1 .. 40)
         {
             usleep(500_000);
             $baseline = $node->safe_psql('postgres', qq{
@@ -285,6 +287,13 @@ sub hold_slot_externally
             chomp $baseline;
             last if $baseline ne '';
         }
+        # An empty baseline here must not silently flow into
+        # wait_for_lsn_advance: there, $lsn ne $baseline is trivially true the
+        # moment consistency first lands, which would read as a checkpoint
+        # firing immediately rather than as the guard it is meant to test.
+        die "slot $sname never reached snapshot consistency within the poll window "
+          . "(confirmed_flush_lsn stayed empty)"
+            if $baseline eq '';
         return ($tbl, $sname, $baseline);
     };
 

@@ -1090,6 +1090,17 @@ VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid)
  * xid whether or not the caller ever intended to wait.  TransactionIdIsInProgress
  * is a non-blocking procarray scan, so callers can check first and defer the
  * record to a later pass instead of taking that wait.
+ *
+ * SnapBuildWaitSnapshot only actually waits on xids at or before its own
+ * cutoff (usually running->nextXid, or builder->initial_xmin_horizon when
+ * the slot was created after the record's oldestRunningXid), and skips any
+ * listed xid newer than that.  This check has no cutoff and treats every
+ * listed in-progress xid the same, so it can defer a record core would not
+ * have blocked on.  That is deliberate, not a missed filter: SnapBuild is an
+ * opaque type outside snapbuild.c (see snapbuild.h), and the cutoff a given
+ * record needs depends on the builder's private phase, which nothing calling
+ * in from here can observe.  The cost of the extra deferrals is bounded by
+ * VamanaWorkerActivatePendingSnapshots' own retry interval, never wrong.
  */
 static bool
 VamanaRunningXactsRecordWouldBlock(XLogReaderState *reader)
