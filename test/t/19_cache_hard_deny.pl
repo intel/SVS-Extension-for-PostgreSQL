@@ -118,6 +118,18 @@ wait_for_worker($node);
 # ---------------------------------------------------------------------------
 # Case 4: a real refusal still happens once a database's own residency
 # budget is exhausted, and it names the ceiling, not a slot count.
+#
+# The trigger is two indexes competing for one tight budget, not a single
+# oversized one: the residency admission check now runs at CREATE INDEX
+# time (SvsMemoryReserveBuild), not only at the worker's later load
+# attempt, so a build that will not fit is refused before it ever
+# allocates, rather than left to build, serialize, and fail only when the
+# worker tries to cache it. big_idx alone fits the budget; big_idx2 does
+# not once big_idx's bytes are already committed, so its own CREATE INDEX
+# is what is denied, naming the same residency ceiling the old
+# worker-side deny used to name. This is a fail-fast trigger, not a
+# weaker one: it reaches the refusal in milliseconds instead of after a
+# full build, and it leaves nothing on disk for the refused index.
 # ---------------------------------------------------------------------------
 
 $node->safe_psql("postgres", "CREATE DATABASE tinydb;");
@@ -125,32 +137,46 @@ $node->safe_psql("tinydb", "CREATE EXTENSION vector;");
 $node->safe_psql("tinydb", "CREATE EXTENSION svs;");
 $node->safe_psql("postgres",
     "INSERT INTO vamana_databases (datname, enabled, residency_memory) "
-  . "VALUES ('tinydb', true, 1);");
+  . "VALUES ('tinydb', true, 10);");
 wait_for_worker_db($node, 'tinydb', 30);
 
 $node->safe_psql("tinydb", qq(
     CREATE TABLE big_tbl (id serial PRIMARY KEY, val vector($dim));
     INSERT INTO big_tbl (val)
         SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000) s;
+    CREATE TABLE big_tbl2 (id serial PRIMARY KEY, val vector($dim));
+    INSERT INTO big_tbl2 (val)
+        SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000) s;
 ));
 
 {
     my ($ret, $stdout, $stderr) = $node->psql("tinydb",
         "CREATE INDEX big_idx ON big_tbl USING vamana (val vector_l2_ops);");
-    is($ret, 0, 'CREATE INDEX itself succeeds; the worker load is asynchronous');
-    like($stderr, qr/residency budget/,
-        "the worker's load warning names the residency ceiling, not a slot count");
-    unlike($stderr, qr/cache slots/,
-        'the load warning is not the old slot-count message');
+    is($ret, 0, 'the first index fits the budget and builds normally')
+      or diag("stderr: $stderr");
+
+    my ($ret2, $stdout2, $stderr2) = $node->psql("tinydb",
+        "CREATE INDEX big_idx2 ON big_tbl2 USING vamana (val vector_l2_ops);");
+    isnt($ret2, 0,
+        'a second, competing index is refused once the first has committed the budget');
+    like($stderr2, qr/residency budget/,
+        "the refusal names the residency ceiling, not a slot count");
+    unlike($stderr2, qr/cache slots/,
+        'the refusal is not the old slot-count message');
+
+    my $idx2_count = $node->safe_psql("tinydb",
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'big_idx2';");
+    chomp $idx2_count;
+    is($idx2_count, '0',
+        'the refused build left nothing behind: no half-built big_idx2');
 
     my ($qret, $qstdout, $qstderr) = $node->psql("tinydb", qq(
         SET enable_seqscan = off;
         SELECT id FROM big_tbl ORDER BY val <-> '[$query_sql]' LIMIT 3;
     ));
-    isnt($qret, 0,
-        'querying the index the worker could not load fails');
-    like($qstderr, qr/residency budget/,
-        'the query error names the residency budget, not a generic "not loaded" message');
+    is($qret, 0,
+        'big_idx, admitted before the refusal, still answers queries normally')
+      or diag("stderr: $qstderr");
 }
 
 # ---------------------------------------------------------------------------

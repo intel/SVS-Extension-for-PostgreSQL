@@ -350,7 +350,7 @@ VamanaInit(void)
 							"Sum of every in-progress CREATE INDEX / REINDEX build's peak memory. "
 							"Always finite: there is no \"0 means unlimited\" path.",
 							&vamana_max_build_memory_mb,
-							100, 1, INT_MAX,
+							4096, 1, INT_MAX,
 							PGC_SIGHUP,
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);
