@@ -111,7 +111,9 @@ effect live, with no restart: promptly on a primary, and within 180 seconds on a
   no floor: the database's request is pure best-effort against the shared pool and can be
   reduced when the pool is oversubscribed. A positive value is honored before anything else is
   distributed, but the guarantee is not unconditional: it is capped at this database's own
-  `search_num_threads` request, and if every enrolled database's configured floors together
+  effective desired thread count, that is, `search_num_threads` after it is clamped to
+  `svs.max_search_threads_per_db` (if you have set that GUC), not the raw configured
+  `search_num_threads` value. And if every enrolled database's configured floors together
   exceed `max_parallel_workers`, the floors themselves are cut down to fit, lowest database OID
   first. A database's own floor can therefore be silently reduced by *other* databases'
   configuration, not just by its own usage or request. Avoid this by keeping the sum of all
@@ -163,7 +165,7 @@ full, current list.
 |---|---|
 | `max_worker_processes` | Restart only |
 | `svs.max_databases` | Restart only |
-| `max_parallel_workers` | Reload (`SIGHUP`), no restart |
+| `max_parallel_workers` | `SET` (this session) immediately; `postgresql.conf` on reload (`SIGHUP`) |
 | `vamana_databases.search_num_threads` | Live, no restart |
 | `vamana_databases.search_threads_reserved` | Live, no restart |
 | `vamana_databases.maintenance_num_threads` | Live, no restart |
