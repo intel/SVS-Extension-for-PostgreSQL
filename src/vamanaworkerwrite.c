@@ -270,7 +270,8 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
 	/* Seed vector is already indexed by the build; no external ID to return. */
 	slot->writeExternalId = 0;
 
-	if (cache->replicationSlot == NULL)
+	slot->writeSlotCreated = (cache->replicationSlot == NULL);
+	if (slot->writeSlotCreated)
 	{
 		VamanaReplicationCreate(VamanaWorkerShmemPtr->dbOid, relid);
 		cache->replicationSlot = VamanaReplicationOpen(
@@ -404,6 +405,7 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				cache->numVectors++;
 				/* Return the allocated external ID to the backend. */
 				slot->writeExternalId = (uint64) externalId;
+				slot->writeSlotCreated = false;
 
 				VamanaWorkerPersistMetaCounters(relid, cache);
 

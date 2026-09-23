@@ -14,6 +14,7 @@
 
 #include "svs_memory.h"
 #include "vamana.h"
+#include "vamana_replication.h"
 #include "vamana_undo.h"
 #include "svs_wrapper.h"
 #include "vamanaworker.h"
@@ -43,6 +44,7 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	Oid			relid = RelationGetRelid(index);
 	Vector	   *vec;
 	uint64		externalId;
+	bool		slotCreated;
 
 	if (isnull[0])
 		return false;
@@ -74,7 +76,8 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 		/* Submit to BGW — blocks until the worker ACKs or errors. */
 		PG_TRY();
 		{
-			VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid, &externalId);
+			VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid,
+									 &externalId, &slotCreated);
 		}
 		PG_CATCH();
 		{
@@ -88,6 +91,9 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 
 	/* Record (relid, externalId) so we can roll back on transaction abort. */
 	VamanaUndoAppend(relid, externalId);
+
+	if (slotCreated)
+		VamanaReplicationQueueRetireOnAbort(MyDatabaseId, relid);
 
 	return true;
 }
