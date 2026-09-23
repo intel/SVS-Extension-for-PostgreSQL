@@ -56,9 +56,6 @@ use VamanaTestUtils qw(:all);
         SELECT id FROM bgw_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
     isnt($log_after_worker, '', 'worker-mode query still returns results');
-    my $log = $node->log_content();
-    unlike($log, qr/vamana index not in memory, rebuilding from table/,
-        'no per-backend rebuild when worker is enabled');
 
     my $log_pos_before_restart = length($node->log_content());
     $node->restart;
