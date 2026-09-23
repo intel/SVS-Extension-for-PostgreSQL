@@ -247,6 +247,14 @@ sub hold_slot_externally
     # clock starts at load time and the BGW will not fire a spurious immediate
     # checkpoint — baseline_lsn is a stable starting point for each case's guard
     # assertions.
+    #
+    # confirmed_flush_lsn is set twice over an index's life: once, asynchronously,
+    # when the worker's main loop first drives the slot to snapshot consistency
+    # (unrelated to any checkpoint), and again on every later checkpoint's
+    # VamanaSlotAdvance.  Capturing baseline_lsn only has to wait for the slot to
+    # exist would race the first of those against this file's own guard windows;
+    # waiting here for the first confirmed_flush_lsn instead isolates every case
+    # below to just the second kind of change, which is what they actually test.
     my $case_num = 0;
     my $make_index = sub {
         $case_num++;
@@ -263,18 +271,20 @@ sub hold_slot_externally
             "SELECT oid FROM pg_class WHERE relname = '$idx';");
         chomp $ioid;
         my $sname = "vamana_${dboid}_${ioid}";
-        # Wait for the slot to appear (BGW has processed the LOAD request).
+        # Wait for the slot to reach its first snapshot consistency, not merely
+        # to exist: existence is immediate, but consistency is now driven by the
+        # worker's main loop rather than by CREATE INDEX's own dispatch.
+        my $baseline = '';
         for (1 .. 20)
         {
             usleep(500_000);
-            my $cnt = $node->safe_psql('postgres', qq{
-                SELECT count(*) FROM pg_replication_slots
+            $baseline = $node->safe_psql('postgres', qq{
+                SELECT confirmed_flush_lsn FROM pg_replication_slots
                 WHERE slot_name = '$sname';
             });
-            chomp $cnt;
-            last if $cnt == 1;
+            chomp $baseline;
+            last if $baseline ne '';
         }
-        my $baseline = current_lsn($node, $sname);
         return ($tbl, $sname, $baseline);
     };
 

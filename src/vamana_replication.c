@@ -31,6 +31,8 @@
 #include "replication/snapbuild.h"
 #include "replication/slot.h"
 #include "storage/lwlock.h"
+#include "storage/procarray.h"
+#include "storage/standby.h"
 #include "utils/hsearch.h"
 #include "utils/injection_point.h"
 #include "utils/inval.h"
@@ -1080,10 +1082,47 @@ VamanaReplicationBuildSnapshot(Oid dboid, Oid indexRelid)
 	PG_END_TRY();
 }
 
-/* Per-record callback for VamanaReplicationActivateSlotBounded's decode loop. */
+/*
+ * True if the just-read record is a running-xacts snapshot listing at least
+ * one transaction still in progress.  Handing such a record to
+ * LogicalDecodingProcessRecord reaches SnapBuildProcessRunningXacts, which
+ * calls SnapBuildWaitSnapshot and blocks in XactLockTableWait on every listed
+ * xid whether or not the caller ever intended to wait.  TransactionIdIsInProgress
+ * is a non-blocking procarray scan, so callers can check first and defer the
+ * record to a later pass instead of taking that wait.
+ */
+static bool
+VamanaRunningXactsRecordWouldBlock(XLogReaderState *reader)
+{
+	xl_running_xacts *running;
+	int			i;
+
+	if (XLogRecGetRmid(reader) != RM_STANDBY_ID ||
+		(XLogRecGetInfo(reader) & ~XLR_INFO_MASK) != XLOG_RUNNING_XACTS)
+		return false;
+
+	running = (xl_running_xacts *) XLogRecGetData(reader);
+
+	for (i = 0; i < running->xcnt; i++)
+	{
+		if (TransactionIdIsInProgress(running->xids[i]))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Per-record callback for VamanaReplicationActivateSlotBounded's decode loop.
+ * Stops without decoding a running-xacts record that would otherwise block;
+ * the next pass rereads it from restart_lsn and tries again.
+ */
 static bool
 ActivateSlotRecordCallback(LogicalDecodingContext *ctx, void *arg)
 {
+	if (VamanaRunningXactsRecordWouldBlock(ctx->reader))
+		return true;
+
 	LogicalDecodingProcessRecord(ctx, ctx->reader);
 	return DecodingContextReady(ctx);
 }
@@ -1091,12 +1130,14 @@ ActivateSlotRecordCallback(LogicalDecodingContext *ctx, void *arg)
 /*
  * Scan WAL from restart_lsn up to role->current_wal_end and stop, whether or
  * not the SnapBuild reaches CONSISTENT.  Unlike VamanaReplicationBuildSnapshot
- * this never waits for a not-yet-replayed xl_running_xacts record, so it is
- * safe to call from the main loop.  A pass that stops short of CONSISTENT
- * discards its progress (the builder is freed with the decoding context; a
- * snapshot is serialized only once CONSISTENT is reached), so the next pass
- * starts over from restart_lsn; convergence needs only that the primary keep
- * emitting xl_running_xacts.
+ * this never blocks on a transaction that was already running when its
+ * running-xacts record was written, and never waits for a not-yet-replayed
+ * running-xacts record either, so it is safe to call from the main loop.  A
+ * pass that stops short of CONSISTENT discards its progress (the builder is
+ * freed with the decoding context; a snapshot is serialized only once
+ * CONSISTENT is reached), so the next pass starts over from restart_lsn;
+ * convergence needs only that the blocking transactions eventually end and
+ * the primary keep emitting xl_running_xacts.
  */
 void
 VamanaReplicationActivateSlotBounded(Oid dboid, Oid indexRelid)
