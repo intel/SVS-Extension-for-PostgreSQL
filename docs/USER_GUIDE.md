@@ -31,7 +31,8 @@
 9. [Troubleshooting](#9-troubleshooting)
 10. [Appendix: Vamana vs. HNSW Comparison](#10-appendix-vamana-vs-hnsw-comparison)
 11. [Reference: Parameter Summary](#11-reference-parameter-summary)
-12. [Resource Sizing](RESOURCE_SIZING.md)
+
+See also: [Resource Sizing for Operators](RESOURCE_SIZING.md), a separate document.
 
 ---
 

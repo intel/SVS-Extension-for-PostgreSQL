@@ -33,16 +33,17 @@ in for search threads, draws a slot from `max_worker_processes`. Size it as:
 ```
 max_worker_processes >= 1                          (the launcher)
                        + 1 per enrolled database    (one worker each)
-                       + autovacuum_max_workers      (default 3)
                        + logical replication workers, if used
                        + max_parallel_workers
 ```
 
-Worked example: 2 enrolled databases, default `autovacuum_max_workers`, no logical replication,
-`max_parallel_workers = 8`:
+Autovacuum workers do not count here: they draw from `autovacuum_worker_slots`, a separate
+reserved-slot pool, not from `max_worker_processes`.
+
+Worked example: 2 enrolled databases, no logical replication, `max_parallel_workers = 8`:
 
 ```
-1 + 2 + 3 + 0 + 8 = 14
+1 + 2 + 0 + 8 = 11
 ```
 
 The PostgreSQL default of `max_worker_processes = 8` is not enough. This setting takes effect
@@ -50,9 +51,9 @@ only on restart.
 
 ### `svs.max_databases`
 
-Sizes the per-database control-block array the extension keeps in shared memory. Default 8,
-range 1-128. If you plan to enroll more than 8 databases, raise this before you need it: it also
-takes effect only on restart.
+Sizes the per-database control-block array the extension keeps in shared memory; also restart
+only. See [USER_GUIDE.md §6.1 "Capacity"](USER_GUIDE.md#capacity) for the default, range, and the
+error you get if you enroll past the limit.
 
 ## 2. Sizing `max_parallel_workers`
 
@@ -73,9 +74,14 @@ max_parallel_workers >= sum of every enrolled database's effective search-thread
 ```
 
 The "headroom for concurrent `CREATE INDEX`" term is not a vague safety margin: an index build's
-requested threads and every enrolled database's search demand draw from the same
-`max_parallel_workers`-bounded pool and are apportioned by the same arbitration, so a build in
-progress can visibly reduce what is left over for search grants (and vice versa).
+requested threads draw from the same `max_parallel_workers`-bounded pool as every enrolled
+database's search demand. But the two are not symmetric competitors. Each database's configured
+floor (`search_threads_reserved`) is protected outright before any build is considered, and above
+that floor a database's elastic demand is weighted by its floor while a build's claim always
+carries zero weight. A build is structurally the lowest-priority claimant in the pool: it can
+only draw against elastic demand headroom, never against a database's floor. In practice this
+means a build in progress can shrink under pressure from search demand, but not the reverse: a
+build never reduces a database's protected floor.
 
 An unconfigured enrolled database (no `search_num_threads` override in `vamana_databases`)
 resolves to a **1-thread grant**. Concretely: `svs.max_databases` defaults to 8,
@@ -87,8 +93,9 @@ This is expected behavior, not a leak. If you see it, raise `max_parallel_worker
 `max_worker_processes` with it, per the formula above) to the sum of what your enrolled databases
 actually need plus your usual core-parallel-query headroom.
 
-Unlike `max_worker_processes`, `max_parallel_workers` takes effect on `SIGHUP` (`pg_reload_conf()`
-or `SET` by a superuser); no restart required.
+Unlike `max_worker_processes`, `max_parallel_workers` is a normal runtime GUC (`PGC_USERSET`):
+any session can change it for itself with `SET`, no superuser required, and a cluster-wide change
+via `postgresql.conf` takes effect on reload (`pg_reload_conf()` or `SIGHUP`) with no restart.
 
 ## 3. The Per-Database Levers
 
@@ -102,8 +109,13 @@ effect live, with no restart: promptly on a primary, and within 180 seconds on a
   `svs.max_search_threads_per_db` if you have set that GUC.
 - **`search_threads_reserved`**: a floor for this database's grant. `NULL` (the default) means
   no floor: the database's request is pure best-effort against the shared pool and can be
-  reduced when the pool is oversubscribed. A positive value guarantees that many threads are
-  honored before anything else is distributed.
+  reduced when the pool is oversubscribed. A positive value is honored before anything else is
+  distributed, but the guarantee is not unconditional: it is capped at this database's own
+  `search_num_threads` request, and if every enrolled database's configured floors together
+  exceed `max_parallel_workers`, the floors themselves are cut down to fit, lowest database OID
+  first. A database's own floor can therefore be silently reduced by *other* databases'
+  configuration, not just by its own usage or request. Avoid this by keeping the sum of all
+  configured floors within `max_parallel_workers`.
 - **`maintenance_num_threads`**: the thread count requested for this database's index builds
   (`CREATE INDEX`, and the equivalent maintenance paths). `NULL` (the default) means "follow the
   cluster build-thread default." `0` means serial.
@@ -131,9 +143,19 @@ Two distinct problems produce a shortfall, and they call for different fixes:
   Raise `max_worker_processes` (see §1); note this is restart-only, unlike
   `max_parallel_workers`.
 
+Two server log lines are usually the first signal an operator sees, before ever querying the
+view:
+
+- `vamana launcher could not register worker for database "<name>"` with a hint to increase
+  `max_worker_processes`: a per-database worker itself could not be registered (a
+  `max_worker_processes` shortfall, distinct from a search-slot shortfall below).
+- `svs cpu slots: holding N of M requested search slots for database "<name>"`: the worker is
+  holding fewer search slots than it was granted, and clears to `svs cpu slots: shortfall
+  cleared, holding N of M requested search slots for database "<name>"` once resolved.
+
 The view has more columns than the four above, including several from the memory-management
-domain (residency and search-scratch memory); the full, current list is in
-`sql/svs--0.1.0.sql`.
+domain (residency and search-scratch memory); run `\d+ pg_stat_vamana_worker` in `psql` for the
+full, current list.
 
 ## 5. Restart, Reload, or Neither
 
