@@ -467,6 +467,55 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 	}
 }
 
+/* Minimum spacing between activation attempts for the same index's slot. */
+#define VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS	200
+
+/*
+ * Advance each cached index's slot toward snapshot consistency, one bounded
+ * WAL scan per pass, until VamanaReplicationSlotIsConsistent is true.  Primary
+ * only: a standby drives the same underlying call from
+ * VamanaStandbyActivateSlotBounded via VamanaReconcileStandbyCache instead.
+ *
+ * Consistency is not on any request's critical path today (a primary applies
+ * writes directly via IPC, never by decoding its own slot), so this is purely
+ * a best-effort head start on the serialized snapshot a future crash restart
+ * or standby bootstrap could use; stopping the per-index scan the moment
+ * VamanaReplicationSlotIsConsistent flips true keeps the cost bounded by the
+ * number of cached indexes rather than by how much WAL has accumulated.
+ *
+ * The main loop's own cadence cannot be trusted to space these out: a
+ * backlog of unrelated write requests keeps it from ever reaching its idle
+ * WaitLatch, so it can call this function thousands of times a second.
+ * VamanaReplicationActivateSlotBounded rescans from restart_lsn on every
+ * call regardless of prior progress, so doing that thousands of times a
+ * second is a spin even though no individual call blocks;
+ * nextSnapshotActivateAttempt caps each index's retry rate independently of
+ * how often this function itself gets called.
+ */
+static void
+VamanaWorkerActivatePendingSnapshots(void)
+{
+	Oid			dbOid = VamanaWorkerShmemPtr->dbOid;
+	List	   *relids = VamanaGetAllCachedRelids();
+	TimestampTz now = GetCurrentTimestamp();
+
+	foreach_oid(relid, relids)
+	{
+		VamanaIndexCache *cache = VamanaGetCache(relid);
+
+		if (cache == NULL || VamanaReplicationSlotIsConsistent(dbOid, relid))
+			continue;
+
+		if (cache->nextSnapshotActivateAttempt != 0 &&
+			cache->nextSnapshotActivateAttempt > now)
+			continue;
+
+		VamanaReplicationActivateSlotBounded(dbOid, relid);
+		cache->nextSnapshotActivateAttempt =
+			TimestampTzPlusMilliseconds(now, VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS);
+	}
+}
+
 /*
  * Drain each cached index's replication slot into its in-memory graph.
  * Standby-only: a primary's write-IPC path already applies every change a
@@ -1012,7 +1061,10 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		}
 
 		if (role->processes_write_ipc)
+		{
 			VamanaWorkerEnforceWalBudgetOnAllSlots();
+			VamanaWorkerActivatePendingSnapshots();
+		}
 		else
 			VamanaWorkerDrainAllSlots();
 

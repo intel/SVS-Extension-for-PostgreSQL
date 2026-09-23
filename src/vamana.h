@@ -258,6 +258,17 @@ typedef struct VamanaIndexCache
 	int			vectorAttNum;		/* 0-based heap attribute number of the vector column */
 	HTAB	   *tidToExternalId;	/* TID → externalId reverse lookup; NULL until first populate */
 
+	/*
+	 * Earliest time the main loop may next call VamanaReplicationActivateSlotBounded
+	 * for this index; 0 = no earlier attempt yet.  Every call rescans from
+	 * restart_lsn regardless of whether the last one made progress, so nothing
+	 * paces retries except this: without it, a dispatch loop kept busy by a
+	 * backlog of unrelated write requests would call it on every one of
+	 * thousands of iterations a second, which is a spin in every sense that
+	 * matters even though no single call blocks.
+	 */
+	TimestampTz nextSnapshotActivateAttempt;
+
 	/* Checkpoint debounce state */
 	int64		opsSinceCheckpoint;
 	TimestampTz lastWriteTime;		/* updated on every write slot; 0 = no writes yet */
