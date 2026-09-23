@@ -111,6 +111,7 @@ VamanaGetTypeInfoForDataType(SVSDType dataType)
 			return &halfvec_info;
 		default:
 			elog(ERROR, "unsupported vamana storage data type: %d", (int) dataType);
+			return NULL;
 	}
 }
 
