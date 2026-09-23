@@ -14,6 +14,16 @@
 # residency footprint exceeds the database's own residency budget, so every
 # load fails during bootstrap, and asserts the worker starts once and stays
 # up regardless.
+#
+# The residency budget the standby denies against is not the primary's:
+# svs.default_residency_memory and svs.max_residency_memory are per-server
+# GUCs, not part of the replicated vamana_databases row, so the primary and
+# the standby can resolve different budgets for the same database
+# (SvsMemoryResolveResidencyBudget, src/svs_memory.c). The primary's own
+# budget must admit all 9 builds -- SvsMemoryReserveBuild runs at CREATE
+# INDEX time now, so a budget too small for that would refuse the setup
+# loop itself, not exercise bootstrap denial at all. The standby's own,
+# separately configured budget is what stays small enough to deny them.
 
 use strict;
 use warnings FATAL => 'all';
@@ -29,9 +39,9 @@ use VamanaTestUtils qw(:all);
 my $N_INDEXES = 9;
 
 # ===========================================================================
-# Setup: primary with 9 vamana indexes, each larger than the database's own
-# 1MB residency budget, then a streaming standby.
-# Fixture pattern follows test/t/08_standby_replay.pl.
+# Setup: primary with 9 vamana indexes, all admitted under its own
+# generous residency budget, then a streaming standby with its own much
+# smaller one. Fixture pattern follows test/t/08_standby_replay.pl.
 # ===========================================================================
 
 my $primary = PostgreSQL::Test::Cluster->new('primary_cache_overflow');
@@ -41,13 +51,21 @@ $primary->append_conf('postgresql.conf', "wal_level = logical");
 $primary->append_conf('postgresql.conf', "max_replication_slots = 20");
 $primary->append_conf('postgresql.conf', "max_wal_senders = 10");
 $primary->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+# No per-row residency_memory override: that row replicates to the standby,
+# which must resolve its own, much smaller budget from its own
+# postgresql.conf instead (see below). svs.default_residency_memory and
+# svs.max_residency_memory are per-server GUCs, not replicated state, so the
+# primary and standby can disagree about how much residency this same
+# database gets -- the primary generously (all 9 builds must fit, summing to
+# ~55MB), the standby not (see the standby's own conf further down).
+$primary->append_conf('postgresql.conf', "svs.default_residency_memory = '80MB'");
+$primary->append_conf('postgresql.conf', "svs.max_residency_memory = '80MB'");
 $primary->start;
 
 $primary->safe_psql('postgres', "CREATE EXTENSION vector;");
 $primary->safe_psql('postgres', "CREATE EXTENSION svs;");
 $primary->safe_psql('postgres',
-    "INSERT INTO vamana_databases (datname, enabled, residency_memory) "
-  . "VALUES ('postgres', true, 1);");
+    "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
 for my $i (0 .. $N_INDEXES - 1)
 {
@@ -74,6 +92,13 @@ $standby->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 $standby->append_conf('postgresql.conf', "hot_standby = on");
 $standby->append_conf('postgresql.conf', "hot_standby_feedback = on");
 $standby->append_conf('postgresql.conf', "primary_slot_name = 'overflow_phys'");
+# The standby's own, much smaller residency budget: below the ~55MB the 9
+# replicated indexes durably sum to, so its own worker denies some or all
+# of them at bootstrap, independent of whatever the primary admitted them
+# under. This is the file's actual fixture now: a real, differently
+# configured standby, not a workaround of the primary's own admission gate.
+$standby->append_conf('postgresql.conf', "svs.default_residency_memory = '1MB'");
+$standby->append_conf('postgresql.conf', "svs.max_residency_memory = '10MB'");
 $standby->start;
 
 $primary->wait_for_replay_catchup($standby);
@@ -85,6 +110,22 @@ $primary->wait_for_replay_catchup($standby);
 
 my $worker_pid = wait_for_worker($standby, 30);
 ok($worker_pid =~ /^\d+$/, "standby worker running (pid=$worker_pid)");
+
+{
+    # A standby's worker reports 'replica', not 'running' -- a distinct,
+    # equally-up state (VAMANA_WORKER_REPLICA), not a slower path to the
+    # same one.
+    my $state = '';
+    for (1 .. 30)
+    {
+        usleep(500_000);
+        $state = $standby->safe_psql('postgres',
+            "SELECT worker_state FROM pg_stat_vamana_worker WHERE worker_pid = $worker_pid;");
+        chomp $state;
+        last if $state eq 'replica';
+    }
+    is($state, 'replica', 'standby worker_state is replica before checking any denial');
+}
 
 # Bootstrap attempts all 9 relids sequentially with a blocking slot-activation
 # wait per index (VamanaWorkerServe, before workerPid is published). Each

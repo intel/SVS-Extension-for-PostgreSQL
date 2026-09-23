@@ -1,10 +1,10 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 31_durable_residency_reconcile.pl — svs_index_residency rows orphaned by
-# DROP INDEX and REINDEX INDEX CONCURRENTLY are swept away at the worker's
-# next startup, the durable floor falls back to what is genuinely resident,
-# and a still-live index's row is left untouched.
+# 31_durable_residency_reconcile.pl — svs_index_residency rows orphaned by a
+# DROP INDEX that commits while the worker is down are swept away once the
+# worker comes back up, the durable floor falls back to what is genuinely
+# resident, and a still-live index's row is left untouched.
 
 use strict;
 use warnings FATAL => 'all';
@@ -78,21 +78,45 @@ sub durable_floor_for_postgres
     return $sum;
 }
 
+# A DROP INDEX or REINDEX CONCURRENTLY committing while the worker is up
+# retires its residency row promptly, through the same worker-side reload
+# path a plain cache invalidation uses. Only a database with no live worker
+# to receive that signal leaves a row this sweep still needs to catch.
+sub kill_worker_and_wait
+{
+    my $worker_pid = $node->safe_psql('postgres',
+        "SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
+    chomp $worker_pid;
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = false WHERE datname = 'postgres';");
+
+    my $log_pos = length($node->log_content());
+    kill('TERM', $worker_pid);
+    $node->wait_for_log(qr/vamana background worker shutting down/, $log_pos);
+    for (1 .. 100)
+    {
+        usleep(100_000);
+        my $alive = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana worker';");
+        chomp $alive;
+        last if $alive eq '0';
+    }
+}
+
 # ---------------------------------------------------------------------------
-# Build three indexes: one to be DROPped, one to be REINDEXed CONCURRENTLY,
-# and one left alone throughout as the regression guard -- a live index's
-# durable row must survive the sweep.
+# Build two indexes: one to be DROPped, and one left alone throughout as the
+# regression guard -- a live index's durable row must survive the sweep.
+#
+# REINDEX INDEX CONCURRENTLY needs a build-thread grant from the launcher,
+# which is unavailable while the database is disabled, so it cannot be used
+# to reproduce the worker-down orphan case below; plain DROP INDEX can.
 # ---------------------------------------------------------------------------
 $node->safe_psql('postgres', qq(
     CREATE TABLE dropped_tbl (id serial PRIMARY KEY, val vector($dim));
     INSERT INTO dropped_tbl (val)
         SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 500);
     CREATE INDEX dropped_idx ON dropped_tbl USING vamana (val vector_l2_ops);
-
-    CREATE TABLE reindexed_tbl (id serial PRIMARY KEY, val vector($dim));
-    INSERT INTO reindexed_tbl (val)
-        SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 500);
-    CREATE INDEX reindexed_idx ON reindexed_tbl USING vamana (val vector_l2_ops);
 
     CREATE TABLE live_tbl (id serial PRIMARY KEY, val vector($dim));
     INSERT INTO live_tbl (val)
@@ -101,12 +125,10 @@ $node->safe_psql('postgres', qq(
 ));
 wait_for_worker($node);
 
-my $dropped_relid   = relid_of('dropped_idx');
-my $reindexed_relid = relid_of('reindexed_idx');
-my $live_relid       = relid_of('live_idx');
+my $dropped_relid = relid_of('dropped_idx');
+my $live_relid     = relid_of('live_idx');
 
-for my $pair (['dropped_idx', $dropped_relid], ['reindexed_idx', $reindexed_relid],
-    ['live_idx', $live_relid])
+for my $pair (['dropped_idx', $dropped_relid], ['live_idx', $live_relid])
 {
     my ($name, $relid) = @$pair;
     ok(residency_row_exists($relid),
@@ -115,56 +137,28 @@ for my $pair (['dropped_idx', $dropped_relid], ['reindexed_idx', $reindexed_reli
 
 my $floor_before_ddl = durable_floor_for_postgres();
 cmp_ok($floor_before_ddl, '>', 0,
-    'the durable floor is positive with all three indexes resident');
+    'the durable floor is positive with both indexes resident');
 
 # ---------------------------------------------------------------------------
-# Orphan one row via DROP INDEX, and another via REINDEX INDEX CONCURRENTLY
-# (which drops the old relid once the new one takes its place). Both leave a
-# permanent row behind without a worker restart -- this is the leak itself,
-# not yet the fix.
+# Take the worker down, then orphan dropped_idx's row via DROP INDEX. With no
+# live worker to signal, the commit's retire request is never delivered --
+# this is the leak itself, not yet the fix.
 # ---------------------------------------------------------------------------
+kill_worker_and_wait();
+
 $node->safe_psql('postgres', "DROP INDEX dropped_idx;");
-$node->safe_psql('postgres', "REINDEX INDEX CONCURRENTLY reindexed_idx;");
-my $reindexed_relid_new = relid_of('reindexed_idx');
-isnt($reindexed_relid_new, $reindexed_relid,
-    'REINDEX CONCURRENTLY gives reindexed_idx a new relid');
 
-# Give any asynchronous eviction/cleanup a moment to happen, then confirm the
-# orphan rows are still there: this is what makes the bug a leak rather than
-# a transient staleness.
-usleep(2_000_000);
 ok(residency_row_exists($dropped_relid),
-    "dropped_idx's old relid leaves an orphaned durable row after DROP INDEX");
-ok(residency_row_exists($reindexed_relid),
-    "reindexed_idx's pre-REINDEX relid leaves an orphaned durable row");
-ok(residency_row_exists($reindexed_relid_new),
-    "reindexed_idx's new relid has its own durable row after REINDEX CONCURRENTLY");
-ok(residency_row_exists($live_relid),
-    "live_idx's durable row is untouched by unrelated DDL");
+    "dropped_idx's relid leaves an orphaned durable row after DROP INDEX with no worker running");
 
 # ---------------------------------------------------------------------------
-# Restart the worker: this is the only point the fix runs. Confirm the
-# restart actually happened (a new pid) before trusting anything that
-# follows -- a restart that silently didn't happen would make a broken sweep
-# look like a working one.
+# Bring the worker back: this is the only point the fix runs.
 # ---------------------------------------------------------------------------
-$node->safe_psql('postgres', "SELECT svs_restart_worker('postgres');");
-my $pid2 = '';
-for (1 .. 60)
-{
-    usleep(500_000);
-    my $pid = $node->safe_psql('postgres',
-        "SELECT pid FROM pg_stat_activity "
-      . "WHERE backend_type = 'vamana worker' AND datname = 'postgres';");
-    chomp $pid;
-    if ($pid =~ /^\d+$/ && $pid ne $pid1)
-    {
-        $pid2 = $pid;
-        last;
-    }
-}
+$node->safe_psql('postgres',
+    "UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';");
+my $pid2 = wait_for_worker($node);
 ok($pid2 =~ /^\d+$/ && $pid2 ne $pid1,
-    "svs_restart_worker actually replaced the worker (pid $pid1 -> $pid2)");
+    "the worker came back up for postgres (pid $pid1 -> $pid2)");
 
 for (1 .. 60)
 {
@@ -181,38 +175,34 @@ is($node->safe_psql('postgres',
     'running', 'the restarted worker settles into running');
 
 # ---------------------------------------------------------------------------
-# After the restart, the orphan rows must be gone, the live rows must
-# remain, and the durable floor must fall back to exactly what the two
-# surviving indexes actually have resident.
+# After the restart, the orphan row must be gone, the live row must remain,
+# and the durable floor must fall back to exactly what the surviving index
+# actually has resident.
 # ---------------------------------------------------------------------------
 my $swept = '';
 for (1 .. 60)
 {
-    $swept = !residency_row_exists($dropped_relid)
-        && !residency_row_exists($reindexed_relid);
+    $swept = !residency_row_exists($dropped_relid);
     last if $swept;
     usleep(500_000);
 }
-ok($swept, 'both orphaned rows are gone after the worker restart');
+ok($swept, "the orphaned row is gone after the worker restart");
 
-ok(residency_row_exists($reindexed_relid_new),
-    "reindexed_idx's current row survives the restart");
 ok(residency_row_exists($live_relid),
     "live_idx's row survives the restart untouched, which is the regression this test guards against");
 
 my $floor_after_restart = durable_floor_for_postgres();
 my $expected_floor = $node->safe_psql('postgres', qq(
     SELECT COALESCE(SUM(resident_bytes), 0) FROM svs_index_residency
-    WHERE index_relid IN ($reindexed_relid_new, $live_relid);
+    WHERE index_relid = $live_relid;
 ));
 chomp $expected_floor;
 is($floor_after_restart, $expected_floor,
-    'the durable floor after restart equals exactly the two surviving indexes\' committed bytes');
+    "the durable floor after restart equals exactly live_idx's committed bytes");
 cmp_ok($floor_after_restart, '<', $floor_before_ddl,
-    'the durable floor drops once the orphaned rows are swept, from '
+    'the durable floor drops once the orphaned row is swept, from '
   . "$floor_before_ddl to $floor_after_restart");
 
-$node->safe_psql('postgres', "DROP TABLE reindexed_tbl;");
 $node->safe_psql('postgres', "DROP TABLE live_tbl;");
 
 $node->stop;

@@ -217,6 +217,22 @@ svs_memory_test_reset_database_accounting(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+/*
+ * Overrides the fake stand-in for the svs.launcher_database GUC, so a test
+ * can exercise RequireAdmitted's discriminator against a chosen database
+ * name instead of the compiled-in default. Lives for the rest of the
+ * session; tests that rely on the default restore it explicitly.
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_set_launcher_database);
+Datum
+svs_memory_test_set_launcher_database(PG_FUNCTION_ARGS)
+{
+	text	   *arg = PG_GETARG_TEXT_PP(0);
+
+	vamana_launcher_database = MemoryContextStrdup(TopMemoryContext, text_to_cstring(arg));
+	PG_RETURN_VOID();
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_test_resolve_residency_budget);
 Datum
 svs_memory_test_resolve_residency_budget(PG_FUNCTION_ARGS)

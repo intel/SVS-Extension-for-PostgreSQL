@@ -904,4 +904,46 @@ sub wait_for_worker_count
     $node->stop;
 }
 
+# A DELETE or an UPDATE...enabled=false racing the worker's own startup, before
+# it ever reaches 'running', settles the same as it would against a worker
+# that had already started: DELETE always releases the slot, and disable
+# never does, regardless of worker_state at the moment either lands.
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_launcher_immediate_teardown');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+
+    $node->safe_psql('postgres', "CREATE DATABASE immediate_delete_db;");
+    my $del_oid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'immediate_delete_db';");
+    chomp $del_oid;
+    $node->safe_psql('postgres', qq{
+        INSERT INTO vamana_databases (datname, enabled) VALUES ('immediate_delete_db', true);
+        DELETE FROM vamana_databases WHERE datname = 'immediate_delete_db';
+    });
+    ok(wait_for_slot_release($node, 'postgres', $del_oid, 30),
+        'a DELETE racing the worker\'s startup still releases the slot');
+
+    $node->safe_psql('postgres', "CREATE DATABASE immediate_disable_db;");
+    my $dis_oid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'immediate_disable_db';");
+    chomp $dis_oid;
+    $node->safe_psql('postgres', qq{
+        INSERT INTO vamana_databases (datname, enabled) VALUES ('immediate_disable_db', true);
+        UPDATE vamana_databases SET enabled = false WHERE datname = 'immediate_disable_db';
+    });
+    ok(!wait_for_slot_release($node, 'postgres', $dis_oid, 10),
+        'a disable racing the worker\'s startup still keeps the slot reserved');
+
+    $node->stop;
+}
+
 done_testing();

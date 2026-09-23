@@ -311,7 +311,13 @@ VamanaWorkerProcessSlotDrops(void)
 
 		relid = (Oid) relid_u32;
 
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 		VamanaEvictCacheEntry(relid);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
 		result = VamanaReplicationDropIfExists(VamanaWorkerShmemPtr->dbOid, relid);
 
 		/*
@@ -361,7 +367,14 @@ VamanaWorkerProcessReloads(void)
 	{
 		ereport(LOG,
 				(errmsg("vamana worker: evict_all set, evicting all cached indexes")));
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 		VamanaEvictAllCacheEntries();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
 		return;
 	}
 
@@ -387,24 +400,31 @@ VamanaWorkerProcessReloads(void)
 		ereport(LOG,
 				(errmsg("vamana worker: reloading index %u", relid)));
 
+		vamana_active_load_relid = relid;
+
+		INJECTION_POINT("vamana-reload-before-txn-start", NULL);
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
 		/*
 		 * Evict only the in-process cache entry so VamanaWorkerGetOrLoadIndex
 		 * picks up the fresh on-disk copy.  Do NOT use
 		 * VamanaInvalidateCache() here: that would delete the on-disk saved
 		 * copy (preventing reload from disk) and re-signal the worker
-		 * (causing a reload loop).
+		 * (causing a reload loop).  Run inside this transaction, not before it
+		 * starts, so the durable residency row for an index that will never
+		 * reload again (its catalog entry is gone) is actually retired rather
+		 * than silently skipped for lack of an open transaction.
 		 */
 		VamanaEvictCacheEntry(relid);
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
-		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+		vamana_active_load_relid = InvalidOid;
 
 		anyReload = true;
 	}
@@ -418,13 +438,21 @@ VamanaWorkerProcessReloads(void)
 
 /*
  * VACUUM FULL / CLUSTER replace the relfilenode without triggering any
- * extension AM callback.  This relcache callback catches those cases so
- * the BGW doesn't serve stale TIDs from the old heap.
+ * extension AM callback.  This relcache callback catches those cases so the
+ * BGW doesn't serve stale TIDs from the old heap.
+ *
+ * Invalidation callbacks can fire with no transaction open, so eviction
+ * itself -- which durably retires the index's residency record and needs
+ * one -- cannot happen here.  Queue it for the main loop's already
+ * transactional reload/evict-all handling instead, the same deferral every
+ * other reload trigger in this file already goes through.
  */
 static void
 VamanaRelcacheCallback(Datum arg, Oid relid)
 {
-	if (relid == InvalidOid || VamanaGetCache(relid) == NULL)
+	bool		wasCached = relid != InvalidOid && VamanaGetCache(relid) != NULL;
+
+	if (relid == InvalidOid || !wasCached)
 		standbyRediscoverPending = true;
 
 	/* Drain/checkpoint: suppress all evictions. */
@@ -436,9 +464,12 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 		return;
 
 	if (relid == InvalidOid)
-		VamanaEvictAllCacheEntries();
-	else
-		VamanaEvictCacheEntry(relid);
+	{
+		pg_atomic_write_u32(&VamanaWorkerShmemPtr->evict_all, 1);
+		SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	}
+	else if (wasCached)
+		VamanaWorkerSignalReload(relid);
 }
 
 /*
@@ -461,6 +492,55 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 							relid, vamana_max_slot_wal_size_mb)));
 			VamanaForceHeapRebuild(relid);
 		}
+	}
+}
+
+/* Minimum spacing between activation attempts for the same index's slot. */
+#define VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS	200
+
+/*
+ * Advance each cached index's slot toward snapshot consistency, one bounded
+ * WAL scan per pass, until VamanaReplicationSlotIsConsistent is true.  Primary
+ * only: a standby drives the same underlying call from
+ * VamanaStandbyActivateSlotBounded via VamanaReconcileStandbyCache instead.
+ *
+ * Consistency is not on any request's critical path today (a primary applies
+ * writes directly via IPC, never by decoding its own slot), so this is purely
+ * a best-effort head start on the serialized snapshot a future crash restart
+ * or standby bootstrap could use; stopping the per-index scan the moment
+ * VamanaReplicationSlotIsConsistent flips true keeps the cost bounded by the
+ * number of cached indexes rather than by how much WAL has accumulated.
+ *
+ * The main loop's own cadence cannot be trusted to space these out: a
+ * backlog of unrelated write requests keeps it from ever reaching its idle
+ * WaitLatch, so it can call this function thousands of times a second.
+ * VamanaReplicationActivateSlotBounded rescans from restart_lsn on every
+ * call regardless of prior progress, so doing that thousands of times a
+ * second is a spin even though no individual call blocks;
+ * nextSnapshotActivateAttempt caps each index's retry rate independently of
+ * how often this function itself gets called.
+ */
+static void
+VamanaWorkerActivatePendingSnapshots(void)
+{
+	Oid			dbOid = VamanaWorkerShmemPtr->dbOid;
+	List	   *relids = VamanaGetAllCachedRelids();
+	TimestampTz now = GetCurrentTimestamp();
+
+	foreach_oid(relid, relids)
+	{
+		VamanaIndexCache *cache = VamanaGetCache(relid);
+
+		if (cache == NULL || VamanaReplicationSlotIsConsistent(dbOid, relid))
+			continue;
+
+		if (cache->nextSnapshotActivateAttempt != 0 &&
+			cache->nextSnapshotActivateAttempt > now)
+			continue;
+
+		VamanaReplicationActivateSlotBounded(dbOid, relid);
+		cache->nextSnapshotActivateAttempt =
+			TimestampTzPlusMilliseconds(now, VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS);
 	}
 }
 
@@ -642,10 +722,16 @@ VamanaWorkerStopAccepting(void)
 static bool
 VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
 {
-	bool		succeeded;
+	/*
+	 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(), so
+	 * it must survive the longjmp back to the PG_TRY() setjmp point
+	 * (-Wclobbered).
+	 */
+	volatile bool succeeded;
 
 	PG_TRY();
 	{
+		INJECTION_POINT("vamana-checkpoint-cached-index-error", NULL);
 		succeeded = VamanaCheckpointCachedIndex(cache);
 	}
 	PG_CATCH();
@@ -1003,7 +1089,10 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		}
 
 		if (role->processes_write_ipc)
+		{
 			VamanaWorkerEnforceWalBudgetOnAllSlots();
+			VamanaWorkerActivatePendingSnapshots();
+		}
 		else
 			VamanaWorkerDrainAllSlots();
 
@@ -1728,13 +1817,15 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
  * VamanaWorkerSubmitInsert
  *
  * Backend-side: ask the worker to call SVSAddPoints for one vector.
- * On success, *externalId_out receives the allocated external ID.
+ * On success, *externalId_out receives the allocated external ID, and
+ * *slotCreated_out reports whether this call was the one that lazily created
+ * the index's replication slot (the first INSERT into an empty-table index).
  * Returns true on success, false on error (ereport(ERROR) in the latter case).
  */
 bool
 VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						 int dimensions, ItemPointer heap_tid,
-						 uint64 *externalId_out)
+						 uint64 *externalId_out, bool *slotCreated_out)
 {
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
@@ -1776,6 +1867,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 
 	pg_read_barrier();
 	*externalId_out = slot->writeExternalId;
+	*slotCreated_out = slot->writeSlotCreated;
 	return true;
 }
 

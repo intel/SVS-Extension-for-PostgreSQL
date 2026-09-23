@@ -2,37 +2,43 @@
 # SPDX-License-Identifier: PostgreSQL
 
 # 29_build_abort_cleanup.pl — PG_ENSURE_ERROR_CLEANUP unwind on a governed
-# build failure, at both ends of the guarded span.
+# build failure, at both ends of the guarded span, now that the span
+# actually holds accounting: reserve, confirm, and hand-off.
 #
 # VamanaBuildSVSIndexGoverned's callers (vamanabuild, VamanaRebuildFromTable)
 # wrap the call through their own worker hand-off point in
-# PG_ENSURE_ERROR_CLEANUP, whose abort-cleanup callback runs on that unwind.
-# Two injection points sit inside that span:
+# PG_ENSURE_ERROR_CLEANUP, whose abort-cleanup callback (SvsMemoryAbortBuild)
+# runs on that unwind. Three injection points sit inside that span:
 #
 #   - vamana-build-governed-pre-allocation, inside
 #     VamanaBuildSVSIndexGoverned, after the SVS algorithm/storage/builder
 #     triple is created and before the flatten allocation -- the start of
-#     the span, before SVSBuildDynamicIndex has run at all.
+#     the span, before the admission gate has reserved anything at all.
+#   - vamana-build-governed-pre-confirm, in each caller, immediately before
+#     SvsMemoryConfirmBuild -- after SVSBuildDynamicIndex has already
+#     succeeded, but before the reservation's estimate is reconciled to a
+#     measured size.
 #   - vamana-build-governed-pre-handoff, in each caller, immediately before
 #     the worker hand-off call (VamanaWorkerSubmitLoad in vamanabuild,
-#     VamanaCacheIndex in VamanaRebuildFromTable) -- the end of the span,
-#     after SVSBuildDynamicIndex has already succeeded.
+#     VamanaCacheIndex in VamanaRebuildFromTable) -- after confirm and
+#     hand-off have both already run.
 #
-# Both callers share both injection points, so attaching 'error' to either
-# forces the same PG_CATCH -> cleanup -> PG_RE_THROW unwind without needing
-# a real admission failure or a real build failure.  This file exercises
-# CREATE INDEX's span (vamanabuild); VamanaRebuildFromTable shares the same
-# two injection points and the same callback, so nothing distinguishes its
-# unwind from these.
+# Both callers share all three injection points, so attaching 'error' to any
+# of them forces the same PG_CATCH -> cleanup -> PG_RE_THROW unwind. This
+# file exercises CREATE INDEX's span (vamanabuild); VamanaRebuildFromTable
+# shares the same injection points and the same callback, so nothing
+# distinguishes its unwind from these.
 #
-# What this file does not claim: SvsBuildAbortCleanup is a no-op today
-# because VamanaBuildSVSIndexGoverned reserves nothing.  A real
-# SvsMemoryAbortBuild will need to tell "nothing built yet" (the
-# pre-allocation point) apart from "already built, not yet handed off"
-# (the pre-handoff point) -- for example, whether the in-process SVS index
-# handle itself needs freeing on that second path.  That distinction is the
-# real gate's job.  This file only proves the unwind mechanism itself fires
-# cleanly, with no crash and no stuck worker, at both points.
+# What pre_allocation actually proves: it fires before the gate has reserved
+# anything, so SvsMemoryAbortBuild finds no reservation for this relid and
+# is a safe no-op. What pre_confirm and pre_handoff prove is different: by
+# the time either fires, this build's estimate is already committed (and,
+# for pre_handoff, already reconciled to a measured size and hand off to
+# HANDOFF); the injected error still rolls the whole CREATE INDEX
+# transaction back (nothing was ever durably serialized), so
+# SvsMemoryAbortBuild must release real committed bytes, not merely find
+# nothing to do. Comparing committed totals before and after each case is
+# what actually tells them apart.
 
 use strict;
 use warnings FATAL => 'all';
@@ -54,6 +60,8 @@ $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
 $node->append_conf('postgresql.conf', "wal_level = logical");
 $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+$node->append_conf('postgresql.conf', "svs.max_residency_memory = '16000MB'");
+$node->append_conf('postgresql.conf', "svs.default_residency_memory = '16000MB'");
 $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION vector;");
@@ -65,11 +73,28 @@ $node->safe_psql('postgres',
 my $worker_pid = wait_for_worker($node);
 ok($worker_pid =~ /^\d+$/, 'worker is running before the build-abort tests');
 
+# committed_totals: this database's own (build_bytes_committed,
+# residency_bytes_committed) from the real, running worker's accounting.
+# Both must return to the same value across any build attempt, whether it
+# succeeds, fails before confirm, or fails after hand-off -- that round trip
+# is the whole point of the reservation lifecycle this file exercises.
+sub committed_totals
+{
+	my $row = $node->safe_psql('postgres', qq(
+		SELECT build_bytes_committed, residency_bytes_committed
+		FROM pg_stat_vamana_worker
+		WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+	));
+	chomp $row;
+	return split(/\|/, $row);
+}
+
 # ---------------------------------------------------------------------------
 # check_abort_at: attach 'error' to $injection_point, run CREATE INDEX on a
 # fresh table, confirm it fails with exactly that injected error and the
 # worker survives, detach, then confirm a retry succeeds cleanly with no
-# residue from the aborted build.
+# residue from the aborted build -- neither in pg_indexes nor in the
+# accounting counters this build touched.
 # ---------------------------------------------------------------------------
 sub check_abort_at
 {
@@ -83,6 +108,8 @@ sub check_abort_at
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200) i;
 	));
 
+	my @before = committed_totals();
+
 	$node->safe_psql('postgres',
 		"SELECT injection_points_attach('$injection_point', 'error');");
 
@@ -92,6 +119,11 @@ sub check_abort_at
 	like($stderr, qr/error triggered for injection point \Q$injection_point\E/,
 		"$label: the injected error is what CREATE INDEX reports")
 	  or diag("stderr: $stderr");
+
+	my @after = committed_totals();
+	is_deeply(\@after, \@before,
+		"$label: the injected failure leaves this database's build and residency "
+	  . "committed bytes exactly where they started");
 
 	my $live_pid = $node->safe_psql('postgres',
 		"SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
@@ -115,7 +147,153 @@ sub check_abort_at
 }
 
 check_abort_at('vamana-build-governed-pre-allocation', 'pre_allocation');
+check_abort_at('vamana-build-governed-pre-confirm', 'pre_confirm');
 check_abort_at('vamana-build-governed-pre-handoff', 'pre_handoff');
+
+# ---------------------------------------------------------------------------
+# Confirm rejection: a rebuild (REINDEX of an already-RESIDENT index) whose
+# measured size genuinely grows past what its reservation can still fit,
+# because something else claims the rest of the budget in between. This
+# window exists only for a rebuild: ReserveBuild folds a rebuild's own prior
+# measured bytes out of the fits check instead of pre-committing its new
+# estimate (see the comment on that branch in svs_memory.c), so nothing
+# pins down the room its eventual confirm will actually need. A fresh
+# build's estimate is pre-committed immediately at reserve time and always
+# upper-bounds its own eventual measured size, so the same construction
+# cannot be made to fail confirm for a fresh build -- confirmed by working
+# through the arithmetic, not by trying every combination by hand.
+#
+# The "something else" here is a second, real, ordinary CREATE INDEX,
+# built to completion while the rebuild is parked at pre-confirm: after it
+# settles, this database's residency budget is lowered to just above what
+# is now committed (legal for a rebuild's own reservation, whose prior
+# measured bytes are the only floor that matters while it is pending), and
+# only then is the parked rebuild woken -- so there is no race between the
+# rebuild's own confirm and the second build's, unlike attaching 'wait' to
+# both and hoping the parked one resumes first.
+# ---------------------------------------------------------------------------
+{
+	my $confirm_tbl = 'confirm_reject_tbl';
+	my $confirm_idx = 'confirm_reject_idx';
+	my $helper_tbl = 'confirm_reject_helper_tbl';
+	my $helper_idx = 'confirm_reject_helper_idx';
+	my $point = 'vamana-build-governed-pre-confirm';
+
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET residency_memory = 200 WHERE datname = 'postgres';");
+
+	$node->safe_psql('postgres', qq(
+		CREATE TABLE $confirm_tbl (id serial PRIMARY KEY, c1 vector($dim));
+		INSERT INTO $confirm_tbl (c1)
+			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000) i;
+		CREATE INDEX $confirm_idx ON $confirm_tbl USING vamana (c1 vector_l2_ops)
+			WITH (graph_degree = 16);
+	));
+
+	my $confirm_relid = $node->safe_psql('postgres', "SELECT '$confirm_idx'::regclass::oid;");
+	chomp $confirm_relid;
+
+	my $prior_resident_bytes = $node->safe_psql('postgres',
+		"SELECT resident_bytes FROM svs_index_residency WHERE index_relid = $confirm_relid;");
+	chomp $prior_resident_bytes;
+	cmp_ok($prior_resident_bytes, '>', 0,
+		'confirm_reject: the original degree=16 build reports a plausible resident size');
+
+	# A larger graph_degree does not itself trigger a rebuild; REINDEX below
+	# does, and rebuilds under the new option -- a materially denser graph
+	# over the same 5000 rows, so its measured size is not a coin flip
+	# against the original's.
+	$node->safe_psql('postgres', "ALTER INDEX $confirm_idx SET (graph_degree = 256);");
+
+	$node->safe_psql('postgres', "SELECT injection_points_attach('$point', 'wait');");
+
+	my $rebuild = $node->background_psql('postgres', on_error_stop => 0);
+	$rebuild->query_until(qr/reindex_started/, qq(
+		\\echo reindex_started
+		REINDEX INDEX $confirm_idx;
+	));
+	$node->wait_for_event('client backend', $point);
+
+	# Detaching does not disturb the rebuild session already asleep inside
+	# injection_wait(): only injection_points_wakeup() does that. It does
+	# mean the helper build below passes straight through this same
+	# injection point rather than parking behind the rebuild, so there is
+	# exactly one waiter left to wake.
+	$node->safe_psql('postgres', "SELECT injection_points_detach('$point');");
+
+	$node->safe_psql('postgres', qq(
+		CREATE TABLE $helper_tbl (id serial PRIMARY KEY, c1 vector(1536));
+		INSERT INTO $helper_tbl (c1)
+			SELECT ARRAY(SELECT random() FROM generate_series(1, 1536))::vector
+			FROM generate_series(1, 500) i;
+		CREATE INDEX $helper_idx ON $helper_tbl USING vamana (c1 vector_l2_ops);
+	));
+
+	my ($budget, $committed) = split(/\|/, $node->safe_psql('postgres', qq(
+		SELECT residency_memory_limit, residency_bytes_committed
+		FROM pg_stat_vamana_worker
+		WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+	)));
+	cmp_ok($committed, '<', $budget,
+		'confirm_reject: the helper build left this database under its residency budget');
+
+	# The tightest budget a rebuild's own reservation permits is whatever is
+	# already committed (its own prior measured bytes plus the helper's,
+	# neither foldable out for this relid); one extra megabyte of slack is
+	# comfortably below the megabytes-scale gap a degree=16 -> degree=256
+	# rebuild of 5000 rows should produce, and comfortably above whatever
+	# sub-megabyte rounding the residency_memory column's whole-MB unit
+	# forces.
+	my $tight_budget_mb = int(($committed + 1024 * 1024 - 1) / (1024 * 1024)) + 1;
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET residency_memory = $tight_budget_mb WHERE datname = 'postgres';");
+
+	$node->safe_psql('postgres', "SELECT injection_points_wakeup('$point');");
+
+	# The parked REINDEX is still mid-statement in this session; psql will
+	# not read the "SELECT 1" below until it finishes, so the REINDEX's own
+	# error text is still sitting in this session's stderr buffer by the
+	# time query() returns, ahead of "SELECT 1"'s own output.
+	my ($stdout, $ret) = $rebuild->query('SELECT 1');
+	my $reindex_stderr = $rebuild->{stderr};
+	like($stdout, qr/1/, 'confirm_reject: the rebuilding session stays usable after REINDEX fails')
+	  or diag("stdout: $stdout");
+	like($reindex_stderr, qr/cannot be confirmed.*residency budget/,
+		'confirm_reject: REINDEX fails with the confirm-rejection error, naming the residency budget')
+	  or diag("stderr: $reindex_stderr");
+	like($reindex_stderr, qr/Measured \d+ bytes/,
+		'confirm_reject: the error reports the exact measured bytes that did not fit')
+	  or diag("stderr: $reindex_stderr");
+	$rebuild->quit;
+
+	my $index_count = $node->safe_psql('postgres',
+		"SELECT count(*) FROM pg_indexes WHERE indexname = '$confirm_idx';");
+	chomp $index_count;
+	is($index_count, '1',
+		'confirm_reject: the original index still exists; a failed REINDEX does not drop it');
+
+	my $post_resident_bytes = $node->safe_psql('postgres',
+		"SELECT resident_bytes FROM svs_index_residency WHERE index_relid = $confirm_relid;");
+	chomp $post_resident_bytes;
+	is($post_resident_bytes, $prior_resident_bytes,
+		'confirm_reject: the durable residency record still shows the pre-rebuild '
+	  . 'measured size; a failed confirm never re-records it');
+
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET residency_memory = NULL WHERE datname = 'postgres';");
+
+	# Confirms the index is still genuinely queryable, not merely present in
+	# pg_indexes as a catalog artifact of a half-finished rebuild.
+	my $query_count = $node->safe_psql('postgres', qq(
+		SET enable_seqscan = off;
+		SELECT count(*) FROM (
+			SELECT id FROM $confirm_tbl ORDER BY c1 <-> '[$query_sql]' LIMIT 5
+		) sub;
+	));
+	chomp $query_count;
+	is($query_count, '5',
+		'confirm_reject: the original index still serves queries after the failed rebuild');
+}
 
 $node->stop;
 

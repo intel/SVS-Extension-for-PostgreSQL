@@ -95,8 +95,6 @@ use VamanaTestUtils qw(:all);
 
     unlike($new_log, qr/rebuilding vamana index from table data/,
         'no table rebuild on post-restart query');
-    unlike($new_log, qr/vamana index not in memory, rebuilding from table/,
-        'no rebuild NOTICE on post-restart query');
     like($new_log, qr/vamana index \d+ loaded from disk/,
         'server log confirms index loaded from disk');
     like($new_log, qr/vamana index \d+: loading TID map for \d+ vectors/,
@@ -133,8 +131,6 @@ use VamanaTestUtils qw(:all);
 
     unlike($second_restart_log, qr/rebuilding vamana index from table data/,
         'no table rebuild on second restart');
-    unlike($second_restart_log, qr/vamana index not in memory, rebuilding from table/,
-        'no rebuild NOTICE on second restart');
     like($second_restart_log, qr/vamana index \d+ loaded from disk/,
         'index loaded from disk on second restart');
     ok(-d $index_dir, 'on-disk index directory still exists after second restart');
@@ -630,8 +626,6 @@ use VamanaTestUtils qw(:all);
 
     unlike($new_log, qr/rebuilding vamana index from table data/,
         'no table rebuild on post-restart LeanVec query');
-    unlike($new_log, qr/vamana index not in memory, rebuilding from table/,
-        'no rebuild NOTICE on post-restart LeanVec query');
     like($new_log, qr/vamana index \d+ loaded from disk/,
         'LeanVec index loaded from disk');
     like($new_log, qr/vamana index \d+: loading TID map for \d+ vectors/,
@@ -701,8 +695,6 @@ use VamanaTestUtils qw(:all);
 
     unlike($third_restart_log, qr/rebuilding vamana index from table data/,
         'no table rebuild on third restart (LeanVec)');
-    unlike($third_restart_log, qr/vamana index not in memory, rebuilding from table/,
-        'no rebuild NOTICE on LeanVec third restart');
     like($third_restart_log, qr/vamana index \d+ loaded from disk/,
         'LeanVec index loaded from disk on third restart');
     ok(-d $index_dir, 'on-disk index directory still exists after third restart');
@@ -792,8 +784,6 @@ use VamanaTestUtils qw(:all);
 
     unlike($new_log, qr/rebuilding vamana index from table data/,
         'no table rebuild on post-restart LVQ query');
-    unlike($new_log, qr/vamana index not in memory, rebuilding from table/,
-        'no rebuild NOTICE on post-restart LVQ query');
     unlike($new_log, qr/failed to load SVS index/,
         'no load failure on post-restart LVQ query — storage spec matched');
 

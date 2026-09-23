@@ -809,3 +809,143 @@ SELECT residency_bytes_committed = (6 * 1024) AS committed_untouched_by_rejected
 SELECT * FROM svs_memory_test_check_invariants();
 SELECT svs_memory_account_unload(605, 1);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- AllocateReservation's exhaustion message names its caller and, on a full
+-- table, whether in-progress builds or resident indexes hold every slot.
+-- A load hitting the limit must not read like a build's own failure.
+
+-- Load-context, at capacity: every slot is a resident index, not a build.
+SELECT svs_memory_admit_database(700, 4096::bigint);
+DO $$
+BEGIN
+	FOR i IN 1..64 LOOP
+		PERFORM svs_memory_reconcile_load(700, i, 1::bigint);
+	END LOOP;
+END $$;
+SELECT svs_memory_reconcile_load(700, 65, 1::bigint);
+SELECT count(*) = 64 AS all_64_slots_still_tracked FROM svs_memory_test_reservations(700);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Load-context, blocked by builds: every slot is a not-yet-resident build
+-- reservation, none of them this load's.
+SELECT svs_memory_admit_database(701, 4096::bigint);
+DO $$
+BEGIN
+	FOR i IN 1..64 LOOP
+		PERFORM svs_memory_reserve_build(701, i, 0::bigint, 1::bigint);
+	END LOOP;
+END $$;
+SELECT svs_memory_reconcile_load(701, 65, 1::bigint);
+SELECT count(*) = 64 AS all_64_slots_still_tracked FROM svs_memory_test_reservations(701);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Build-context, at capacity: the mirror image of the load case, so the
+-- build message (not the load message) is the one that names the limit.
+SELECT svs_memory_admit_database(702, 4096::bigint);
+DO $$
+BEGIN
+	FOR i IN 1..64 LOOP
+		PERFORM svs_memory_reconcile_load(702, i, 1::bigint);
+	END LOOP;
+END $$;
+SELECT svs_memory_reserve_build(702, 65, 0::bigint, 1::bigint);
+SELECT count(*) = 64 AS all_64_slots_still_tracked FROM svs_memory_test_reservations(702);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Build-context, blocked by builds, with all three non-resident states
+-- represented: a REBUILDING record must not be double-counted as blocking,
+-- since it never came through AllocateReservation and never frees its slot
+-- by finishing either way, but RESERVED/CONFIRMED/HANDOFF all do count.
+SELECT svs_memory_admit_database(703, 4096::bigint);
+DO $$
+BEGIN
+	FOR i IN 1..61 LOOP
+		PERFORM svs_memory_reconcile_load(703, i, 1::bigint);
+	END LOOP;
+END $$;
+SELECT svs_memory_reserve_build(703, 62, 0::bigint, 1::bigint);
+SELECT svs_memory_confirm_build(703, 62, 0::bigint, 1::bigint);
+SELECT svs_memory_handoff_build(703, 62);
+SELECT svs_memory_reserve_build(703, 63, 0::bigint, 1::bigint);
+SELECT svs_memory_confirm_build(703, 63, 0::bigint, 1::bigint);
+SELECT svs_memory_reserve_build(703, 64, 0::bigint, 1::bigint);
+SELECT count(*) = 64 AS all_64_slots_tracked_before_the_probe
+  FROM svs_memory_test_reservations(703);
+SELECT svs_memory_reserve_build(703, 65, 0::bigint, 1::bigint);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- REBUILDING is steady-state occupancy, not a build in progress: it reuses
+-- an already-RESIDENT slot in place (ReserveBuild never calls
+-- AllocateReservation for a rebuild), and finishing -- confirm or abort --
+-- leaves that same slot occupied either way. A table full of RESIDENT and
+-- REBUILDING records alone must read as "at capacity", not "blocked".
+SELECT svs_memory_admit_database(704, 4096::bigint);
+DO $$
+BEGIN
+	FOR i IN 1..63 LOOP
+		PERFORM svs_memory_reconcile_load(704, i, 1::bigint);
+	END LOOP;
+END $$;
+SELECT svs_memory_reserve_build(704, 63, 0::bigint, 1::bigint) AS starts_a_rebuild;
+SELECT state FROM svs_memory_test_reservations(704) WHERE relid = 63;
+SELECT svs_memory_reconcile_load(704, 64, 1::bigint);
+SELECT count(*) = 64 AS all_64_slots_tracked_before_the_probe
+  FROM svs_memory_test_reservations(704);
+SELECT svs_memory_reserve_build(704, 65, 0::bigint, 1::bigint);
+SELECT svs_memory_reconcile_load(704, 66, 1::bigint);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- RequireAdmitted's discriminator: dbOid is not the launcher database (the
+-- ordinary shape for most databases, and also the wrong-enrolment-database
+-- footgun's only observable symptom, since that footgun's own admission
+-- always succeeds and never reaches this check -- see the report). A
+-- non-existent dbOid, which get_database_name resolves to NULL, always
+-- takes this branch regardless of svs.launcher_database's value.
+SELECT svs_memory_reserve_build(705, 1, 0::bigint, 100::bigint);
+
+-- RequireAdmitted's other branch: dbOid names the current
+-- svs.launcher_database exactly, the ordinary shape for a genuinely
+-- transient admission race. The numeric dbOid is redacted below, and the
+-- probe is built through format()/\gexec-style substitution rather than a
+-- literal :variable inside the DO body, since psql does not interpolate
+-- variables inside a dollar-quoted block -- a real database's OID is not
+-- stable across clusters either way, hence the redaction.
+SELECT current_database() AS curdb \gset
+SELECT oid AS curdb_oid FROM pg_database WHERE datname = :'curdb' \gset
+SELECT format('DO $do$
+DECLARE
+    message text;
+    detail text;
+    hint text;
+BEGIN
+    BEGIN
+        PERFORM svs_memory_reserve_build(%s, 1, 0::bigint, 100::bigint);
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL, hint = PG_EXCEPTION_HINT;
+        RAISE NOTICE ''message: %%'', regexp_replace(message, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''detail: %%'', regexp_replace(detail, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''hint: %%'', regexp_replace(hint, ''[0-9]+'', ''<oid>'', ''g'');
+    END;
+END
+$do$;', :curdb_oid) AS not_launcher_probe \gset
+:not_launcher_probe
+SELECT svs_memory_test_set_launcher_database(:'curdb');
+SELECT format('DO $do$
+DECLARE
+    message text;
+    detail text;
+    hint text;
+BEGIN
+    BEGIN
+        PERFORM svs_memory_reserve_build(%s, 2, 0::bigint, 100::bigint);
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS message = MESSAGE_TEXT, detail = PG_EXCEPTION_DETAIL, hint = PG_EXCEPTION_HINT;
+        RAISE NOTICE ''message: %%'', regexp_replace(message, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''detail: %%'', regexp_replace(detail, ''[0-9]+'', ''<oid>'', ''g'');
+        RAISE NOTICE ''hint: %%'', regexp_replace(hint, ''[0-9]+'', ''<oid>'', ''g'');
+    END;
+END
+$do$;', :curdb_oid) AS is_launcher_probe \gset
+:is_launcher_probe
+SELECT svs_memory_test_set_launcher_database('postgres');
+SELECT * FROM svs_memory_test_check_invariants();

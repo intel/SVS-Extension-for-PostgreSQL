@@ -292,7 +292,8 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
 	/* Seed vector is already indexed by the build; no external ID to return. */
 	slot->writeExternalId = 0;
 
-	if (cache->replicationSlot == NULL)
+	slot->writeSlotCreated = (cache->replicationSlot == NULL);
+	if (slot->writeSlotCreated)
 	{
 		VamanaReplicationCreate(VamanaWorkerShmemPtr->dbOid, relid);
 		cache->replicationSlot = VamanaReplicationOpen(
@@ -426,6 +427,7 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				cache->numVectors++;
 				/* Return the allocated external ID to the backend. */
 				slot->writeExternalId = (uint64) externalId;
+				slot->writeSlotCreated = false;
 
 				VamanaWorkerPersistMetaCounters(relid, cache);
 
@@ -663,6 +665,8 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		 */
 		vamana_active_load_relid = relid;
 
+		INJECTION_POINT("vamana-load-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -771,29 +775,16 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 	/*
 	 * SLOT_DONE is now visible to the backend, which is free to commit the
-	 * CREATE INDEX transaction.  Build the initial consistent snapshot here —
-	 * the only window where DecodingContextFindStartpoint sees no user inserts
-	 * yet, so start_decoding_at is anchored before any post-index writes.
-	 * A failure is non-fatal: crash recovery falls back to a full WAL rescan.
+	 * CREATE INDEX transaction.  The initial consistent snapshot is not built
+	 * here: DecodingContextFindStartpoint can block on an unrelated backend's
+	 * open transaction for as long as that transaction runs, which would
+	 * monopolize this worker's single dispatch loop for every other database
+	 * client.  The main loop's VamanaWorkerActivatePendingSnapshots reaches
+	 * the same consistent point with a bounded, resumable scan instead; a
+	 * snapshot that never completes is non-fatal, same as an outright
+	 * BuildSnapshot failure always was: crash recovery falls back to a full
+	 * WAL rescan from restart_lsn.
 	 */
-	ereport(DEBUG1,
-			(errmsg("vamana: entering BuildSnapshot for index %u", relid)));
-	PG_TRY();
-	{
-		VamanaReplicationBuildSnapshot(VamanaWorkerShmemPtr->dbOid, relid);
-	}
-	PG_CATCH();
-	{
-		if (ProcDiePending)
-			PG_RE_THROW();
-		FlushErrorState();
-		ereport(LOG,
-				(errmsg("vamana: snapshot build failed for index %u; "
-						"crash recovery will rescan from restart_lsn", relid)));
-	}
-	PG_END_TRY();
-	ereport(DEBUG1,
-			(errmsg("vamana: exited BuildSnapshot for index %u", relid)));
 }
 
 /*
@@ -803,10 +794,11 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
  * VamanaWorkerGetOrLoadIndex, so a hot index is a no-op via its fast path.
  *
  * Unlike ProcessLoadSlot, GetOrLoadIndex opens the index relation and reads
- * the catalog, so it must run inside a transaction.  Eviction is suppressed
- * across the load for the same reason the reload path does it: a relcache
- * invalidation fired during StartTransactionCommand must not evict the entry
- * mid-load.  Must not throw: all errors become VAMANA_SLOT_ERROR.
+ * the catalog, so it must run inside a transaction.  The guard must bracket
+ * the whole transaction, not just the load call: a relcache invalidation for
+ * an unrelated cached index can be delivered as soon as StartTransactionCommand
+ * runs, before GetOrLoadIndex is even reached.  Must not throw: all errors
+ * become VAMANA_SLOT_ERROR.
  */
 void
 VamanaWorkerProcessWarmupSlot(int slotIdx)
@@ -817,16 +809,19 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 
 	PG_TRY();
 	{
+		vamana_active_load_relid = relid;
+
+		INJECTION_POINT("vamana-warmup-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, true);
-		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+		vamana_active_load_relid = InvalidOid;
 
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
