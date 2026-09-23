@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 32_snapshot_off_dispatch.pl - an unrelated open transaction must not tie up
+# 30_snapshot_off_dispatch.pl - an unrelated open transaction must not tie up
 # the worker's single dispatch loop after CREATE INDEX.
 #
 # VamanaWorkerProcessLoadSlot used to call VamanaReplicationBuildSnapshot
