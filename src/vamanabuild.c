@@ -33,6 +33,7 @@
 #include "common/int.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -426,17 +427,11 @@ typedef struct VamanaSVSIndexParams
 #define VAMANA_BUILD_MEMORY_MARGIN_DIVISOR 6
 
 /*
- * Per-backend baseline: PostgreSQL backend startup, SVS and MKL library
- * loading, and session overhead. None of the other terms in the build-peak
- * estimate has a fixed component, so none of them can represent this one.
- * Scales with vector dimensionality; independent of compression_type,
- * measured as near-identical across compression types at every dimension
- * tested. Measured at exactly the three dimensions below; see
+ * Per-backend baseline: PostgreSQL/SVS/MKL startup and session overhead,
+ * the only fixed-cost term in the build-peak estimate. Scales with vector
+ * dimensionality, not compression_type. From a 54-configuration
+ * calibration sweep, measured at exactly the three dimensions below; see
  * SvsDimBaselineBytes for how an unmeasured dimension is charged.
- *
- * Source: 54-configuration calibration sweep,
- * ~/workspace/pgv-svs-dev-scripts/docs/memory-trackb-b0c-formula-modelling/report.md,
- * section 4.
  */
 static const struct { int dims; double baseline_mb; } SvsDimBaselineTable[] = {
 	{ 128,  50.97 },
@@ -446,14 +441,11 @@ static const struct { int dims; double baseline_mb; } SvsDimBaselineTable[] = {
 
 /*
  * Dimension-dependent adjustment to rawBuffer, shared by every
- * compression_type. Positive at 128 dimensions, where 128*4 bytes lands
- * exactly on an allocator size class and leaves the smallest headroom of any
- * dimension measured; the fitted values at 768 and 1536 are negative
- * (physical RSS undershooting bytes requested, an artifact of this host's
- * kernel and overcommit behavior) and are clamped to zero here, since
- * applying a negative correction would convert today's safe margin into a
- * future under-prediction on a host with different overcommit behavior.
- * Same source and caveat as SvsDimBaselineTable above.
+ * compression_type. Positive at 128 (128*4 bytes lands exactly on an
+ * allocator size class, the tightest margin measured); the fitted values
+ * at 768/1536 are negative (this host's overcommit behavior, not a
+ * general property) and clamped to zero so they can only add margin, never
+ * remove it. Same source as SvsDimBaselineTable above.
  */
 static const struct { int dims; double raw_multiplier; } SvsDimAdjustmentTable[] = {
 	{ 128,  0.80 },
@@ -462,15 +454,13 @@ static const struct { int dims; double raw_multiplier; } SvsDimAdjustmentTable[]
 };
 
 /*
- * LeanVec-specific extra term, additive on top of SvsDimAdjustmentTable,
- * applied only when compression_type is VAMANA_COMPRESSION_LEANVEC. SVS
- * needs a full-precision working copy of the input to derive LeanVec's
- * reduced-dimension primary representation; this is that copy's cost,
- * expressed as a multiple of rawBuffer. The dim=128 value is the least
- * trusted entry in this table: LeanVec's footprint at 128 dimensions does
- * not respond to leanvec_dims or compression_primary in this SVS build, so
- * that number describes a fixed library fallback rather than a controlled
- * trade-off. Same source as SvsDimBaselineTable above.
+ * LeanVec's extra full-precision working copy of the input, needed to
+ * derive its reduced-dimension representation, as a multiple of
+ * rawBuffer. Applied only when compression_type is
+ * VAMANA_COMPRESSION_LEANVEC. The dim=128 value is the least trusted:
+ * LeanVec's footprint there ignores leanvec_dims and compression_primary
+ * in this SVS build, so it reflects a fixed library fallback, not a
+ * tuned trade-off. Same source as SvsDimBaselineTable above.
  */
 static const struct { int dims; double raw_multiplier; } SvsLeanVecExtraTable[] = {
 	{ 128,  0.77 },
@@ -804,7 +794,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	IndexBuildResult *result;
 	VamanaBuildState buildstate;
-	SVSIndexHandle svsIndex = NULL;
+	SVSIndexHandle volatile svsIndex = NULL;
 	int			error_code;
 	Oid			relid = RelationGetRelid(index);
 	uint64		buildPeak = 0;
@@ -914,20 +904,39 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		 * SvsBuildAbortCleanup finds nothing left for relid and is a
 		 * no-op; freeing svsIndex here is this function's own job, since
 		 * ConfirmBuild's contract is about accounting only, not about the
-		 * native handle.
+		 * native handle. ConfirmBuild can also ereport(ERROR) itself
+		 * (no pending reservation, or one a concurrent ReconcileLoad
+		 * already claimed to RESIDENT ahead of this call), which never
+		 * reaches the fits-check below; svsIndex must be freed on that
+		 * path too, not just on a plain false return.
 		 */
-		measured = SVSGetIndexMemoryUsage(svsIndex);
-
-		INJECTION_POINT("vamana-build-governed-pre-confirm", NULL);
-
-		if (!SvsMemoryConfirmBuild(MyDatabaseId, relid, buildPeak, measured))
 		{
-			SVSFreeIndex(svsIndex);
-			ereport(ERROR,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("build of index %u cannot be confirmed: exceeds this database's residency budget",
-							relid),
-					 errdetail("Measured %llu bytes.", (unsigned long long) measured)));
+			bool	confirmed;
+
+			measured = SVSGetIndexMemoryUsage(svsIndex);
+
+			INJECTION_POINT("vamana-build-governed-pre-confirm", NULL);
+
+			PG_TRY(Confirm);
+			{
+				confirmed = SvsMemoryConfirmBuild(MyDatabaseId, relid, buildPeak, measured);
+			}
+			PG_CATCH(Confirm);
+			{
+				SVSFreeIndex(svsIndex);
+				PG_RE_THROW();
+			}
+			PG_END_TRY(Confirm);
+
+			if (!confirmed)
+			{
+				SVSFreeIndex(svsIndex);
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("build of index %u cannot be confirmed: exceeds this database's residency budget",
+								relid),
+						 errdetail("Measured %llu bytes.", (unsigned long long) measured)));
+			}
 		}
 
 		/* Serialize index to disk so the BGW can adopt it. */
@@ -1007,18 +1016,14 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		}
 
 		/*
-		 * Recorded here, after the warm-up attempt above rather than
-		 * alongside the confirm it reports, because
-		 * SvsIndexResidencyRecordLoad takes a row lock on vamana_databases
-		 * that it holds until this transaction ends. Taking it before
-		 * VamanaWorkerSubmitLoad self-deadlocks: this backend would wait on
-		 * the worker while still holding the very lock the worker's own
-		 * VamanaCacheIndex needs to finish that same load, and neither
-		 * side's wait is visible to the other as a heavyweight lock wait,
-		 * so Postgres's own deadlock detector never sees it. Recording
-		 * after the warm-up attempt (success, failure, or the worker not
-		 * yet being available) still guarantees a durable record in this
-		 * transaction regardless of whether the worker ever loads it.
+		 * Recorded after the warm-up attempt, not alongside the confirm it
+		 * reports: SvsIndexResidencyRecordLoad holds a row lock on
+		 * vamana_databases until this transaction ends, and taking it
+		 * before VamanaWorkerSubmitLoad self-deadlocks against
+		 * VamanaCacheIndex needing that same lock to finish the load this
+		 * backend is waiting on. Recording afterward still guarantees a
+		 * durable record in this transaction regardless of whether the
+		 * worker ever loads the index.
 		 */
 		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measured);
 	}
@@ -1079,7 +1084,7 @@ VamanaRebuildFromTable(Relation index)
 	TableScanDesc heapScan;
 	HeapTuple	tuple;
 	TupleDesc	tupdesc;
-	SVSIndexHandle svsIndex;
+	SVSIndexHandle volatile svsIndex;
 	VamanaOptions *opts;
 	int			dimensions;
 	int			graph_degree;
@@ -1316,14 +1321,28 @@ VamanaRebuildFromTable(Relation index)
 		 * RESERVED reservation just as well as a HANDOFF one. It still
 		 * runs, to keep one state machine for every build path and to fail
 		 * on this rebuild's measured bytes before caching rather than
-		 * inside it.
+		 * inside it. ConfirmBuild can also ereport(ERROR) itself (see
+		 * vamanabuild()'s own confirm for why); svsIndex must be freed on
+		 * that path too, not just on a plain false return.
 		 */
 		{
 			uint64		measured = SVSGetIndexMemoryUsage(svsIndex);
+			bool		confirmed;
 
 			INJECTION_POINT("vamana-build-governed-pre-confirm", NULL);
 
-			if (!SvsMemoryConfirmBuild(MyDatabaseId, relid, buildPeak, measured))
+			PG_TRY(Confirm);
+			{
+				confirmed = SvsMemoryConfirmBuild(MyDatabaseId, relid, buildPeak, measured);
+			}
+			PG_CATCH(Confirm);
+			{
+				SVSFreeIndex(svsIndex);
+				PG_RE_THROW();
+			}
+			PG_END_TRY(Confirm);
+
+			if (!confirmed)
 			{
 				SVSFreeIndex(svsIndex);
 				ereport(ERROR,
