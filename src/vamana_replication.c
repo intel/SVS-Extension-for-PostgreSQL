@@ -1350,7 +1350,7 @@ VamanaReplicationQueueDropAtCommit(Oid dboid, Oid indexRelid)
  * only escalates to a WARNING once the hand-off itself has no taker.
  */
 static void
-VamanaRetireIndexArtifacts(Oid dbOid, Oid indexRelid)
+VamanaRetireIndexArtifacts(Oid dbOid, Oid indexRelid, const char *reason)
 {
 	char		slotName[NAMEDATALEN];
 
@@ -1365,8 +1365,8 @@ VamanaRetireIndexArtifacts(Oid dbOid, Oid indexRelid)
 
 	SlotName(dbOid, indexRelid, slotName);
 	ereport(WARNING,
-			(errmsg("vamana: could not drop replication slot \"%s\" for index %u",
-					slotName, indexRelid),
+			(errmsg("vamana: could not drop replication slot \"%s\" for %s %u",
+					slotName, reason, indexRelid),
 			 errdetail("Another process holds the slot, and the drop could not be handed to this database's vamana worker; the slot now has no index and will retain WAL."),
 			 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
 }
@@ -1387,7 +1387,7 @@ ApplyPendingSlotDrops(void)
 		if (entry->subxid == InvalidSubTransactionId)
 			continue;
 
-		VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid);
+		VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid, "dropped index");
 	}
 }
 
@@ -1539,7 +1539,7 @@ ApplyPendingBuildRetires(void)
 		if (entry->subxid == InvalidSubTransactionId)
 			continue;
 
-		VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid);
+		VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid, "aborted index build");
 	}
 }
 
@@ -1584,14 +1584,16 @@ VamanaBuildRetireXactCallback(XactEvent event, void *arg)
 }
 
 /*
- * Unlike a queued DROP INDEX (undone by discarding the entry, since the drop
- * itself is undone), a ROLLBACK TO SAVEPOINT here does not undo anything:
- * the build already handed a durable slot and cache entry to the worker
- * before the savepoint aborted, and no later event in this transaction --
- * not even its own eventual COMMIT -- retires them if this one doesn't. The
- * subtransaction's own abort is the retirement trigger.  A released
- * savepoint's entry is reparented so an ancestor's later abort still finds
- * and retires it.
+ * Despite the parallel name, this does the opposite of
+ * VamanaSlotDropSubXactCallback on SUBXACT_EVENT_ABORT_SUB: that one discards
+ * its entry, because a queued DROP INDEX is undone when the savepoint that
+ * queued it aborts. This one retires instead, because a ROLLBACK TO SAVEPOINT
+ * here does not undo anything -- the build already handed a durable slot and
+ * cache entry to the worker before the savepoint aborted, and no later event
+ * in this transaction, not even its own eventual COMMIT, retires them if this
+ * one doesn't. The subtransaction's own abort is the retirement trigger. A
+ * released savepoint's entry is reparented so an ancestor's later abort still
+ * finds and retires it.
  */
 static void
 VamanaBuildRetireSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
@@ -1609,7 +1611,7 @@ VamanaBuildRetireSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 			PendingBuildRetire *entry = VamanaSubxidPendingArrayEntryAt(list, i);
 
 			if (entry->subxid == mySubid)
-				VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid);
+				VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid, "aborted index build");
 		}
 
 		VamanaSubxidPendingArrayPruneAbortedSubxact(list, mySubid);
