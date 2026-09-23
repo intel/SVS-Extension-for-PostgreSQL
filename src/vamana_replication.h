@@ -126,6 +126,15 @@ VamanaSlotDropResult VamanaReplicationDropIfExists(Oid dboid, Oid indexRelid);
  */
 void	VamanaReplicationQueueDropAtCommit(Oid dboid, Oid indexRelid);
 
+/*
+ * Backend: retire the index's slot and cache entry if this transaction
+ * aborts.  A build hands its index to the worker mid-transaction, which
+ * creates the slot durably right then; call this immediately after that
+ * hand-off so a later abort (of the CREATE INDEX, REINDEX, or first INSERT
+ * that triggered the build) does not leave the slot behind.
+ */
+void	VamanaReplicationQueueRetireOnAbort(Oid dboid, Oid indexRelid);
+
 /* Output plugin entry point — required by logical decoding infrastructure. */
 extern void _PG_output_plugin_init(OutputPluginCallbacks *cb);
 

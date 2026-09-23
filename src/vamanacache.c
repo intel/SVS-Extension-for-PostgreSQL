@@ -83,6 +83,9 @@ VamanaFreeCacheEntryResources(VamanaIndexCache *entry)
 {
 	/* Every cached entry has a reservation, even the empty-table 0-byte case (VamanaCacheIndex). */
 	SvsMemoryAccountUnload(MyDatabaseId, entry->indexRelid);
+
+	/* Caller owns a transaction; SvsIndexResidencyRecordUnload silently no-ops without one. */
+	Assert(IsTransactionState());
 	SvsIndexResidencyRecordUnload(entry->indexRelid);
 
 	if (entry->svsIndex)

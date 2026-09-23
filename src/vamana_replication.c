@@ -1338,6 +1338,39 @@ VamanaReplicationQueueDropAtCommit(Oid dboid, Oid indexRelid)
  * with no shmem entry has no worker to hand it to, and no worker means nobody
  * could have been holding the slot, so BUSY there is a genuine anomaly.
  */
+/*
+ * Retire a relid's worker-side artifacts: its in-memory cache entry and its
+ * replication slot.  Used both when a DROP INDEX commits and when a build
+ * that created them never does.
+ *
+ * Signalling the BGW to evict its cache entry causes
+ * VamanaWorkerProcessReloads to reload from the (now-absent) save
+ * directory/catalog and fail cleanly.  The slot drop can lose the race to
+ * whichever process holds the slot; that case is hand-off, not error, and
+ * only escalates to a WARNING once the hand-off itself has no taker.
+ */
+static void
+VamanaRetireIndexArtifacts(Oid dbOid, Oid indexRelid)
+{
+	char		slotName[NAMEDATALEN];
+
+	if (!AmBackgroundWorkerProcess() && VamanaWorkerIsAvailable())
+		VamanaWorkerSignalReload(indexRelid);
+
+	if (VamanaReplicationDropIfExists(dbOid, indexRelid) != VAMANA_SLOT_DROP_BUSY)
+		return;
+
+	if (VamanaWorkerRequestSlotDrop(dbOid, indexRelid))
+		return;
+
+	SlotName(dbOid, indexRelid, slotName);
+	ereport(WARNING,
+			(errmsg("vamana: could not drop replication slot \"%s\" for index %u",
+					slotName, indexRelid),
+			 errdetail("Another process holds the slot, and the drop could not be handed to this database's vamana worker; the slot now has no index and will retain WAL."),
+			 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+}
+
 static void
 ApplyPendingSlotDrops(void)
 {
@@ -1349,36 +1382,12 @@ ApplyPendingSlotDrops(void)
 	for (int i = 0; i < list->count; i++)
 	{
 		PendingSlotDrop *entry = VamanaSubxidPendingArrayEntryAt(list, i);
-		char		slotName[NAMEDATALEN];
 
 		/* Queued by a subtransaction that rolled back. */
 		if (entry->subxid == InvalidSubTransactionId)
 			continue;
 
-		/*
-		 * Signal the BGW to evict its in-memory cache entry for the dropped
-		 * index.  The RELOAD request causes VamanaWorkerProcessReloads to
-		 * evict the slot; the subsequent reload attempt fails cleanly because
-		 * the save directory and the catalog entry are both gone.  This call
-		 * runs after commit so the BGW does not race the still-in-progress
-		 * DROP when it opens the transaction for the reload.
-		 */
-		if (!AmBackgroundWorkerProcess() && VamanaWorkerIsAvailable())
-			VamanaWorkerSignalReload(entry->indexRelid);
-
-		if (VamanaReplicationDropIfExists(entry->dbOid,
-										  entry->indexRelid) != VAMANA_SLOT_DROP_BUSY)
-			continue;
-
-		if (VamanaWorkerRequestSlotDrop(entry->dbOid, entry->indexRelid))
-			continue;
-
-		SlotName(entry->dbOid, entry->indexRelid, slotName);
-		ereport(WARNING,
-				(errmsg("vamana: could not drop replication slot \"%s\" for dropped index %u",
-						slotName, entry->indexRelid),
-				 errdetail("Another process holds the slot, and the drop could not be handed to this database's vamana worker; the slot now has no index and will retain WAL."),
-				 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+		VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid);
 	}
 }
 
@@ -1440,4 +1449,171 @@ VamanaSlotDropSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
 	else if (event == SUBXACT_EVENT_COMMIT_SUB)
 		VamanaSubxidPendingArrayReparentSubxact(CurrentSlotDrops, mySubid,
 											   parentSubid);
+}
+
+/* -----------------------------------------------------------------------
+ * Slot-and-cache retirement on an aborted build (commit-discarded)
+ *
+ * VamanaReplicationCreate and the residency row it accompanies are written by
+ * the BGW in its own transaction, or with no transaction open at all, so they
+ * are already durable the instant a build hands its index to the worker --
+ * independent of whether the backend's own transaction (CREATE INDEX,
+ * REINDEX, or the first INSERT into an empty-table index) goes on to commit.
+ * The caller queues the relid here right after that hand-off; retirement
+ * runs only if the transaction then aborts, using the same
+ * VamanaRetireIndexArtifacts as a genuine DROP INDEX.
+ * ----------------------------------------------------------------------- */
+
+#define VAMANA_BUILD_RETIRE_QUEUE_INITIAL_CAPACITY	16
+
+typedef struct PendingBuildRetire
+{
+	Oid			dbOid;
+	Oid			indexRelid;
+	SubTransactionId subxid;
+}			PendingBuildRetire;
+
+static VamanaSubxidPendingArray * CurrentBuildRetires = NULL;
+
+static bool buildRetireCallbacksRegistered = false;
+
+static void VamanaBuildRetireXactCallback(XactEvent event, void *arg);
+static void VamanaBuildRetireSubXactCallback(SubXactEvent event,
+											  SubTransactionId mySubid,
+											  SubTransactionId parentSubid,
+											  void *arg);
+
+static VamanaSubxidPendingArray *
+GetOrCreateBuildRetires(void)
+{
+	if (CurrentBuildRetires == NULL)
+		CurrentBuildRetires =
+			VamanaSubxidPendingArrayCreate(TopTransactionContext,
+										   sizeof(PendingBuildRetire),
+										   offsetof(PendingBuildRetire, subxid),
+										   VAMANA_BUILD_RETIRE_QUEUE_INITIAL_CAPACITY);
+	return CurrentBuildRetires;
+}
+
+static void
+EnsureBuildRetireCallbacksRegistered(void)
+{
+	if (!buildRetireCallbacksRegistered)
+	{
+		RegisterXactCallback(VamanaBuildRetireXactCallback, NULL);
+		RegisterSubXactCallback(VamanaBuildRetireSubXactCallback, NULL);
+		buildRetireCallbacksRegistered = true;
+	}
+}
+
+void
+VamanaReplicationQueueRetireOnAbort(Oid dbOid, Oid indexRelid)
+{
+	PendingBuildRetire *entry;
+
+	EnsureBuildRetireCallbacksRegistered();
+	entry = VamanaSubxidPendingArrayAppend(GetOrCreateBuildRetires());
+	entry->dbOid = dbOid;
+	entry->indexRelid = indexRelid;
+}
+
+/*
+ * Retire every relid queued by this transaction's build(s).  Runs on abort,
+ * so unlike ApplyPendingSlotDrops nothing here needs to worry about racing a
+ * still-in-progress commit: the transaction that created these artifacts is
+ * gone.
+ */
+static void
+ApplyPendingBuildRetires(void)
+{
+	VamanaSubxidPendingArray *list = CurrentBuildRetires;
+
+	if (list == NULL)
+		return;
+
+	for (int i = 0; i < list->count; i++)
+	{
+		PendingBuildRetire *entry = VamanaSubxidPendingArrayEntryAt(list, i);
+
+		/* Queued by a subtransaction that itself rolled back. */
+		if (entry->subxid == InvalidSubTransactionId)
+			continue;
+
+		VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid);
+	}
+}
+
+static void
+VamanaBuildRetireXactCallback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			CurrentBuildRetires = NULL;
+			break;
+
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			ApplyPendingBuildRetires();
+			CurrentBuildRetires = NULL;
+			break;
+
+		/*
+		 * Refused here, not at XACT_EVENT_PREPARE: COMMIT PREPARED and
+		 * ROLLBACK PREPARED run in a different backend, which shares none of
+		 * this queue's state and fires none of these callbacks -- a prepared
+		 * build that was later rolled back would leak its slot with no event
+		 * left to ever catch it.
+		 */
+		case XACT_EVENT_PRE_PREPARE:
+			if (CurrentBuildRetires != NULL &&
+				VamanaSubxidPendingArrayHasLiveEntries(CurrentBuildRetires))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("vamana index does not support two-phase commit")));
+			break;
+
+		case XACT_EVENT_PREPARE:
+			CurrentBuildRetires = NULL;
+			break;
+
+		default:
+			break;
+	}
+}
+
+/*
+ * Unlike a queued DROP INDEX (undone by discarding the entry, since the drop
+ * itself is undone), a ROLLBACK TO SAVEPOINT here does not undo anything:
+ * the build already handed a durable slot and cache entry to the worker
+ * before the savepoint aborted, and no later event in this transaction --
+ * not even its own eventual COMMIT -- retires them if this one doesn't. The
+ * subtransaction's own abort is the retirement trigger.  A released
+ * savepoint's entry is reparented so an ancestor's later abort still finds
+ * and retires it.
+ */
+static void
+VamanaBuildRetireSubXactCallback(SubXactEvent event, SubTransactionId mySubid,
+								  SubTransactionId parentSubid, void *arg)
+{
+	VamanaSubxidPendingArray *list = CurrentBuildRetires;
+
+	if (list == NULL)
+		return;
+
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		for (int i = 0; i < list->count; i++)
+		{
+			PendingBuildRetire *entry = VamanaSubxidPendingArrayEntryAt(list, i);
+
+			if (entry->subxid == mySubid)
+				VamanaRetireIndexArtifacts(entry->dbOid, entry->indexRelid);
+		}
+
+		VamanaSubxidPendingArrayPruneAbortedSubxact(list, mySubid);
+	}
+	else if (event == SUBXACT_EVENT_COMMIT_SUB)
+		VamanaSubxidPendingArrayReparentSubxact(list, mySubid, parentSubid);
 }

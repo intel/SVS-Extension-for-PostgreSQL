@@ -311,7 +311,13 @@ VamanaWorkerProcessSlotDrops(void)
 
 		relid = (Oid) relid_u32;
 
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 		VamanaEvictCacheEntry(relid);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
 		result = VamanaReplicationDropIfExists(VamanaWorkerShmemPtr->dbOid, relid);
 
 		/*
@@ -361,7 +367,14 @@ VamanaWorkerProcessReloads(void)
 	{
 		ereport(LOG,
 				(errmsg("vamana worker: evict_all set, evicting all cached indexes")));
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 		VamanaEvictAllCacheEntries();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
 		return;
 	}
 
@@ -387,6 +400,10 @@ VamanaWorkerProcessReloads(void)
 		ereport(LOG,
 				(errmsg("vamana worker: reloading index %u", relid)));
 
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
 		/*
 		 * Evict only the in-process cache entry so VamanaWorkerGetOrLoadIndex
 		 * picks up the fresh on-disk copy.  Do NOT use
@@ -395,9 +412,6 @@ VamanaWorkerProcessReloads(void)
 		 * (causing a reload loop).
 		 */
 		VamanaEvictCacheEntry(relid);
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
 
 		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
@@ -418,13 +432,21 @@ VamanaWorkerProcessReloads(void)
 
 /*
  * VACUUM FULL / CLUSTER replace the relfilenode without triggering any
- * extension AM callback.  This relcache callback catches those cases so
- * the BGW doesn't serve stale TIDs from the old heap.
+ * extension AM callback.  This relcache callback catches those cases so the
+ * BGW doesn't serve stale TIDs from the old heap.
+ *
+ * Invalidation callbacks can fire with no transaction open, so eviction
+ * itself -- which durably retires the index's residency record and needs
+ * one -- cannot happen here.  Queue it for the main loop's already
+ * transactional reload/evict-all handling instead, the same deferral every
+ * other reload trigger in this file already goes through.
  */
 static void
 VamanaRelcacheCallback(Datum arg, Oid relid)
 {
-	if (relid == InvalidOid || VamanaGetCache(relid) == NULL)
+	bool		wasCached = relid != InvalidOid && VamanaGetCache(relid) != NULL;
+
+	if (relid == InvalidOid || !wasCached)
 		standbyRediscoverPending = true;
 
 	/* Drain/checkpoint: suppress all evictions. */
@@ -436,9 +458,12 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 		return;
 
 	if (relid == InvalidOid)
-		VamanaEvictAllCacheEntries();
-	else
-		VamanaEvictCacheEntry(relid);
+	{
+		pg_atomic_write_u32(&VamanaWorkerShmemPtr->evict_all, 1);
+		SetLatch(&VamanaWorkerShmemPtr->workerLatch);
+	}
+	else if (wasCached)
+		VamanaWorkerSignalReload(relid);
 }
 
 /*
@@ -1734,13 +1759,15 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
  * VamanaWorkerSubmitInsert
  *
  * Backend-side: ask the worker to call SVSAddPoints for one vector.
- * On success, *externalId_out receives the allocated external ID.
+ * On success, *externalId_out receives the allocated external ID, and
+ * *slotCreated_out reports whether this call was the one that lazily created
+ * the index's replication slot (the first INSERT into an empty-table index).
  * Returns true on success, false on error (ereport(ERROR) in the latter case).
  */
 bool
 VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						 int dimensions, ItemPointer heap_tid,
-						 uint64 *externalId_out)
+						 uint64 *externalId_out, bool *slotCreated_out)
 {
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
@@ -1782,6 +1809,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 
 	pg_read_barrier();
 	*externalId_out = slot->writeExternalId;
+	*slotCreated_out = slot->writeSlotCreated;
 	return true;
 }
 

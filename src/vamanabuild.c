@@ -15,6 +15,7 @@
 #include "vamana.h"
 #include "svs_build_thread_grant.h"
 #include "svs_wrapper.h"
+#include "vamana_replication.h"
 #include "vamanaworker.h"
 
 #include "access/amapi.h"
@@ -676,6 +677,14 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 									"index will be adopted by the worker on startup",
 									RelationGetRelationName(index))));
 				}
+
+				/*
+				 * A timed-out VamanaWorkerSubmitLoad does not rule out the
+				 * worker having already created the slot before this
+				 * backend gave up waiting; queuing is a safe no-op when it
+				 * has not.
+				 */
+				VamanaReplicationQueueRetireOnAbort(MyDatabaseId, relid);
 			}
 			else
 			{

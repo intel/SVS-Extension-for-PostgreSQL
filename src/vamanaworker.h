@@ -155,6 +155,7 @@ typedef struct VamanaWorkerSlot
 	 */
 	ItemPointerData writeHeapTid;	/* heap TID for INSERT */
 	uint64			writeExternalId; /* allocated external ID returned to backend */
+	bool			writeSlotCreated; /* INSERT lazily created the index's replication slot */
 } VamanaWorkerSlot;
 
 /*
@@ -670,7 +671,7 @@ int		VamanaWorkerSubmitSearch(Oid indexRelid,
 								 ItemPointer results, float *distances);
 bool	VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 								 int dimensions, ItemPointer heap_tid,
-								 uint64 *externalId_out);
+								 uint64 *externalId_out, bool *slotCreated_out);
 bool	VamanaWorkerSubmitDelete(Oid indexRelid,
 								 const size_t *externalIds, int nIds);
 bool	VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op);

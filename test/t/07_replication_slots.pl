@@ -1417,4 +1417,295 @@ sub hold_slot_externally
     $node->stop;
 }
 
+# ===========================================================================
+# Slot and residency retirement when the build that created them aborts
+#
+# VamanaReplicationCreate and the residency row VamanaCacheIndex writes for it
+# are durable the moment the worker hands a build off, in its own transaction
+# or with none open at all -- independent of whether the backend's own
+# transaction (CREATE INDEX, REINDEX, or the first INSERT into an empty-table
+# index) goes on to commit.  This is the mirror image of the DROP INDEX
+# section above: there the slot survives a rollback because dropping it
+# cannot be undone; here it must not survive one, because nothing else will
+# ever retire it once this transaction is gone.
+# ===========================================================================
+
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_build_abort_retire');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 20");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 20");
+    $node->append_conf('postgresql.conf', "max_prepared_transactions = 5");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    wait_for_worker($node, 30);
+
+    my $residency_count = sub {
+        my ($relid) = @_;
+        my $n;
+        for (1 .. 20)
+        {
+            $n = $node->safe_psql('postgres',
+                "SELECT count(*) FROM svs_index_residency WHERE index_relid = $relid;");
+            chomp $n;
+            return $n if $n eq '0';
+            usleep(500_000);
+        }
+        return $n;
+    };
+
+    my $psql_err = sub {
+        my ($sql) = @_;
+        my ($rc, $out, $err) = $node->psql('postgres', $sql, on_error_stop => 0);
+        return $err;
+    };
+
+    # ---------------------------------------------------------------- Rollback --
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE ci_tbl (id serial, val vector($dim));
+        INSERT INTO ci_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+    });
+
+    my $ci_relid = $node->safe_psql('postgres', qq{
+        BEGIN;
+        CREATE INDEX ci_idx ON ci_tbl USING vamana (val vector_l2_ops);
+        SELECT oid FROM pg_class WHERE relname = 'ci_idx';
+        ROLLBACK;
+    });
+    chomp $ci_relid;
+    ok($ci_relid =~ /^\d+$/, "captured the rolled-back index's relid ($ci_relid)");
+
+    is($node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_class WHERE relname = 'ci_idx';"),
+        '0', 'rolled-back CREATE INDEX leaves no catalog entry');
+
+    is(wait_for_no_orphan_slots($node, 'postgres', 10), 0,
+        'no orphan slot after CREATE INDEX rolls back (populated table)');
+
+    is($residency_count->($ci_relid), '0',
+        'no orphan residency row after CREATE INDEX rolls back');
+
+    $node->safe_psql('postgres', qq{
+        CREATE INDEX ci_idx ON ci_tbl USING vamana (val vector_l2_ops);
+    });
+    my $retry_count = $node->safe_psql('postgres', qq{
+        SET enable_seqscan = off;
+        SELECT count(*) FROM (
+            SELECT id FROM ci_tbl ORDER BY val <-> ARRAY[$query_sql]::vector LIMIT 10
+        ) t;
+    });
+    chomp $retry_count;
+    is($retry_count, '10',
+        'retry with the same index name succeeds and is searchable after the rollback');
+
+    # ------------------------------------------------------- Empty-table build --
+    # The slot and cache entry for an empty-table build are created lazily on
+    # the first INSERT, not at CREATE INDEX time -- a separate call site from
+    # the one above, needing its own abort coverage.
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE et_tbl (id serial, val vector($dim));
+        CREATE INDEX et_idx ON et_tbl USING vamana (val vector_l2_ops);
+    });
+
+    $node->safe_psql('postgres', qq{
+        BEGIN;
+        INSERT INTO et_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+        ROLLBACK;
+    });
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM et_tbl;"),
+        '0', 'rolled-back INSERT leaves no row');
+
+    is(wait_for_no_orphan_slots($node, 'postgres', 10), 0,
+        'no orphan slot after the first INSERT into an empty-table index rolls back');
+
+    $node->safe_psql('postgres', qq{
+        INSERT INTO et_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+    });
+    my $et_retry = $node->safe_psql('postgres', "SELECT count(*) FROM et_tbl;");
+    chomp $et_retry;
+    is($et_retry, '1',
+        'a later real INSERT into the same index still succeeds after the rollback');
+
+    # ------------------------------------------------------ Two-phase commit --
+    # COMMIT/ROLLBACK PREPARED run in a different backend, sharing none of this
+    # queue's state and firing none of its callbacks -- a prepared build that
+    # was later rolled back would leak its slot with no event left to ever
+    # catch it.  PREPARE must be refused while a retirement obligation from
+    # this build is still pending.
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE tp_tbl (id serial, val vector($dim));
+        INSERT INTO tp_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+    });
+
+    like($psql_err->(qq{
+            BEGIN;
+            CREATE INDEX tp_idx ON tp_tbl USING vamana (val vector_l2_ops);
+            PREPARE TRANSACTION 'vamana_pt_167_ci';
+        }),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while a CREATE INDEX build is pending');
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts;"),
+        '0', 'the rejected PREPARE (CREATE INDEX) left no prepared transaction behind');
+
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE tp2_tbl (id serial, val vector($dim));
+        CREATE INDEX tp2_idx ON tp2_tbl USING vamana (val vector_l2_ops);
+    });
+
+    like($psql_err->(qq{
+            BEGIN;
+            INSERT INTO tp2_tbl (val) VALUES (ARRAY[$array_sql]::vector);
+            PREPARE TRANSACTION 'vamana_pt_167_ins';
+        }),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while the first-INSERT slot creation is pending');
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts;"),
+        '0', 'the rejected PREPARE (first INSERT) left no prepared transaction behind');
+
+    # A plain REINDEX reuses the same relid and neither OAT_POST_CREATE (no new
+    # pg_class row) nor the undo log (no INSERT) fires for it, so it is not
+    # coincidentally covered by either of those queues' own PRE_PREPARE guard --
+    # this isolates that the new queue's guard is load-bearing on its own.
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE rx_tbl (id serial, val vector($dim));
+        INSERT INTO rx_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+        CREATE INDEX rx_idx ON rx_tbl USING vamana (val vector_l2_ops);
+    });
+
+    for (1 .. 20)
+    {
+        my $cnt = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_class c JOIN pg_replication_slots s "
+          . "ON s.slot_name = 'vamana_' || (SELECT oid FROM pg_database WHERE datname = current_database()) || '_' || c.oid "
+          . "WHERE c.relname = 'rx_idx';");
+        chomp $cnt;
+        last if $cnt == 1;
+        usleep(500_000);
+    }
+
+    like($psql_err->(q{
+            BEGIN;
+            REINDEX INDEX rx_idx;
+            PREPARE TRANSACTION 'vamana_pt_167_reindex';
+        }),
+        qr/does not support two-phase commit/,
+        'PREPARE is rejected while a REINDEX-triggered slot (re)creation is pending');
+
+    is($node->safe_psql('postgres', "SELECT count(*) FROM pg_prepared_xacts;"),
+        '0', 'the rejected PREPARE (REINDEX) left no prepared transaction behind');
+
+    is(wait_for_no_orphan_slots($node, 'postgres', 10), 0,
+        'no orphan slot after the rejected REINDEX PREPARE');
+
+    # -------------------------------------------------------------- Savepoints --
+    # The retirement obligation is queued in a VamanaSubxidPendingArray, same as
+    # the DROP INDEX queue above, but with the opposite trigger: a subtransaction
+    # that itself aborts is what must retire the slot here, since -- unlike a
+    # queued DROP -- nothing about the artifacts this build created gets undone
+    # by the outer transaction's own eventual commit or abort.
+    $node->safe_psql('postgres', qq{
+        CREATE TABLE sp_tbl (id serial, val vector($dim));
+        INSERT INTO sp_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+    });
+
+    # ROLLBACK TO SAVEPOINT discards the CREATE INDEX; the outer transaction
+    # commits regardless -- the subtransaction's own abort must still retire it.
+    my $sp_a_relid = $node->safe_psql('postgres', qq{
+        BEGIN;
+        SAVEPOINT sp;
+        CREATE INDEX sp_idx_a ON sp_tbl USING vamana (val vector_l2_ops);
+        SELECT oid FROM pg_class WHERE relname = 'sp_idx_a';
+        ROLLBACK TO SAVEPOINT sp;
+        COMMIT;
+    });
+    chomp $sp_a_relid;
+    is(wait_for_no_orphan_slots($node, 'postgres', 10), 0,
+        'ROLLBACK TO SAVEPOINT + outer COMMIT leaves no orphan slot');
+    is($residency_count->($sp_a_relid), '0',
+        'ROLLBACK TO SAVEPOINT + outer COMMIT leaves no orphan residency row');
+    is($node->safe_psql('postgres', "SELECT count(*) FROM pg_class WHERE relname = 'sp_idx_a';"),
+        '0', 'the discarded CREATE INDEX never exists');
+
+    # A subtransaction whose entry is released into its parent, where the
+    # parent then aborts: the entry was reparented, so the abort must still
+    # find and retire it.
+    my $sp_b_relid = $node->safe_psql('postgres', qq{
+        BEGIN;
+        SAVEPOINT sp;
+        CREATE INDEX sp_idx_b ON sp_tbl USING vamana (val vector_l2_ops);
+        SELECT oid FROM pg_class WHERE relname = 'sp_idx_b';
+        RELEASE SAVEPOINT sp;
+        ROLLBACK;
+    });
+    chomp $sp_b_relid;
+    is(wait_for_no_orphan_slots($node, 'postgres', 10), 0,
+        'a released savepoint whose transaction aborts leaves no orphan slot');
+    is($residency_count->($sp_b_relid), '0',
+        'a released savepoint whose transaction aborts leaves no orphan residency row');
+
+    # The one case that must retire nothing: released into the parent, and the
+    # parent commits for real.
+    $node->safe_psql('postgres', q{
+        BEGIN;
+        SAVEPOINT sp;
+        CREATE INDEX sp_idx_c ON sp_tbl USING vamana (val vector_l2_ops);
+        RELEASE SAVEPOINT sp;
+        COMMIT;
+    });
+    my $sp_c_slot_exists = 0;
+    for (1 .. 20)
+    {
+        my $cnt = $node->safe_psql('postgres', q{
+            SELECT count(*) FROM pg_replication_slots s
+            JOIN pg_class c ON c.oid::text = split_part(s.slot_name, '_', 3)
+            WHERE c.relname = 'sp_idx_c';
+        });
+        chomp $cnt;
+        if ($cnt == 1) { $sp_c_slot_exists = 1; last; }
+        usleep(500_000);
+    }
+    ok($sp_c_slot_exists,
+        'a released savepoint that commits keeps its slot (nothing wrongly retired)');
+    is($node->safe_psql('postgres', "SELECT count(*) FROM pg_class WHERE relname = 'sp_idx_c';"),
+        '1', 'a released savepoint that commits keeps the index');
+
+    # ------------------------------------------------------------------- Race --
+    # No pause between build and rollback, so the worker may still hold the
+    # slot when the abort fires (forces the hand-off-to-worker path).
+    for my $i (1 .. 5)
+    {
+        $node->safe_psql('postgres', qq{
+            CREATE TABLE race_$i (id serial, val vector($dim));
+            INSERT INTO race_$i (val)
+                SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 2000);
+            BEGIN;
+            CREATE INDEX race_idx_$i ON race_$i USING vamana (val vector_l2_ops);
+            ROLLBACK;
+        });
+    }
+
+    is(wait_for_no_orphan_slots($node, 'postgres', 40), 0,
+        'no orphan slot after five back-to-back build+rollback races');
+
+    ok(wait_for_worker($node, 30),
+        'worker still alive after the contended rollbacks');
+
+    $node->stop;
+}
+
 done_testing();
