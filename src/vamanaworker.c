@@ -400,6 +400,10 @@ VamanaWorkerProcessReloads(void)
 		ereport(LOG,
 				(errmsg("vamana worker: reloading index %u", relid)));
 
+		vamana_active_load_relid = relid;
+
+		INJECTION_POINT("vamana-reload-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -409,16 +413,18 @@ VamanaWorkerProcessReloads(void)
 		 * picks up the fresh on-disk copy.  Do NOT use
 		 * VamanaInvalidateCache() here: that would delete the on-disk saved
 		 * copy (preventing reload from disk) and re-signal the worker
-		 * (causing a reload loop).
+		 * (causing a reload loop).  Run inside this transaction, not before it
+		 * starts, so the durable residency row for an index that will never
+		 * reload again (its catalog entry is gone) is actually retired rather
+		 * than silently skipped for lack of an open transaction.
 		 */
 		VamanaEvictCacheEntry(relid);
 
-		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
-		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+		vamana_active_load_relid = InvalidOid;
 
 		anyReload = true;
 	}

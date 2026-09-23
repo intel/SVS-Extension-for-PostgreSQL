@@ -643,6 +643,8 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		 */
 		vamana_active_load_relid = relid;
 
+		INJECTION_POINT("vamana-load-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -775,10 +777,11 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
  * VamanaWorkerGetOrLoadIndex, so a hot index is a no-op via its fast path.
  *
  * Unlike ProcessLoadSlot, GetOrLoadIndex opens the index relation and reads
- * the catalog, so it must run inside a transaction.  Eviction is suppressed
- * across the load for the same reason the reload path does it: a relcache
- * invalidation fired during StartTransactionCommand must not evict the entry
- * mid-load.  Must not throw: all errors become VAMANA_SLOT_ERROR.
+ * the catalog, so it must run inside a transaction.  The guard must bracket
+ * the whole transaction, not just the load call: a relcache invalidation for
+ * an unrelated cached index can be delivered as soon as StartTransactionCommand
+ * runs, before GetOrLoadIndex is even reached.  Must not throw: all errors
+ * become VAMANA_SLOT_ERROR.
  */
 void
 VamanaWorkerProcessWarmupSlot(int slotIdx)
@@ -789,16 +792,19 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 
 	PG_TRY();
 	{
+		vamana_active_load_relid = relid;
+
+		INJECTION_POINT("vamana-warmup-before-txn-start", NULL);
+
 		SetCurrentStatementStartTimestamp();
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		vamana_active_load_relid = relid;
 		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, true);
-		vamana_active_load_relid = InvalidOid;
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+		vamana_active_load_relid = InvalidOid;
 
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
