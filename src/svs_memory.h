@@ -314,6 +314,15 @@ extern void SvsMemoryReconcileResidentReservations(Oid dbOid,
 													const Oid *liveRelids, int numLiveRelids,
 													Oid *droppedRelids, int *numDropped);
 
+/*
+ * Worker, at startup, for a relid with no reservation of its own yet (fresh
+ * shmem, nothing preserved to reconcile). Reconciles durableBytes into
+ * relid's committed total via SvsMemoryReconcileLoad, exactly as if it were
+ * a real measurement. A no-op if relid already has a reservation -- that
+ * one is never staler than the durable record and must not be overwritten.
+ */
+extern void SvsMemorySeedDurableResidency(Oid dbOid, Oid relid, uint64 durableBytes);
+
 typedef struct SvsMemoryStats
 {
 	uint64		residencyBudget;

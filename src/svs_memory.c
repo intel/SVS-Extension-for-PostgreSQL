@@ -1131,6 +1131,22 @@ SvsMemoryReconcileResidentReservations(Oid dbOid, const Oid *liveRelids, int num
 	LWLockRelease(&entry->memLock);
 }
 
+void
+SvsMemorySeedDurableResidency(Oid dbOid, Oid relid, uint64 durableBytes)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	bool		alreadyReserved;
+
+	LWLockAcquire(&entry->memLock, LW_SHARED);
+	alreadyReserved = FindReservation(entry, relid) != NULL;
+	LWLockRelease(&entry->memLock);
+
+	if (alreadyReserved)
+		return;
+
+	SvsMemoryReconcileLoad(dbOid, relid, durableBytes);
+}
+
 /*
  * Snapshots which databases currently hold a slot under one LW_SHARED pass
  * over the header, then processes each separately so memLock is always

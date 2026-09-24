@@ -340,6 +340,87 @@ my $baseline = committed_bytes();
     $node->safe_psql('postgres', "DROP TABLE floor_tbl;");
 }
 
+# ---------------------------------------------------------------------------
+# Case 9: the global ceiling sums resolved per-database budgets, not just
+# one database's own. A second database that alone would fit still gets
+# rejected once its resolved budget, added to every other admitted
+# database's, would cross svs.max_residency_memory. Also races a real build
+# on postgres (build axis) against an override update on the second
+# database (residency axis) to prove the two axes' header roll-ups don't
+# block or corrupt each other.
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres', "ALTER SYSTEM SET svs.max_residency_memory = '150MB';");
+    $node->safe_psql('postgres', "ALTER SYSTEM SET svs.max_search_work_mem = '1500MB';");
+    $node->safe_psql('postgres', "ALTER SYSTEM SET svs.default_search_work_mem = '10MB';");
+    $node->reload;
+
+    $node->safe_psql('postgres', "CREATE DATABASE ceiling_b;");
+
+    # postgres already holds the default 100MB against the new 150MB
+    # ceiling; another 100MB for ceiling_b would sum to 200MB, over it.
+    my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
+        INSERT INTO vamana_databases (datname, enabled, residency_memory)
+            VALUES ('ceiling_b', true, 100);
+    ));
+    isnt($ret, 0, 'a second database is rejected once its budget would push the sum over the ceiling');
+    like($stderr, qr/svs\.max_residency_memory/,
+        'the rejection names svs.max_residency_memory')
+      or diag("stderr: $stderr");
+
+    my $row_count = $node->safe_psql('postgres',
+        "SELECT count(*) FROM vamana_databases WHERE datname = 'ceiling_b';");
+    chomp $row_count;
+    is($row_count, '0', 'the rejected enrollment leaves no row behind');
+
+    # 40MB fits: 100 (postgres) + 40 = 140 <= 150.
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled, residency_memory) VALUES ('ceiling_b', true, 40);");
+    my $pid_b = wait_for_worker_db($node, 'ceiling_b');
+    ok($pid_b =~ /^\d+$/, 'the second database is admitted once it fits under the ceiling');
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE ceiling_tbl (id serial PRIMARY KEY, c1 vector($dim));
+        INSERT INTO ceiling_tbl (c1)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 2000) i;
+    ));
+
+    my $build = $node->background_psql('postgres', on_error_stop => 0);
+    $build->query_until(qr/ceiling_build_started/, qq(
+        \\echo ceiling_build_started
+        CREATE INDEX ceiling_idx ON ceiling_tbl USING vamana (c1 vector_l2_ops);
+    ));
+
+    my ($ret2, $stdout2, $stderr2) = $node->psql('postgres',
+        "UPDATE vamana_databases SET residency_memory = 45 WHERE datname = 'ceiling_b';");
+    is($ret2, 0, 'the second database\'s override update completes while the first is mid-build')
+      or diag("stderr: $stderr2");
+
+    $build->query('SELECT 1');
+    my $build_stderr = $build->{stderr};
+    $build->quit;
+    unlike($build_stderr, qr/ERROR/, 'the concurrent build reports no error')
+      or diag("stderr: $build_stderr");
+
+    my $index_count = $node->safe_psql('postgres',
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'ceiling_idx';");
+    chomp $index_count;
+    is($index_count, '1', 'the build completed despite the concurrent override update on the other database');
+
+    is($node->safe_psql('postgres',
+            "SELECT residency_memory FROM vamana_databases WHERE datname = 'ceiling_b';"),
+        '45', 'the override took effect despite the concurrent build on the other database');
+
+    cmp_ok(committed_bytes(), '>', 0,
+        'postgres\'s own committed total reflects its build, unaffected by the other database\'s update');
+
+    $node->safe_psql('postgres', "UPDATE vamana_databases SET enabled = false WHERE datname = 'ceiling_b';");
+    $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.max_residency_memory;");
+    $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.max_search_work_mem;");
+    $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.default_search_work_mem;");
+    $node->reload;
+}
+
 $node->stop;
 
 done_testing();

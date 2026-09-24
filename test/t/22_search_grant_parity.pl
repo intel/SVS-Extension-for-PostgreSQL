@@ -9,6 +9,11 @@
 # value was *published*; the DEBUG1 lines added alongside SVSSetIndexSearchThreads
 # and in SVSLoadDynamicIndex prove it was *applied*.  Every case below checks
 # both, deliberately kept separate.
+#
+# Also covers the search-scratch/thread-grant gate collision at their shared
+# call site, VamanaWorkerDispatchBatch: a batch the search-scratch check
+# refuses must never reach the thread-grant apply, and a batch it admits
+# must still get the grant applied normally.
 
 use strict;
 use warnings FATAL => 'all';
@@ -20,6 +25,11 @@ use Time::HiRes qw(usleep);
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
+
+if (($ENV{enable_injection_points} // 'no') ne 'yes')
+{
+	plan skip_all => 'server not built with --enable-injection-points';
+}
 
 # ---------------------------------------------------------------------------
 # Poll pg_stat_vamana_worker.search_threads_granted for a specific database
@@ -54,6 +64,7 @@ $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION vector;");
 $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+$node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
 $node->safe_psql('postgres',
 	"INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 wait_for_worker($node);
@@ -234,6 +245,96 @@ sub run_search
 	unlike($log,
 		qr/vamana worker: dispatching batch on index $relid with \d+ search threads/,
 		'second dispatch with an unchanged grant does not repeat the apply');
+}
+
+# ---------------------------------------------------------------------------
+# Search-scratch gate collision: the search-scratch admission check and the
+# thread-grant apply share VamanaWorkerDispatchBatch. A batch the
+# search-scratch check refuses must never reach the thread-grant apply; a
+# batch it admits must still get the grant applied normally.
+# ---------------------------------------------------------------------------
+{
+	# The default svs.search_window_size makes one query's real cost too
+	# small for any plausible batch to exceed the 1 MB minimum
+	# search_work_mem; inflate it, matching how 27_search_scratch_
+	# accounting.pl sizes the same probe.
+	$node->safe_psql('postgres', "ALTER SYSTEM SET svs.search_window_size = 10000;");
+	$node->safe_psql('postgres', "SELECT pg_reload_conf();");
+
+	my ($probe_session, $probe_client_pid, $probe_worker_pid) =
+		park_search_scratch_reservation($node, 'postgres', qq(
+			SET enable_seqscan = off;
+			SELECT id FROM sga_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+		));
+	isnt($probe_worker_pid, '', 'collision: a probe search parks with its cost admitted');
+
+	my $cost_bytes = search_scratch_cost_for_relid($node, 'postgres', $relid);
+	cmp_ok($cost_bytes, '>', 0, 'collision: the probe reports a positive per-query cost');
+
+	release_search_scratch_reservation($node, 'postgres', $probe_session);
+	is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
+		'collision: nothing left in flight after the probe');
+
+	my $cost_mb = int(($cost_bytes + 1024 * 1024 - 1) / (1024 * 1024));
+	$cost_mb = 1 if $cost_mb < 1;
+
+	my $collision_batch_n = 60;
+	my @collision_query_vecs =
+		map { join(",", map { sprintf("%.6f", rand()) } 1 .. $dim) } 1 .. $collision_batch_n;
+	my $collision_search_sql = sub {
+		my ($i) = @_;
+		return "SELECT id FROM sga_tbl ORDER BY val <-> '[$collision_query_vecs[$i]]' LIMIT 5;\n";
+	};
+
+	# Rejection side: a budget that admits one query but not $collision_batch_n
+	# of them together. The refusal must come from the search-scratch gate,
+	# and no refused dispatch may reach the thread-grant apply.
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET search_work_mem = $cost_mb WHERE datname = 'postgres';");
+
+	my $log_pos = length($node->log_content());
+	my @refused_results = run_synchronized(
+		$node, 'postgres', $collision_batch_n,
+		sub { return "SET enable_seqscan = off;\n"; },
+		$collision_search_sql);
+	ok((grep { $_ eq '' } @refused_results),
+		"collision: at least one of $collision_batch_n synchronized queries is refused "
+	  . "once their combined cost exceeds the search-scratch budget");
+
+	my $refusal_log = substr($node->log_content(), $log_pos);
+	like($refusal_log, qr/exceeds this database's search-scratch budget/,
+		'collision: the refusal names the search-scratch budget');
+	unlike($refusal_log, qr/vamana worker: dispatching batch on index $relid with \d+ search threads/,
+		'collision: a refused dispatch never reaches the thread-grant apply');
+
+	is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
+		'collision: nothing left in flight after the refused batch');
+
+	# Admission side: raise the budget comfortably and change the thread
+	# grant, so the apply log is guaranteed to fire fresh on this dispatch
+	# (Case 6: it is skipped when the grant is unchanged from a prior one).
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET search_work_mem = " . ($cost_mb * ($collision_batch_n + 1)) .
+		", search_num_threads = 3 WHERE datname = 'postgres';");
+	is(wait_for_granted($node, 'postgres', 3), '3', 'collision: search_threads_granted reaches 3');
+
+	$log_pos = length($node->log_content());
+	my @admitted_results = run_synchronized(
+		$node, 'postgres', $collision_batch_n,
+		sub { return "SET enable_seqscan = off;\n"; },
+		$collision_search_sql);
+	ok(!(grep { $_ eq '' } @admitted_results),
+		"collision: the same $collision_batch_n-way batch succeeds once the budget comfortably covers it");
+
+	my $admit_log = substr($node->log_content(), $log_pos);
+	like($admit_log, qr/vamana worker: dispatching batch on index $relid with 3 search threads/,
+		'collision: the thread grant is applied once the scratch gate admits the batch');
+
+	is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
+		'collision: nothing left in flight once the admitted batch completes');
+
+	$node->safe_psql('postgres',
+		"UPDATE vamana_databases SET search_work_mem = NULL WHERE datname = 'postgres';");
 }
 
 $node->stop;

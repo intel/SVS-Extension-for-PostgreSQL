@@ -686,6 +686,24 @@ VamanaWorkerReconcileResidencyOnStartup(void)
 		SvsIndexResidencyRecordUnload(droppedRelids[i]);
 
 	/*
+	 * A postmaster restart (unlike a plain worker-process crash) reinitializes
+	 * shared memory, so the pass above has nothing to preserve: every live
+	 * relid starts with no reservation at all, reading 0 until its own lazy
+	 * reload. Seed each from its durable record now, so the committed total
+	 * is already correct the moment this worker reports live, not only after
+	 * something happens to query it.
+	 */
+	{
+		uint64	   *durableBytes = palloc(sizeof(uint64) * numLive);
+
+		SvsIndexResidencyReadBytesForRelids(VamanaWorkerShmemPtr->dbOid, liveRelids, numLive, durableBytes);
+		for (i = 0; i < numLive; i++)
+			if (durableBytes[i] > 0)
+				SvsMemorySeedDurableResidency(VamanaWorkerShmemPtr->dbOid, liveRelids[i], durableBytes[i]);
+		pfree(durableBytes);
+	}
+
+	/*
 	 * The pass above only catches an index whose reservation was dropped
 	 * just now; it never revisits a durable row whose index was already
 	 * evicted before this startup. Sweep the durable table directly
