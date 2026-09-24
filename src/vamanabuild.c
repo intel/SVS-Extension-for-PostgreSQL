@@ -57,22 +57,17 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 			  bool *isnull, bool tupleIsAlive, void *state)
 {
 	VamanaBuildState *buildstate = (VamanaBuildState *) state;
-	Vector	   *vec;
+	float	   *floats;
+	int			dimensions;
 
 	if (isnull[0])
 		return;
 
-	/*
-	 * Use PG_DETOAST_DATUM_COPY so vec->x sits in its own palloc block.
-	 * Without _COPY, SVS aligned reads can overshoot the heap-page buffer.
-	 * See also vamanascan.c (query vector detoast).
-	 */
-	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
-	if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
-		VamanaValidateVectorData(vec->x, vec->dim, "build");
+	floats = VamanaDatumToFloats(buildstate->typeInfo, values[0],
+								 &dimensions, "build");
 
-	SvsVectorBufferAppend(&buildstate->vectors, vec->x);
-	pfree(vec);
+	SvsVectorBufferAppend(&buildstate->vectors, floats);
+	pfree(floats);
 
 	if (buildstate->tidBufferCapacity < buildstate->vectors.capacity)
 	{
@@ -397,6 +392,7 @@ typedef struct VamanaSVSIndexParams
 	int				compression_secondary;
 	int				leanvec_dims;
 	SVSDistanceType	distance_type;
+	SVSDType		data_type;
 } VamanaSVSIndexParams;
 
 /*
@@ -553,7 +549,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 									params->use_search_history);
 
 	storage = SVSCreateStorageForCompression(params->compression_type,
-											 SVS_DTYPE_FLOAT32,
+											 params->data_type,
 											 params->dimensions,
 											 params->leanvec_dims,
 											 params->compression_primary,
@@ -802,6 +798,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			.compression_secondary = buildstate.compression_secondary,
 			.leanvec_dims = buildstate.leanvec_dims,
 			.distance_type = buildstate.distance_type,
+			.data_type = buildstate.typeInfo->dataType,
 		};
 
 		svsIndex = VamanaBuildSVSIndexGoverned(&params, buildstate.vectors.data,
@@ -905,6 +902,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 						(int) meta.compression_secondary,
 						opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS,
 						(int) VamanaGetDistanceMetric(index),
+						(int) buildstate.typeInfo->dataType,
 						(int) meta.numVectors,
 						(int) meta.tidMappingCapacity,
 						meta.nextExternalId,
@@ -1018,6 +1016,7 @@ VamanaRebuildFromTable(Relation index)
 	TupleDesc	tupdesc;
 	SVSIndexHandle volatile svsIndex;
 	VamanaOptions *opts;
+	const		VamanaTypeInfo *typeInfo;
 	int			dimensions;
 	int			graph_degree;
 	int			alpha;
@@ -1041,6 +1040,7 @@ VamanaRebuildFromTable(Relation index)
 			(errmsg("rebuilding vamana index from table data")));
 
 	opts = (VamanaOptions *) index->rd_options;
+	typeInfo = VamanaGetTypeInfo(index);
 	dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
 	graph_degree = opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE;
 	alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
@@ -1090,7 +1090,8 @@ VamanaRebuildFromTable(Relation index)
 	{
 		Datum	   *values;
 		bool	   *isnull;
-		Vector	   *vec;
+		float	   *floats;
+		int			datumDim;
 		int			natts = tupdesc->natts;
 		int			vectorAttNum;
 
@@ -1105,27 +1106,20 @@ VamanaRebuildFromTable(Relation index)
 
 		if (!isnull[vectorAttNum])
 		{
-			/*
-			 * Extract vector using _COPY to avoid reading past page-buffer
-			 * boundary.  PG_DETOAST_DATUM for untoasted vectors returns a
-			 * pointer directly into the 8192-byte heap page; memcpy's
-			 * internal 8-byte reads can overshoot the palloc block end.
-			 */
-			vec = (Vector *) PG_DETOAST_DATUM_COPY(values[vectorAttNum]);
-			if (vec->dim != dimensions)
+			floats = VamanaDatumToFloats(typeInfo, values[vectorAttNum],
+										 &datumDim, "rebuild");
+			if (datumDim != dimensions)
 			{
-				pfree(vec);
+				pfree(floats);
 				pfree(values);
 				pfree(isnull);
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
-						 errmsg("vector dimension mismatch: expected %d, got %d", dimensions, vec->dim)));
+						 errmsg("vector dimension mismatch: expected %d, got %d", dimensions, datumDim)));
 			}
-			if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
-				VamanaValidateVectorData(vec->x, vec->dim, "rebuild");
 
-			SvsVectorBufferAppend(&vectors, vec->x);
-			pfree(vec);			/* free the _COPY allocation */
+			SvsVectorBufferAppend(&vectors, floats);
+			pfree(floats);
 
 			if (tidBufferCapacity < vectors.capacity)
 			{
@@ -1209,6 +1203,7 @@ VamanaRebuildFromTable(Relation index)
 			.compression_secondary = compression_secondary,
 			.leanvec_dims = leanvec_dims,
 			.distance_type = distanceType,
+			.data_type = typeInfo->dataType,
 		};
 
 		int			numVectors = (int) vectors.count;

@@ -67,6 +67,136 @@ SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <=> (SELECT NULL::halfvec)) t
 
 DROP TABLE t;
 
+-- element width
+--
+-- A halfvec element is half as wide as a vector element, so the datum has to
+-- be read at its own element width and widened on the way to the index.  Read
+-- at the wrong width, every distance is computed from the wrong numbers and
+-- the rows come back in the wrong order, with no error.
+--
+-- The data below is deliberately asymmetric.  Symmetric data such as
+-- '[1,0,0]', '[0,1,0]', '[0,0,1]' cannot detect this: every candidate is
+-- mismeasured the same way and the ordering survives.  Each case prints the
+-- index order and then the exact order over the same rows, so a difference
+-- between them is the failure, not a value anyone has to read.
+--
+-- Note the missing ", id" tie-break that the rest of this file uses.  It is
+-- left off on purpose: it puts an Incremental Sort above the index scan, and
+-- below DEFAULT_MIN_GROUP_SIZE (32) tuples that node buffers the whole input
+-- and sorts it outright, which repairs a wrong index order before it is ever
+-- printed.  Every distance in these cases is distinct, so no tie-break is
+-- needed to make the output deterministic.
+
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[100,1,0]'), ('[0,2,0]'), ('[0,8,0]'), ('[0,32,0]');
+SET client_min_messages = error;
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
+RESET client_min_messages;
+
+-- The index is what answers this, and nothing re-sorts what it returns --
+-- otherwise the comparison below would hold no matter what the index held.
+EXPLAIN (COSTS OFF) SELECT id FROM t ORDER BY val <-> '[0,1,0]';
+SELECT id FROM t ORDER BY val <-> '[0,1,0]';
+
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT id FROM t ORDER BY val <-> '[0,1,0]';
+RESET enable_indexscan;
+SET enable_seqscan = off;
+
+DROP TABLE t;
+
+-- Same, for inner product and cosine: the element width is read the same way
+-- whatever the metric, so each metric has to be shown reaching its own
+-- correct order.
+--
+-- The inner-product rows put the weight the query asks about in the first
+-- dimension and an opposing value in the second, because a wrong-width read
+-- pairs the two: with the L2 rows above, the pairing happens to preserve the
+-- correct order for this metric, and the case would pass either way.
+
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[1,32,0]'), ('[2,8,0]'), ('[8,2,0]'), ('[32,1,0]');
+CREATE INDEX ON t USING vamana (val halfvec_ip_ops);
+
+SELECT id FROM t ORDER BY val <#> '[1,0,0]';
+
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT id FROM t ORDER BY val <#> '[1,0,0]';
+RESET enable_indexscan;
+SET enable_seqscan = off;
+
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[1,4,0]'), ('[1,1,0]'), ('[4,1,0]'), ('[0,1,0]');
+CREATE INDEX ON t USING vamana (val halfvec_cosine_ops);
+
+SELECT id FROM t ORDER BY val <=> '[1,0,0]';
+
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT id FROM t ORDER BY val <=> '[1,0,0]';
+RESET enable_indexscan;
+SET enable_seqscan = off;
+
+DROP TABLE t;
+
+-- Compression composes with the element width rather than replacing it: under
+-- LeanVec or LVQ the compressed spec owns the stored format, but the datum
+-- still arrives as halfvec and still has to be read at halfvec's width.
+
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[100,1,0]'), ('[0,2,0]'), ('[0,8,0]'), ('[0,32,0]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops)
+	WITH (compression_type = 1, compression_primary = 8, compression_secondary = 8);
+
+SELECT id FROM t ORDER BY val <-> '[0,1,0]';
+
+DROP TABLE t;
+
+CREATE TABLE t (id serial PRIMARY KEY, val halfvec(3));
+INSERT INTO t (val) VALUES ('[100,1,0]'), ('[0,2,0]'), ('[0,8,0]'), ('[0,32,0]');
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops)
+	WITH (compression_type = 2, compression_primary = 4, compression_secondary = 8);
+
+SELECT id FROM t ORDER BY val <-> '[0,1,0]';
+
+DROP TABLE t;
+
+-- A wider, denser case: 300 rows at 64 dimensions, every row distinct, with
+-- each dimension carrying its own value so that neither the correct ordering
+-- nor a mismeasured one is simply the row order.
+--
+-- This one prints the top-5 distances rather than the top-5 ids: two rows can
+-- sit at the same distance from the query, and which of those the index puts
+-- first is arbitrary, while the sequence of distances is not.  A wrong element
+-- width shows up as a sequence that does not ascend, or does not match the
+-- exact one below it.
+
+CREATE TABLE t (id int PRIMARY KEY, val halfvec(64));
+INSERT INTO t
+SELECT i,
+	   (SELECT array_agg(CASE WHEN j = 1 THEN i ELSE ((i * (j + 7)) % 89) + 1 END ORDER BY j)
+		  FROM generate_series(1, 64) AS j)::halfvec
+  FROM generate_series(1, 300) AS i;
+SET client_min_messages = error;
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
+RESET client_min_messages;
+
+SELECT round((val <-> (SELECT val FROM t WHERE id = 150))::numeric, 3) AS distance
+  FROM t ORDER BY val <-> (SELECT val FROM t WHERE id = 150) LIMIT 5;
+
+SET enable_indexscan = off;
+SET enable_seqscan = on;
+SELECT round((val <-> (SELECT val FROM t WHERE id = 150))::numeric, 3) AS distance
+  FROM t ORDER BY val <-> (SELECT val FROM t WHERE id = 150) LIMIT 5;
+RESET enable_indexscan;
+SET enable_seqscan = off;
+
+DROP TABLE t;
+
 -- unlogged
 
 CREATE UNLOGGED TABLE t (id serial PRIMARY KEY, val halfvec(3));

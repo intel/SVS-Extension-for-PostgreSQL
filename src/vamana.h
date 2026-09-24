@@ -16,6 +16,7 @@
 #include "optimizer/optimizer.h"
 #include "utils/sampling.h"
 #include "utils/timestamp.h"
+#include "halfvec.h"
 #include "vector.h"
 #include "svs_vector_buffer.h"
 #include "svs_wrapper.h"
@@ -133,9 +134,18 @@ typedef struct VamanaOptions
 /* Search window size: svs.search_window_size GUC, else opts' reloption, else the default. */
 extern int VamanaResolveSearchWindowSize(const VamanaOptions *opts);
 
+/*
+ * Per-indexed-type properties.  elementSize is the width of one element in
+ * the on-disk datum, which is what decides how far a datum read may go;
+ * dataType is the element format SVS stores internally.  The two differ in
+ * kind: the SVS C API only ever accepts float32 arrays, so a halfvec datum is
+ * widened to float on the way in and stored back down as float16.
+ */
 typedef struct VamanaTypeInfo
 {
 	int			maxDimensions;
+	Size		elementSize;	/* bytes per element in the datum */
+	SVSDType	dataType;		/* SVS storage element type */
 	Datum		(*normalize) (PG_FUNCTION_ARGS);
 	void		(*checkValue) (Pointer v);
 }			VamanaTypeInfo;
@@ -255,6 +265,13 @@ typedef struct VamanaIndexCache
 	XLogRecPtr	lastReplayWalEnd;
 	Oid			heapRelid;			/* heap relation OID (for replay decoder) */
 	int			vectorAttNum;		/* 0-based heap attribute number of the vector column */
+
+	/*
+	 * Indexed column's type properties.  WAL replay reads heap datums with no
+	 * index relation open, so it cannot call VamanaGetTypeInfo; carry the
+	 * answer here, alongside vectorAttNum, from where the index is opened.
+	 */
+	const		VamanaTypeInfo *typeInfo;
 	HTAB	   *tidToExternalId;	/* TID → externalId reverse lookup; NULL until first populate */
 
 	/*
@@ -316,6 +333,7 @@ Buffer		VamanaNewBuffer(Relation index, ForkNumber forkNum);
 void		VamanaInitPage(Buffer buf, Page page);
 void		VamanaInit(void);
 const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
+const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
 void		VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno, Size indexDataSize, uint32 numVectors, ForkNumber forkNum);
@@ -341,6 +359,8 @@ bool		VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int ti
 void		VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count);
 void		VamanaInstallObjectAccessHook(void);
 void		VamanaValidateVectorData(const float *data, int dim, const char *context);
+float	   *VamanaDatumToFloats(const VamanaTypeInfo *typeInfo, Datum datum,
+								int *dim, const char *context);
 
 /* Dynamic index support */
 void		VamanaWriteMetaPageDynamic(Relation index, uint64 nextExternalId,

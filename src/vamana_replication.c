@@ -388,7 +388,8 @@ ApplyInsertChange(VamanaReplayContext *priv, Relation relation,
 	TupleTableSlot *slot;
 	Datum		datum;
 	bool		isnull;
-	Vector	   *vec;
+	float	   *floats;
+	int			dim;
 	size_t		externalId;
 	int			added;
 
@@ -423,12 +424,19 @@ ApplyInsertChange(VamanaReplayContext *priv, Relation relation,
 	/* Models a detoast/fetch failure (VACUUMed TID, missing TOAST) for tests. */
 	INJECTION_POINT("vamana-replay-apply-insert", NULL);
 
-	vec = (Vector *) PG_DETOAST_DATUM_COPY(datum);
+	/*
+	 * No index relation is open here, so the element type comes from the
+	 * cache entry rather than from VamanaGetTypeInfo.  Every path that puts an
+	 * entry in the cache fills this in, either from the open relation or from
+	 * the load parameters.
+	 */
+	Assert(cache->typeInfo != NULL);
+	floats = VamanaDatumToFloats(cache->typeInfo, datum, &dim, "replay");
 	ExecDropSingleTupleTableSlot(slot);
 
 	externalId = (size_t) cache->nextExternalId;
-	added = SVSAddPoints(cache->svsIndex, vec->x, &externalId, 1);
-	pfree(vec);
+	added = SVSAddPoints(cache->svsIndex, floats, &externalId, 1);
+	pfree(floats);
 
 	if (added <= 0)
 	{
