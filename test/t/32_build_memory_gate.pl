@@ -85,39 +85,6 @@ $node->reload;
 is($ret, 0, 'the same build succeeds once svs.max_build_memory is raised')
   or diag("stderr: $stderr");
 
-# committed_totals: a database's own (build_bytes_committed,
-# residency_bytes_committed) from the real, running worker's accounting.
-sub committed_totals
-{
-	my ($db) = @_;
-	my $row = $node->safe_psql('postgres', qq(
-		SELECT build_bytes_committed, residency_bytes_committed
-		FROM pg_stat_vamana_worker
-		WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = '$db');
-	));
-	chomp $row;
-	return split(/\|/, $row);
-}
-
-# park_build: attach 'wait' to $point, start a background CREATE INDEX of
-# $idx on $tbl in $db, and return once it is parked there.  The caller is
-# responsible for detaching and waking $point.
-sub park_build
-{
-	my ($db, $tbl, $idx, $point) = @_;
-
-	$node->safe_psql('postgres', "SELECT injection_points_attach('$point', 'wait');");
-
-	my $build = $node->background_psql($db, on_error_stop => 0);
-	$build->query_until(qr/build_started/, qq(
-		\\echo build_started
-		CREATE INDEX $idx ON $tbl USING vamana (c1 vector_l2_ops);
-	));
-	$node->wait_for_event('client backend', $point);
-
-	return $build;
-}
-
 # release_point: detach $point (so it does not catch a later arrival) and
 # wake whoever is currently parked there.  Does not touch $build itself:
 # the session may still be about to park at a second injection point
@@ -171,10 +138,10 @@ sub wake_build
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200) i;
 	));
 
-	my ($prior_build, $prior_residency) = committed_totals('postgres');
+	my ($prior_build, $prior_residency) = worker_committed_totals($node, 'postgres');
 
 	my $log_offset = -s $node->logfile;
-	my $build = park_build('postgres', $tbl, $idx, $point);
+	my $build = park_build($node, 'postgres', $tbl, $idx, $point);
 
 	$node->wait_for_log(qr/buildPeak \(margined\)/, $log_offset);
 	my $log_tail = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
@@ -182,13 +149,13 @@ sub wake_build
 	ok(defined $build_peak_from_log && $build_peak_from_log > 0,
 		'committed_visible: the DEBUG1 estimate line reports a positive buildPeak');
 
-	my ($parked_build, undef) = committed_totals('postgres');
+	my ($parked_build, undef) = worker_committed_totals($node, 'postgres');
 	is($parked_build, $build_peak_from_log,
 		'committed_visible: build_bytes_committed while parked at pre-confirm equals the DEBUG1 buildPeak estimate');
 
 	wake_build($build, $point, 'committed_visible');
 
-	my ($after_build, undef) = committed_totals('postgres');
+	my ($after_build, undef) = worker_committed_totals($node, 'postgres');
 	is($after_build, $prior_build,
 		'committed_visible: build_bytes_committed returns to its prior value once confirm releases the build peak');
 }
@@ -212,10 +179,10 @@ sub wake_build
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200) i;
 	));
 
-	my (undef, $prior_residency) = committed_totals('postgres');
+	my (undef, $prior_residency) = worker_committed_totals($node, 'postgres');
 
-	my $build = park_build('postgres', $tbl, $idx, $confirm_point);
-	my (undef, $at_confirm) = committed_totals('postgres');
+	my $build = park_build($node, 'postgres', $tbl, $idx, $confirm_point);
+	my (undef, $at_confirm) = worker_committed_totals($node, 'postgres');
 
 	# Arm pre-handoff before releasing pre-confirm, so the build parks there
 	# on its very next step instead of racing straight through.  release_point,
@@ -226,7 +193,7 @@ sub wake_build
 	release_point($confirm_point);
 
 	$node->wait_for_event('client backend', $handoff_point);
-	my (undef, $at_handoff) = committed_totals('postgres');
+	my (undef, $at_handoff) = worker_committed_totals($node, 'postgres');
 
 	release_point($handoff_point);
 
@@ -261,7 +228,7 @@ sub wake_build
 	cmp_ok($resident_bytes, '>', 0,
 		'residency_no_dip: the loaded index reports a positive resident size');
 
-	my (undef, $at_resident) = committed_totals('postgres');
+	my (undef, $at_resident) = worker_committed_totals($node, 'postgres');
 
 	is($at_confirm, $at_handoff,
 		'residency_no_dip: residency_bytes_committed at pre-confirm equals its value at pre-handoff');
@@ -273,10 +240,16 @@ sub wake_build
 
 # ---------------------------------------------------------------------------
 # A residency budget admits exactly one of two competing builds, not both.
-# The budget is sized from a trial build's own measured resident_bytes,
-# not a guess: build A is the same shape as the trial, so its own estimate
-# and measured size land in the same range, and B (same shape again) is
-# refused once A's estimate is already committed.
+# The budget is sized from a trial build's own reserve-time
+# residencyEstimate, recovered from its DEBUG1 estimate line, not from an
+# assumed ratio against its measured resident_bytes: SvsMemoryReserveBuild's
+# admission check itself compares an estimate against the budget, so
+# deriving the budget from that exact same quantity needs no calibration
+# assumption at all. Build A repeats the trial's table shape exactly, so
+# its own estimate is the identical deterministic value (confirmed below,
+# not assumed); one small fixed margin above the trial's estimate admits A
+# but stays under twice that estimate, so B's identical estimate cannot
+# also fit.
 # ---------------------------------------------------------------------------
 {
 	$node->safe_psql('postgres', "CREATE DATABASE gate_concurrent;");
@@ -288,12 +261,19 @@ sub wake_build
 
 	my $confirm_point = 'vamana-build-governed-pre-confirm';
 
+	my $trial_log_offset = -s $node->logfile;
 	$node->safe_psql('gate_concurrent', qq(
 		CREATE TABLE trial_tbl (id serial PRIMARY KEY, c1 vector($dim));
 		INSERT INTO trial_tbl (c1)
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000) i;
 		CREATE INDEX trial_idx ON trial_tbl USING vamana (c1 vector_l2_ops);
 	));
+	$node->wait_for_log(qr/buildPeak \(margined\)/, $trial_log_offset);
+	my $trial_log_tail = PostgreSQL::Test::Utils::slurp_file($node->logfile, $trial_log_offset);
+	my ($trial_estimate) = $trial_log_tail =~ /residency (\d+),/;
+	ok(defined $trial_estimate && $trial_estimate > 0,
+		'concurrent_admit: the trial build\'s own DEBUG1 line reports a positive residency estimate');
+
 	my $trial_relid = $node->safe_psql('gate_concurrent', "SELECT 'trial_idx'::regclass::oid;");
 	chomp $trial_relid;
 	my $trial_bytes = $node->safe_psql('gate_concurrent',
@@ -309,18 +289,23 @@ sub wake_build
 	# still committed, and the trial's bytes must be gone before that.
 	for my $i (1 .. 60)
 	{
-		my ($committed, undef) = committed_totals('gate_concurrent');
+		my ($committed, undef) = worker_committed_totals($node, 'gate_concurrent');
 		last if $committed eq '0';
 		usleep(500_000);
 	}
-	my ($post_drop_committed, undef) = committed_totals('gate_concurrent');
+	my ($post_drop_committed, undef) = worker_committed_totals($node, 'gate_concurrent');
 	is($post_drop_committed, '0',
 		'concurrent_admit: the dropped trial build\'s bytes are released before the tight budget is set');
 
-	# Room for one build's estimate (which upper-bounds its own measured
-	# size) comfortably, never two: 1.4x the trial's measured bytes.
-	my $tight_budget_mb = int((1.4 * $trial_bytes + 1024 * 1024 - 1) / (1024 * 1024));
-	$tight_budget_mb = 1 if $tight_budget_mb < 1;
+	# One comfortable 1MB margin above the trial's own estimate: room for
+	# one build's estimate, never two.  Checked below, not assumed: the
+	# margined budget must still sit under twice the trial's estimate, or
+	# this construction would not actually refuse a second same-shaped
+	# build.
+	my $tight_budget_bytes = $trial_estimate + 1024 * 1024;
+	cmp_ok($tight_budget_bytes, '<', 2 * $trial_estimate,
+		'concurrent_admit: the tight budget sits below twice the trial\'s own residency estimate, so two builds of this shape cannot both fit');
+	my $tight_budget_mb = int(($tight_budget_bytes + 1024 * 1024 - 1) / (1024 * 1024));
 	$node->safe_psql('postgres',
 		"UPDATE vamana_databases SET residency_memory = $tight_budget_mb WHERE datname = 'gate_concurrent';");
 
@@ -333,7 +318,14 @@ sub wake_build
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 5000) i;
 	));
 
-	my $build_a = park_build('gate_concurrent', 'conc_a_tbl', 'conc_a_idx', $confirm_point);
+	my $a_log_offset = -s $node->logfile;
+	my $build_a = park_build($node, 'gate_concurrent', 'conc_a_tbl', 'conc_a_idx', $confirm_point);
+
+	$node->wait_for_log(qr/buildPeak \(margined\)/, $a_log_offset);
+	my $a_log_tail = PostgreSQL::Test::Utils::slurp_file($node->logfile, $a_log_offset);
+	my ($a_estimate) = $a_log_tail =~ /residency (\d+),/;
+	is($a_estimate, $trial_estimate,
+		'concurrent_admit: A\'s own residency estimate is identical to the trial\'s, confirming the shared-shape assumption this budget is built on');
 
 	my ($ret_b, $stdout_b, $stderr_b) = $node->psql('gate_concurrent',
 		"CREATE INDEX conc_b_idx ON conc_b_tbl USING vamana (c1 vector_l2_ops);");
@@ -402,7 +394,7 @@ sub wake_build
 	));
 
 	my $log_offset = -s $node->logfile;
-	my $build_x = park_build('gate_ceiling_x', 'ceiling_x_tbl', 'ceiling_x_idx', $confirm_point);
+	my $build_x = park_build($node, 'gate_ceiling_x', 'ceiling_x_tbl', 'ceiling_x_idx', $confirm_point);
 
 	$node->wait_for_log(qr/buildPeak \(margined\)/, $log_offset);
 	my $log_tail = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_offset);
@@ -411,7 +403,7 @@ sub wake_build
 	ok(defined $x_relid && defined $x_build_peak,
 		'ceiling_hygiene: recovered X\'s relid and buildPeak from its own DEBUG1 estimate line');
 
-	my ($x_committed, undef) = committed_totals('gate_ceiling_x');
+	my ($x_committed, undef) = worker_committed_totals($node, 'gate_ceiling_x');
 	is($x_committed, $x_build_peak,
 		'ceiling_hygiene: X\'s committed build bytes while parked equal its own buildPeak');
 

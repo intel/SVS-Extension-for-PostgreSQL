@@ -16,8 +16,11 @@
 # the reservation themselves; a SIGKILL instead makes the postmaster treat
 # the death as possible corruption and force a full crash-restart, which
 # reinitializes shared memory (including the reservation table) rather than
-# leaving a dead owner's record behind.  See the report for the reproduction
-# that established this.
+# leaving a dead owner's record behind.  Confirmed directly: SIGKILL
+# against a backend parked at pre-confirm, holding a RESERVED reservation,
+# produces "terminated by signal 9" followed by the postmaster's own
+# crash-restart log line, and every other backend disconnects -- there is
+# no surviving shared memory left to hold a stale entry in.
 
 use strict;
 use warnings FATAL => 'all';
@@ -56,47 +59,8 @@ $node->safe_psql('postgres',
 my $worker_pid = wait_for_worker($node);
 ok($worker_pid =~ /^\d+$/, 'worker is running before the build-cleanup tests');
 
-# committed_totals: $db's own (build_bytes_committed, residency_bytes_committed).
-sub committed_totals
-{
-	my ($db) = @_;
-	my $row = $node->safe_psql('postgres', qq(
-		SELECT build_bytes_committed, residency_bytes_committed
-		FROM pg_stat_vamana_worker
-		WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = '$db');
-	));
-	chomp $row;
-	return split(/\|/, $row);
-}
-
-# start_parked_build: start a background CREATE INDEX of $idx on $tbl in
-# $db, and return once it is parked at $point.  Assumes $point is already
-# attached 'wait' -- injection_points_attach errors if called twice on the
-# same still-attached point, so a second build parking at a point a first
-# build is already using must not attach again.
-sub start_parked_build
-{
-	my ($db, $tbl, $idx, $point) = @_;
-
-	my $build = $node->background_psql($db, on_error_stop => 0);
-	$build->query_until(qr/build_started/, qq(
-		\\echo build_started
-		CREATE INDEX $idx ON $tbl USING vamana (c1 vector_l2_ops);
-	));
-	$node->wait_for_event('client backend', $point);
-
-	return $build;
-}
-
-# park_build: attach 'wait' to $point, then start_parked_build.  The caller
-# is responsible for releasing $point.
-sub park_build
-{
-	my ($db, $tbl, $idx, $point) = @_;
-
-	$node->safe_psql('postgres', "SELECT injection_points_attach('$point', 'wait');");
-	return start_parked_build($db, $tbl, $idx, $point);
-}
+# worker_committed_totals and park_build are shared with
+# 32_build_memory_gate.pl and live in VamanaTestUtils.pm.
 
 # ---------------------------------------------------------------------------
 # A terminated backend mid-build releases everything: pg_terminate_backend
@@ -114,9 +78,9 @@ sub park_build
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200) i;
 	));
 
-	my @before = committed_totals('postgres');
+	my @before = worker_committed_totals($node, 'postgres');
 
-	my $build = park_build('postgres', $tbl, $idx, $point);
+	my $build = park_build($node, 'postgres', $tbl, $idx, $point);
 
 	my $victim_pid = $node->safe_psql('postgres',
 		"SELECT pid FROM pg_stat_activity WHERE wait_event = '$point';");
@@ -136,7 +100,7 @@ sub park_build
 	my @after;
 	for my $i (1 .. 60)
 	{
-		@after = committed_totals('postgres');
+		@after = worker_committed_totals($node, 'postgres');
 		last if "$after[0]|$after[1]" eq "$before[0]|$before[1]";
 		usleep(500_000);
 	}
@@ -183,7 +147,7 @@ sub park_build
 	chomp $old_bytes;
 	cmp_ok($old_bytes, '>', 0, 'reindex_size: the original build reports a plausible resident size');
 
-	my (undef, $prior_total) = committed_totals('postgres');
+	my (undef, $prior_total) = worker_committed_totals($node, 'postgres');
 
 	# A materially denser graph over the same 5000 rows, so the rebuild's
 	# measured size is not a coin flip against the original's.
@@ -196,7 +160,7 @@ sub park_build
 	cmp_ok($new_bytes, '!=', $old_bytes,
 		'reindex_size: the denser rebuild measures a materially different size');
 
-	my (undef, $after_total) = committed_totals('postgres');
+	my (undef, $after_total) = worker_committed_totals($node, 'postgres');
 	is($after_total, $prior_total - $old_bytes + $new_bytes,
 		'reindex_size: the committed total is the prior total minus the old size plus the new one, not their sum');
 
@@ -239,7 +203,7 @@ sub park_build
 	}
 	cmp_ok($old_bytes, '>', 0, 'reindex_concurrently: the original build becomes resident');
 
-	my (undef, $prior_total) = committed_totals('postgres');
+	my (undef, $prior_total) = worker_committed_totals($node, 'postgres');
 
 	$node->safe_psql('postgres', "REINDEX INDEX CONCURRENTLY $idx;");
 
@@ -259,21 +223,17 @@ sub park_build
 	}
 	cmp_ok($new_bytes, '>', 0, 'reindex_concurrently: the replacement index becomes resident');
 
-	# Not asserted below: what the committed total or the residency table
-	# should look like after this REINDEX. Repeated measurement here
-	# (holding for well over the polling window used everywhere else in
-	# this file) found residency_bytes_committed drops by old_bytes and
-	# never rises by new_bytes at all, while svs_index_residency keeps a
-	# permanent row for $old_relid on top of the new one for $new_relid --
-	# neither the live counter nor the durable table ends up counting the
-	# replacement index once REINDEX INDEX CONCURRENTLY finishes. This is a
-	# product bug found while writing this case, not a documented invariant
-	# to assert as a requirement; see the report for the full reproduction.
-	my (undef, $after_total) = committed_totals('postgres');
-	diag("reindex_concurrently: prior_total=$prior_total old_bytes=$old_bytes "
-	   . "new_bytes=$new_bytes after_total=$after_total "
-	   . "(expected prior_total - old_bytes + new_bytes = "
-	   . ($prior_total - $old_bytes + $new_bytes) . " if accounting were clean)");
+	my (undef, $after_total) = worker_committed_totals($node, 'postgres');
+	is($after_total, $prior_total - $old_bytes + $new_bytes,
+		'reindex_concurrently: the committed total ends up counting only the replacement index, '
+	  . 'not the one it replaced on top of it')
+	  or diag("prior_total=$prior_total old_bytes=$old_bytes new_bytes=$new_bytes after_total=$after_total");
+
+	my $old_relid_row_count = $node->safe_psql('postgres',
+		"SELECT count(*) FROM svs_index_residency WHERE index_relid = $old_relid;");
+	chomp $old_relid_row_count;
+	is($old_relid_row_count, '0',
+		'reindex_concurrently: no leftover residency row for the relid it replaced');
 }
 
 # ---------------------------------------------------------------------------
@@ -352,16 +312,14 @@ sub park_build
 	# Blocked-by-builds variant (AllocateReservation's other errhint, for
 	# slots held by in-progress builds rather than resident indexes):
 	# attempted and abandoned as impractical in this environment, per this
-	# case's own instructions. Two problems compound: svs_index_residency
-	# never drops its row for a plainly DROP'd index (see the report's
-	# product-bug finding, which this generalizes beyond REINDEX
-	# CONCURRENTLY), so there is no durable signal that a dropped index's
-	# slot has actually been reclaimed; and residency_bytes_committed's own
-	# timing near this boundary was not reliably reproducible run to run.
-	# A parked reproduction attempt also observed a build admitted into a
-	# RESERVED reservation at a moment where all 64 slots were expected to
-	# be occupied, which needs more investigation than this task's budget
-	# allows. See the report for the full reproduction and findings.
+	# case's own instructions. residency_bytes_committed's own timing near
+	# this boundary was not reliably reproducible run to run, and a parked
+	# reproduction attempt separately observed a build admitted into a
+	# RESERVED reservation while pg_stat_vamana_worker reported an
+	# index_count of 62, with no way in this file to determine whether true
+	# reservation-table occupancy was actually below 64 at that instant. Not
+	# filed as a confirmed defect; flagged here for whoever next touches
+	# slot accounting near this boundary.
 }
 
 $node->stop;
