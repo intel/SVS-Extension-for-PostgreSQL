@@ -478,4 +478,65 @@ sub log_stays_clean
 	$node->stop;
 }
 
+# ===========================================================================
+# A cancel during a standby's own load of a new index must not take the
+# whole worker down, or evict an unrelated, already-cached index
+# ===========================================================================
+{
+	my ($primary, $standby) = setup_primary_standby('loadcancel', 5);
+
+	my $bystand_relid = $standby->safe_psql('postgres',
+		"SELECT oid FROM pg_class WHERE relname = 'rep_idx';");
+	chomp $bystand_relid;
+
+	my $pid_before = wait_for_worker($standby, 30);
+	ok($pid_before =~ /^\d+$/, "load cancel: standby worker running (pid=$pid_before)");
+
+	# Park the standby worker mid-load of a brand-new index, created on the
+	# primary after the backup, so the standby must discover and load it via
+	# VamanaReconcileStandbyCache -> VamanaStandbyLoadIndex.
+	$standby->safe_psql('postgres',
+		"SELECT injection_points_attach('vamana-get-or-load-index-error', 'wait');");
+
+	$primary->safe_psql('postgres', qq{
+		CREATE TABLE fault_tbl (id serial, val vector($dim));
+		CREATE INDEX fault_idx ON fault_tbl USING vamana (val vector_l2_ops);
+		INSERT INTO fault_tbl (val)
+			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20);
+	});
+
+	my $log_pos = -s $standby->logfile;
+
+	my $parked_pid = '';
+	for (1 .. 60)
+	{
+		usleep(500_000);
+		$primary->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+		$parked_pid = $standby->safe_psql('postgres',
+			"SELECT pid FROM pg_stat_activity "
+		  . "WHERE wait_event = 'vamana-get-or-load-index-error';");
+		chomp $parked_pid;
+		last if $parked_pid ne '';
+	}
+	is($parked_pid, $pid_before,
+		"load cancel: standby worker parked mid-load of the new index (pid=$parked_pid)");
+
+	# The same kind of cancel an operator's pg_cancel_backend or a recovery
+	# conflict would deliver.
+	$standby->safe_psql('postgres', "SELECT pg_cancel_backend($parked_pid);");
+
+	is(wait_for_worker($standby, 30), $pid_before,
+		'load cancel: the standby worker survives, it is not respawned under a new pid');
+
+	my $log_delta = substr(slurp_file($standby->logfile), $log_pos);
+	unlike($log_delta, qr/loading vamana index $bystand_relid\b/,
+		'load cancel: the unrelated, already-cached bystander index is never cold-reloaded');
+
+	$standby->safe_psql('postgres',
+		"SELECT injection_points_detach('vamana-get-or-load-index-error');");
+
+	$standby->stop;
+	$primary->stop;
+}
+
 done_testing();

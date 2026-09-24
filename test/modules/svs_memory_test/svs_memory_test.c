@@ -315,6 +315,14 @@ svs_memory_reserve_build(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_check_estimated_build_size);
+Datum
+svs_memory_check_estimated_build_size(PG_FUNCTION_ARGS)
+{
+	SvsMemoryCheckEstimatedBuildSize(PG_GETARG_FLOAT8(0), PG_GETARG_INT32(1));
+	PG_RETURN_VOID();
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_confirm_build);
 Datum
 svs_memory_confirm_build(PG_FUNCTION_ARGS)

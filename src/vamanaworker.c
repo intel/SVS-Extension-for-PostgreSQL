@@ -22,6 +22,7 @@
 #include "vamana.h"
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
+#include "vamana_subxact_guard.h"
 #include "svs_index_residency.h"
 #include "vamanaworker.h"
 #include "svs_cpu_slots.h"
@@ -67,19 +68,18 @@ volatile sig_atomic_t worker_got_sigterm = false;
 volatile sig_atomic_t worker_got_sighup = false;
 
 /*
- * Two eviction-suppression guards, checked together by VamanaRelcacheCallback:
+ * Suppresses VamanaRelcacheCallback-driven eviction for every relid, not just
+ * whichever one a caller is working on: any transaction opened while this is
+ * true can have an unrelated cached relid's queued invalidation delivered on
+ * its StartTransactionCommand. DROP INDEX reaches the worker through
+ * VamanaReplicationQueueDropAtCommit, not this callback, so suppressing here
+ * cannot miss a drop.
  *
- * vamana_eviction_suppressed -- blanket suppression for drain/checkpoint/standby.
- *
- * vamana_active_load_relid -- set by write/warmup/reload paths for their own
- *   transaction's duration. Suppresses eviction of every relid, not just this
- *   one: a queued invalidation for an unrelated cached relid can be delivered
- *   on this transaction's StartTransactionCommand. DROP INDEX reaches the
- *   worker through VamanaReplicationQueueDropAtCommit, not this callback, so
- *   suppressing here cannot miss a drop.
+ * Every caller must save the prior value and restore it on all exit paths,
+ * including errors, rather than force it to false: that is what lets callers
+ * nest inside a caller that already holds its own suppressed span.
  */
 bool		vamana_eviction_suppressed = false;
-Oid			vamana_active_load_relid = InvalidOid;
 
 /*
  * Set by VamanaRelcacheCallback when a relid outside the cache is invalidated;
@@ -378,55 +378,78 @@ VamanaWorkerProcessReloads(void)
 		return;
 	}
 
-	for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
 	{
-		uint32		relid_u32;
-		Oid			relid;
-
-		relid_u32 = pg_atomic_read_u32(
-									   &VamanaWorkerShmemPtr->reloadRequests[i].relid);
-		if (relid_u32 == 0)
-			continue;
-
-		relid = (Oid) relid_u32;
+		bool		prevSuppressed = vamana_eviction_suppressed;
 
 		/*
-		 * Clear the slot first (before loading) so that a new invalidation
-		 * that arrives during the load is not silently lost.
+		 * Suppress for the whole drain pass, not per item: a single DDL
+		 * statement can deliver an unrelated cached relid's invalidation in
+		 * more than one wave, and clearing between items would reopen the
+		 * window for a wave that lands after one item's commit but before
+		 * the next.
 		 */
-		pg_atomic_write_u32(
-							&VamanaWorkerShmemPtr->reloadRequests[i].relid, 0);
+		vamana_eviction_suppressed = true;
 
-		ereport(LOG,
-				(errmsg("vamana worker: reloading index %u", relid)));
+		PG_TRY();
+		{
+			for (int i = 0; i < VAMANA_MAX_RELOAD_QUEUE; i++)
+			{
+				uint32		relid_u32;
+				Oid			relid;
 
-		vamana_active_load_relid = relid;
+				relid_u32 = pg_atomic_read_u32(
+											   &VamanaWorkerShmemPtr->reloadRequests[i].relid);
+				if (relid_u32 == 0)
+					continue;
 
-		INJECTION_POINT("vamana-reload-before-txn-start", NULL);
+				relid = (Oid) relid_u32;
 
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
+				/*
+				 * Clear the slot first (before loading) so that a new
+				 * invalidation that arrives during the load is not silently
+				 * lost.
+				 */
+				pg_atomic_write_u32(
+									&VamanaWorkerShmemPtr->reloadRequests[i].relid, 0);
 
-		/*
-		 * Evict only the in-process cache entry so VamanaWorkerGetOrLoadIndex
-		 * picks up the fresh on-disk copy.  Do NOT use
-		 * VamanaInvalidateCache() here: that would delete the on-disk saved
-		 * copy (preventing reload from disk) and re-signal the worker
-		 * (causing a reload loop).  Run inside this transaction, not before it
-		 * starts, so the durable residency row for an index that will never
-		 * reload again (its catalog entry is gone) is actually retired rather
-		 * than silently skipped for lack of an open transaction.
-		 */
-		VamanaEvictCacheEntry(relid);
+				ereport(LOG,
+						(errmsg("vamana worker: reloading index %u", relid)));
 
-		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
+				INJECTION_POINT("vamana-reload-before-txn-start", NULL);
 
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		vamana_active_load_relid = InvalidOid;
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
 
-		anyReload = true;
+				/*
+				 * Evict only the in-process cache entry so
+				 * VamanaWorkerGetOrLoadIndex picks up the fresh on-disk copy.
+				 * Do NOT use VamanaInvalidateCache() here: that would delete
+				 * the on-disk saved copy (preventing reload from disk) and
+				 * re-signal the worker (causing a reload loop).  Run inside
+				 * this transaction, not before it starts, so the durable
+				 * residency row for an index that will never reload again
+				 * (its catalog entry is gone) is actually retired rather
+				 * than silently skipped for lack of an open transaction.
+				 */
+				VamanaEvictCacheEntry(relid);
+
+				(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
+
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+
+				anyReload = true;
+			}
+
+			vamana_eviction_suppressed = prevSuppressed;
+		}
+		PG_CATCH();
+		{
+			vamana_eviction_suppressed = prevSuppressed;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 
 	(void) anyReload;
@@ -455,12 +478,7 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 	if (relid == InvalidOid || !wasCached)
 		standbyRediscoverPending = true;
 
-	/* Drain/checkpoint: suppress all evictions. */
 	if (vamana_eviction_suppressed)
-		return;
-
-	/* Write/warmup/reload: see vamana_active_load_relid's comment above. */
-	if (vamana_active_load_relid != InvalidOid)
 		return;
 
 	if (relid == InvalidOid)
@@ -519,6 +537,11 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
  * second is a spin even though no individual call blocks;
  * nextSnapshotActivateAttempt caps each index's retry rate independently of
  * how often this function itself gets called.
+ *
+ * VamanaReplicationActivateSlotBounded decodes WAL, which opens its own
+ * transaction and can deliver a relcache invalidation queued for any other
+ * cached index since this worker last checked; suppressed for the whole
+ * sweep, not per index, for the same reason as the reload drain loop.
  */
 static void
 VamanaWorkerActivatePendingSnapshots(void)
@@ -526,22 +549,36 @@ VamanaWorkerActivatePendingSnapshots(void)
 	Oid			dbOid = VamanaWorkerShmemPtr->dbOid;
 	List	   *relids = VamanaGetAllCachedRelids();
 	TimestampTz now = GetCurrentTimestamp();
+	bool		prevSuppressed = vamana_eviction_suppressed;
 
-	foreach_oid(relid, relids)
+	vamana_eviction_suppressed = true;
+
+	PG_TRY();
 	{
-		VamanaIndexCache *cache = VamanaGetCache(relid);
+		foreach_oid(relid, relids)
+		{
+			VamanaIndexCache *cache = VamanaGetCache(relid);
 
-		if (cache == NULL || VamanaReplicationSlotIsConsistent(dbOid, relid))
-			continue;
+			if (cache == NULL || VamanaReplicationSlotIsConsistent(dbOid, relid))
+				continue;
 
-		if (cache->nextSnapshotActivateAttempt != 0 &&
-			cache->nextSnapshotActivateAttempt > now)
-			continue;
+			if (cache->nextSnapshotActivateAttempt != 0 &&
+				cache->nextSnapshotActivateAttempt > now)
+				continue;
 
-		VamanaReplicationActivateSlotBounded(dbOid, relid);
-		cache->nextSnapshotActivateAttempt =
-			TimestampTzPlusMilliseconds(now, VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS);
+			VamanaReplicationActivateSlotBounded(dbOid, relid);
+			cache->nextSnapshotActivateAttempt =
+				TimestampTzPlusMilliseconds(now, VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS);
+		}
+
+		vamana_eviction_suppressed = prevSuppressed;
 	}
+	PG_CATCH();
+	{
+		vamana_eviction_suppressed = prevSuppressed;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -650,6 +687,36 @@ VamanaWorkerSeedIndexCount(void)
 	list_free(relids);
 }
 
+typedef struct SeedDurableResidencyArgs
+{
+	Oid			relid;
+	uint64		durableBytes;
+} SeedDurableResidencyArgs;
+
+static void
+SeedDurableResidencyBody(void *arg)
+{
+	SeedDurableResidencyArgs *args = (SeedDurableResidencyArgs *) arg;
+
+	SvsMemorySeedDurableResidency(VamanaWorkerShmemPtr->dbOid, args->relid, args->durableBytes);
+}
+
+static void
+SeedDurableResidencyGuarded(Oid relid, uint64 durableBytes)
+{
+	SeedDurableResidencyArgs args = {relid, durableBytes};
+	VamanaSubXactResult result = VamanaRunInSubXact(SeedDurableResidencyBody, &args, NULL);
+
+	if (!result.succeeded)
+	{
+		ereport(WARNING,
+				(errmsg("vamana worker: durable residency seed for index %u failed, will retry",
+						relid),
+				 errdetail("%s", result.edata->message)));
+		FreeErrorData(result.edata);
+	}
+}
+
 /*
  * An index dropped while the worker was down leaves its RESIDENT
  * reservation stale -- nothing reloads it, and relcache invalidation only
@@ -684,6 +751,24 @@ VamanaWorkerReconcileResidencyOnStartup(void)
 
 	for (i = 0; i < numDropped; i++)
 		SvsIndexResidencyRecordUnload(droppedRelids[i]);
+
+	/*
+	 * A postmaster restart (unlike a plain worker-process crash) reinitializes
+	 * shared memory, so the pass above has nothing to preserve: every live
+	 * relid starts with no reservation at all, reading 0 until its own lazy
+	 * reload. Seed each from its durable record now, so the committed total
+	 * is already correct the moment this worker reports live, not only after
+	 * something happens to query it.
+	 */
+	{
+		uint64	   *durableBytes = palloc(sizeof(uint64) * numLive);
+
+		SvsIndexResidencyReadBytesForRelids(VamanaWorkerShmemPtr->dbOid, liveRelids, numLive, durableBytes);
+		for (i = 0; i < numLive; i++)
+			if (durableBytes[i] > 0)
+				SeedDurableResidencyGuarded(liveRelids[i], durableBytes[i]);
+		pfree(durableBytes);
+	}
 
 	/*
 	 * The pass above only catches an index whose reservation was dropped

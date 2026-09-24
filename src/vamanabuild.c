@@ -34,7 +34,6 @@
 #include "common/int.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -67,21 +66,16 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	floats = VamanaDatumToFloats(buildstate->typeInfo, values[0],
 								 &dimensions, "build");
 
-	if (buildstate->numVectors >= buildstate->bufferCapacity)
+	SvsVectorBufferAppend(&buildstate->vectors, floats);
+	pfree(floats);
+
+	if (buildstate->tidBufferCapacity < buildstate->vectors.capacity)
 	{
-		buildstate->bufferCapacity *= 2;
-		buildstate->vectorBuffer = repalloc(buildstate->vectorBuffer,
-											buildstate->bufferCapacity * sizeof(float *));
+		buildstate->tidBufferCapacity = buildstate->vectors.capacity;
 		buildstate->tidBuffer = repalloc(buildstate->tidBuffer,
-										 buildstate->bufferCapacity * sizeof(ItemPointerData));
+										 buildstate->tidBufferCapacity * sizeof(ItemPointerData));
 	}
-
-	buildstate->vectorBuffer[buildstate->numVectors] = floats;
-
-	/* Store heap TID for mapping: must be after repalloc above */
-	ItemPointerCopy(tid, &buildstate->tidBuffer[buildstate->numVectors]);
-
-	buildstate->numVectors++;
+	ItemPointerCopy(tid, &buildstate->tidBuffer[buildstate->vectors.count - 1]);
 }
 
 /*
@@ -139,9 +133,9 @@ SerializeIndexToPages(VamanaBuildState * buildstate, SVSIndexHandle svsIndex)
 	meta.graph_degree = buildstate->graph_degree;
 	meta.alpha = VAMANA_ALPHA_TO_FLOAT(buildstate->alpha);
 	meta.tidMapping = buildstate->tidBuffer;
-	meta.numVectors = buildstate->numVectors;
-	meta.tidMappingCapacity = buildstate->numVectors;
-	meta.nextExternalId = (uint64) buildstate->numVectors;
+	meta.numVectors = (int) buildstate->vectors.count;
+	meta.tidMappingCapacity = (int) buildstate->vectors.count;
+	meta.nextExternalId = (uint64) buildstate->vectors.count;
 	meta.numDeleted = 0;
 	meta.needsSave = false;
 
@@ -321,11 +315,6 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 
 	buildstate->distance_type = VamanaGetDistanceMetric(index);
 
-	buildstate->bufferCapacity = VAMANA_INITIAL_BUFFER_CAPACITY;
-	buildstate->vectorBuffer = palloc(buildstate->bufferCapacity * sizeof(float *));
-	buildstate->tidBuffer = palloc(buildstate->bufferCapacity * sizeof(ItemPointerData));
-	buildstate->numVectors = 0;
-
 	buildstate->buildCtx = AllocSetContextCreate(CurrentMemoryContext,
 												 "Vamana build context",
 												 ALLOCSET_DEFAULT_SIZES);
@@ -340,9 +329,7 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 static void
 FreeBuildState(VamanaBuildState * buildstate)
 {
-	for (int i = 0; i < buildstate->numVectors; i++)
-		pfree(buildstate->vectorBuffer[i]);
-	pfree(buildstate->vectorBuffer);
+	SvsVectorBufferFree(&buildstate->vectors);
 	pfree(buildstate->tidBuffer);
 
 	MemoryContextDelete(buildstate->buildCtx);
@@ -513,19 +500,6 @@ SvsLeanVecExtraMultiplier(int dimensions)
 }
 
 /*
- * Rounds byteRequest up to the allocator size class it would occupy as a
- * palloc chunk: the next power of two, floored at 8 bytes. Matches
- * PostgreSQL 18's aset.c, where ALLOC_MINBITS is 3 and AllocSetFreeIndex
- * computes its class from (size - 1), so an exact power of two keeps its
- * own class rather than rounding up to the next one.
- */
-static inline uint64
-SvsAllocChunkClassBytes(uint64 byteRequest)
-{
-	return Max(pg_nextpower2_size_t(byteRequest), (uint64) 8);
-}
-
-/*
  * Adds a and b, raising an admission-time error naming relid rather than
  * silently wrapping, since every term downstream of this sum multiplies
  * numVectors by dimensions and a wrapped sum would under-predict the one
@@ -544,32 +518,12 @@ SvsBuildPeakCheckedAdd(uint64 a, uint64 b, Oid relid)
 }
 
 /*
- * Multiplies a and b under the same overflow discipline as
- * SvsBuildPeakCheckedAdd above.
- */
-static uint64
-SvsBuildPeakCheckedMul(uint64 a, uint64 b, Oid relid)
-{
-	uint64		result;
-
-	if (pg_mul_u64_overflow(a, b, &result))
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("build memory estimate for index %u overflowed", relid)));
-	return result;
-}
-
-/*
- * Builds an SVS index under a launcher-granted thread count.  Takes the
- * caller's raw per-vector buffer and flattens it internally rather than
- * requiring an already-flattened one, so that an admission check needing a
- * live builder handle can sit between builder creation and the flatten,
- * ahead of the large allocation it would exist to refuse.  Owns the
- * builder/storage/algorithm handles it creates and the flattened buffer it
- * allocates, and frees all of them on every exit path, including an ERROR
- * raised while waiting for or running under the grant -- the SVS handles
- * are native objects that PostgreSQL's own memory-context cleanup does not
- * know how to reclaim.  The caller retains ownership of vectorBuffer.
+ * Builds an SVS index under a launcher-granted thread count, from an
+ * already-flattened vector array the caller retains ownership of.  Owns the
+ * builder/storage/algorithm handles it creates and frees all of them on
+ * every exit path, including an ERROR raised while waiting for or running
+ * under the grant -- the SVS handles are native objects that PostgreSQL's
+ * own memory-context cleanup does not know how to reclaim.
  *
  * Writes the admission gate's buildPeak through *buildPeakOut as soon as it
  * is computed, regardless of how the build itself later turns out: the
@@ -579,14 +533,14 @@ SvsBuildPeakCheckedMul(uint64 a, uint64 b, Oid relid)
  */
 static SVSIndexHandle
 VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
-							 float **vectorBuffer, int numVectors,
+							 const float *flatData, int numVectors,
+							 int64 bufferCapacity,
 							 int *errorCodeOut, uint64 *buildPeakOut)
 {
 	SVSAlgorithmHandle algorithm;
 	SVSStorageHandle storage;
 	SVSBuilderHandle builder;
 	VamanaSVSBuildContext buildCtx;
-	float	   *volatile flatData = NULL;
 	Size		dataSize;
 	int			buildWindow = params->build_window_size > 0 ?
 		params->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(params->graph_degree);
@@ -618,32 +572,35 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 		 * (2000) by both callers, so firing needs more than ~2.3e15 vectors
 		 * on a 64-bit system.  Guards the multiplication as belt-and-braces.
 		 */
-		if ((size_t) numVectors > 0 &&
-			(size_t) params->dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)
+		if (bufferCapacity > 0 &&
+			(size_t) params->dimensions > SIZE_MAX / sizeof(float) / (size_t) bufferCapacity)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("vector dataset too large to index "
 							"(%d vectors x %d dimensions exceeds memory limit)",
 							numVectors, params->dimensions)));
 
-		dataSize = (Size) numVectors * params->dimensions * sizeof(float);
+		/*
+		 * Priced against the buffer's allocated capacity rather than
+		 * numVectors: SvsVectorBuffer doubles on growth, so the buffer live
+		 * during the build can hold up to ~2x more than the final count.
+		 */
+		dataSize = (Size) bufferCapacity * params->dimensions * sizeof(float);
 
 		/*
 		 * Memory admission gate. Estimates this build's peak backend RSS
 		 * and reserves it against svs.max_build_memory and this database's
-		 * residency budget before the flatten below performs the first
-		 * large allocation; SvsMemoryReserveBuild raises its own ERROR,
-		 * naming the GUC, on rejection. This runs ahead of the CPU-side
-		 * pending-build admission inside SvsRunGovernedBuild further down,
-		 * so a build refused here never consumes a launcher grant slot; the
-		 * accepted cost of that order is that buildPeak stays committed
-		 * while this backend waits for the grant, bounded by
-		 * vamana_worker_timeout_ms.
+		 * residency budget before SvsRunGovernedBuild below runs;
+		 * SvsMemoryReserveBuild raises its own ERROR, naming the GUC, on
+		 * rejection. This runs ahead of the CPU-side pending-build
+		 * admission inside SvsRunGovernedBuild further down, so a build
+		 * refused here never consumes a launcher grant slot; the accepted
+		 * cost of that order is that buildPeak stays committed while this
+		 * backend waits for the grant, bounded by vamana_worker_timeout_ms.
 		 */
 		{
 			SVSMemoryBreakdown breakdown;
 			uint64		rawBuffer = (uint64) dataSize;
-			uint64		scanBuffer;
 			uint64		residency;
 			uint64		buildPeak;
 			uint64		term;
@@ -673,22 +630,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 						 errdetail("SVS reported a zero-byte estimate for a %d-vector build.",
 								   numVectors)));
 
-			/*
-			 * Three allocations are live at once during the flatten and
-			 * build below: the per-vector palloc blocks from the heap scan
-			 * (freed only after the build returns and the index is
-			 * serialized), the flattened copy (rawBuffer), and the SVS
-			 * graph (part of residency above). scanBuffer prices the first
-			 * of those, one allocator chunk per vector.
-			 */
-			scanBuffer = SvsBuildPeakCheckedAdd(
-				SvsAllocChunkClassBytes((uint64) params->dimensions * sizeof(float)),
-				8, params->relid);
-			scanBuffer = SvsBuildPeakCheckedMul(scanBuffer, (uint64) numVectors,
-												 params->relid);
-
 			buildPeak = SvsBuildPeakCheckedAdd(residency, rawBuffer, params->relid);
-			buildPeak = SvsBuildPeakCheckedAdd(buildPeak, scanBuffer, params->relid);
 			buildPeak = SvsBuildPeakCheckedAdd(buildPeak,
 												(uint64) SvsDimBaselineBytes(params->dimensions),
 												params->relid);
@@ -712,22 +654,13 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 					 errdetail_log("graphBytes " UINT64_FORMAT ", dataBytes " UINT64_FORMAT
 								   ", metadataBytes " UINT64_FORMAT
 								   "; residency " UINT64_FORMAT ", rawBuffer " UINT64_FORMAT
-								   ", scanBuffer " UINT64_FORMAT
 								   "; buildPeak (margined) " UINT64_FORMAT " bytes.",
 								   breakdown.graphBytes, breakdown.dataBytes,
 								   breakdown.metadataBytes, residency, rawBuffer,
-								   scanBuffer, buildPeak)));
+								   buildPeak)));
 
 			SvsMemoryReserveBuild(MyDatabaseId, params->relid, buildPeak, residency);
 			*buildPeakOut = buildPeak;
-		}
-
-		flatData = MemoryContextAllocHuge(CurrentMemoryContext, dataSize);
-		for (int i = 0; i < numVectors; i++)
-		{
-			memcpy(flatData + (Size) i * params->dimensions,
-				   vectorBuffer[i],
-				   params->dimensions * sizeof(float));
 		}
 
 		buildCtx = (VamanaSVSBuildContext) {
@@ -742,8 +675,6 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 	}
 	PG_FINALLY();
 	{
-		if (flatData)
-			pfree(flatData);
 		SVSFreeBuilder(builder);
 		SVSFreeStorage(storage);
 		SVSFreeAlgorithm(algorithm);
@@ -798,6 +729,12 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	InitBuildState(&buildstate, heap, index, indexInfo, MAIN_FORKNUM);
 
+	SvsMemoryCheckEstimatedBuildSize(heap->rd_rel->reltuples, buildstate.dimensions);
+
+	SvsVectorBufferInit(&buildstate.vectors, heap->rd_rel->reltuples, buildstate.dimensions);
+	buildstate.tidBufferCapacity = buildstate.vectors.capacity;
+	buildstate.tidBuffer = palloc(buildstate.tidBufferCapacity * sizeof(ItemPointerData));
+
 	CreateMetaPage(&buildstate);
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_VAMANA_PHASE_LOAD);
@@ -806,26 +743,26 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 												  (void *) &buildstate, NULL);
 
 	ereport(NOTICE,
-			(errmsg("buffered %d vectors for SVS index build", buildstate.numVectors)));
+			(errmsg("buffered %d vectors for SVS index build", (int) buildstate.vectors.count)));
 
 	if (buildstate.compression_type == VAMANA_COMPRESSION_LEANVEC &&
-		buildstate.numVectors > 0 && buildstate.numVectors < 100000)
+		buildstate.vectors.count > 0 && buildstate.vectors.count < 100000)
 	{
 		ereport(WARNING,
 				(errmsg("building LeanVec index with only %d vectors; "
 						"recall may be poor (recommend >= 100000, minimum 10000)",
-						buildstate.numVectors)));
+						(int) buildstate.vectors.count)));
 	}
 	else if (buildstate.compression_type == VAMANA_COMPRESSION_LVQ &&
-			 buildstate.numVectors > 0 && buildstate.numVectors < 10000)
+			 buildstate.vectors.count > 0 && buildstate.vectors.count < 10000)
 	{
 		ereport(WARNING,
 				(errmsg("building LVQ index with only %d vectors; "
 						"recall may be poor (recommend >= 10000)",
-						buildstate.numVectors)));
+						(int) buildstate.vectors.count)));
 	}
 
-	if (buildstate.numVectors == 0)
+	if (buildstate.vectors.count == 0)
 	{
 		ereport(NOTICE,
 				(errmsg("no vectors to index, skipping SVS build")));
@@ -843,7 +780,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	ereport(NOTICE,
 			(errmsg("building SVS index with %d vectors of dimension %d",
-					buildstate.numVectors, buildstate.dimensions)));
+					(int) buildstate.vectors.count, buildstate.dimensions)));
 
 	/*
 	 * SvsBuildAbortCleanup releases whatever memory reservation this build
@@ -870,8 +807,9 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			.data_type = buildstate.typeInfo->dataType,
 		};
 
-		svsIndex = VamanaBuildSVSIndexGoverned(&params, buildstate.vectorBuffer,
-											   buildstate.numVectors, &error_code,
+		svsIndex = VamanaBuildSVSIndexGoverned(&params, buildstate.vectors.data,
+											   (int) buildstate.vectors.count,
+											   buildstate.vectors.capacity, &error_code,
 											   &buildPeak);
 
 		if (svsIndex == NULL)
@@ -1043,7 +981,7 @@ cleanup:
 
 	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
 	result->heap_tuples = buildstate.reltuples;
-	result->index_tuples = buildstate.numVectors;
+	result->index_tuples = buildstate.vectors.count;
 
 	return result;
 }
@@ -1098,10 +1036,9 @@ VamanaRebuildFromTable(Relation index)
 	int			compression_secondary;
 	int			leanvec_dims;
 	Snapshot	snapshot;
-	float	  **vectorBuffer = NULL;
+	SvsVectorBuffer vectors = {0};
 	ItemPointerData *tidMapping = NULL;
-	int			numVectors = 0;
-	int			bufferCapacity = VAMANA_INITIAL_BUFFER_CAPACITY;
+	int64		tidBufferCapacity = 0;
 	int			errorCode = 0;
 	Oid			relid = RelationGetRelid(index);
 	uint64		buildPeak = 0;
@@ -1125,9 +1062,6 @@ VamanaRebuildFromTable(Relation index)
 
 	distanceType = VamanaGetDistanceMetric(index);
 
-	vectorBuffer = palloc(bufferCapacity * sizeof(float *));
-	tidMapping = palloc(bufferCapacity * sizeof(ItemPointerData));
-
 	/*
 	 * Acquire AccessShareLock on the heap non-blocking.  The BGW must never
 	 * block on a relation-level lock: holding ASL on the index (acquired by
@@ -1137,8 +1071,6 @@ VamanaRebuildFromTable(Relation index)
 	 */
 	if (!ConditionalLockRelationOid(index->rd_index->indrelid, AccessShareLock))
 	{
-		pfree(vectorBuffer);
-		pfree(tidMapping);
 		ereport(LOG,
 				(errmsg("vamana index %u: heap locked by DDL, skipping rebuild",
 						RelationGetRelid(index))));
@@ -1147,6 +1079,12 @@ VamanaRebuildFromTable(Relation index)
 
 	heap = table_open(index->rd_index->indrelid, NoLock);
 	tupdesc = RelationGetDescr(heap);
+
+	SvsMemoryCheckEstimatedBuildSize(heap->rd_rel->reltuples, dimensions);
+
+	SvsVectorBufferInit(&vectors, heap->rd_rel->reltuples, dimensions);
+	tidBufferCapacity = vectors.capacity;
+	tidMapping = palloc(tidBufferCapacity * sizeof(ItemPointerData));
 
 	/*
 	 * Scan table to collect vectors - use an MVCC snapshot to exclude dead
@@ -1175,18 +1113,6 @@ VamanaRebuildFromTable(Relation index)
 
 		if (!isnull[vectorAttNum])
 		{
-			if (numVectors >= bufferCapacity)
-			{
-				bufferCapacity *= 2;
-				vectorBuffer = repalloc(vectorBuffer,
-										bufferCapacity * sizeof(float *));
-				tidMapping = repalloc(tidMapping,
-									  bufferCapacity * sizeof(ItemPointerData));
-			}
-
-			/* Store heap TID for mapping */
-			ItemPointerCopy(&tuple->t_self, &tidMapping[numVectors]);
-
 			floats = VamanaDatumToFloats(typeInfo, values[vectorAttNum],
 										 &datumDim, "rebuild");
 			if (datumDim != dimensions)
@@ -1198,17 +1124,26 @@ VamanaRebuildFromTable(Relation index)
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("vector dimension mismatch: expected %d, got %d", dimensions, datumDim)));
 			}
-			vectorBuffer[numVectors] = floats;
-			numVectors++;
+
+			SvsVectorBufferAppend(&vectors, floats);
+			pfree(floats);
+
+			if (tidBufferCapacity < vectors.capacity)
+			{
+				tidBufferCapacity = vectors.capacity;
+				tidMapping = repalloc(tidMapping,
+									  tidBufferCapacity * sizeof(ItemPointerData));
+			}
+			ItemPointerCopy(&tuple->t_self, &tidMapping[vectors.count - 1]);
 
 			/*
 			 * Emit progress LOG at regular intervals to surface progress during
 			 * long-running rebuilds.
 			 */
-			if (numVectors % VAMANA_PROGRESS_INTERVAL == 0)
+			if (vectors.count % VAMANA_PROGRESS_INTERVAL == 0)
 				ereport(LOG,
 						(errmsg("vamana index %u: scanning table, %d vectors collected",
-								RelationGetRelid(index), numVectors)));
+								RelationGetRelid(index), (int) vectors.count)));
 		}
 
 		pfree(values);
@@ -1222,33 +1157,33 @@ VamanaRebuildFromTable(Relation index)
 	table_close(heap, NoLock);
 	UnlockRelationOid(index->rd_index->indrelid, AccessShareLock);
 
-	if (numVectors == 0)
+	if (vectors.count == 0)
 	{
 		ereport(WARNING,
 				(errmsg("no vectors found in table for index rebuild")));
 		pfree(tidMapping);
-		pfree(vectorBuffer);
+		SvsVectorBufferFree(&vectors);
 		return NULL;
 	}
 
 	ereport(NOTICE,
-			(errmsg("collected %d vectors, building SVS index...", numVectors)));
+			(errmsg("collected %d vectors, building SVS index...", (int) vectors.count)));
 
 	if (compression_type == VAMANA_COMPRESSION_LEANVEC &&
-		numVectors < 100000)
+		vectors.count < 100000)
 	{
 		ereport(WARNING,
 				(errmsg("rebuilding LeanVec index with only %d vectors; "
 						"recall may be poor (recommend >= 100000, minimum 10000)",
-						numVectors)));
+						(int) vectors.count)));
 	}
 	else if (compression_type == VAMANA_COMPRESSION_LVQ &&
-			 numVectors < 10000)
+			 vectors.count < 10000)
 	{
 		ereport(WARNING,
 				(errmsg("rebuilding LVQ index with only %d vectors; "
 						"recall may be poor (recommend >= 10000)",
-						numVectors)));
+						(int) vectors.count)));
 	}
 
 	/*
@@ -1278,14 +1213,15 @@ VamanaRebuildFromTable(Relation index)
 			.data_type = typeInfo->dataType,
 		};
 
-		svsIndex = VamanaBuildSVSIndexGoverned(&params, vectorBuffer, numVectors, &errorCode,
-												&buildPeak);
+		int			numVectors = (int) vectors.count;
+
+		svsIndex = VamanaBuildSVSIndexGoverned(&params, vectors.data,
+												numVectors, vectors.capacity,
+												&errorCode, &buildPeak);
 
 		if (svsIndex == NULL || errorCode != 0)
 		{
-			for (int i = 0; i < numVectors; i++)
-				pfree(vectorBuffer[i]);
-			pfree(vectorBuffer);
+			SvsVectorBufferFree(&vectors);
 
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
@@ -1296,9 +1232,7 @@ VamanaRebuildFromTable(Relation index)
 		SVSSetIndexSearchThreads(svsIndex, SvsCurrentSearchGrant());
 
 		/* tidMapping is still needed below, by VamanaCacheIndex. */
-		for (int i = 0; i < numVectors; i++)
-			pfree(vectorBuffer[i]);
-		pfree(vectorBuffer);
+		SvsVectorBufferFree(&vectors);
 
 		ereport(NOTICE,
 				(errmsg("successfully rebuilt vamana index with %d vectors", numVectors)));

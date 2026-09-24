@@ -188,6 +188,12 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 residencyEstimate);
 
 /*
+ * A no-op when reltuples <= 0 (never analyzed); SvsMemoryReserveBuild is
+ * still the authoritative gate either way.
+ */
+extern void SvsMemoryCheckEstimatedBuildSize(double reltuples, int dimensions);
+
+/*
  * Backend, after a successful build and before serializing to disk.
  * Releases buildPeak unconditionally and reconciles the residency
  * reservation from estimate to measuredResidencyBytes (RESERVED ->
@@ -313,6 +319,15 @@ extern void SvsMemoryReapDeadReservations(void);
 extern void SvsMemoryReconcileResidentReservations(Oid dbOid,
 													const Oid *liveRelids, int numLiveRelids,
 													Oid *droppedRelids, int *numDropped);
+
+/*
+ * Worker, at startup, for a relid with no reservation of its own yet (fresh
+ * shmem, nothing preserved to reconcile). Reconciles durableBytes into
+ * relid's committed total via SvsMemoryReconcileLoad, exactly as if it were
+ * a real measurement. A no-op if relid already has a reservation -- that
+ * one is never staler than the durable record and must not be overwritten.
+ */
+extern void SvsMemorySeedDurableResidency(Oid dbOid, Oid relid, uint64 durableBytes);
 
 typedef struct SvsMemoryStats
 {

@@ -949,3 +949,13 @@ $do$;', :curdb_oid) AS is_launcher_probe \gset
 :is_launcher_probe
 SELECT svs_memory_test_set_launcher_database('postgres');
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- Below, at, and one byte past the raw-data ceiling (dimensions=4, so 16
+-- bytes/row).
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 - 1)::float8, 4);
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16)::float8, 4);
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 + 1)::float8, 4);
+
+-- An unanalyzed table (reltuples <= 0) is not checked here.
+SELECT svs_memory_check_estimated_build_size(0, 999999999);
+SELECT svs_memory_check_estimated_build_size(-1, 999999999);

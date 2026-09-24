@@ -22,6 +22,9 @@ our @EXPORT_OK = qw(
     run_concurrent run_synchronized dir_size vamana_save_dir
     wait_for_worker wait_for_worker_db wait_for_slot_release
     orphan_slot_count wait_for_no_orphan_slots
+    search_scratch_in_flight_bytes wait_for_search_scratch_in_flight
+    park_search_scratch_reservation search_scratch_cost_for_relid
+    release_search_scratch_reservation
     worker_committed_totals park_build
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
@@ -342,6 +345,111 @@ sub wait_for_no_orphan_slots
         usleep(500_000);
     }
     return $count;
+}
+
+# ---------------------------------------------------------------------------
+# search_scratch_in_flight_bytes: this database's live search-scratch
+# in-flight total, read from pg_stat_vamana_worker.
+# ---------------------------------------------------------------------------
+sub search_scratch_in_flight_bytes
+{
+    my ($node, $db) = @_;
+    my $bytes = $node->safe_psql($db,
+        "SELECT search_scratch_bytes_in_flight FROM pg_stat_vamana_worker "
+      . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = '$db');");
+    chomp $bytes;
+    return $bytes;
+}
+
+# ---------------------------------------------------------------------------
+# wait_for_search_scratch_in_flight: poll search_scratch_in_flight_bytes until
+# it reaches $expected (up to $attempts x 0.1s).  Returns the final value, so
+# a timeout is visible to the caller's own assertion rather than silently
+# passing.
+# ---------------------------------------------------------------------------
+sub wait_for_search_scratch_in_flight
+{
+    my ($node, $db, $expected, $attempts) = @_;
+    $attempts //= 100;
+    my $bytes = '';
+    for (1 .. $attempts)
+    {
+        $bytes = search_scratch_in_flight_bytes($node, $db);
+        return $bytes if $bytes eq $expected;
+        usleep(100_000);
+    }
+    return $bytes;
+}
+
+# ---------------------------------------------------------------------------
+# park_search_scratch_reservation: attach 'wait' to the worker's
+# vamana-search-scratch-reserved injection point (already fired for a search
+# whose cost has just been admitted, before it runs against SVS), then run
+# $search_sql in a fresh background session and wait for the worker to park
+# there.  Requires injection_points already created in $db.
+#
+# Returns ($session, $client_pid, $worker_pid): $session is the still-open
+# background_psql handle for $search_sql; $client_pid is that session's own
+# backend pid (for a later pg_cancel_backend); $worker_pid is the vamana
+# worker's own pid, parked at the injection point -- distinct from
+# $client_pid.  The caller owns releasing the reservation, via
+# release_search_scratch_reservation or by killing $worker_pid directly.
+# ---------------------------------------------------------------------------
+sub park_search_scratch_reservation
+{
+    my ($node, $db, $search_sql) = @_;
+    my $point = 'vamana-search-scratch-reserved';
+
+    $node->safe_psql($db, "SELECT injection_points_attach('$point', 'wait');");
+
+    my $session = $node->background_psql($db, on_error_stop => 0);
+    my $client_pid_out = $session->query('SELECT pg_backend_pid();');
+    my ($client_pid) = $client_pid_out =~ /(\d+)/;
+    $session->query_until(qr/park_search_scratch_reservation_started/,
+        "\\echo park_search_scratch_reservation_started\n" . $search_sql);
+
+    my $worker_pid = '';
+    for (1 .. 100)
+    {
+        usleep(100_000);
+        $worker_pid = $node->safe_psql($db,
+            "SELECT pid FROM pg_stat_activity WHERE wait_event = '$point';");
+        chomp $worker_pid;
+        last if $worker_pid ne '';
+    }
+    return ($session, $client_pid, $worker_pid);
+}
+
+# ---------------------------------------------------------------------------
+# search_scratch_cost_for_relid: the memoized per-query search-scratch cost
+# currently charged to a search in flight against $relid. Only meaningful
+# while that search's slot is still 'processing' -- typically read while
+# parked via park_search_scratch_reservation.
+# ---------------------------------------------------------------------------
+sub search_scratch_cost_for_relid
+{
+    my ($node, $db, $relid) = @_;
+    my $cost = $node->safe_psql($db,
+        "SELECT search_scratch_bytes_per_query FROM pg_stat_vamana_worker_slot "
+      . "WHERE index_relid = $relid AND slot_status = 'processing';");
+    chomp $cost;
+    return $cost;
+}
+
+# ---------------------------------------------------------------------------
+# release_search_scratch_reservation: wake and detach a reservation parked by
+# park_search_scratch_reservation, then let $session's search run to
+# completion and close it.
+# ---------------------------------------------------------------------------
+sub release_search_scratch_reservation
+{
+    my ($node, $db, $session) = @_;
+    my $point = 'vamana-search-scratch-reserved';
+
+    $node->safe_psql($db, "SELECT injection_points_wakeup('$point');");
+    $session->query('SELECT 1');
+    $session->quit;
+    $node->safe_psql($db, "SELECT injection_points_detach('$point');");
 }
 
 # ---------------------------------------------------------------------------
