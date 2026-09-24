@@ -25,6 +25,7 @@ our @EXPORT_OK = qw(
     search_scratch_in_flight_bytes wait_for_search_scratch_in_flight
     park_search_scratch_reservation search_scratch_cost_for_relid
     release_search_scratch_reservation
+    worker_committed_totals park_build
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 
@@ -449,6 +450,48 @@ sub release_search_scratch_reservation
     $session->query('SELECT 1');
     $session->quit;
     $node->safe_psql($db, "SELECT injection_points_detach('$point');");
+}
+
+# ---------------------------------------------------------------------------
+# worker_committed_totals: $db's own (build_bytes_committed,
+# residency_bytes_committed) from the real, running worker's accounting.
+# Named worker_committed_totals rather than committed_totals: an
+# already-merged test file defines its own differently-shaped
+# committed_totals (no $db parameter, hardcoded to 'postgres'), and this
+# module's :all export tag is the whole @EXPORT_OK list, so a same-named
+# export would collide with that file's own sub under warnings FATAL.
+# ---------------------------------------------------------------------------
+sub worker_committed_totals
+{
+    my ($node, $db) = @_;
+    my $row = $node->safe_psql('postgres', qq(
+        SELECT build_bytes_committed, residency_bytes_committed
+        FROM pg_stat_vamana_worker
+        WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = '$db');
+    ));
+    chomp $row;
+    return split(/\|/, $row);
+}
+
+# ---------------------------------------------------------------------------
+# park_build: attach 'wait' to $point, start a background CREATE INDEX of
+# $idx on $tbl in $db, and return once it is parked there.  The caller is
+# responsible for detaching and waking $point.
+# ---------------------------------------------------------------------------
+sub park_build
+{
+    my ($node, $db, $tbl, $idx, $point) = @_;
+
+    $node->safe_psql('postgres', "SELECT injection_points_attach('$point', 'wait');");
+
+    my $build = $node->background_psql($db, on_error_stop => 0);
+    $build->query_until(qr/build_started/, qq(
+        \\echo build_started
+        CREATE INDEX $idx ON $tbl USING vamana (c1 vector_l2_ops);
+    ));
+    $node->wait_for_event('client backend', $point);
+
+    return $build;
 }
 
 1;
