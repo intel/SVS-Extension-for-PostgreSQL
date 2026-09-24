@@ -424,10 +424,20 @@ VamanaWorkerProcessReloads(void)
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		vamana_active_load_relid = InvalidOid;
+
+		/*
+		 * Do not clear the guard here. A single DDL statement can deliver an
+		 * unrelated relid's invalidation in more than one wave; clearing
+		 * between queue items reopens the suppression window for a wave that
+		 * lands after this item's commit but before the next item (or after
+		 * the last item, before the loop exits). Leave it set for the whole
+		 * drain pass and clear once below.
+		 */
 
 		anyReload = true;
 	}
+
+	vamana_active_load_relid = InvalidOid;
 
 	(void) anyReload;
 }
@@ -526,6 +536,7 @@ VamanaWorkerActivatePendingSnapshots(void)
 	Oid			dbOid = VamanaWorkerShmemPtr->dbOid;
 	List	   *relids = VamanaGetAllCachedRelids();
 	TimestampTz now = GetCurrentTimestamp();
+	bool		anyActivated = false;
 
 	foreach_oid(relid, relids)
 	{
@@ -538,10 +549,26 @@ VamanaWorkerActivatePendingSnapshots(void)
 			cache->nextSnapshotActivateAttempt > now)
 			continue;
 
+		/*
+		 * VamanaReplicationActivateSlotBounded decodes WAL, which opens its
+		 * own transaction and can deliver a relcache invalidation queued for
+		 * any other cached index since this worker last checked. Suppress
+		 * eviction for the whole sweep, not just this call, same as the
+		 * reload/load/warmup guard; see vamana_active_load_relid's
+		 * declaration.
+		 */
+		if (!anyActivated)
+			vamana_active_load_relid = relid;
+
 		VamanaReplicationActivateSlotBounded(dbOid, relid);
 		cache->nextSnapshotActivateAttempt =
 			TimestampTzPlusMilliseconds(now, VAMANA_SNAPSHOT_ACTIVATE_INTERVAL_MS);
+
+		anyActivated = true;
 	}
+
+	if (anyActivated)
+		vamana_active_load_relid = InvalidOid;
 }
 
 /*
