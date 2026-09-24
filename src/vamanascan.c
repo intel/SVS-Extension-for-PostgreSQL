@@ -158,7 +158,8 @@ LoadIndexFromPages(Relation index)
 					 VAMANA_ALPHA_TO_FLOAT(meta.alpha),
 					 tidMapping, meta.numVectors,
 					 (int) tidMappingCapacity,
-					 nextExternalId, (int) numDeleted);
+					 nextExternalId, (int) numDeleted,
+					 SVSComputeCapacityHeadroomVectors(&config));
 
 	if (tidMapping)
 		pfree(tidMapping);

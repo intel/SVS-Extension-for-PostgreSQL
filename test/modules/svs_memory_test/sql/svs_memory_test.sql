@@ -987,3 +987,38 @@ SELECT * FROM svs_memory_read_stats(800);
 SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
 SELECT * FROM svs_memory_read_stats(800);
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- Budget has zero byte slack, so only a zero charge can succeed.
+SELECT svs_memory_admit_database(900, 100::bigint);
+SELECT svs_memory_reconcile_load(900, 90, 100::bigint);
+SELECT svs_memory_reconcile_resident(900, 90, 100::bigint, 3::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+
+-- Three rows of headroom: three inserts succeed at zero cost.
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+
+-- Headroom exhausted: the next insert falls back to the full charge and
+-- is refused.
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Aborting a headroom-backed reservation gives the row back.
+SELECT svs_memory_reconcile_resident(900, 90, 100::bigint, 1::bigint);
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT svs_memory_abort_insert(900, 90);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+SELECT * FROM svs_memory_test_check_invariants();

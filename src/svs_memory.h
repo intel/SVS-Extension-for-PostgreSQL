@@ -118,6 +118,14 @@ typedef struct SvsMemReservation
 	 * zero until that confirm.
 	 */
 	uint64		priorResidentBytes;
+
+	/*
+	 * Rows that fit above numVectors before the next SVS block growth,
+	 * as of the last measuredBytes refresh. Consumed by SvsMemoryReserveInsert
+	 * one row at a time; restored by SvsMemoryAbortInsert if that row's
+	 * insert never applies.
+	 */
+	uint64		capacityHeadroomVectors;
 } SvsMemReservation;
 
 /*
@@ -132,6 +140,7 @@ typedef struct SvsMemInsertReservation
 	int			ownerPid;
 	TimestampTz reservedAt;
 	uint64		deltaBytes;
+	bool		consumedHeadroom;
 } SvsMemInsertReservation;
 
 /*
@@ -255,7 +264,8 @@ extern void SvsMemoryAbortBuild(Oid dbOid, Oid relid);
  * the same way ConfirmBuild would, and the resulting RESIDENT record leaves
  * no leftover priorResidentBytes or buildPeakBytes behind.
  */
-extern bool SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes);
+extern bool SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes,
+									uint64 capacityHeadroomVectors);
 
 /*
  * Worker, at unload. Subtracts relid's committed resident bytes and drops
@@ -286,7 +296,8 @@ extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
  * Like SvsMemoryReanchorInsert, but never touches pending insert
  * reservations for relid -- those belong to unrelated, unapplied inserts.
  */
-extern void SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes);
+extern void SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
+										uint64 capacityHeadroomVectors);
 
 /*
  * Worker, on the empty-table first-insert build path: relid's reservation

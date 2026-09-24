@@ -9,6 +9,7 @@
 
 #include "postgres.h"
 #include "svs_wrapper.h"
+#include "svs_capacity_search.h"
 #include "vamana.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
@@ -693,6 +694,78 @@ SVSComputeBlockSizeBytes(svs_index_builder_h builder, int numVectors)
 	svs_error_free(error);
 
 	return pg_nextpower2_size_t(Max(vectorBytes, Min(dataBytes, defaultBlockSizeBytes)));
+}
+
+typedef struct SvsBuildEstimateCostContext
+{
+	svs_index_builder_h builder;
+	size_t		blocksizeBytes;
+	bool		useGraphBytes;
+} SvsBuildEstimateCostContext;
+
+static uint64
+SvsBuildEstimateCost(void *contextArg, uint64 numVectors)
+{
+	SvsBuildEstimateCostContext *context = (SvsBuildEstimateCostContext *) contextArg;
+	svs_error_h error = svs_error_create();
+	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+
+	svs_index_builder_estimate_memory_dynamic(context->builder, (size_t) numVectors,
+											   context->blocksizeBytes, &breakdown, error);
+	CheckSVSError(error, "estimate capacity headroom");
+	svs_error_free(error);
+
+	return context->useGraphBytes ? breakdown.graph_bytes : breakdown.data_bytes;
+}
+
+/*
+ * Rows that fit above config->numVectors before this index's next real SVS
+ * block growth. blocksizeBytes matches SVSComputeBlockSizeBytes so this
+ * agrees with what the live index was actually built or loaded with.
+ */
+uint64
+SVSComputeCapacityHeadroomVectors(const SVSBuildConfig *config)
+{
+	SVSAlgorithmHandle algorithm;
+	SVSStorageHandle storage;
+	SVSBuilderHandle builder;
+	int			buildWindow = (config->build_window_size > 0)
+		? config->build_window_size
+		: VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
+	size_t		blocksizeBytes;
+	SvsBuildEstimateCostContext dataContext;
+	SvsBuildEstimateCostContext graphContext;
+	uint64		dataHeadroom;
+	uint64		graphHeadroom;
+
+	algorithm = SVSCreateAlgorithm(config->graph_degree, buildWindow, config->search_window_size,
+									config->alpha, VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+	storage = SVSCreateStorageForCompression(config->compression_type, config->data_type,
+											 config->dimensions, config->leanvec_dims,
+											 config->compression_primary,
+											 config->compression_secondary);
+	builder = SVSCreateBuilder(config->distance_type, config->dimensions, algorithm);
+	SVSBuilderSetStorage(builder, storage);
+
+	blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder, config->numVectors);
+	dataContext = (SvsBuildEstimateCostContext) {(svs_index_builder_h) builder, blocksizeBytes, false};
+	graphContext = (SvsBuildEstimateCostContext) {(svs_index_builder_h) builder, blocksizeBytes, true};
+
+	dataHeadroom = SvsSearchCapacityHeadroom(SvsBuildEstimateCost, &dataContext,
+											  (uint64) config->numVectors, blocksizeBytes);
+	graphHeadroom = SvsSearchCapacityHeadroom(SvsBuildEstimateCost, &graphContext,
+											   (uint64) config->numVectors, blocksizeBytes);
+
+	SVSFreeBuilder(builder);
+	SVSFreeStorage(storage);
+	SVSFreeAlgorithm(algorithm);
+
+	ereport(DEBUG1,
+			(errmsg("vamana: capacity headroom for %d vectors is %llu (data %llu, graph %llu)",
+					config->numVectors, (unsigned long long) Min(dataHeadroom, graphHeadroom),
+					(unsigned long long) dataHeadroom, (unsigned long long) graphHeadroom)));
+
+	return Min(dataHeadroom, graphHeadroom);
 }
 
 void

@@ -180,7 +180,8 @@ void
 VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 				 int graph_degree, float alpha, ItemPointerData *tidMapping,
 				 int numVectors, int tidMappingCapacity,
-				 uint64 nextExternalId, int numDeleted)
+				 uint64 nextExternalId, int numDeleted,
+				 uint64 capacityHeadroomVectors)
 {
 	VamanaIndexCache *entry;
 	MemoryContext oldCtx;
@@ -189,7 +190,7 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 
 	entry = VamanaAllocCacheSlot(indexRelid);
 
-	if (!SvsMemoryReconcileLoad(MyDatabaseId, indexRelid, measuredBytes))
+	if (!SvsMemoryReconcileLoad(MyDatabaseId, indexRelid, measuredBytes, capacityHeadroomVectors))
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("cannot load vamana index %u: exceeds this database's residency budget",

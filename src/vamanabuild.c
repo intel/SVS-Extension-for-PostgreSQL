@@ -1357,12 +1357,31 @@ VamanaRebuildFromTable(Relation index)
 		 * path does not repeat either call.
 		 */
 		INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
-		VamanaCacheIndex(relid, svsIndex, dimensions,
-						 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
-						 numVectors,	/* tidMappingCapacity (fresh rebuild, no
-										 * holes) */
-						 (uint64) numVectors,	/* nextExternalId */
-						 0);		/* numDeleted */
+		{
+			SVSBuildConfig config = {
+				.graph_degree = graph_degree,
+				.alpha = alpha,
+				.search_window_size = searchWindow,
+				.compression_type = compression_type,
+				.compression_primary = compression_primary,
+				.compression_secondary = compression_secondary,
+				.distance_type = distanceType,
+				.data_type = typeInfo->dataType,
+				.dimensions = dimensions,
+				.leanvec_dims = leanvec_dims,
+				.build_window_size = buildWindow,
+				.search_num_threads = 0,
+				.numVectors = numVectors,
+			};
+
+			VamanaCacheIndex(relid, svsIndex, dimensions,
+							 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
+							 numVectors,	/* tidMappingCapacity (fresh rebuild, no
+											 * holes) */
+							 (uint64) numVectors,	/* nextExternalId */
+							 0,			/* numDeleted */
+							 SVSComputeCapacityHeadroomVectors(&config));
+		}
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, ObjectIdGetDatum(relid));
 

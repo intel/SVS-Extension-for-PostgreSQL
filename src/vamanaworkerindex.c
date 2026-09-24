@@ -109,10 +109,11 @@ CacheEmptyTableIndex(Relation indexRel, Oid relid)
 	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
 	int			dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
 
+	/* No SVS index exists yet, so it has no capacity and no headroom. */
 	VamanaCacheIndex(relid, NULL, dims,
 					  opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
 					  opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
-					  NULL, 0, 0, 0, 0);
+					  NULL, 0, 0, 0, 0, 0);
 }
 
 /*
@@ -266,6 +267,38 @@ VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config, b
 }
 
 /*
+ * The one place that builds an SVSBuildConfig, so every caller agrees.
+ * Takes dimensions/graph_degree/numVectors as plain values rather than a
+ * VamanaIndexCache -- callers assembling a config to create that cache
+ * entry (VamanaCacheIndex has not run yet) have no such entry to read.
+ */
+SVSBuildConfig
+VamanaAssembleBuildConfig(Relation indexRel, int dimensions, int graph_degree,
+						  int numVectors, const VamanaOptions *opts)
+{
+	SVSBuildConfig config;
+	VamanaMetaPageData meta;
+
+	VamanaReadMetaPage(indexRel, &meta);
+
+	config.graph_degree = graph_degree;
+	config.alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
+	config.search_window_size = VamanaResolveSearchWindowSize(opts);
+	config.compression_type = meta.compression_type;
+	config.compression_primary = meta.compression_primary;
+	config.compression_secondary = meta.compression_secondary;
+	config.distance_type = VamanaGetDistanceMetric(indexRel);
+	config.data_type = VamanaGetTypeInfo(indexRel)->dataType;
+	config.dimensions = dimensions;
+	config.leanvec_dims = opts ? opts->leanvec_dims : -1;
+	config.build_window_size = opts ? opts->build_window_size : 0;
+	config.search_num_threads = 0;
+	config.numVectors = numVectors;
+
+	return config;
+}
+
+/*
  * Adapter for callers holding an open Relation and its current reloptions
  * (a load or reload, where nothing has resolved these into an SVSBuildConfig
  * already). Assembles one and delegates to the shared core.
@@ -279,22 +312,21 @@ VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCac
 	if (cache == NULL)
 		return;
 
-	config.graph_degree = cache->graph_degree;
-	config.alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	config.search_window_size = VamanaResolveSearchWindowSize(opts);
-	config.compression_type = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
-	config.compression_primary = opts ? opts->compression_primary : 0;
-	config.compression_secondary = opts ? opts->compression_secondary : 0;
-	config.distance_type = VamanaGetDistanceMetric(indexRel);
-	config.data_type = VamanaGetTypeInfo(indexRel)->dataType;
-	config.dimensions = cache->dimensions;
-	config.leanvec_dims = opts ? opts->leanvec_dims : -1;
-	config.build_window_size = opts ? opts->build_window_size : 0;
-	config.search_num_threads = 0;
-	config.numVectors = cache->numVectors;
+	config = VamanaAssembleBuildConfig(indexRel, cache->dimensions, cache->graph_degree,
+										cache->numVectors, opts);
 
 	VamanaSeedSearchScratchCostFromConfig(relid, &config,
 										   opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+}
+
+uint64
+VamanaRefreshIndexCapacityHeadroom(Relation indexRel, int dimensions, int graph_degree,
+									int numVectors, const VamanaOptions *opts)
+{
+	SVSBuildConfig config = VamanaAssembleBuildConfig(indexRel, dimensions, graph_degree,
+													   numVectors, opts);
+
+	return SVSComputeCapacityHeadroomVectors(&config);
 }
 
 /* Worker SIGHUP handling: refreshes every cached index's search-scratch cost. */

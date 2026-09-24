@@ -178,6 +178,8 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		return NULL;
 	}
 
+	cache->numVectors = 1;
+
 	/*
 	 * cache already holds a RESIDENT reservation at 0 bytes, from the
 	 * empty-table VamanaCacheIndex call that created this entry; reconcile
@@ -186,29 +188,6 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	 */
 	{
 		uint64		measuredBytes = SVSGetIndexMemoryUsage(svsIndex);
-
-		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes))
-		{
-			SVSFreeIndex(svsIndex);
-			ereport(WARNING,
-					(errmsg("vamana worker: first-insert build for index %u exceeds this database's residency budget",
-							relid),
-					 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes)));
-			return NULL;
-		}
-
-		/* ReconcileLoad only reconciles the build reservation; the inserting backend's own pending-insert reservation is separate and untouched by it. */
-		SvsMemoryCloseInsertReservation(MyDatabaseId, relid);
-
-		cache->residentBytes = measuredBytes;
-		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
-	}
-
-	cache->svsIndex = svsIndex;
-	cache->nextExternalId = 1;
-	cache->numVectors = 1;
-
-	{
 		SVSBuildConfig config = {
 			.graph_degree = cache->graph_degree,
 			.alpha = rawAlpha,
@@ -224,9 +203,29 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 			.search_num_threads = 0,
 			.numVectors = cache->numVectors,
 		};
+		uint64		headroomVectors = SVSComputeCapacityHeadroomVectors(&config);
+
+		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes, headroomVectors))
+		{
+			SVSFreeIndex(svsIndex);
+			ereport(WARNING,
+					(errmsg("vamana worker: first-insert build for index %u exceeds this database's residency budget",
+							relid),
+					 errdetail("Measured %llu bytes.", (unsigned long long) measuredBytes)));
+			return NULL;
+		}
+
+		/* ReconcileLoad only reconciles the build reservation; the inserting backend's own pending-insert reservation is separate and untouched by it. */
+		SvsMemoryCloseInsertReservation(MyDatabaseId, relid);
+
+		cache->residentBytes = measuredBytes;
+		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
 
 		VamanaSeedSearchScratchCostFromConfig(relid, &config, useSearchHistory);
 	}
+
+	cache->svsIndex = svsIndex;
+	cache->nextExternalId = 1;
 
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	cache->tidMapping = palloc0((Size) 1024 * sizeof(ItemPointerData));
@@ -262,6 +261,28 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	}
 
 	return svsIndex;
+}
+
+static uint64
+VamanaComputeCapacityHeadroomVectors(Oid relid, VamanaIndexCache *cache)
+{
+	Relation	indexRel;
+	uint64		headroomVectors;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	indexRel = index_open(relid, AccessShareLock);
+
+	headroomVectors = VamanaRefreshIndexCapacityHeadroom(indexRel, cache->dimensions,
+														  cache->graph_degree, cache->numVectors,
+														  (VamanaOptions *) indexRel->rd_options);
+
+	index_close(indexRel, AccessShareLock);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	return headroomVectors;
 }
 
 /*
@@ -500,9 +521,13 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 										relid)));
 					if (cache != NULL)
 					{
+						uint64		headroomVectors;
+
 						cache->numDeleted = 0;
 						cache->residentBytes = SVSGetIndexMemoryUsage(index);
-						SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes);
+						headroomVectors = VamanaComputeCapacityHeadroomVectors(relid, cache);
+						SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes,
+													headroomVectors);
 					}
 				}
 
@@ -683,7 +708,8 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 						 params->numVectors,
 						 params->tidMappingCapacity,
 						 params->nextExternalId,
-						 params->numDeleted);
+						 params->numDeleted,
+						 SVSComputeCapacityHeadroomVectors(&config));
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();

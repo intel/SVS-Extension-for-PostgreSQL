@@ -141,7 +141,7 @@ SvsMemoryRecheckSearchScratchOptions(Oid dbOid, Oid relid, int searchWindowSize,
 }
 
 bool
-SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
+SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes, uint64 capacityHeadroomVectors)
 {
 	return true;
 }
@@ -179,7 +179,7 @@ svs_cache_fake_load(PG_FUNCTION_ARGS)
 	Oid			relid = PG_GETARG_OID(0);
 
 	EnsureFakeWorkerContext();
-	VamanaCacheIndex(relid, NULL, 4, 64, 1.2f, NULL, 0, 0, 1, 0);
+	VamanaCacheIndex(relid, NULL, 4, 64, 1.2f, NULL, 0, 0, 1, 0, 0);
 	PG_RETURN_VOID();
 }
 

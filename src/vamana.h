@@ -372,7 +372,8 @@ void		VamanaWriteMetaPageDynamic(Relation index, uint64 nextExternalId,
 void		VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 							 int graph_degree, float alpha, ItemPointerData * tidMapping,
 							 int numVectors, int tidMappingCapacity,
-							 uint64 nextExternalId, int numDeleted);
+							 uint64 nextExternalId, int numDeleted,
+							 uint64 capacityHeadroomVectors);
 SVSIndexHandle VamanaGetCachedIndex(Oid indexRelid, bool *needsRebuild);
 VamanaIndexCache *VamanaGetCache(Oid indexRelid);
 void		VamanaCacheForgetExternalId(VamanaIndexCache *cache, size_t externalId);
@@ -387,6 +388,10 @@ void		VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid,
 												 VamanaIndexCache *cache, const VamanaOptions *opts);
 void		VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config,
 												   bool useSearchHistory);
+SVSBuildConfig VamanaAssembleBuildConfig(Relation indexRel, int dimensions, int graph_degree,
+										  int numVectors, const VamanaOptions *opts);
+uint64		VamanaRefreshIndexCapacityHeadroom(Relation indexRel, int dimensions, int graph_degree,
+												int numVectors, const VamanaOptions *opts);
 void		VamanaCacheSetNeedsSave(Oid indexRelid, bool flag);
 bool		VamanaCacheGetNeedsSave(Oid indexRelid);
 SVSIndexHandle VamanaRebuildFromTable(Relation index);
