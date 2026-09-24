@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 32_eviction_guard_scope.pl — vamana_active_load_relid must bracket the
+# 37_eviction_guard_scope.pl — vamana_eviction_suppressed must bracket the
 # whole transaction, at every call site that sets it.
 #
 # A relcache invalidation for an unrelated, untouched cached index can be

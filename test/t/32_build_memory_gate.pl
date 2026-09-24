@@ -12,7 +12,9 @@
 # Also covers the cheaper pre-scan tripwire ahead of that gate: a build
 # refused on reltuples alone, before the heap scan runs.  And covers the
 # estimate no longer including a separate scan-buffer term now that
-# BuildCallback writes directly into the same flat buffer the build uses.
+# BuildCallback writes directly into the same flat buffer the build uses,
+# and that the rawBuffer term itself prices that buffer's real allocated
+# capacity rather than just the final row count.
 #
 # Also covers three joint-integration scenarios that need both the build and
 # residency axes wired together: the counter staying correct across the
@@ -112,6 +114,58 @@ unlike($log, qr/scanBuffer/,
 	'the double-buffered scan copy no longer contributes to the build memory estimate')
   or diag("log: $log");
 $node->safe_psql('postgres', "DROP INDEX gate_idx;");
+
+# rawBuffer must price SvsVectorBuffer's real allocated capacity, not just
+# the final row count: the buffer doubles on growth, so it can end up
+# allocated near 2x whatever the final count alone suggests. Two tables
+# with the identical final row count and dimensions, differing only in the
+# reltuples estimate on file before the build scans them, isolate exactly
+# that term: A's estimate matches its real row count (no doubling,
+# capacity stays at the row count), B's estimate is low enough that one
+# doubling happens mid-scan (capacity ends up ~2x A's). Every other input
+# to the estimate depends only on the final row count, identical for both,
+# so the two builds' logged rawBuffer values must differ by exactly
+# (B's capacity - A's capacity) * dimensions * sizeof(float).
+{
+	my $rows = 1001;
+	my $capacity_a = 1001;
+	my $capacity_b = 1200;
+
+	$node->safe_psql('postgres', qq(
+		CREATE TABLE bufcap_a_tbl (id serial PRIMARY KEY, c1 vector($dim));
+		INSERT INTO bufcap_a_tbl (c1)
+			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, $rows) i;
+		UPDATE pg_class SET reltuples = $capacity_a WHERE relname = 'bufcap_a_tbl';
+
+		CREATE TABLE bufcap_b_tbl (id serial PRIMARY KEY, c1 vector($dim));
+		INSERT INTO bufcap_b_tbl (c1)
+			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, $rows) i;
+		UPDATE pg_class SET reltuples = 600 WHERE relname = 'bufcap_b_tbl';
+	));
+
+	my $raw_buffer_of = sub {
+		my ($tbl, $idx) = @_;
+		my $log_offset = length($node->log_content());
+		my ($ret, $stdout, $stderr) = $node->psql('postgres',
+			"CREATE INDEX $idx ON $tbl USING vamana (c1 vector_l2_ops);");
+		is($ret, 0, "bufcap: $tbl build succeeds")
+		  or diag("stderr: $stderr");
+		my $log = substr($node->log_content(), $log_offset);
+		my ($raw_buffer) = $log =~ /rawBuffer (\d+)/;
+		ok(defined $raw_buffer, "bufcap: $tbl build logged a rawBuffer estimate")
+		  or diag("log: $log");
+		return $raw_buffer;
+	};
+
+	my $raw_buffer_a = $raw_buffer_of->('bufcap_a_tbl', 'bufcap_a_idx');
+	my $raw_buffer_b = $raw_buffer_of->('bufcap_b_tbl', 'bufcap_b_idx');
+
+	my $expected_diff = ($capacity_b - $capacity_a) * $dim * 4;	# sizeof(float)
+	is($raw_buffer_b - $raw_buffer_a, $expected_diff,
+		'bufcap: rawBuffer prices the buffer\'s real allocated capacity, not just the final row count');
+
+	$node->safe_psql('postgres', "DROP TABLE bufcap_a_tbl; DROP TABLE bufcap_b_tbl;");
+}
 
 # The pre-scan estimate uses reltuples, not the real row count, so it can be
 # exercised without actually scanning a huge table: inflate reltuples on a

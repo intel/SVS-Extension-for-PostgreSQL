@@ -421,6 +421,82 @@ my $baseline = committed_bytes();
     $node->reload;
 }
 
+# ---------------------------------------------------------------------------
+# Case 10: svs.default_residency_memory shrinks below the durable total of
+# two already-resident indexes, then the node restarts. Only one index's
+# residency is re-seeded; the other must be logged, not silently dropped.
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres', "DROP TABLE ceiling_tbl;");
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE shrink_a_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO shrink_a_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20000);
+        CREATE INDEX shrink_a_idx ON shrink_a_tbl USING vamana (val vector_l2_ops);
+    ));
+    wait_for_worker($node);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE shrink_b_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO shrink_b_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 20000);
+        CREATE INDEX shrink_b_idx ON shrink_b_tbl USING vamana (val vector_l2_ops);
+    ));
+    wait_for_worker($node);
+
+    my $relid_a = $node->safe_psql('postgres', "SELECT 'shrink_a_idx'::regclass::oid;");
+    my $relid_b = $node->safe_psql('postgres', "SELECT 'shrink_b_idx'::regclass::oid;");
+    chomp($relid_a, $relid_b);
+
+    my $size_a = $node->safe_psql('postgres',
+        "SELECT resident_bytes FROM svs_index_residency WHERE index_relid = $relid_a;");
+    my $size_b = $node->safe_psql('postgres',
+        "SELECT resident_bytes FROM svs_index_residency WHERE index_relid = $relid_b;");
+    chomp($size_a, $size_b);
+
+    my $budget_mb = int(($size_a + 1024 * 1024 - 1) / (1024 * 1024));
+    my $budget_bytes = $budget_mb * 1024 * 1024;
+    cmp_ok($size_a + $size_b, '>', $budget_bytes,
+        'both indexes together exceed the budget this test is about to shrink to');
+
+    $node->safe_psql('postgres',
+        "ALTER SYSTEM SET svs.default_residency_memory = '${budget_mb}MB';");
+
+    my $log_pos = length($node->log_content());
+    $node->restart;
+
+    my $state = '';
+    for (1 .. 60)
+    {
+        $state = $node->safe_psql('postgres',
+            "SELECT worker_state FROM pg_stat_vamana_worker "
+          . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
+        chomp $state;
+        last if $state eq 'running';
+        usleep(500_000);
+    }
+    is($state, 'running', 'the worker settles into running after the restart');
+
+    my $committed = committed_bytes();
+    my $dropped_relid = $committed eq $size_a ? $relid_b
+                       : $committed eq $size_b ? $relid_a
+                       : undef;
+    ok(defined $dropped_relid,
+        "committed total ($committed) matches exactly one index's durable size "
+      . "(size_a=$size_a, size_b=$size_b)");
+
+    my $log_since_restart = substr($node->log_content(), $log_pos);
+    like($log_since_restart,
+        qr/WARNING.*residency budget.*\b$dropped_relid\b|WARNING.*\b$dropped_relid\b.*residency budget/s,
+        "the seed that lost to the budget is logged, naming index $dropped_relid")
+      or diag("log since restart:\n$log_since_restart");
+
+    $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.default_residency_memory;");
+    $node->reload;
+    $node->safe_psql('postgres', "DROP TABLE shrink_a_tbl, shrink_b_tbl;");
+}
+
 $node->stop;
 
 done_testing();

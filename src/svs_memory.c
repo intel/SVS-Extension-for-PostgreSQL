@@ -1164,7 +1164,11 @@ SvsMemorySeedDurableResidency(Oid dbOid, Oid relid, uint64 durableBytes)
 	if (alreadyReserved)
 		return;
 
-	SvsMemoryReconcileLoad(dbOid, relid, durableBytes);
+	if (!SvsMemoryReconcileLoad(dbOid, relid, durableBytes))
+		ereport(WARNING,
+				(errmsg("vamana worker: durable residency seed for index %u exceeds this database's residency budget",
+						relid),
+				 errdetail("Durable size %llu bytes.", (unsigned long long) durableBytes)));
 }
 
 /*

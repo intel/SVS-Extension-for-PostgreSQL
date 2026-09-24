@@ -534,6 +534,7 @@ SvsBuildPeakCheckedAdd(uint64 a, uint64 b, Oid relid)
 static SVSIndexHandle
 VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 							 const float *flatData, int numVectors,
+							 int64 bufferCapacity,
 							 int *errorCodeOut, uint64 *buildPeakOut)
 {
 	SVSAlgorithmHandle algorithm;
@@ -571,15 +572,20 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 		 * (2000) by both callers, so firing needs more than ~2.3e15 vectors
 		 * on a 64-bit system.  Guards the multiplication as belt-and-braces.
 		 */
-		if ((size_t) numVectors > 0 &&
-			(size_t) params->dimensions > SIZE_MAX / sizeof(float) / (size_t) numVectors)
+		if (bufferCapacity > 0 &&
+			(size_t) params->dimensions > SIZE_MAX / sizeof(float) / (size_t) bufferCapacity)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("vector dataset too large to index "
 							"(%d vectors x %d dimensions exceeds memory limit)",
 							numVectors, params->dimensions)));
 
-		dataSize = (Size) numVectors * params->dimensions * sizeof(float);
+		/*
+		 * Priced against the buffer's allocated capacity rather than
+		 * numVectors: SvsVectorBuffer doubles on growth, so the buffer live
+		 * during the build can hold up to ~2x more than the final count.
+		 */
+		dataSize = (Size) bufferCapacity * params->dimensions * sizeof(float);
 
 		/*
 		 * Memory admission gate. Estimates this build's peak backend RSS
@@ -802,7 +808,8 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		};
 
 		svsIndex = VamanaBuildSVSIndexGoverned(&params, buildstate.vectors.data,
-											   (int) buildstate.vectors.count, &error_code,
+											   (int) buildstate.vectors.count,
+											   buildstate.vectors.capacity, &error_code,
 											   &buildPeak);
 
 		if (svsIndex == NULL)
@@ -1209,8 +1216,8 @@ VamanaRebuildFromTable(Relation index)
 		int			numVectors = (int) vectors.count;
 
 		svsIndex = VamanaBuildSVSIndexGoverned(&params, vectors.data,
-												numVectors, &errorCode,
-												&buildPeak);
+												numVectors, vectors.capacity,
+												&errorCode, &buildPeak);
 
 		if (svsIndex == NULL || errorCode != 0)
 		{

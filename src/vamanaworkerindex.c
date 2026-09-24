@@ -591,22 +591,49 @@ VamanaWorkerEnumerateAllIndexes(void)
  * Load a not-yet-cached standby index, suppressing eviction for the load so a
  * relcache invalidation fired while opening the relation does not evict the
  * entry being populated.  Owns its own transaction.
+ *
+ * Must not throw: a cancel here (operator pg_cancel_backend, a recovery
+ * conflict) would otherwise reach VamanaWorkerMain uncaught and take the
+ * whole standby worker down. Left uncached on failure; the caller's own
+ * not-yet-cached check retries it on the next reconcile pass.
  */
 static void
 VamanaStandbyLoadIndex(Oid relid)
 {
+	MemoryContext oldcontext = CurrentMemoryContext;
 	bool		prevSuppressed = vamana_eviction_suppressed;
 
-	vamana_eviction_suppressed = true;
+	PG_TRY();
+	{
+		vamana_eviction_suppressed = true;
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
-	(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
+		(void) VamanaWorkerGetOrLoadIndex(relid, NULL, false);
 
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		if (IsTransactionState())
+			AbortCurrentTransaction();
+		MemoryContextSwitchTo(oldcontext);
+
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		ereport(WARNING,
+				(errmsg("vamana worker: standby load of index %u failed, will retry",
+						relid),
+				 errdetail("%s", edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
 
 	vamana_eviction_suppressed = prevSuppressed;
 }
