@@ -22,6 +22,7 @@
 #include "vamana.h"
 #include "vamana_checkpoint.h"
 #include "vamana_replication.h"
+#include "vamana_subxact_guard.h"
 #include "svs_index_residency.h"
 #include "vamanaworker.h"
 #include "svs_cpu_slots.h"
@@ -686,6 +687,36 @@ VamanaWorkerSeedIndexCount(void)
 	list_free(relids);
 }
 
+typedef struct SeedDurableResidencyArgs
+{
+	Oid			relid;
+	uint64		durableBytes;
+} SeedDurableResidencyArgs;
+
+static void
+SeedDurableResidencyBody(void *arg)
+{
+	SeedDurableResidencyArgs *args = (SeedDurableResidencyArgs *) arg;
+
+	SvsMemorySeedDurableResidency(VamanaWorkerShmemPtr->dbOid, args->relid, args->durableBytes);
+}
+
+static void
+SeedDurableResidencyGuarded(Oid relid, uint64 durableBytes)
+{
+	SeedDurableResidencyArgs args = {relid, durableBytes};
+	VamanaSubXactResult result = VamanaRunInSubXact(SeedDurableResidencyBody, &args, NULL);
+
+	if (!result.succeeded)
+	{
+		ereport(WARNING,
+				(errmsg("vamana worker: durable residency seed for index %u failed, will retry",
+						relid),
+				 errdetail("%s", result.edata->message)));
+		FreeErrorData(result.edata);
+	}
+}
+
 /*
  * An index dropped while the worker was down leaves its RESIDENT
  * reservation stale -- nothing reloads it, and relcache invalidation only
@@ -735,7 +766,7 @@ VamanaWorkerReconcileResidencyOnStartup(void)
 		SvsIndexResidencyReadBytesForRelids(VamanaWorkerShmemPtr->dbOid, liveRelids, numLive, durableBytes);
 		for (i = 0; i < numLive; i++)
 			if (durableBytes[i] > 0)
-				SvsMemorySeedDurableResidency(VamanaWorkerShmemPtr->dbOid, liveRelids[i], durableBytes[i]);
+				SeedDurableResidencyGuarded(liveRelids[i], durableBytes[i]);
 		pfree(durableBytes);
 	}
 
