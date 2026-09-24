@@ -334,33 +334,43 @@ VamanaWorkerRefreshSearchScratchCosts(void)
  *
  * The transaction's AcceptInvalidationMessages() can evict relid via
  * VamanaRelcacheCallback, freeing the SVSIndexHandle the caller already
- * fetched for this dispatch; vamana_active_load_relid guards
- * against that (see VamanaWorkerProcessWriteSlot).
+ * fetched for this dispatch; vamana_eviction_suppressed guards against that.
  */
 void
 VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
 {
 	VamanaIndexCache *cache = VamanaGetCache(relid);
-	Relation	indexRel;
+	bool		prevSuppressed = vamana_eviction_suppressed;
 
 	if (cache == NULL || SvsMemorySearchScratchBytesPerQuery(MyDatabaseId, relid) != 0)
 		return;
 
-	vamana_active_load_relid = relid;
+	vamana_eviction_suppressed = true;
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
+	PG_TRY();
+	{
+		Relation	indexRel;
 
-	indexRel = index_open(relid, AccessShareLock);
-	VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
-										 (VamanaOptions *) indexRel->rd_options);
-	index_close(indexRel, AccessShareLock);
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
 
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+		indexRel = index_open(relid, AccessShareLock);
+		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
+											 (VamanaOptions *) indexRel->rd_options);
+		index_close(indexRel, AccessShareLock);
 
-	vamana_active_load_relid = InvalidOid;
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		vamana_eviction_suppressed = prevSuppressed;
+	}
+	PG_CATCH();
+	{
+		vamana_eviction_suppressed = prevSuppressed;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 typedef struct GetOrLoadIndexArgs
