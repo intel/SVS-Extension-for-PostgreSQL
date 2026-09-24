@@ -1300,4 +1300,82 @@ use VamanaTestUtils qw(:all);
     $node->stop;
 }
 
+# ===========================================================================
+# VamanaRebuildFromTable's own pre-scan estimate check, ahead of the scan
+# that fills BuildCallback's buffers
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_rebuild_estimate');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'vector,svs'");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 20");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.max_build_memory = '300MB'");
+    $node->append_conf('postgresql.conf', "svs.max_residency_memory = '16000MB'");
+    $node->append_conf('postgresql.conf', "svs.default_residency_memory = '16000MB'");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    wait_for_worker($node);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE rb_estimate_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO rb_estimate_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 10) i;
+        CREATE INDEX rb_estimate_idx ON rb_estimate_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    my $ioid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'rb_estimate_idx';");
+    chomp $ioid;
+    my $save_dir = vamana_save_dir($node, 'postgres', $ioid);
+
+    my $query = "SET enable_seqscan = off; "
+        . "SELECT id FROM rb_estimate_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;";
+
+    # An ordinary forced rebuild, with no inflated estimate, still succeeds.
+    $node->stop;
+    remove_tree($save_dir) if -d $save_dir;
+    $node->start;
+    wait_for_worker($node);
+
+    my ($out, $err) = ('', '');
+    my $rc = $node->psql('postgres', $query, stdout => \$out, stderr => \$err);
+    is($rc, 0, 'an ordinary worker rebuild still succeeds')
+      or diag("stderr: $err");
+
+    # Inflating reltuples on this small table, then forcing another rebuild,
+    # must be refused before VamanaRebuildFromTable's own scan runs -- the
+    # same check vamanabuild() already applies at CREATE INDEX time.
+    $node->safe_psql('postgres',
+        "UPDATE pg_class SET reltuples = 100000000 WHERE relname = 'rb_estimate_tbl';");
+
+    $node->stop;
+    remove_tree($save_dir) if -d $save_dir;
+    my $log_pos = length($node->log_content());
+    $node->start;
+    wait_for_worker($node);
+
+    ($out, $err) = ('', '');
+    $rc = $node->psql('postgres', $query, stdout => \$out, stderr => \$err);
+    isnt($rc, 0, 'the query fails once the worker rebuild is refused on an inflated estimate');
+    like($err, qr/estimated build size exceeds svs\.max_build_memory/,
+        'the client sees the estimate refusal directly')
+      or diag("stderr: $err");
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/rebuilding vamana index from table data/,
+        'a worker rebuild was attempted');
+    like($log, qr/estimated build size exceeds svs\.max_build_memory/,
+        'the worker log shows the same refusal');
+
+    $node->stop;
+}
+
 done_testing();
