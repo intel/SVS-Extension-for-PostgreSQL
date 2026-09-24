@@ -563,6 +563,26 @@ SvsMemoryReserveBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 residencyEs
 	LWLockRelease(&entry->memLock);
 }
 
+void
+SvsMemoryCheckEstimatedBuildSize(double reltuples, int dimensions)
+{
+	uint64		estimatedBytes;
+
+	if (reltuples <= 0)
+		return;
+
+	estimatedBytes = (uint64) reltuples * (uint64) dimensions * sizeof(float);
+
+	if (estimatedBytes > BuildMemoryCeilingBytes())
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("estimated build size exceeds svs.max_build_memory"),
+				 errdetail("Estimated %.0f rows x %d dimensions ~= %llu bytes against the %llu byte ceiling.",
+						   reltuples, dimensions,
+						   (unsigned long long) estimatedBytes,
+						   (unsigned long long) BuildMemoryCeilingBytes())));
+}
+
 bool
 SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredResidencyBytes)
 {

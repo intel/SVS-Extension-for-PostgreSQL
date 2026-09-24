@@ -1,0 +1,46 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+CREATE EXTENSION svs_vector_buffer_test;
+-- Appending fewer vectors than the initial estimate: no regrowth, and the
+-- output matches the input exactly, in order.
+SELECT flat_output, final_count, final_capacity
+  FROM svs_vector_buffer_test_run(5, 2, ARRAY[1,2, 3,4, 5,6, 7,8]::float8[]);
+    flat_output    | final_count | final_capacity 
+-------------------+-------------+----------------
+ {1,2,3,4,5,6,7,8} |           4 |              5
+(1 row)
+
+-- Appending exactly the initial estimate: capacity must not grow past it.
+SELECT final_count = 4 AND final_capacity = 4 AS no_premature_growth
+  FROM svs_vector_buffer_test_run(4, 2, ARRAY[1,2, 3,4, 5,6, 7,8]::float8[]);
+ no_premature_growth 
+---------------------
+ t
+(1 row)
+
+-- Appending one more than the initial estimate: capacity must grow, and
+-- every vector, including the ones written before the growth, must survive
+-- intact.
+SELECT flat_output, final_count, final_capacity > 2 AS capacity_grew
+  FROM svs_vector_buffer_test_run(2, 2, ARRAY[1,2, 3,4, 5,6]::float8[]);
+  flat_output  | final_count | capacity_grew 
+---------------+-------------+---------------
+ {1,2,3,4,5,6} |           3 | t
+(1 row)
+
+-- A non-positive estimate (never analyzed) falls back to the default seed,
+-- not to zero or a garbage capacity.
+SELECT final_capacity = 1000 AS falls_back_to_default_capacity
+  FROM svs_vector_buffer_test_run(0, 3, ARRAY[1,2,3, 4,5,6, 7,8,9]::float8[]);
+ falls_back_to_default_capacity 
+--------------------------------
+ t
+(1 row)
+
+SELECT final_capacity = 1000 AS falls_back_to_default_capacity_on_negative
+  FROM svs_vector_buffer_test_run(-1, 3, ARRAY[1,2,3, 4,5,6, 7,8,9]::float8[]);
+ falls_back_to_default_capacity_on_negative 
+--------------------------------------------
+ t
+(1 row)
+

@@ -18,6 +18,7 @@
 #include "utils/timestamp.h"
 #include "halfvec.h"
 #include "vector.h"
+#include "svs_vector_buffer.h"
 #include "svs_wrapper.h"
 
 #define VAMANA_MAX_DIM 2000
@@ -79,7 +80,6 @@
 #define VAMANA_BUILD_WINDOW_FROM_DEGREE(degree)	((degree) * VAMANA_DEFAULT_BUILD_WINDOW_MULTIPLIER)
 #define VAMANA_ALPHA_SCALE						100.0
 #define VAMANA_ALPHA_TO_FLOAT(a)				((float)(a) / VAMANA_ALPHA_SCALE)
-#define VAMANA_INITIAL_BUFFER_CAPACITY			1000
 #define VAMANA_PROGRESS_INTERVAL				100000	/* emit LOG every N tuples during long heap scans */
 #define VAMANA_COST_SCALING_FACTOR				0.8		/* empirically tuned index cost multiplier */
 #define VAMANA_LEANVEC_DEFAULT_DIM_DIVISOR		2
@@ -187,10 +187,9 @@ typedef struct VamanaBuildState
 	VamanaSupport support;
 
 	/* Vector accumulation buffer (for batch build) */
-	float	  **vectorBuffer;	/* Array of vector pointers */
-	ItemPointerData *tidBuffer; /* Corresponding heap TIDs (array of structs) */
-	int			numVectors;		/* Current count */
-	int			bufferCapacity; /* Allocated capacity */
+	SvsVectorBuffer vectors;
+	ItemPointerData *tidBuffer; /* Parallel to vectors; grown in lockstep */
+	int64		tidBufferCapacity;
 
 	/* Memory */
 	MemoryContext buildCtx;

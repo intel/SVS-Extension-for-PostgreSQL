@@ -188,6 +188,12 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
 								   uint64 buildPeak, uint64 residencyEstimate);
 
 /*
+ * A no-op when reltuples <= 0 (never analyzed); SvsMemoryReserveBuild is
+ * still the authoritative gate either way.
+ */
+extern void SvsMemoryCheckEstimatedBuildSize(double reltuples, int dimensions);
+
+/*
  * Backend, after a successful build and before serializing to disk.
  * Releases buildPeak unconditionally and reconciles the residency
  * reservation from estimate to measuredResidencyBytes (RESERVED ->

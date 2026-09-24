@@ -18,6 +18,7 @@ OBJS = src/svs.o \
        src/vamana_undo.o \
        src/vamana_subxid_pending_array.o \
        src/vamana_subxact_guard.o \
+       src/svs_vector_buffer.o \
        src/vamanabuild.o \
        src/svs_parallel_build.o \
        src/svs_build_thread_grant.o \
@@ -39,7 +40,7 @@ OBJS = src/svs.o \
        src/vamana_databases.o \
        src/vamana_teardown.o \
        src/vamana_warmup.o
-HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h src/svs_cpu_budget.h src/svs_memory.h src/svs_index_residency.h src/svs_slot_naming.h src/svs_cpu_slots.h
+HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h src/svs_cpu_budget.h src/svs_memory.h src/svs_index_residency.h src/svs_slot_naming.h src/svs_cpu_slots.h src/svs_vector_buffer.h
 
 TESTS = $(wildcard test/sql/*.sql)
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
