@@ -283,6 +283,12 @@ extern bool SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes);
 extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
 
 /*
+ * Like SvsMemoryReanchorInsert, but never touches pending insert
+ * reservations for relid -- those belong to unrelated, unapplied inserts.
+ */
+extern void SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes);
+
+/*
  * Worker, on the empty-table first-insert build path: relid's reservation
  * comes from SvsMemoryReconcileLoad rather than pre-existing, so this closes
  * the oldest pending insert reservation for relid without reanchoring one.

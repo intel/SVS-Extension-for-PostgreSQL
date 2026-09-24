@@ -3128,3 +3128,96 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
+-- Issue #168 bug 2: a maintenance operation (e.g. COMPACT) reconciling a
+-- resident index's measured bytes must not disturb another backend's
+-- still-pending insert reservation for the same relid. Reusing
+-- svs_memory_reanchor_insert for that -- the shape first proposed for the
+-- compact fix -- pops whichever pending insert reservation is oldest for
+-- the relid as a side effect, even though it belongs to a different,
+-- not-yet-applied operation. That both erases the reservation record and
+-- under-counts the database's residency commitment, defeating the
+-- reservation's purpose: bounding concurrent admission while an insert is
+-- still in flight.
+-- Byte counts here are deliberately tiny (not MB-scale like the sections
+-- above): the global residency ceiling is already nearly exhausted by
+-- every database admitted earlier in this file, and this section's point
+-- is the accounting logic, not realistic sizes.
+SELECT svs_memory_admit_database(800, 900::bigint);
+ svs_memory_admit_database 
+---------------------------
+ 
+(1 row)
+
+SELECT svs_memory_reconcile_load(800, 80, 800::bigint);
+ svs_memory_reconcile_load 
+---------------------------
+ t
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(800);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+              900 |                       800 |                     0
+(1 row)
+
+-- Backend B reserves an insert; committed lands exactly at budget. Pin its
+-- owner pid to a fixed value so the row printed below is deterministic.
+SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
+ svs_memory_reserve_insert 
+---------------------------
+ t
+(1 row)
+
+SELECT svs_memory_test_set_insert_reservation_owner_pid(800, 80, 100::bigint, -1);
+ svs_memory_test_set_insert_reservation_owner_pid 
+--------------------------------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(800);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+              900 |                       900 |                     0
+(1 row)
+
+-- A maintenance reconcile for the same relid, reporting the same measured
+-- total SVSCompact actually produced (800 bytes, unchanged), must not
+-- touch B's still-pending reservation.
+SELECT svs_memory_reconcile_resident(800, 80, 800::bigint);
+ svs_memory_reconcile_resident 
+-------------------------------
+ 
+(1 row)
+
+SELECT * FROM svs_memory_test_insert_reservations(800);
+ relid | owner_pid | delta_bytes 
+-------+-----------+-------------
+    80 |        -1 |         100
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(800);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+              900 |                       900 |                     0
+(1 row)
+
+-- With B's reservation intact, a second concurrent insert (backend C) must
+-- still be refused: real pending demand is 800 (resident) + 100 (B) + 100
+-- (C) = 1000 against a 900-byte budget.
+SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
+ svs_memory_reserve_insert 
+---------------------------
+ f
+(1 row)
+
+SELECT * FROM svs_memory_read_stats(800);
+ residency_budget | residency_bytes_committed | build_bytes_committed 
+------------------+---------------------------+-----------------------
+              900 |                       900 |                     0
+(1 row)
+
+SELECT * FROM svs_memory_test_check_invariants();
+ db_oid | violation 
+--------+-----------
+(0 rows)
+

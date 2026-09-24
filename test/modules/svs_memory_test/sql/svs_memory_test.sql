@@ -949,3 +949,41 @@ $do$;', :curdb_oid) AS is_launcher_probe \gset
 :is_launcher_probe
 SELECT svs_memory_test_set_launcher_database('postgres');
 SELECT * FROM svs_memory_test_check_invariants();
+
+-- Issue #168 bug 2: a maintenance operation (e.g. COMPACT) reconciling a
+-- resident index's measured bytes must not disturb another backend's
+-- still-pending insert reservation for the same relid. Reusing
+-- svs_memory_reanchor_insert for that -- the shape first proposed for the
+-- compact fix -- pops whichever pending insert reservation is oldest for
+-- the relid as a side effect, even though it belongs to a different,
+-- not-yet-applied operation. That both erases the reservation record and
+-- under-counts the database's residency commitment, defeating the
+-- reservation's purpose: bounding concurrent admission while an insert is
+-- still in flight.
+-- Byte counts here are deliberately tiny (not MB-scale like the sections
+-- above): the global residency ceiling is already nearly exhausted by
+-- every database admitted earlier in this file, and this section's point
+-- is the accounting logic, not realistic sizes.
+SELECT svs_memory_admit_database(800, 900::bigint);
+SELECT svs_memory_reconcile_load(800, 80, 800::bigint);
+SELECT * FROM svs_memory_read_stats(800);
+
+-- Backend B reserves an insert; committed lands exactly at budget. Pin its
+-- owner pid to a fixed value so the row printed below is deterministic.
+SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
+SELECT svs_memory_test_set_insert_reservation_owner_pid(800, 80, 100::bigint, -1);
+SELECT * FROM svs_memory_read_stats(800);
+
+-- A maintenance reconcile for the same relid, reporting the same measured
+-- total SVSCompact actually produced (800 bytes, unchanged), must not
+-- touch B's still-pending reservation.
+SELECT svs_memory_reconcile_resident(800, 80, 800::bigint);
+SELECT * FROM svs_memory_test_insert_reservations(800);
+SELECT * FROM svs_memory_read_stats(800);
+
+-- With B's reservation intact, a second concurrent insert (backend C) must
+-- still be refused: real pending demand is 800 (resident) + 100 (B) + 100
+-- (C) = 1000 against a 900-byte budget.
+SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
+SELECT * FROM svs_memory_read_stats(800);
+SELECT * FROM svs_memory_test_check_invariants();

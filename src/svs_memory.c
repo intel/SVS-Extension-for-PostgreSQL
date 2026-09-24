@@ -911,6 +911,33 @@ SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes)
 	return fits;
 }
 
+static SvsMemReservation *
+FindResidentReservationOrError(VamanaWorkerShmem *entry, Oid dbOid, Oid relid,
+								const char *action)
+{
+	SvsMemReservation *reservation = FindReservation(entry, relid);
+
+	if (reservation == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no resident reservation for index %u in database %u to %s",
+						relid, dbOid, action)));
+
+	return reservation;
+}
+
+static void
+WarnIfResidencyOverBudget(VamanaWorkerShmem *entry, Oid dbOid, Oid relid, const char *afterWhat)
+{
+	if (entry->residencyBytesCommitted > entry->residencyBudget)
+		ereport(WARNING,
+				(errmsg("database %u's residency budget is now exceeded after %s index %u",
+						dbOid, afterWhat, relid),
+				 errdetail("%llu bytes committed, %llu byte budget.",
+						   (unsigned long long) entry->residencyBytesCommitted,
+						   (unsigned long long) entry->residencyBudget)));
+}
+
 void
 SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 {
@@ -921,14 +948,7 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 
 	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
 
-	reservation = FindReservation(entry, relid);
-	if (reservation == NULL)
-	{
-		LWLockRelease(&entry->memLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("no resident reservation for index %u in database %u to reanchor", relid, dbOid)));
-	}
+	reservation = FindResidentReservationOrError(entry, dbOid, relid, "reanchor");
 
 	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
 					"an index's pre-reanchor residency");
@@ -936,13 +956,37 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 	entry->residencyBytesCommitted += measuredBytes;
 	reservation->measuredBytes = measuredBytes;
 
-	if (entry->residencyBytesCommitted > entry->residencyBudget)
-		ereport(WARNING,
-				(errmsg("database %u's residency budget is now exceeded after an insert into index %u",
-						dbOid, relid),
-				 errdetail("%llu bytes committed, %llu byte budget.",
-						   (unsigned long long) entry->residencyBytesCommitted,
-						   (unsigned long long) entry->residencyBudget)));
+	WarnIfResidencyOverBudget(entry, dbOid, relid, "an insert into");
+
+	LWLockRelease(&entry->memLock);
+}
+
+void
+SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	SvsMemReservation *reservation;
+
+	Assert(OidIsValid(relid));
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	reservation = FindResidentReservationOrError(entry, dbOid, relid, "reconcile");
+	if (reservation->state != SVS_MEM_RESIDENT)
+	{
+		LWLockRelease(&entry->memLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reservation for index %u in database %u is not resident, cannot reconcile",
+						relid, dbOid)));
+	}
+
+	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
+					"an index's pre-reconcile residency");
+	entry->residencyBytesCommitted += measuredBytes;
+	reservation->measuredBytes = measuredBytes;
+
+	WarnIfResidencyOverBudget(entry, dbOid, relid, "a compact of");
 
 	LWLockRelease(&entry->memLock);
 }

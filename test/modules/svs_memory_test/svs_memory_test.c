@@ -379,6 +379,15 @@ svs_memory_reanchor_insert(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_reconcile_resident);
+Datum
+svs_memory_reconcile_resident(PG_FUNCTION_ARGS)
+{
+	SvsMemoryReconcileResident(PG_GETARG_OID(0), PG_GETARG_OID(1),
+							   GetNonNegativeArgAsUint64(fcinfo, 2));
+	PG_RETURN_VOID();
+}
+
 PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_close_insert_reservation);
 Datum
 svs_memory_close_insert_reservation(PG_FUNCTION_ARGS)

@@ -499,7 +499,11 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 								(errmsg("vamana worker: SVSCompact failed for index %u",
 										relid)));
 					if (cache != NULL)
+					{
 						cache->numDeleted = 0;
+						cache->residentBytes = SVSGetIndexMemoryUsage(index);
+						SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes);
+					}
 				}
 
 				if (cache != NULL)
