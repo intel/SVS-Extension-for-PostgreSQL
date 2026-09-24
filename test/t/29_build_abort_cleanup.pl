@@ -90,6 +90,54 @@ sub committed_totals
 }
 
 # ---------------------------------------------------------------------------
+# poll_until_committed_totals_baseline: poll committed_totals() and the
+# durable residency row count for $relid, up to $bound_seconds, until both
+# match $before's totals and the row count reaches zero. Returns the final
+# observed (\@totals, $residency_rows) rather than asserting anything itself;
+# assertions stay in the caller, matching this file's other polling helpers.
+#
+# The poll itself runs server-side, inside a single psql script (one DO
+# block, one connection), rather than as a Perl-level loop of separate
+# safe_psql round trips: a fresh connection per poll attempt is needless
+# round-trip overhead once the abort has already happened, and this file's
+# other in-transaction checks already establish that a single script is the
+# reliable shape for talking to this worker.
+# ---------------------------------------------------------------------------
+sub poll_until_committed_totals_baseline
+{
+	my ($before, $relid, $bound_seconds) = @_;
+	my $attempts = int($bound_seconds / 0.2);
+	my ($before_build, $before_resid) = @$before;
+
+	my $row = $node->safe_psql('postgres', qq(
+		DO \$poll\$
+		DECLARE
+			v_build bigint;
+			v_resid bigint;
+			v_rows  bigint;
+		BEGIN
+			FOR i IN 1..$attempts LOOP
+				SELECT build_bytes_committed, residency_bytes_committed
+				INTO v_build, v_resid
+				FROM pg_stat_vamana_worker
+				WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+				SELECT count(*) INTO v_rows
+				FROM svs_index_residency WHERE index_relid = $relid;
+				EXIT WHEN v_build = $before_build AND v_resid = $before_resid AND v_rows = 0;
+				PERFORM pg_sleep(0.2);
+			END LOOP;
+			CREATE TEMP TABLE poll_result (build_v bigint, resid_v bigint, rows_v bigint);
+			INSERT INTO poll_result VALUES (v_build, v_resid, v_rows);
+		END
+		\$poll\$;
+		SELECT build_v, resid_v, rows_v FROM poll_result;
+	));
+	chomp $row;
+	my ($build_v, $resid_v, $rows_v) = split(/\|/, $row);
+	return ([$build_v, $resid_v], $rows_v);
+}
+
+# ---------------------------------------------------------------------------
 # check_abort_at: attach 'error' to $injection_point, run CREATE INDEX on a
 # fresh table, confirm it fails with exactly that injected error and the
 # worker survives, detach, then confirm a retry succeeds cleanly with no
@@ -149,6 +197,80 @@ sub check_abort_at
 check_abort_at('vamana-build-governed-pre-allocation', 'pre_allocation');
 check_abort_at('vamana-build-governed-pre-confirm', 'pre_confirm');
 check_abort_at('vamana-build-governed-pre-handoff', 'pre_handoff');
+
+# ---------------------------------------------------------------------------
+# check_rollback_after_warmup: unlike check_abort_at, no injection point is
+# involved here -- the build itself succeeds and reaches RESIDENT inside an
+# open transaction, and only then does $abort_sql abort it (an explicit
+# ROLLBACK, or a statement error followed by the ROLLBACK a client must still
+# send to close the aborted block). The whole transaction, including the
+# in-transaction check that residency_bytes_committed already grew, is sent
+# as a single psql script in one round trip: driving the same open
+# transaction interactively over several background_psql query() calls hangs
+# indefinitely on this server.
+# ---------------------------------------------------------------------------
+sub check_rollback_after_warmup
+{
+	my ($label, $abort_sql) = @_;
+	my $tbl = "${label}_tbl";
+	my $idx = "${label}_idx";
+
+	$node->safe_psql('postgres', qq(
+		CREATE TABLE $tbl (id serial PRIMARY KEY, c1 vector($dim));
+		INSERT INTO $tbl (c1)
+			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 2000) i;
+	));
+
+	my @before = committed_totals();
+
+	# The follow-up SELECT reading residency_bytes_committed's growth must run
+	# immediately after CREATE INDEX, in the same script and the same still-
+	# open transaction: the worker's own reload sweep evicts this relid's
+	# residency unconditionally before it can re-load it (see
+	# VamanaWorkerProcessReloads), and re-loading fails for as long as this
+	# transaction still holds the index's lock -- so any extra round trip or
+	# in-transaction delay between CREATE INDEX and this SELECT risks
+	# observing that eviction instead of the warm-up's own growth.
+	my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
+		BEGIN;
+		CREATE INDEX $idx ON $tbl USING vamana (c1 vector_l2_ops);
+		SELECT '$idx'::regclass::oid AS relid_v \\gset
+		SELECT build_bytes_committed AS build_v, residency_bytes_committed AS resid_v
+		FROM pg_stat_vamana_worker
+		WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+		\\gset
+		\\echo PARSED_RELID=:relid_v
+		\\echo PARSED_BUILD=:build_v
+		\\echo PARSED_RESID=:resid_v
+		$abort_sql
+		ROLLBACK;
+	));
+
+	my ($relid) = $stdout =~ /PARSED_RELID=(\d+)/;
+	my ($warmed_resid) = $stdout =~ /PARSED_RESID=(\d+)/;
+	ok(defined $relid && defined $warmed_resid,
+		"$label: the built index's relid and warm-up residency bytes were captured before the abort")
+	  or diag("stdout: $stdout\nstderr: $stderr");
+	cmp_ok($warmed_resid, '>', $before[1],
+		"$label: residency_bytes_committed already grew before the abort, proving the warm-up reached RESIDENT");
+
+	my ($after, $residency_rows) =
+	  poll_until_committed_totals_baseline(\@before, $relid, 10);
+
+	is_deeply($after, \@before,
+		"$label: build and residency committed bytes return to baseline after the abort, residency_rows=$residency_rows");
+	is($residency_rows, '0',
+		"$label: no durable residency row remains for the aborted build");
+
+	my $live_pid = $node->safe_psql('postgres',
+		"SELECT pid FROM pg_stat_activity WHERE backend_type = 'vamana worker';");
+	chomp $live_pid;
+	is($live_pid, $worker_pid,
+		"$label: worker survives the abort without restarting");
+}
+
+check_rollback_after_warmup('rollback_after_warmup', '');
+check_rollback_after_warmup('error_after_warmup', 'SELECT 1/0;');
 
 # ---------------------------------------------------------------------------
 # Confirm rejection: a rebuild (REINDEX of an already-RESIDENT index) whose
