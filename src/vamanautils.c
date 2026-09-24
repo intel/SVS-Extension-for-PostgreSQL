@@ -23,6 +23,7 @@
 #include "access/amapi.h"
 #include "access/generic_xlog.h"
 #include "access/reloptions.h"
+#include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
 #include "commands/progress.h"
 #include "miscadmin.h"
@@ -31,19 +32,215 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/selfuncs.h"
 
+/* The supported indexed types, one descriptor each. */
+static const VamanaTypeInfo vector_info = {
+	.maxDimensions = VAMANA_MAX_DIM,
+	.elementSize = sizeof(float),
+	.dataType = SVS_DTYPE_FLOAT32
+};
+static const VamanaTypeInfo halfvec_info = {
+	.maxDimensions = VAMANA_MAX_DIM,
+	.elementSize = sizeof(half),
+	.dataType = SVS_DTYPE_FLOAT16
+};
+
 /*
- * Get type-specific information
+ * Get type-specific information for the indexed column.
+ *
+ * Resolved from the attribute's type rather than assumed, because vector and
+ * halfvec share an identical varlena header and differ only in element width:
+ * reading one as the other is not caught by any size check the datum itself
+ * carries.
+ *
+ * Compared by name through the syscache rather than by OID: pgvector's type
+ * OIDs are assigned at CREATE EXTENSION and are not fixed, and format_type_be
+ * may return a schema-qualified name.
  */
 const		VamanaTypeInfo *
 VamanaGetTypeInfo(Relation index)
 {
-	static const VamanaTypeInfo vector_info = {
-		.maxDimensions = VAMANA_MAX_DIM
-	};
+	Oid			atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
+	HeapTuple	typeTup;
+	char	   *typname;
+	const VamanaTypeInfo *result;
 
-	return &vector_info;
+	typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(atttypid));
+	if (!HeapTupleIsValid(typeTup))
+		elog(ERROR, "cache lookup failed for type %u", atttypid);
+
+	typname = NameStr(((Form_pg_type) GETSTRUCT(typeTup))->typname);
+
+	if (strcmp(typname, "vector") == 0)
+		result = &vector_info;
+	else if (strcmp(typname, "halfvec") == 0)
+		result = &halfvec_info;
+	else
+	{
+		char	   *unsupported = pstrdup(typname);
+
+		ReleaseSysCache(typeTup);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported type for vamana index: %s", unsupported),
+				 errhint("A vamana index supports the vector and halfvec types.")));
+	}
+
+	ReleaseSysCache(typeTup);
+
+	return result;
+}
+
+/*
+ * Get type-specific information from an SVS storage element type.
+ *
+ * For the background worker, which populates cache entries from the load
+ * parameters a backend handed it and so has no index relation to inspect.  The
+ * mapping is one-to-one because each supported type has its own dataType.
+ */
+const		VamanaTypeInfo *
+VamanaGetTypeInfoForDataType(SVSDType dataType)
+{
+	switch (dataType)
+	{
+		case SVS_DTYPE_FLOAT32:
+			return &vector_info;
+		case SVS_DTYPE_FLOAT16:
+			return &halfvec_info;
+		default:
+			elog(ERROR, "unsupported vamana storage data type: %d", (int) dataType);
+			return NULL;
+	}
+}
+
+/*
+ * Convert a binary16 bit pattern to float.
+ *
+ * pgvector's HalfToFloat4 lives in its halfutils.h, which pgvector does not
+ * install, so this is the same conversion carried locally (pgvector is under
+ * the PostgreSQL licence, as is this file).  pgvector also has an _cvtsh_ss
+ * path for F16C hardware; this keeps the portable arithmetic instead, which is
+ * exact for every input including subnormals, infinities and NaN, so the result
+ * does not depend on which of halfvec.h's three configurations the build picked.
+ * The cast is the right conversion in exactly the one configuration where half
+ * is a native _Float16.
+ */
+static inline float
+VamanaHalfToFloat4(half num)
+{
+#ifdef FLT16_SUPPORT
+	return (float) num;
+#else
+	uint16		bits = (uint16) num;
+	uint16		sign = (bits >> 15) & 0x0001;
+	uint16		expo = (bits >> 10) & 0x001F;
+	uint16		mant = bits & 0x03FF;
+	uint32		result;
+
+	if (expo == 0)
+	{
+		if (mant == 0)
+		{
+			/* +-zero */
+			result = (uint32) sign << 31;
+		}
+		else
+		{
+			/* subnormal: renormalize into a float32 normal */
+			int			shift = 0;
+
+			while ((mant & 0x0400) == 0)
+			{
+				mant <<= 1;
+				shift++;
+			}
+			mant &= 0x03FF;
+
+			result = ((uint32) sign << 31)
+				| ((uint32) (127 - 15 - shift) << 23)
+				| ((uint32) mant << 13);
+		}
+	}
+	else if (expo == 0x1F)
+	{
+		/* Inf or NaN; a non-zero mantissa stays non-zero, so NaN stays NaN */
+		result = ((uint32) sign << 31) | 0x7F800000 | ((uint32) mant << 13);
+	}
+	else
+	{
+		result = ((uint32) sign << 31)
+			| ((uint32) (expo - 15 + 127) << 23)
+			| ((uint32) mant << 13);
+	}
+
+	return *((float *) &result);
+#endif
+}
+
+/*
+ * Read an indexed datum into a freshly palloc'd float array.
+ *
+ * Every SVS entry point takes float32, so this is the one place a stored
+ * element width turns into the float buffer the rest of the extension works
+ * in.  Detoasting with _COPY keeps the elements in their own palloc block:
+ * without it SVS's aligned reads can overshoot the heap-page buffer.
+ *
+ * The varlena size is checked against the header plus dim elements of the
+ * *indexed* type before any element is touched, so a datum of another width
+ * is rejected with an error rather than misread.  dim is an output, mirroring
+ * the datum's own dimension rather than the index's.
+ */
+float *
+VamanaDatumToFloats(const VamanaTypeInfo *typeInfo, Datum datum,
+					int *dim, const char *context)
+{
+	struct varlena *raw = (struct varlena *) PG_DETOAST_DATUM_COPY(datum);
+	int16		datumDim;
+	Size		expectedSize;
+	float	   *result;
+
+	/*
+	 * vector and halfvec share this header layout exactly (int32 vl_len_,
+	 * int16 dim, int16 unused), so the dimension can be read before the
+	 * element type is known.
+	 */
+	datumDim = ((Vector *) raw)->dim;
+
+	if (datumDim < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vector has negative dimension %d in %s",
+						datumDim, context)));
+
+	expectedSize = offsetof(Vector, x) + (Size) datumDim * typeInfo->elementSize;
+
+	if (VARSIZE_ANY_EXHDR(raw) + VARHDRSZ != expectedSize)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vector datum size %u does not match %d dimensions in %s",
+						(unsigned) VARSIZE_ANY(raw), datumDim, context)));
+
+	result = (float *) palloc((Size) datumDim * sizeof(float));
+
+	if (typeInfo->elementSize == sizeof(float))
+		memcpy(result, ((Vector *) raw)->x, (Size) datumDim * sizeof(float));
+	else
+	{
+		half	   *elems = ((HalfVector *) raw)->x;
+
+		for (int i = 0; i < datumDim; i++)
+			result[i] = VamanaHalfToFloat4(elems[i]);
+	}
+
+	pfree(raw);
+
+	VamanaValidateVectorData(result, datumDim, context);
+
+	*dim = datumDim;
+
+	return result;
 }
 
 /*

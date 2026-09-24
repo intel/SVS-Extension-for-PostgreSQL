@@ -103,8 +103,10 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	MemoryContext	oldCtx;
 	Relation		indexRel;
 	VamanaOptions  *opts;
+	VamanaMetaPageData meta;
 	int				rawAlpha;
 	SVSDistanceType distanceType;
+	SVSDType		dataType;
 	int				searchWindowSize;
 	bool			useSearchHistory;
 	int				compressionType;
@@ -123,12 +125,22 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		? opts->build_window_size
 		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
 	distanceType = VamanaGetDistanceMetric(indexRel);
+	dataType = VamanaGetTypeInfo(indexRel)->dataType;
 	searchWindowSize = VamanaResolveSearchWindowSize(opts);
 	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
-	compressionType = opts ? opts->compression_type : VAMANA_COMPRESSION_NONE;
-	compressionPrimary = opts ? opts->compression_primary : 0;
-	compressionSecondary = opts ? opts->compression_secondary : 0;
-	leanvecDims = opts ? opts->leanvec_dims : -1;
+
+	/*
+	 * Compression comes from the metapage, as it does in LoadIndexFromPages:
+	 * the metapage is what the load path after a restart will read, so
+	 * sourcing it here is what makes this build's spec and that load's spec
+	 * agree even if reloptions were altered since CREATE INDEX.  leanvec_dims
+	 * is the exception -- the metapage does not store it.
+	 */
+	VamanaReadMetaPage(indexRel, &meta);
+	compressionType = meta.compression_type;
+	compressionPrimary = meta.compression_primary;
+	compressionSecondary = meta.compression_secondary;
+	leanvecDims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 
 	index_close(indexRel, AccessShareLock);
 	PopActiveSnapshot();
@@ -137,7 +149,17 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	algorithm = SVSCreateAlgorithm(cache->graph_degree, buildWindow,
 								   searchWindowSize,
 								   rawAlpha, useSearchHistory);
-	storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
+
+	/*
+	 * An index created on an empty table is first populated here, so this is
+	 * the one build path that must honour compression too: a simple-storage
+	 * build under an LVQ or LeanVec metapage produces a file the load path
+	 * cannot read, and the worker then silently rebuilds from the table.
+	 */
+	storage = SVSCreateStorageForCompression(compressionType, dataType,
+											 cache->dimensions, leanvecDims,
+											 compressionPrimary,
+											 compressionSecondary);
 	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
 
@@ -195,7 +217,7 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 			.compression_primary = compressionPrimary,
 			.compression_secondary = compressionSecondary,
 			.distance_type = distanceType,
-			.data_type = SVS_DTYPE_FLOAT32,
+			.data_type = dataType,
 			.dimensions = cache->dimensions,
 			.leanvec_dims = leanvecDims,
 			.build_window_size = buildWindow,
@@ -611,7 +633,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		config.compression_secondary = params->compression_secondary;
 		config.leanvec_dims			= params->leanvec_dims;
 		config.distance_type		= (SVSDistanceType) params->distance_type;
-		config.data_type			= SVS_DTYPE_FLOAT32;
+		config.data_type			= (SVSDType) params->data_type;
 		config.search_num_threads	= SvsCurrentSearchGrant();
 
 		svsIndex = SVSLoadDynamicIndex(savepath, &config);
@@ -673,6 +695,14 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 			{
 				cache->heapRelid    = params->heapRelid;
 				cache->vectorAttNum = params->vectorAttNum;
+
+				/*
+				 * Replay reads heap datums with no index relation open, so the
+				 * element type has to reach the cache entry from here; the
+				 * dtype the index was built and just loaded under is the one
+				 * the datums must be read with.
+				 */
+				cache->typeInfo = VamanaGetTypeInfoForDataType(config.data_type);
 
 				/*
 				 * Slot creation must happen in the BGW: CreateInitDecodingContext

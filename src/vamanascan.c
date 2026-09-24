@@ -92,7 +92,7 @@ LoadIndexFromPages(Relation index)
 	config.compression_primary = meta.compression_primary;
 	config.compression_secondary = meta.compression_secondary;
 	config.distance_type = VamanaGetDistanceMetric(index);
-	config.data_type = SVS_DTYPE_FLOAT32;
+	config.data_type = VamanaGetTypeInfo(index)->dataType;
 	config.dimensions = (int) meta.dimensions;
 	config.numVectors = (int) meta.numVectors;
 	config.leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
@@ -220,7 +220,8 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 	/* Extract query vector from orderbys */
 	if (norderbys > 0 && so->svsIndex)
 	{
-		Vector	   *queryVec;
+		float	   *queryFloats;
+		int			queryDim;
 		int			k = Max(so->k, 1);
 
 		so->queryValue = orderbys[0].sk_argument;
@@ -233,13 +234,8 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 			return;
 		}
 
-		/*
-		 * Use _COPY to ensure queryVec->x is in its own palloc allocation.
-		 * SVS reads the query vector in aligned chunks; without _COPY, an
-		 * untoasted datum points into the heap page buffer and SVS could read
-		 * past the palloc block boundary.
-		 */
-		queryVec = (Vector *) PG_DETOAST_DATUM_COPY(so->queryValue);
+		queryFloats = VamanaDatumToFloats(so->typeInfo, so->queryValue,
+										  &queryDim, "search");
 
 		if (so->results)
 			pfree(so->results);
@@ -257,8 +253,8 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 			 */
 			so->numResults = VamanaWorkerSubmitSearch(
 													  so->indexRelid,
-													  queryVec->x,
-													  queryVec->dim,
+													  queryFloats,
+													  queryDim,
 													  k,
 													  so->searchWindowSize,
 													  so->results,
@@ -272,7 +268,7 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 						 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
 		}
 
-		pfree(queryVec);		/* free the _COPY allocation */
+		pfree(queryFloats);
 
 		so->currentResult = 0;
 	}

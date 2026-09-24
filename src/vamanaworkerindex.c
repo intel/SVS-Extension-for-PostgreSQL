@@ -160,6 +160,7 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
 
 	cache->heapRelid = indexRel->rd_index->indrelid;
 	cache->vectorAttNum = indexRel->rd_index->indkey.values[0] - 1;
+	cache->typeInfo = VamanaGetTypeInfo(indexRel);
 
 	if (cache->replicationSlot == NULL)
 		cache->replicationSlot = VamanaReplicationOpen(VamanaWorkerShmemPtr->dbOid, relid);
@@ -214,12 +215,16 @@ ComputeSearchScratchBytesPerQuery(const SVSBuildConfig *config, bool useSearchHi
 	algorithm = SVSCreateAlgorithm(config->graph_degree, buildWindow, config->search_window_size,
 									config->alpha, useSearchHistory);
 
-	if (config->compression_type == VAMANA_COMPRESSION_LEANVEC)
-		storage = SVSCreateLeanVecStorage(config->dimensions, config->leanvec_dims,
-										   config->compression_primary,
-										   config->compression_secondary);
-	else
-		storage = SVSCreateSimpleStorage(SVS_DTYPE_FLOAT32);
+	/*
+	 * Must be the same selector the build and load paths use: an LVQ index
+	 * estimated against simple storage is estimated against the wrong spec.
+	 */
+	storage = SVSCreateStorageForCompression(config->compression_type,
+											  config->data_type,
+											  config->dimensions,
+											  config->leanvec_dims,
+											  config->compression_primary,
+											  config->compression_secondary);
 
 	builder = SVSCreateBuilder(config->distance_type, config->dimensions, algorithm);
 	SVSBuilderSetStorage(builder, storage);
@@ -281,7 +286,7 @@ VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCac
 	config.compression_primary = opts ? opts->compression_primary : 0;
 	config.compression_secondary = opts ? opts->compression_secondary : 0;
 	config.distance_type = VamanaGetDistanceMetric(indexRel);
-	config.data_type = SVS_DTYPE_FLOAT32;
+	config.data_type = VamanaGetTypeInfo(indexRel)->dataType;
 	config.dimensions = cache->dimensions;
 	config.leanvec_dims = opts ? opts->leanvec_dims : -1;
 	config.build_window_size = opts ? opts->build_window_size : 0;

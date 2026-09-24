@@ -24,11 +24,15 @@
 #include "miscadmin.h"
 #include "utils/rel.h"
 
-/* Conservative upper bound: raw vector storage plus one full neighbor list. */
+/*
+ * Conservative upper bound: raw vector storage plus one full neighbor list.
+ * elementSize is the stored element width, not the float the datum is widened
+ * to, so a halfvec index is not charged twice what it occupies.
+ */
 static uint64
-VamanaEstimateInsertGrowthBytes(int dimensions, int graphDegree)
+VamanaEstimateInsertGrowthBytes(int dimensions, Size elementSize, int graphDegree)
 {
-	return (uint64) dimensions * sizeof(float) +
+	return (uint64) dimensions * elementSize +
 		(uint64) graphDegree * sizeof(uint32);
 }
 
@@ -42,7 +46,9 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 			 IndexInfo *indexInfo)
 {
 	Oid			relid = RelationGetRelid(index);
-	Vector	   *vec;
+	const		VamanaTypeInfo *typeInfo = VamanaGetTypeInfo(index);
+	float	   *floats;
+	int			dim;
 	uint64		externalId;
 	bool		slotCreated;
 
@@ -51,19 +57,18 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 
 	VamanaWorkerWaitUntilAvailable(relid, "insert into");
 
-	vec = (Vector *) PG_DETOAST_DATUM_COPY(values[0]);
-	if (VARSIZE(vec) == VECTOR_SIZE(vec->dim))
-		VamanaValidateVectorData(vec->x, vec->dim, "insert");
+	floats = VamanaDatumToFloats(typeInfo, values[0], &dim, "insert");
 
 	/* Defense-in-depth: PostgreSQL's type system normally prevents this. */
-	if (vec->dim != TupleDescAttr(index->rd_att, 0)->atttypmod)
+	if (dim != TupleDescAttr(index->rd_att, 0)->atttypmod)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("vector dimension %d does not match index dimension %d",
-						vec->dim, TupleDescAttr(index->rd_att, 0)->atttypmod)));
+						dim, TupleDescAttr(index->rd_att, 0)->atttypmod)));
 
 	{
-		uint64		growthBytes = VamanaEstimateInsertGrowthBytes(vec->dim,
+		uint64		growthBytes = VamanaEstimateInsertGrowthBytes(dim,
+																	typeInfo->elementSize,
 																	VamanaGetGraphDegree(index));
 
 		if (!SvsMemoryReserveInsert(MyDatabaseId, relid, growthBytes))
@@ -76,7 +81,7 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 		/* Submit to BGW — blocks until the worker ACKs or errors. */
 		PG_TRY();
 		{
-			VamanaWorkerSubmitInsert(relid, vec->x, vec->dim, heap_tid,
+			VamanaWorkerSubmitInsert(relid, floats, dim, heap_tid,
 									 &externalId, &slotCreated);
 		}
 		PG_CATCH();
@@ -87,7 +92,7 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 		PG_END_TRY();
 	}
 
-	pfree(vec);
+	pfree(floats);
 
 	/* Record (relid, externalId) so we can roll back on transaction abort. */
 	VamanaUndoAppend(relid, externalId);
