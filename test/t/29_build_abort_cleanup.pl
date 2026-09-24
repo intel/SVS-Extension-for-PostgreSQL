@@ -94,14 +94,9 @@ sub committed_totals
 # durable residency row count for $relid, up to $bound_seconds, until both
 # match $before's totals and the row count reaches zero. Returns the final
 # observed (\@totals, $residency_rows) rather than asserting anything itself;
-# assertions stay in the caller, matching this file's other polling helpers.
-#
-# The poll itself runs server-side, inside a single psql script (one DO
-# block, one connection), rather than as a Perl-level loop of separate
-# safe_psql round trips: a fresh connection per poll attempt is needless
-# round-trip overhead once the abort has already happened, and this file's
-# other in-transaction checks already establish that a single script is the
-# reliable shape for talking to this worker.
+# assertions stay in the caller. The poll loop runs server-side in a single
+# DO block rather than as repeated safe_psql calls, avoiding a fresh
+# connection per attempt.
 # ---------------------------------------------------------------------------
 sub poll_until_committed_totals_baseline
 {
@@ -200,14 +195,12 @@ check_abort_at('vamana-build-governed-pre-handoff', 'pre_handoff');
 
 # ---------------------------------------------------------------------------
 # check_rollback_after_warmup: unlike check_abort_at, no injection point is
-# involved here -- the build itself succeeds and reaches RESIDENT inside an
-# open transaction, and only then does $abort_sql abort it (an explicit
-# ROLLBACK, or a statement error followed by the ROLLBACK a client must still
-# send to close the aborted block). The whole transaction, including the
-# in-transaction check that residency_bytes_committed already grew, is sent
-# as a single psql script in one round trip: driving the same open
-# transaction interactively over several background_psql query() calls hangs
-# indefinitely on this server.
+# involved here -- the build itself succeeds, and only then does $abort_sql
+# abort it (an explicit ROLLBACK, or a statement error followed by the
+# ROLLBACK a client must still send to close the aborted block). The whole
+# transaction is sent as a single psql script in one round trip: driving the
+# same open transaction interactively over several background_psql query()
+# calls hangs indefinitely on this server.
 # ---------------------------------------------------------------------------
 sub check_rollback_after_warmup
 {
@@ -223,14 +216,6 @@ sub check_rollback_after_warmup
 
 	my @before = committed_totals();
 
-	# The follow-up SELECT reading residency_bytes_committed's growth must run
-	# immediately after CREATE INDEX, in the same script and the same still-
-	# open transaction: the worker's own reload sweep evicts this relid's
-	# residency unconditionally before it can re-load it (see
-	# VamanaWorkerProcessReloads), and re-loading fails for as long as this
-	# transaction still holds the index's lock -- so any extra round trip or
-	# in-transaction delay between CREATE INDEX and this SELECT risks
-	# observing that eviction instead of the warm-up's own growth.
 	my ($ret, $stdout, $stderr) = $node->psql('postgres', qq(
 		BEGIN;
 		CREATE INDEX $idx ON $tbl USING vamana (c1 vector_l2_ops);
@@ -252,7 +237,7 @@ sub check_rollback_after_warmup
 		"$label: the built index's relid and warm-up residency bytes were captured before the abort")
 	  or diag("stdout: $stdout\nstderr: $stderr");
 	cmp_ok($warmed_resid, '>', $before[1],
-		"$label: residency_bytes_committed already grew before the abort, proving the warm-up reached RESIDENT");
+		"$label: residency_bytes_committed already grew before the abort, proving the reservation reached CONFIRMED or later");
 
 	my ($after, $residency_rows) =
 	  poll_until_committed_totals_baseline(\@before, $relid, 10);
