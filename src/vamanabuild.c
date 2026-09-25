@@ -403,45 +403,68 @@ typedef struct VamanaSVSIndexParams
 #define VAMANA_BUILD_MEMORY_MARGIN_DIVISOR 6
 
 /*
- * Per-backend baseline: PostgreSQL/SVS/MKL startup and session overhead,
- * the only fixed-cost term in the build-peak estimate. Scales with vector
- * dimensionality, not compression_type. From a 54-configuration
- * calibration sweep, measured at exactly the three dimensions below; see
- * SvsDimBaselineBytes for how an unmeasured dimension is charged.
+ * Per-backend baseline: PostgreSQL/SVS/MKL build-time working set that
+ * SVSEstimateBuildMemory's residency breakdown does not account for and
+ * that does not scale with rawBuffer, the only fixed-cost term in the
+ * build-peak estimate. Scales with vector dimensionality, not
+ * compression_type. Refitted on the single-growable-buffer vector-collection
+ * path (capacity-priced rawBuffer, no separate scan-block allocation):
+ * compression none, LeanVec and LVQ, both vector and halfvec storage, row
+ * counts 10k/100k/500k, graph_degree 32/128, tables freshly VACUUM ANALYZEd
+ * so buffer capacity matches the row count exactly, measured at exactly the
+ * three dimensions below; see SvsDimBaselineBytes for how an unmeasured
+ * dimension is charged. This term is not explained by a fresh idle
+ * backend's own RSS (an order of magnitude smaller): it is real SVS/MKL
+ * build-time working set, not per-backend connection overhead, and the fit
+ * cannot separate the two further from three measured dimensions.
+ * The worst observed ratio of measured peak RSS to predicted buildPeak
+ * (residency + rawBuffer + this baseline + the two multiplier terms below,
+ * before the margin) across every measured configuration is 1.0000: this
+ * table's values are each the maximum shortfall observed at that
+ * dimension, so the baseline alone is already an exact upper bound with no
+ * adjustment needed, and cannot under-predict at a dimension it measured.
  */
 static const struct { int dims; double baseline_mb; } SvsDimBaselineTable[] = {
-	{ 128,  50.97 },
-	{ 768,  107.89 },
-	{ 1536, 132.50 },
+	{ 128,  107.03 },
+	{ 768,  221.74 },
+	{ 1536, 223.20 },
 };
 
 /*
  * Dimension-dependent adjustment to rawBuffer, shared by every
- * compression_type. Positive at 128 (128*4 bytes lands exactly on an
- * allocator size class, the tightest margin measured); the fitted values
- * at 768/1536 are negative (this host's overcommit behavior, not a
- * general property) and clamped to zero so they can only add margin, never
- * remove it. Same source as SvsDimBaselineTable above.
+ * compression_type. Refitted alongside SvsDimBaselineTable: at every
+ * measured dimension the baseline term alone already upper-bounds every
+ * measured configuration, so the fitted slope is zero or negative at all
+ * three points and clamps to zero throughout. Kept as a table, rather than
+ * removed, so a future dimension whose shortfall genuinely grows with
+ * rawBuffer has somewhere to record a nonzero value without changing the
+ * estimate's shape.
  */
 static const struct { int dims; double raw_multiplier; } SvsDimAdjustmentTable[] = {
-	{ 128,  0.80 },
-	{ 768,  0.0 },			/* fitted -0.226, clamped to zero */
-	{ 1536, 0.0 },			/* fitted -0.289, clamped to zero */
+	{ 128,  0.0 },			/* fitted <= 0, clamped to zero */
+	{ 768,  0.0 },			/* fitted <= 0, clamped to zero */
+	{ 1536, 0.0 },			/* fitted <= 0, clamped to zero */
 };
 
 /*
  * LeanVec's extra full-precision working copy of the input, needed to
  * derive its reduced-dimension representation, as a multiple of
  * rawBuffer. Applied only when compression_type is
- * VAMANA_COMPRESSION_LEANVEC. The dim=128 value is the least trusted:
- * LeanVec's footprint there ignores leanvec_dims and compression_primary
- * in this SVS build, so it reflects a fixed library fallback, not a
- * tuned trade-off. Same source as SvsDimBaselineTable above.
+ * VAMANA_COMPRESSION_LEANVEC. Refitted from the same sweep as
+ * SvsDimBaselineTable: each value is the largest (shortfall - baseline) /
+ * rawBuffer ratio observed for LeanVec at that dimension, so baseline plus
+ * this multiplier times rawBuffer upper-bounds every measured LeanVec
+ * configuration exactly. At dim=128 the baseline term alone already covers
+ * every measured LeanVec configuration, so the fitted multiplier clamps to
+ * zero; LeanVec's footprint there ignores leanvec_dims and
+ * compression_primary in this SVS build, so it reflects a fixed library
+ * fallback, not a tuned trade-off. Same source as SvsDimBaselineTable
+ * above.
  */
 static const struct { int dims; double raw_multiplier; } SvsLeanVecExtraTable[] = {
-	{ 128,  0.77 },
+	{ 128,  0.0 },			/* fitted <= 0, clamped to zero */
 	{ 768,  1.26 },
-	{ 1536, 1.29 },
+	{ 1536, 1.30 },
 };
 
 /*
