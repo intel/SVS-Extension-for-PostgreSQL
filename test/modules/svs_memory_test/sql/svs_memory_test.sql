@@ -950,20 +950,10 @@ $do$;', :curdb_oid) AS is_launcher_probe \gset
 SELECT svs_memory_test_set_launcher_database('postgres');
 SELECT * FROM svs_memory_test_check_invariants();
 
--- Issue #168 bug 2: a maintenance operation (e.g. COMPACT) reconciling a
--- resident index's measured bytes must not disturb another backend's
--- still-pending insert reservation for the same relid. Reusing
--- svs_memory_reanchor_insert for that -- the shape first proposed for the
--- compact fix -- pops whichever pending insert reservation is oldest for
--- the relid as a side effect, even though it belongs to a different,
--- not-yet-applied operation. That both erases the reservation record and
--- under-counts the database's residency commitment, defeating the
--- reservation's purpose: bounding concurrent admission while an insert is
--- still in flight.
--- Byte counts here are deliberately tiny (not MB-scale like the sections
--- above): the global residency ceiling is already nearly exhausted by
--- every database admitted earlier in this file, and this section's point
--- is the accounting logic, not realistic sizes.
+-- A maintenance reconcile for one relid must not touch another backend's
+-- still-pending insert reservation for the same relid.
+-- Byte counts are tiny on purpose: the residency ceiling is already
+-- nearly exhausted by databases admitted earlier in this file.
 SELECT svs_memory_admit_database(800, 900::bigint);
 SELECT svs_memory_reconcile_load(800, 80, 800::bigint);
 SELECT * FROM svs_memory_read_stats(800);

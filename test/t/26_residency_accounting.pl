@@ -353,7 +353,7 @@ my $baseline = committed_bytes();
     $node->safe_psql('postgres', qq(
         CREATE TABLE calib_tbl (id serial PRIMARY KEY, val vector($dim));
         INSERT INTO calib_tbl (val)
-            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 70);
     ));
 
     my $log_pos = length($node->log_content());
@@ -362,19 +362,25 @@ my $baseline = committed_bytes();
     wait_for_worker($node);
 
     my $log_slice = substr($node->log_content(), $log_pos);
-    like($log_slice, qr/capacity headroom for 50 vectors is 14 \(data \d+, graph 14\)/,
-        'real calibration computes the analytically expected headroom for a fresh 50-row index');
+    like($log_slice, qr/capacity headroom for 70 vectors is 58 \(data \d+, graph 58\)/,
+        'real calibration computes the analytically expected headroom for a fresh 70-row index');
+
+    my $committed_before_compact = committed_bytes();
 
     # Delete past vamana_compact_threshold_pct (10% default) and VACUUM to
     # force a real COMPACT; it must recalibrate for the post-compact count.
+    # 70 rows span two graph blocks (block size 64); dropping to 60 fits back
+    # in one, so compact frees a block and the committed total must shrink.
     $log_pos = length($node->log_content());
     $node->safe_psql('postgres', "DELETE FROM calib_tbl WHERE id <= 10;");
     $node->safe_psql('postgres', "VACUUM calib_tbl;");
     wait_for_worker($node);
 
     $log_slice = substr($node->log_content(), $log_pos);
-    like($log_slice, qr/capacity headroom for 40 vectors is \d+ \(data \d+, graph \d+\)/,
+    like($log_slice, qr/capacity headroom for 60 vectors is \d+ \(data \d+, graph \d+\)/,
         'compact triggers real recalibration for the post-compact row count');
+    cmp_ok(committed_bytes(), '<', $committed_before_compact,
+        'compact reconciles the committed residency total, not just the headroom');
 
     $node->safe_psql('postgres', "DROP INDEX calib_idx;");
     $node->safe_psql('postgres', "DROP TABLE calib_tbl;");
