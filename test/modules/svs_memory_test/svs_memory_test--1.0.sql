@@ -87,6 +87,10 @@ CREATE FUNCTION svs_memory_reserve_build(db_oid oid, relid oid, build_peak bigin
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
+CREATE FUNCTION svs_memory_check_estimated_build_size(reltuples float8, dimensions int)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
 CREATE FUNCTION svs_memory_confirm_build(db_oid oid, relid oid, build_peak bigint, measured_residency_bytes bigint)
 RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;

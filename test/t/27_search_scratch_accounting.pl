@@ -129,85 +129,27 @@ my $BATCH_N = 60;
 my @batch_query_vecs =
     map { join(",", map { sprintf("%.6f", rand()) } 1 .. $dim) } 1 .. $BATCH_N;
 
-sub in_flight_bytes
-{
-    my $bytes = $node->safe_psql('postgres',
-        "SELECT search_scratch_bytes_in_flight FROM pg_stat_vamana_worker "
-      . "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = 'postgres');");
-    chomp $bytes;
-    return $bytes;
-}
+my $probe_search_sql = qq(
+    SET enable_seqscan = off;
+    SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+);
+my ($probe_session, $probe_client_pid, $probe_worker_pid) =
+    park_search_scratch_reservation($node, 'postgres', $probe_search_sql);
+isnt($probe_worker_pid, '', 'a search parks once its search-scratch cost is admitted');
 
-# A client's slot is marked DONE/ERROR, and so becomes visible to the
-# client, before the worker calls SvsMemoryReleaseSearchScratch for that
-# same batch -- polls rather than trusting the client's own return to mean
-# the release already happened.
-sub wait_for_in_flight
-{
-    my ($expected) = @_;
-    my $bytes = '';
-    for (1 .. 100)
-    {
-        $bytes = in_flight_bytes();
-        return $bytes if $bytes eq $expected;
-        usleep(100_000);
-    }
-    return $bytes;
-}
+my $cost_bytes = search_scratch_cost_for_relid($node, 'postgres', $relid);
+ok($cost_bytes =~ /^\d+$/ && $cost_bytes > 0,
+    "the paused search's memoized cost is a positive byte count ($cost_bytes)");
+is(search_scratch_in_flight_bytes($node, 'postgres'), $cost_bytes,
+    'the in-flight total while paused equals exactly this one admitted cost');
 
-# ---------------------------------------------------------------------------
-# Pause a single search at the point it has just been admitted, so its
-# memoized per-query cost and the resulting in-flight total are both
-# observable while still held -- neither is reliably readable once the
-# query completes and its slot is freed.  Returns the per-query cost in
-# bytes and leaves the paused query running to completion before returning.
-# ---------------------------------------------------------------------------
-sub discover_cost_bytes
-{
-    $node->safe_psql('postgres',
-        "SELECT injection_points_attach('vamana-search-scratch-reserved', 'wait');");
+release_search_scratch_reservation($node, 'postgres', $probe_session);
 
-    my $req = $node->background_psql('postgres', on_error_stop => 0);
-    $req->query_until(qr//, qq(
-        SET enable_seqscan = off;
-        SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
-    ));
-
-    my $parked = '';
-    for (1 .. 100)
-    {
-        usleep(100_000);
-        $parked = $node->safe_psql('postgres',
-            "SELECT pid FROM pg_stat_activity "
-          . "WHERE wait_event = 'vamana-search-scratch-reserved';");
-        last if $parked ne '';
-    }
-    isnt($parked, '', 'a search parks once its search-scratch cost is admitted');
-
-    my $cost = $node->safe_psql('postgres',
-        "SELECT search_scratch_bytes_per_query FROM pg_stat_vamana_worker_slot "
-      . "WHERE index_relid = $relid AND slot_status = 'processing';");
-    chomp $cost;
-    ok($cost =~ /^\d+$/ && $cost > 0, "the paused search's memoized cost is a positive byte count ($cost)");
-
-    is(in_flight_bytes(), $cost,
-        'the in-flight total while paused equals exactly this one admitted cost');
-
-    $node->safe_psql('postgres',
-        "SELECT injection_points_wakeup('vamana-search-scratch-reserved');");
-    $req->quit;
-
-    $node->safe_psql('postgres',
-        "SELECT injection_points_detach('vamana-search-scratch-reserved');");
-
-    return $cost;
-}
-
-my $cost_bytes = discover_cost_bytes();
 my $cost_mb = int(($cost_bytes + 1024 * 1024 - 1) / (1024 * 1024));
 $cost_mb = 1 if $cost_mb < 1;
 
-is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the paused search completes');
+is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
+    'the in-flight total returns to zero once the paused search completes');
 
 # ---------------------------------------------------------------------------
 # Case 1: a batch whose combined cost exceeds the database's search-scratch
@@ -245,7 +187,7 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
     like($log, qr/exceeds this database's search-scratch budget/,
         'the refusal names the search-scratch budget');
 
-    is(wait_for_in_flight('0'), '0',
+    is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
         'nothing is left in flight after the refused queries error');
 }
 
@@ -284,40 +226,26 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
     like($log, qr/vamana worker: dispatching batch on index $relid with 2 search threads/,
         'the thread grant is applied once the scratch gate admits the batch');
 
-    is(wait_for_in_flight('0'), '0',
+    is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
         'nothing is left in flight once the admitted batch completes');
 }
 
 # ---------------------------------------------------------------------------
 # Case 3: the live in-flight total resets to zero on worker restart, with no
 # re-derivation needed -- unlike residency, nothing here is durable.  The
-# worker is killed while genuinely holding a reservation (parked at the same
-# injection point discover_cost_bytes uses, before this batch's own release
+# worker is killed while genuinely holding a reservation (parked via the
+# same mechanism as the probe above, before this batch's own release
 # is reached), so this is the one path that can leak the counter forever
 # without the worker-startup reset.
 # ---------------------------------------------------------------------------
 {
-    $node->safe_psql('postgres',
-        "SELECT injection_points_attach('vamana-search-scratch-reserved', 'wait');");
-
-    my $victim = $node->background_psql('postgres', on_error_stop => 0);
-    my $victim_pid = $victim->query('SELECT pg_backend_pid()');
-    chomp $victim_pid;
-    $victim->query_until(qr//, qq(
+    my ($victim, $victim_pid, $pid1) = park_search_scratch_reservation($node, 'postgres', qq(
         SET enable_seqscan = off;
         SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
     ));
-
-    my $pid1 = '';
-    for (1 .. 100)
-    {
-        usleep(100_000);
-        $pid1 = $node->safe_psql('postgres',
-            "SELECT pid FROM pg_stat_activity WHERE wait_event = 'vamana-search-scratch-reserved';");
-        last if $pid1 ne '';
-    }
     isnt($pid1, '', 'the worker parks holding a reservation, before this batch\'s own release');
-    is(in_flight_bytes(), $cost_bytes, 'the in-flight total reflects the reservation the worker is about to lose');
+    is(search_scratch_in_flight_bytes($node, 'postgres'), $cost_bytes,
+        'the in-flight total reflects the reservation the worker is about to lose');
 
     kill('TERM', $pid1);
 
@@ -334,7 +262,7 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
     ok($pid2 =~ /^\d+$/ && $pid2 ne $pid1,
         "worker respawns after being killed while holding a reservation (pid=$pid2)");
 
-    is(wait_for_in_flight('0'), '0',
+    is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
         'the in-flight total reads zero after respawn, not the leaked reservation from the killed worker');
 
     # The victim's slot was reset straight to EMPTY by the new worker's
@@ -357,35 +285,21 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
         "UPDATE vamana_databases SET search_work_mem = " . ($cost_mb * 3) .
         " WHERE datname = 'postgres';");
 
-    $node->safe_psql('postgres',
-        "SELECT injection_points_attach('vamana-search-scratch-reserved', 'wait');");
-
-    my $parked_req = $node->background_psql('postgres', on_error_stop => 0);
-    my $parked_req_pid = $parked_req->query('SELECT pg_backend_pid()');
-    chomp $parked_req_pid;
-    $parked_req->query_until(qr//, qq(
-        SET enable_seqscan = off;
-        SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
-    ));
-
-    my $worker_pid = '';
-    for (1 .. 100)
-    {
-        usleep(100_000);
-        $worker_pid = $node->safe_psql('postgres',
-            "SELECT pid FROM pg_stat_activity "
-          . "WHERE wait_event = 'vamana-search-scratch-reserved';");
-        last if $worker_pid ne '';
-    }
+    my ($parked_req, $parked_req_pid, $worker_pid) =
+        park_search_scratch_reservation($node, 'postgres', qq(
+            SET enable_seqscan = off;
+            SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+        ));
     isnt($worker_pid, '', 'a fresh search parks with its cost already admitted');
-    is(in_flight_bytes(), $cost_bytes, 'the in-flight total reflects the paused batch');
+    is(search_scratch_in_flight_bytes($node, 'postgres'), $cost_bytes,
+        'the in-flight total reflects the paused batch');
 
     my ($ret, $stdout, $stderr) = $node->psql('postgres',
         "UPDATE vamana_databases SET search_work_mem = $cost_mb WHERE datname = 'postgres';");
     is($ret, 0,
         'lowering search_work_mem while a batch is in flight succeeds with no decrease check');
 
-    is(in_flight_bytes(), $cost_bytes,
+    is(search_scratch_in_flight_bytes($node, 'postgres'), $cost_bytes,
         'the paused batch\'s admitted cost is untouched by the lower ceiling');
 
     # Released via a kill/respawn (Case 3's mechanism, already proven clean)
@@ -413,7 +327,8 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
     ok($new_worker_pid =~ /^\d+$/ && $new_worker_pid ne $worker_pid,
         "worker respawns after releasing the paused batch (pid=$new_worker_pid)");
 
-    is(wait_for_in_flight('0'), '0', 'the paused batch left nothing in flight once released');
+    is(wait_for_search_scratch_in_flight($node, 'postgres', '0'), '0',
+        'the paused batch left nothing in flight once released');
 
     # A single query fits the new, lower ceiling; $BATCH_N concurrent ones
     # against the same index push their combined cost over it.
@@ -435,9 +350,10 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
 }
 
 # ---------------------------------------------------------------------------
-# Case 5: the two non-hot-path recompute triggers for the memoized per-query
-# cost (see the design's three-trigger list; the hot-path trigger, at index
-# load, is already exercised implicitly by every case above).
+# Case 5: the memoized per-query cost is computed once and read from cache
+# on every unchanged repeat, then the two non-hot-path recompute triggers
+# (see the design's three-trigger list; the hot-path trigger, at index load,
+# is already exercised implicitly by every case above).
 #
 # Trigger 2, ALTER INDEX: the OAT_POST_ALTER hook rechecks the memoized cost
 # against the index's current reloptions and invalidates it on a real
@@ -452,6 +368,15 @@ is(wait_for_in_flight('0'), '0', 'the in-flight total returns to zero once the p
 # ---------------------------------------------------------------------------
 {
     my $log_pos = length($node->log_content());
+    $node->safe_psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM ssg_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    my $repeat_log = substr($node->log_content(), $log_pos);
+    unlike($repeat_log, qr/vamana worker: computed search-scratch cost/,
+        'a repeat query against an unchanged index reads the memoized cost, not a recompute');
+
+    $log_pos = length($node->log_content());
     $node->safe_psql('postgres', "ALTER INDEX ssg_idx SET (use_search_history = false);");
     $node->safe_psql('postgres', qq(
         SET enable_seqscan = off;

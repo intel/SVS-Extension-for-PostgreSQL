@@ -38,6 +38,14 @@ typedef struct ReconcileOrphansArgs
 	int			numLive;
 } ReconcileOrphansArgs;
 
+typedef struct ReadBytesForRelidsArgs
+{
+	Oid			dbOid;
+	Oid		   *liveRelids;
+	int			numLive;
+	uint64	   *outBytes;
+} ReadBytesForRelidsArgs;
+
 static void
 ConnectOrError(const char *callerName)
 {
@@ -234,6 +242,92 @@ SvsIndexResidencyReconcileOrphans(Oid dbOid, Oid *liveRelids, int numLive)
 	ereport(LOG,
 			(errmsg("vamana database %u: could not reconcile orphaned residency records; "
 					"will retry at the next worker startup", dbOid)));
+}
+
+static void
+ReadBytesForRelidsBody(void *arg)
+{
+	ReadBytesForRelidsArgs *args = (ReadBytesForRelidsArgs *) arg;
+	char	   *qualifiedName = SvsExtensionQualifiedRelationName("svs_index_residency");
+	Datum	   *elems;
+	ArrayType  *liveArray;
+	Oid			argTypes[2] = {OIDOID, OIDARRAYOID};
+	Datum		argValues[2];
+	int			ret;
+
+	if (qualifiedName == NULL)
+		return;
+
+	elems = (Datum *) palloc(sizeof(Datum) * args->numLive);
+	for (int i = 0; i < args->numLive; i++)
+		elems[i] = ObjectIdGetDatum(args->liveRelids[i]);
+	liveArray = construct_array(elems, args->numLive, OIDOID,
+								 sizeof(Oid), true, TYPALIGN_INT);
+
+	argValues[0] = ObjectIdGetDatum(args->dbOid);
+	argValues[1] = PointerGetDatum(liveArray);
+
+	ConnectOrError("SvsIndexResidencyReadBytesForRelids");
+	ret = SPI_execute_with_args(psprintf("SELECT index_relid, resident_bytes FROM %s "
+										  "WHERE db_oid = $1 AND index_relid = ANY($2)",
+										  qualifiedName),
+								 2, argTypes, argValues, NULL, true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 r = 0; r < SPI_processed; r++)
+		{
+			bool		relidNull,
+						bytesNull;
+			Oid			relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc,
+																 1, &relidNull));
+			int64		bytes = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[r], SPI_tuptable->tupdesc,
+															 2, &bytesNull));
+
+			if (relidNull || bytesNull)
+				continue;
+
+			for (int i = 0; i < args->numLive; i++)
+			{
+				if (args->liveRelids[i] == relid)
+				{
+					args->outBytes[i] = (uint64) bytes;
+					break;
+				}
+			}
+		}
+	}
+
+	SPI_finish();
+}
+
+void
+SvsIndexResidencyReadBytesForRelids(Oid dbOid, const Oid *liveRelids, int numLive, uint64 *outBytes)
+{
+	ReadBytesForRelidsArgs args;
+	VamanaSubXactResult result;
+
+	memset(outBytes, 0, sizeof(uint64) * numLive);
+
+	if (numLive == 0)
+		return;
+
+	if (!IsTransactionState())
+		return;
+
+	args.dbOid = dbOid;
+	args.liveRelids = (Oid *) liveRelids;
+	args.numLive = numLive;
+	args.outBytes = outBytes;
+
+	result = VamanaRunInSubXact(ReadBytesForRelidsBody, &args, NULL);
+
+	if (result.succeeded)
+		return;
+
+	FreeErrorData(result.edata);
+	ereport(LOG,
+			(errmsg("vamana database %u: could not read durable residency records", dbOid)));
 }
 
 static uint64

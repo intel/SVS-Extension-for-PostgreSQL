@@ -1022,3 +1022,12 @@ SELECT svs_memory_abort_insert(900, 90);
 SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
 SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
 SELECT * FROM svs_memory_test_check_invariants();
+-- Below, at, and one byte past the raw-data ceiling (dimensions=4, so 16
+-- bytes/row).
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 - 1)::float8, 4);
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16)::float8, 4);
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 + 1)::float8, 4);
+
+-- An unanalyzed table (reltuples <= 0) is not checked here.
+SELECT svs_memory_check_estimated_build_size(0, 999999999);
+SELECT svs_memory_check_estimated_build_size(-1, 999999999);

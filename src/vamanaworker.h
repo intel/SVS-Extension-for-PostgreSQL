@@ -574,7 +574,6 @@ void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 cat
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
-extern Oid	vamana_active_load_relid;
 
 /*
  * True when the error currently being handled is the query-cancel raised by the

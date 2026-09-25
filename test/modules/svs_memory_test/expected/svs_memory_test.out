@@ -3368,3 +3368,33 @@ SELECT * FROM svs_memory_test_check_invariants();
 --------+-----------
 (0 rows)
 
+-- Below, at, and one byte past the raw-data ceiling (dimensions=4, so 16
+-- bytes/row).
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 - 1)::float8, 4);
+ svs_memory_check_estimated_build_size 
+---------------------------------------
+ 
+(1 row)
+
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16)::float8, 4);
+ svs_memory_check_estimated_build_size 
+---------------------------------------
+ 
+(1 row)
+
+SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 + 1)::float8, 4);
+ERROR:  estimated build size exceeds svs.max_build_memory
+DETAIL:  Estimated 6553601 rows x 4 dimensions ~= 104857616 bytes against the 104857600 byte ceiling.
+-- An unanalyzed table (reltuples <= 0) is not checked here.
+SELECT svs_memory_check_estimated_build_size(0, 999999999);
+ svs_memory_check_estimated_build_size 
+---------------------------------------
+ 
+(1 row)
+
+SELECT svs_memory_check_estimated_build_size(-1, 999999999);
+ svs_memory_check_estimated_build_size 
+---------------------------------------
+ 
+(1 row)
+

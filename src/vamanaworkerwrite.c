@@ -564,16 +564,16 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
  * caller's responsibility.
  *
  * Called from VamanaWorkerProcessRequests after the slot has been transitioned
- * to PROCESSING.  Must not throw: this guard is the sole owner of the
- * eviction-suppression flag and the terminal error status, so every failure
- * below becomes VAMANA_SLOT_ERROR uniformly.
+ * to PROCESSING.  Must not throw: every failure below becomes VAMANA_SLOT_ERROR
+ * uniformly, so the worker stays up.
  */
 void
 VamanaWorkerProcessWriteSlot(int slotIdx)
 {
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	bool		prevSuppressed = vamana_eviction_suppressed;
 
-	vamana_active_load_relid = slot->indexRelid;
+	vamana_eviction_suppressed = true;
 
 	PG_TRY();
 	{
@@ -605,12 +605,12 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 							 VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
 
-		vamana_active_load_relid = InvalidOid;
+		vamana_eviction_suppressed = prevSuppressed;
 		return;
 	}
 	PG_END_TRY();
 
-	vamana_active_load_relid = InvalidOid;
+	vamana_eviction_suppressed = prevSuppressed;
 }
 
 /* -----------------------------------------------------------------------
@@ -646,6 +646,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 	char		savepath[MAXPGPATH];
 	volatile bool loadSucceeded = false;
 	MemoryContext oldcontext = CurrentMemoryContext;
+	bool		prevSuppressed = vamana_eviction_suppressed;
 
 	PG_TRY();
 	{
@@ -686,13 +687,12 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 		/*
 		 * Protects relid's own cache entry from eviction while it's being
-		 * populated; see vamana_active_load_relid's declaration for why every
-		 * other cached relid is also protected for the same window. Cleared
-		 * only after DONE is written, so the next write slot's own guard
-		 * covers the window where the CREATE INDEX commit's invalidation
-		 * arrives.
+		 * populated, and every other cached relid too; see
+		 * vamana_eviction_suppressed's declaration. Cleared only after DONE
+		 * is written, so the next write slot's own guard covers the window
+		 * where the CREATE INDEX commit's invalidation arrives.
 		 */
-		vamana_active_load_relid = relid;
+		vamana_eviction_suppressed = true;
 
 		INJECTION_POINT("vamana-load-before-txn-start", NULL);
 
@@ -752,14 +752,14 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		slot->numResults = params->numVectors;
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-		vamana_active_load_relid = InvalidOid;
+		vamana_eviction_suppressed = prevSuppressed;
 		loadSucceeded = true;
 	}
 	PG_CATCH();
 	{
 		ErrorData  *edata;
 
-		vamana_active_load_relid = InvalidOid;
+		vamana_eviction_suppressed = prevSuppressed;
 
 		/*
 		 * VamanaReplicationCreate runs after the residency transaction already
@@ -836,10 +836,11 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
 	Oid			relid = slot->indexRelid;
 	MemoryContext oldcontext = CurrentMemoryContext;
+	bool		prevSuppressed = vamana_eviction_suppressed;
 
 	PG_TRY();
 	{
-		vamana_active_load_relid = relid;
+		vamana_eviction_suppressed = true;
 
 		INJECTION_POINT("vamana-warmup-before-txn-start", NULL);
 
@@ -851,7 +852,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		vamana_active_load_relid = InvalidOid;
+		vamana_eviction_suppressed = prevSuppressed;
 
 		pg_write_barrier();
 		pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
@@ -860,7 +861,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 	{
 		ErrorData  *edata;
 
-		vamana_active_load_relid = InvalidOid;
+		vamana_eviction_suppressed = prevSuppressed;
 
 		if (IsTransactionState())
 			AbortCurrentTransaction();

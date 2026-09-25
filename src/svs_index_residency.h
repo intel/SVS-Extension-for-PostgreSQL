@@ -67,4 +67,13 @@ extern void SvsIndexResidencyReconcileOrphans(Oid dbOid, Oid *liveRelids, int nu
  */
 extern uint64 SvsIndexResidencyDurableFloor(Oid dbOid, struct VamanaWorkerShmem *entry);
 
+/*
+ * Durable resident_bytes for each of liveRelids, written into outBytes at
+ * the same index; 0 where a relid has no durable row. Always zeroes
+ * outBytes first. Best-effort: a failure is logged, not propagated.
+ * Caller must already be inside a transaction with an active snapshot.
+ */
+extern void SvsIndexResidencyReadBytesForRelids(Oid dbOid, const Oid *liveRelids,
+												 int numLive, uint64 *outBytes);
+
 #endif							/* SVS_INDEX_RESIDENCY_H */
