@@ -120,8 +120,8 @@ svs_memory_test_reservations(PG_FUNCTION_ARGS)
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
 	{
 		SvsMemReservation *r = &entry->reservations[i];
-		Datum		values[8];
-		bool		nulls[8] = {false, false, false, false, false, false, false, false};
+		Datum		values[9];
+		bool		nulls[9] = {false, false, false, false, false, false, false, false, false};
 
 		if (r->relid == InvalidOid)
 			continue;
@@ -137,6 +137,7 @@ svs_memory_test_reservations(PG_FUNCTION_ARGS)
 		else
 			nulls[6] = true;
 		values[7] = Int64GetDatum((int64) r->priorResidentBytes);
+		values[8] = Int64GetDatum((int64) r->capacityHeadroomVectors);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
@@ -355,7 +356,8 @@ Datum
 svs_memory_reconcile_load(PG_FUNCTION_ARGS)
 {
 	bool		fits = SvsMemoryReconcileLoad(PG_GETARG_OID(0), PG_GETARG_OID(1),
-											  GetNonNegativeArgAsUint64(fcinfo, 2));
+											  GetNonNegativeArgAsUint64(fcinfo, 2),
+											  GetNonNegativeArgAsUint64(fcinfo, 3));
 
 	PG_RETURN_BOOL(fits);
 }
@@ -384,6 +386,16 @@ svs_memory_reanchor_insert(PG_FUNCTION_ARGS)
 {
 	SvsMemoryReanchorInsert(PG_GETARG_OID(0), PG_GETARG_OID(1),
 							 GetNonNegativeArgAsUint64(fcinfo, 2));
+	PG_RETURN_VOID();
+}
+
+PGDLLEXPORT PG_FUNCTION_INFO_V1(svs_memory_reconcile_resident);
+Datum
+svs_memory_reconcile_resident(PG_FUNCTION_ARGS)
+{
+	SvsMemoryReconcileResident(PG_GETARG_OID(0), PG_GETARG_OID(1),
+							   GetNonNegativeArgAsUint64(fcinfo, 2),
+							   GetNonNegativeArgAsUint64(fcinfo, 3));
 	PG_RETURN_VOID();
 }
 

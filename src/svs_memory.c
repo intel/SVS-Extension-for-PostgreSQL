@@ -762,7 +762,7 @@ SvsMemoryAbortBuild(Oid dbOid, Oid relid)
 }
 
 bool
-SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
+SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes, uint64 capacityHeadroomVectors)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
@@ -817,6 +817,7 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
 			reservation->state = SVS_MEM_RESIDENT;
 			reservation->ownerPid = 0;
 			reservation->measuredBytes = measuredBytes;
+			reservation->capacityHeadroomVectors = capacityHeadroomVectors;
 			reservation->priorResidentBytes = 0;
 			reservation->buildPeakBytes = 0;
 		}
@@ -833,6 +834,7 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
 			reservation->reservedAt = GetCurrentTimestamp();
 			reservation->estimateBytes = measuredBytes;
 			reservation->measuredBytes = measuredBytes;
+			reservation->capacityHeadroomVectors = capacityHeadroomVectors;
 
 			entry->residencyBytesCommitted += measuredBytes;
 		}
@@ -895,7 +897,10 @@ bool
 SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	SvsMemReservation *resident;
 	SvsMemInsertReservation *reservation;
+	bool		consumesHeadroom;
+	uint64		chargeBytes;
 	bool		fits;
 
 	Assert(OidIsValid(relid));
@@ -904,7 +909,11 @@ SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes)
 
 	RequireAdmitted(entry, dbOid);
 
-	fits = entry->residencyBytesCommitted + deltaBytes <= entry->residencyBudget;
+	resident = FindReservation(entry, relid);
+	consumesHeadroom = resident != NULL && resident->capacityHeadroomVectors > 0;
+	chargeBytes = consumesHeadroom ? 0 : deltaBytes;
+
+	fits = entry->residencyBytesCommitted + chargeBytes <= entry->residencyBudget;
 	if (fits)
 	{
 		reservation = FindFreeInsertReservation(entry);
@@ -921,14 +930,44 @@ SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes)
 		reservation->relid = relid;
 		reservation->ownerPid = MyProcPid;
 		reservation->reservedAt = GetCurrentTimestamp();
-		reservation->deltaBytes = deltaBytes;
+		reservation->deltaBytes = chargeBytes;
+		reservation->consumedHeadroom = consumesHeadroom;
 
-		entry->residencyBytesCommitted += deltaBytes;
+		entry->residencyBytesCommitted += chargeBytes;
+		if (consumesHeadroom)
+			resident->capacityHeadroomVectors--;
 	}
 
 	LWLockRelease(&entry->memLock);
 
 	return fits;
+}
+
+static SvsMemReservation *
+FindResidentReservationOrError(VamanaWorkerShmem *entry, Oid dbOid, Oid relid,
+								const char *action)
+{
+	SvsMemReservation *reservation = FindReservation(entry, relid);
+
+	if (reservation == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no resident reservation for index %u in database %u to %s",
+						relid, dbOid, action)));
+
+	return reservation;
+}
+
+static void
+WarnIfResidencyOverBudget(VamanaWorkerShmem *entry, Oid dbOid, Oid relid, const char *afterWhat)
+{
+	if (entry->residencyBytesCommitted > entry->residencyBudget)
+		ereport(WARNING,
+				(errmsg("database %u's residency budget is now exceeded after %s index %u",
+						dbOid, afterWhat, relid),
+				 errdetail("%llu bytes committed, %llu byte budget.",
+						   (unsigned long long) entry->residencyBytesCommitted,
+						   (unsigned long long) entry->residencyBudget)));
 }
 
 void
@@ -941,14 +980,7 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 
 	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
 
-	reservation = FindReservation(entry, relid);
-	if (reservation == NULL)
-	{
-		LWLockRelease(&entry->memLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("no resident reservation for index %u in database %u to reanchor", relid, dbOid)));
-	}
+	reservation = FindResidentReservationOrError(entry, dbOid, relid, "reanchor");
 
 	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
 					"an index's pre-reanchor residency");
@@ -956,13 +988,39 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 	entry->residencyBytesCommitted += measuredBytes;
 	reservation->measuredBytes = measuredBytes;
 
-	if (entry->residencyBytesCommitted > entry->residencyBudget)
-		ereport(WARNING,
-				(errmsg("database %u's residency budget is now exceeded after an insert into index %u",
-						dbOid, relid),
-				 errdetail("%llu bytes committed, %llu byte budget.",
-						   (unsigned long long) entry->residencyBytesCommitted,
-						   (unsigned long long) entry->residencyBudget)));
+	WarnIfResidencyOverBudget(entry, dbOid, relid, "an insert into");
+
+	LWLockRelease(&entry->memLock);
+}
+
+void
+SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
+						   uint64 capacityHeadroomVectors)
+{
+	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
+	SvsMemReservation *reservation;
+
+	Assert(OidIsValid(relid));
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	reservation = FindResidentReservationOrError(entry, dbOid, relid, "reconcile");
+	if (reservation->state != SVS_MEM_RESIDENT)
+	{
+		LWLockRelease(&entry->memLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("reservation for index %u in database %u is not resident, cannot reconcile",
+						relid, dbOid)));
+	}
+
+	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
+					"an index's pre-reconcile residency");
+	entry->residencyBytesCommitted += measuredBytes;
+	reservation->measuredBytes = measuredBytes;
+	reservation->capacityHeadroomVectors = capacityHeadroomVectors;
+
+	WarnIfResidencyOverBudget(entry, dbOid, relid, "a compact of");
 
 	LWLockRelease(&entry->memLock);
 }
@@ -1000,6 +1058,13 @@ SvsMemoryAbortInsert(Oid dbOid, Oid relid)
 	{
 		SubtractFloored(&entry->residencyBytesCommitted, reservation->deltaBytes,
 						"an aborted pending insert reservation");
+		if (reservation->consumedHeadroom)
+		{
+			SvsMemReservation *resident = FindReservation(entry, relid);
+
+			if (resident != NULL)
+				resident->capacityHeadroomVectors++;
+		}
 		FreeInsertReservation(reservation);
 	}
 
@@ -1164,7 +1229,7 @@ SvsMemorySeedDurableResidency(Oid dbOid, Oid relid, uint64 durableBytes)
 	if (alreadyReserved)
 		return;
 
-	if (!SvsMemoryReconcileLoad(dbOid, relid, durableBytes))
+	if (!SvsMemoryReconcileLoad(dbOid, relid, durableBytes, 0))
 		ereport(WARNING,
 				(errmsg("vamana worker: durable residency seed for index %u exceeds this database's residency budget",
 						relid),

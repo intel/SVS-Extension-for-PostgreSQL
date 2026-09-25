@@ -362,6 +362,13 @@ VamanaReadMetaPage(Relation index, VamanaMetaPageData * meta)
 	metap = VamanaPageGetMeta(page);
 	memcpy(meta, metap, sizeof(VamanaMetaPageData));
 	UnlockReleaseBuffer(buf);
+
+	if (meta->magicNumber != VAMANA_MAGIC_NUMBER)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index \"%s\" was built with an incompatible on-disk format",
+						RelationGetRelationName(index)),
+				 errhint("REINDEX this index.")));
 }
 
 /*

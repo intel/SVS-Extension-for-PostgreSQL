@@ -950,6 +950,68 @@ $do$;', :curdb_oid) AS is_launcher_probe \gset
 SELECT svs_memory_test_set_launcher_database('postgres');
 SELECT * FROM svs_memory_test_check_invariants();
 
+-- A maintenance reconcile for one relid must not touch another backend's
+-- still-pending insert reservation for the same relid.
+-- Byte counts are tiny on purpose: the residency ceiling is already
+-- nearly exhausted by databases admitted earlier in this file.
+SELECT svs_memory_admit_database(800, 900::bigint);
+SELECT svs_memory_reconcile_load(800, 80, 800::bigint);
+SELECT * FROM svs_memory_read_stats(800);
+
+-- Backend B reserves an insert; committed lands exactly at budget. Pin its
+-- owner pid to a fixed value so the row printed below is deterministic.
+SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
+SELECT svs_memory_test_set_insert_reservation_owner_pid(800, 80, 100::bigint, -1);
+SELECT * FROM svs_memory_read_stats(800);
+
+-- A maintenance reconcile for the same relid, reporting the same measured
+-- total SVSCompact actually produced (800 bytes, unchanged), must not
+-- touch B's still-pending reservation.
+SELECT svs_memory_reconcile_resident(800, 80, 800::bigint);
+SELECT * FROM svs_memory_test_insert_reservations(800);
+SELECT * FROM svs_memory_read_stats(800);
+
+-- With B's reservation intact, a second concurrent insert (backend C) must
+-- still be refused: real pending demand is 800 (resident) + 100 (B) + 100
+-- (C) = 1000 against a 900-byte budget.
+SELECT svs_memory_reserve_insert(800, 80, 100::bigint);
+SELECT * FROM svs_memory_read_stats(800);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Budget has zero byte slack, so only a zero charge can succeed.
+SELECT svs_memory_admit_database(900, 100::bigint);
+SELECT svs_memory_reconcile_load(900, 90, 100::bigint);
+SELECT svs_memory_reconcile_resident(900, 90, 100::bigint, 3::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+
+-- Three rows of headroom: three inserts succeed at zero cost.
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+
+-- Headroom exhausted: the next insert falls back to the full charge and
+-- is refused.
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+SELECT * FROM svs_memory_test_check_invariants();
+
+-- Aborting a headroom-backed reservation gives the row back.
+SELECT svs_memory_reconcile_resident(900, 90, 100::bigint, 1::bigint);
+SELECT svs_memory_reserve_insert(900, 90, 50::bigint);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT svs_memory_abort_insert(900, 90);
+SELECT capacity_headroom_vectors FROM svs_memory_test_reservations(900);
+SELECT residency_bytes_committed FROM svs_memory_read_stats(900);
+SELECT * FROM svs_memory_test_check_invariants();
 -- Below, at, and one byte past the raw-data ceiling (dimensions=4, so 16
 -- bytes/row).
 SELECT svs_memory_check_estimated_build_size((:build_ceiling / 16 - 1)::float8, 4);

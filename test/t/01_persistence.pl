@@ -703,6 +703,71 @@ use VamanaTestUtils qw(:all);
 }
 
 # ===========================================================================
+# Metapage-sourced config survives ALTER INDEX + reload without corruption
+# ===========================================================================
+{
+    my $node = PostgreSQL::Test::Cluster->new('vamana_config_sourcing_persist');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'vector,svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "log_min_messages = 'notice'");
+    $node->start;
+
+    $node->safe_psql("postgres", "CREATE EXTENSION vector;");
+    $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+
+    $node->safe_psql("postgres", qq(
+        CREATE TABLE alpha_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO alpha_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50) i;
+        CREATE INDEX alpha_idx ON alpha_tbl USING vamana (val vector_l2_ops);
+    ));
+    $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM alpha_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+
+    $node->safe_psql('postgres', "ALTER INDEX alpha_idx SET (alpha = 120);");
+    $node->restart;
+    my $after_alpha_alter = $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM alpha_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    isnt($after_alpha_alter, '',
+        'a metapage-frozen alpha/build_window_size/use_search_history still round-trips '
+      . 'through ALTER + reload without corrupting the graph');
+
+    $node->safe_psql("postgres", qq(
+        CREATE TABLE lv_cfg_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO lv_cfg_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50) i;
+        CREATE INDEX lv_cfg_idx ON lv_cfg_tbl USING vamana (val vector_l2_ops)
+            WITH (compression_type = 1, leanvec_dims = 4);
+    ));
+    my $lv_cfg_baseline = $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_cfg_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
+    isnt($lv_cfg_baseline, '', 'pre-ALTER LeanVec query returns results');
+
+    $node->safe_psql('postgres', "ALTER INDEX lv_cfg_idx SET (leanvec_dims = 7);");
+    $node->restart;
+    my $lv_cfg_after_alter = $node->safe_psql("postgres", qq(
+        SET enable_seqscan = off;
+        SELECT id FROM lv_cfg_tbl ORDER BY val <-> '[$lv_query_sql]' LIMIT 5;
+    ));
+    is($lv_cfg_after_alter, $lv_cfg_baseline,
+        'ALTER INDEX ... SET (leanvec_dims=...) does not corrupt results on reload '
+      . '(metapage value still wins over the altered reloption)');
+
+    $node->stop;
+}
+
+# ===========================================================================
 # LVQ-compressed persistence — the saved file must reload under a matching spec
 #
 # Both LVQ families get their own round trip.  (4,8) uses a residual; (8,0) does

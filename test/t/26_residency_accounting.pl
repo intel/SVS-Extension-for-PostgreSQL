@@ -31,6 +31,7 @@ $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 $node->append_conf('postgresql.conf', "wal_level = logical");
 $node->append_conf('postgresql.conf', "max_replication_slots = 20");
 $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+$node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
 $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION vector;");
@@ -338,6 +339,51 @@ my $baseline = committed_bytes();
     wait_for_worker($node);
     $node->safe_psql('postgres', "DROP INDEX floor_idx;");
     $node->safe_psql('postgres', "DROP TABLE floor_tbl;");
+}
+
+# ---------------------------------------------------------------------------
+# Case: an insert needing no real SVS block growth is admitted, using the
+# real, SVS-linked capacity calibration -- not the fake shmem harness
+# svs_memory_test uses for the gate logic itself. A fresh index's degree-64
+# graph component has room for exactly 64 - N rows before its first real
+# block growth, independent of dims (16-dim data, 260-byte adjacency
+# entries dominate here).
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE calib_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO calib_tbl (val)
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 70);
+    ));
+
+    my $log_pos = length($node->log_content());
+    $node->safe_psql('postgres',
+        "CREATE INDEX calib_idx ON calib_tbl USING vamana (val vector_l2_ops);");
+    wait_for_worker($node);
+
+    my $log_slice = substr($node->log_content(), $log_pos);
+    like($log_slice, qr/capacity headroom for 70 vectors is 58 \(data \d+, graph 58\)/,
+        'real calibration computes the analytically expected headroom for a fresh 70-row index');
+
+    my $committed_before_compact = committed_bytes();
+
+    # Delete past vamana_compact_threshold_pct (10% default) and VACUUM to
+    # force a real COMPACT; it must recalibrate for the post-compact count.
+    # 70 rows span two graph blocks (block size 64); dropping to 60 fits back
+    # in one, so compact frees a block and the committed total must shrink.
+    $log_pos = length($node->log_content());
+    $node->safe_psql('postgres', "DELETE FROM calib_tbl WHERE id <= 10;");
+    $node->safe_psql('postgres', "VACUUM calib_tbl;");
+    wait_for_worker($node);
+
+    $log_slice = substr($node->log_content(), $log_pos);
+    like($log_slice, qr/capacity headroom for 60 vectors is \d+ \(data \d+, graph \d+\)/,
+        'compact triggers real recalibration for the post-compact row count');
+    cmp_ok(committed_bytes(), '<', $committed_before_compact,
+        'compact reconciles the committed residency total, not just the headroom');
+
+    $node->safe_psql('postgres', "DROP INDEX calib_idx;");
+    $node->safe_psql('postgres', "DROP TABLE calib_tbl;");
 }
 
 # ---------------------------------------------------------------------------

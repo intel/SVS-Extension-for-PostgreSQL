@@ -9,6 +9,7 @@
 
 #include "postgres.h"
 #include "svs_wrapper.h"
+#include "svs_capacity_search.h"
 #include "vamana.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
@@ -320,6 +321,67 @@ SVSBuilderSetStorage(SVSBuilderHandle builder, SVSStorageHandle storage)
 
 	CheckSVSError(error, "setting storage on builder");
 	svs_error_free(error);
+}
+
+SVSAlgorithmBuilderTriple
+SVSCreateAlgorithmBuilderTriple(const SVSAlgorithmBuilderSpec *spec)
+{
+	SVSAlgorithmBuilderTriple triple = {0};
+	int			buildWindow = (spec->build_window_size > 0)
+		? spec->build_window_size
+		: VAMANA_BUILD_WINDOW_FROM_DEGREE(spec->graph_degree);
+
+	PG_TRY();
+	{
+		triple.algorithm = SVSCreateAlgorithm(spec->graph_degree, buildWindow,
+											   spec->search_window_size, spec->alpha,
+											   spec->use_search_history);
+		triple.storage = SVSCreateStorageForCompression(spec->compression_type,
+														 spec->data_type,
+														 spec->dimensions,
+														 spec->leanvec_dims,
+														 spec->compression_primary,
+														 spec->compression_secondary);
+		triple.builder = SVSCreateBuilder(spec->distance_type, spec->dimensions,
+										   triple.algorithm);
+		SVSBuilderSetStorage(triple.builder, triple.storage);
+	}
+	PG_CATCH();
+	{
+		SVSFreeAlgorithmBuilderTriple(&triple);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return triple;
+}
+
+void
+SVSFreeAlgorithmBuilderTriple(SVSAlgorithmBuilderTriple *triple)
+{
+	SVSFreeBuilder(triple->builder);
+	SVSFreeStorage(triple->storage);
+	SVSFreeAlgorithm(triple->algorithm);
+	*triple = (SVSAlgorithmBuilderTriple) {0};
+}
+
+SVSAlgorithmBuilderSpec
+SVSAlgorithmBuilderSpecFromConfig(const SVSBuildConfig *config, bool use_search_history)
+{
+	return (SVSAlgorithmBuilderSpec) {
+		.graph_degree = config->graph_degree,
+		.build_window_size = config->build_window_size,
+		.search_window_size = config->search_window_size,
+		.alpha = config->alpha,
+		.use_search_history = use_search_history,
+		.distance_type = config->distance_type,
+		.data_type = config->data_type,
+		.dimensions = config->dimensions,
+		.leanvec_dims = config->leanvec_dims,
+		.compression_type = config->compression_type,
+		.compression_primary = config->compression_primary,
+		.compression_secondary = config->compression_secondary,
+	};
 }
 
 /*
@@ -695,6 +757,73 @@ SVSComputeBlockSizeBytes(svs_index_builder_h builder, int numVectors)
 	return pg_nextpower2_size_t(Max(vectorBytes, Min(dataBytes, defaultBlockSizeBytes)));
 }
 
+typedef struct SvsBuildEstimateCostContext
+{
+	svs_index_builder_h builder;
+	size_t		blocksizeBytes;
+	bool		useGraphBytes;
+} SvsBuildEstimateCostContext;
+
+static uint64
+SvsBuildEstimateCost(void *contextArg, uint64 numVectors)
+{
+	SvsBuildEstimateCostContext *context = (SvsBuildEstimateCostContext *) contextArg;
+	svs_error_h error = svs_error_create();
+	svs_memory_breakdown_t breakdown = SVS_INIT_MEMORY_BREAKDOWN();
+
+	svs_index_builder_estimate_memory_dynamic(context->builder, (size_t) numVectors,
+											   context->blocksizeBytes, &breakdown, error);
+	CheckSVSError(error, "estimate capacity headroom");
+	svs_error_free(error);
+
+	return context->useGraphBytes ? breakdown.graph_bytes : breakdown.data_bytes;
+}
+
+/*
+ * Rows that fit above config->numVectors before this index's next real SVS
+ * block growth. blocksizeBytes matches SVSComputeBlockSizeBytes so this
+ * agrees with what the live index was actually built or loaded with.
+ */
+uint64
+SVSComputeCapacityHeadroomVectors(const SVSBuildConfig *config)
+{
+	SVSAlgorithmBuilderSpec spec = SVSAlgorithmBuilderSpecFromConfig(config,
+																	  VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+	SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
+	size_t		blocksizeBytes;
+	SvsBuildEstimateCostContext dataContext;
+	SvsBuildEstimateCostContext graphContext;
+	uint64		dataHeadroom;
+	uint64		graphHeadroom;
+
+	PG_TRY();
+	{
+		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) triple.builder, config->numVectors);
+		dataContext = (SvsBuildEstimateCostContext) {(svs_index_builder_h) triple.builder, blocksizeBytes, false};
+		graphContext = (SvsBuildEstimateCostContext) {(svs_index_builder_h) triple.builder, blocksizeBytes, true};
+
+		dataHeadroom = SvsSearchCapacityHeadroom(SvsBuildEstimateCost, &dataContext,
+												  (uint64) config->numVectors, blocksizeBytes);
+		graphHeadroom = SvsSearchCapacityHeadroom(SvsBuildEstimateCost, &graphContext,
+												   (uint64) config->numVectors, blocksizeBytes);
+	}
+	PG_CATCH();
+	{
+		SVSFreeAlgorithmBuilderTriple(&triple);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	SVSFreeAlgorithmBuilderTriple(&triple);
+
+	ereport(DEBUG1,
+			(errmsg("vamana: capacity headroom for %d vectors is %llu (data %llu, graph %llu)",
+					config->numVectors, (unsigned long long) Min(dataHeadroom, graphHeadroom),
+					(unsigned long long) dataHeadroom, (unsigned long long) graphHeadroom)));
+
+	return Min(dataHeadroom, graphHeadroom);
+}
+
 void
 SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out)
 {
@@ -830,68 +959,35 @@ SVSBuildDynamicIndex(SVSBuilderHandle builder, const float *data,
 SVSIndexHandle
 SVSLoadDynamicIndex(const char *path, const SVSBuildConfig * config)
 {
-	SVSAlgorithmHandle algorithm = NULL;
-	SVSBuilderHandle builder = NULL;
-	SVSStorageHandle storage = NULL;
+	SVSAlgorithmBuilderSpec spec = SVSAlgorithmBuilderSpecFromConfig(config, false);
+	SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 	svs_index_h loaded;
 	svs_error_h error;
-	int			build_window;
-
-	build_window = (config->build_window_size > 0) ?
-		config->build_window_size :
-		VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
 
 	PG_TRY();
 	{
-		algorithm = SVSCreateAlgorithm(config->graph_degree,
-									   build_window,
-									   config->search_window_size,
-									   config->alpha,
-									   false);
-
-		builder = SVSCreateBuilder(config->distance_type,
-								   config->dimensions,
-								   algorithm);
-
-		storage = SVSCreateStorageForCompression(config->compression_type,
-												config->data_type,
-												config->dimensions,
-												config->leanvec_dims,
-												config->compression_primary,
-												config->compression_secondary);
-
-		SVSBuilderSetStorage(builder, storage);
-		{
-			SVSBuilderSetThreadpool(builder, config->search_num_threads);
-			ereport(DEBUG1,
-					(errmsg("loading SVS index with %d search threads",
-							config->search_num_threads)));
-		}
+		SVSBuilderSetThreadpool(triple.builder, config->search_num_threads);
+		ereport(DEBUG1,
+				(errmsg("loading SVS index with %d search threads",
+						config->search_num_threads)));
 
 		{
 			/* Same floor as SVSBuildDynamicIndex; see its comment. */
-			size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) builder,
+			size_t		blocksizeBytes = SVSComputeBlockSizeBytes((svs_index_builder_h) triple.builder,
 																	Max(config->numVectors, config->graph_degree));
 
 			error = svs_error_create();
-			loaded = svs_index_load_dynamic((svs_index_builder_h) builder, path, blocksizeBytes, error);
+			loaded = svs_index_load_dynamic((svs_index_builder_h) triple.builder, path, blocksizeBytes, error);
 		}
-
-		SVSFreeBuilder(builder);
-		builder = NULL;
-		SVSFreeAlgorithm(algorithm);
-		algorithm = NULL;
-		SVSFreeStorage(storage);
-		storage = NULL;
 	}
 	PG_CATCH();
 	{
-		SVSFreeBuilder(builder);
-		SVSFreeAlgorithm(algorithm);
-		SVSFreeStorage(storage);
+		SVSFreeAlgorithmBuilderTriple(&triple);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	SVSFreeAlgorithmBuilderTriple(&triple);
 
 	if (loaded == NULL || !svs_error_ok(error))
 	{

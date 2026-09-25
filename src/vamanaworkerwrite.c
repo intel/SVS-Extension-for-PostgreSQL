@@ -93,82 +93,43 @@ static SVSIndexHandle
 VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 							 float *vec, ItemPointer heapTid)
 {
-	SVSAlgorithmHandle algorithm;
-	SVSStorageHandle storage;
-	SVSBuilderHandle builder;
 	SVSIndexHandle	svsIndex;
 	int				errorCode = 0;
 	size_t			externalId = 0;
-	int				buildWindow;
 	MemoryContext	oldCtx;
 	Relation		indexRel;
-	VamanaOptions  *opts;
-	VamanaMetaPageData meta;
-	int				rawAlpha;
-	SVSDistanceType distanceType;
-	SVSDType		dataType;
-	int				searchWindowSize;
 	bool			useSearchHistory;
-	int				compressionType;
-	int				compressionPrimary;
-	int				compressionSecondary;
-	int				leanvecDims;
+	SVSBuildConfig	config;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	indexRel = index_open(relid, AccessShareLock);
 
-	opts = (VamanaOptions *) indexRel->rd_options;
-	rawAlpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	buildWindow = (opts && opts->build_window_size > 0)
-		? opts->build_window_size
-		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
-	distanceType = VamanaGetDistanceMetric(indexRel);
-	dataType = VamanaGetTypeInfo(indexRel)->dataType;
-	searchWindowSize = VamanaResolveSearchWindowSize(opts);
-	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
-
-	/*
-	 * Compression comes from the metapage, as it does in LoadIndexFromPages:
-	 * the metapage is what the load path after a restart will read, so
-	 * sourcing it here is what makes this build's spec and that load's spec
-	 * agree even if reloptions were altered since CREATE INDEX.  leanvec_dims
-	 * is the exception -- the metapage does not store it.
-	 */
-	VamanaReadMetaPage(indexRel, &meta);
-	compressionType = meta.compression_type;
-	compressionPrimary = meta.compression_primary;
-	compressionSecondary = meta.compression_secondary;
-	leanvecDims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
+	config = VamanaAssembleBuildConfig(indexRel, cache->numVectors, &useSearchHistory);
 
 	index_close(indexRel, AccessShareLock);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	algorithm = SVSCreateAlgorithm(cache->graph_degree, buildWindow,
-								   searchWindowSize,
-								   rawAlpha, useSearchHistory);
+	{
+		SVSAlgorithmBuilderSpec spec = SVSAlgorithmBuilderSpecFromConfig(&config, useSearchHistory);
+		SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 
-	/*
-	 * An index created on an empty table is first populated here, so this is
-	 * the one build path that must honour compression too: a simple-storage
-	 * build under an LVQ or LeanVec metapage produces a file the load path
-	 * cannot read, and the worker then silently rebuilds from the table.
-	 */
-	storage = SVSCreateStorageForCompression(compressionType, dataType,
-											 cache->dimensions, leanvecDims,
-											 compressionPrimary,
-											 compressionSecondary);
-	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
+		PG_TRY();
+		{
+			svsIndex = SVSBuildDynamicIndex(triple.builder, vec, &externalId, 1,
+											 config.graph_degree, config.dimensions, &errorCode);
+		}
+		PG_CATCH();
+		{
+			SVSFreeAlgorithmBuilderTriple(&triple);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 
-	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1,
-									 cache->graph_degree, cache->dimensions, &errorCode);
-
-	SVSFreeBuilder(builder);
-	SVSFreeStorage(storage);
-	SVSFreeAlgorithm(algorithm);
+		SVSFreeAlgorithmBuilderTriple(&triple);
+	}
 
 	if (svsIndex == NULL || errorCode != 0)
 	{
@@ -178,6 +139,9 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 		return NULL;
 	}
 
+	cache->numVectors = 1;
+	config.numVectors = cache->numVectors;
+
 	/*
 	 * cache already holds a RESIDENT reservation at 0 bytes, from the
 	 * empty-table VamanaCacheIndex call that created this entry; reconcile
@@ -186,8 +150,9 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	 */
 	{
 		uint64		measuredBytes = SVSGetIndexMemoryUsage(svsIndex);
+		uint64		headroomVectors = SVSComputeCapacityHeadroomVectors(&config);
 
-		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes))
+		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes, headroomVectors))
 		{
 			SVSFreeIndex(svsIndex);
 			ereport(WARNING,
@@ -202,31 +167,12 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 
 		cache->residentBytes = measuredBytes;
 		SvsIndexResidencyRecordLoad(relid, MyDatabaseId, measuredBytes);
+
+		VamanaSeedSearchScratchCostFromConfig(relid, &config, useSearchHistory);
 	}
 
 	cache->svsIndex = svsIndex;
 	cache->nextExternalId = 1;
-	cache->numVectors = 1;
-
-	{
-		SVSBuildConfig config = {
-			.graph_degree = cache->graph_degree,
-			.alpha = rawAlpha,
-			.search_window_size = searchWindowSize,
-			.compression_type = compressionType,
-			.compression_primary = compressionPrimary,
-			.compression_secondary = compressionSecondary,
-			.distance_type = distanceType,
-			.data_type = dataType,
-			.dimensions = cache->dimensions,
-			.leanvec_dims = leanvecDims,
-			.build_window_size = buildWindow,
-			.search_num_threads = 0,
-			.numVectors = cache->numVectors,
-		};
-
-		VamanaSeedSearchScratchCostFromConfig(relid, &config, useSearchHistory);
-	}
 
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	cache->tidMapping = palloc0((Size) 1024 * sizeof(ItemPointerData));
@@ -262,6 +208,26 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	}
 
 	return svsIndex;
+}
+
+static uint64
+VamanaComputeCapacityHeadroomVectors(Oid relid, VamanaIndexCache *cache)
+{
+	Relation	indexRel;
+	uint64		headroomVectors;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	indexRel = index_open(relid, AccessShareLock);
+
+	headroomVectors = VamanaRefreshIndexCapacityHeadroom(indexRel, cache->numVectors);
+
+	index_close(indexRel, AccessShareLock);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	return headroomVectors;
 }
 
 /*
@@ -314,6 +280,12 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
  * LW_EXCLUSIVE lock across the INSERT/DELETE/MAINTENANCE paths.  Every failure
  * throws; the caller's guard releases all locks and converts it to a slot
  * error.
+ *
+ * Anything that opens a transaction or takes a heavyweight relation lock
+ * (e.g. the post-COMPACT capacity headroom recompute) must run after rwlock
+ * is released below, never inside the switch, or a concurrent search batch
+ * waiting on rwlock LW_SHARED queues behind whatever that heavyweight lock
+ * is waiting on too.
  */
 static void
 VamanaWorkerExecuteWriteSlot(int slotIdx)
@@ -322,6 +294,7 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	Oid			relid = slot->indexRelid;
 	LWLock	   *rwlock;
 	SVSIndexHandle index;
+	VamanaIndexCache *cache;
 	bool		needsRebuild;
 
 	/* Load and catch up the index if it is not already warm. */
@@ -347,6 +320,8 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 		return;
 	}
 
+	cache = VamanaGetCache(relid);
+
 	/* Acquire LW_EXCLUSIVE — blocks until all shared (search) holders exit. */
 	rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
 	if (rwlock != NULL)
@@ -363,7 +338,6 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				 * Allocate the next external ID from the cached nextExternalId,
 				 * then call SVSAddPoints.
 				 */
-				VamanaIndexCache *cache = VamanaGetCache(relid);
 				size_t		externalId;
 				int			added;
 				float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
@@ -432,10 +406,6 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				VamanaWorkerPersistMetaCounters(relid, cache);
 
 				slot->numResults = 1;
-				cache->opsSinceCheckpoint++;
-				cache->lastWriteTime = GetCurrentTimestamp();
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 				break;
 			}
 
@@ -449,7 +419,6 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				int			nIds = slot->numResults;
 				size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 				int			deleted;
-				VamanaIndexCache *cache = VamanaGetCache(relid);
 
 				deleted = SVSDeletePoints(index, ids, nIds);
 
@@ -471,20 +440,11 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				}
 
 				slot->numResults = deleted;
-				if (cache != NULL)
-				{
-					cache->opsSinceCheckpoint++;
-					cache->lastWriteTime = GetCurrentTimestamp();
-				}
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 				break;
 			}
 
 		case VAMANA_SLOTKIND_MAINTENANCE:
 			{
-				VamanaIndexCache *cache = VamanaGetCache(relid);
-
 				if (slot->maintenanceOp == VAMANA_MAINTENANCE_CONSOLIDATE)
 				{
 					if (!SVSConsolidate(index))
@@ -499,18 +459,13 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 								(errmsg("vamana worker: SVSCompact failed for index %u",
 										relid)));
 					if (cache != NULL)
+					{
 						cache->numDeleted = 0;
-				}
-
-				if (cache != NULL)
-				{
-					cache->opsSinceCheckpoint++;
-					cache->lastWriteTime = GetCurrentTimestamp();
+						cache->residentBytes = SVSGetIndexMemoryUsage(index);
+					}
 				}
 
 				slot->numResults = 0;
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 				break;
 			}
 
@@ -524,6 +479,25 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 
 	if (rwlock != NULL)
 		LWLockRelease(rwlock);
+
+	if (slot->slotKind == VAMANA_SLOTKIND_MAINTENANCE &&
+		slot->maintenanceOp == VAMANA_MAINTENANCE_COMPACT &&
+		cache != NULL)
+	{
+		uint64		headroomVectors;
+
+		headroomVectors = VamanaComputeCapacityHeadroomVectors(relid, cache);
+		SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes,
+									headroomVectors);
+	}
+
+	if (cache != NULL)
+	{
+		cache->opsSinceCheckpoint++;
+		cache->lastWriteTime = GetCurrentTimestamp();
+	}
+	pg_write_barrier();
+	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 }
 
 /*
@@ -679,7 +653,8 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 						 params->numVectors,
 						 params->tidMappingCapacity,
 						 params->nextExternalId,
-						 params->numDeleted);
+						 params->numDeleted,
+						 SVSComputeCapacityHeadroomVectors(&config));
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();

@@ -102,6 +102,9 @@ CreateMetaPage(VamanaBuildState * buildstate)
 	metap->compression_type = buildstate->compression_type;
 	metap->compression_primary = buildstate->compression_primary;
 	metap->compression_secondary = buildstate->compression_secondary;
+	metap->leanvec_dims = buildstate->leanvec_dims;
+	metap->build_window_size = buildstate->build_window_size;
+	metap->use_search_history = buildstate->use_search_history;
 	metap->indexDataBlkno = InvalidBlockNumber;
 	metap->indexDataSize = 0;
 	metap->numVectors = 0;
@@ -555,27 +558,23 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 							 int64 bufferCapacity,
 							 int *errorCodeOut, uint64 *buildPeakOut)
 {
-	SVSAlgorithmHandle algorithm;
-	SVSStorageHandle storage;
-	SVSBuilderHandle builder;
+	SVSAlgorithmBuilderSpec spec = {
+		.graph_degree = params->graph_degree,
+		.build_window_size = params->build_window_size,
+		.search_window_size = params->search_window_size,
+		.alpha = params->alpha,
+		.use_search_history = params->use_search_history,
+		.distance_type = params->distance_type,
+		.data_type = params->data_type,
+		.dimensions = params->dimensions,
+		.leanvec_dims = params->leanvec_dims,
+		.compression_type = params->compression_type,
+		.compression_primary = params->compression_primary,
+		.compression_secondary = params->compression_secondary,
+	};
+	SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 	VamanaSVSBuildContext buildCtx;
 	Size		dataSize;
-	int			buildWindow = params->build_window_size > 0 ?
-		params->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(params->graph_degree);
-
-	algorithm = SVSCreateAlgorithm(params->graph_degree, buildWindow,
-									params->search_window_size, params->alpha,
-									params->use_search_history);
-
-	storage = SVSCreateStorageForCompression(params->compression_type,
-											 params->data_type,
-											 params->dimensions,
-											 params->leanvec_dims,
-											 params->compression_primary,
-											 params->compression_secondary);
-
-	builder = SVSCreateBuilder(params->distance_type, params->dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
 
 	PG_TRY();
 	{
@@ -623,7 +622,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 			uint64		buildPeak;
 			uint64		term;
 
-			SVSEstimateBuildMemory(builder, numVectors, &breakdown);
+			SVSEstimateBuildMemory(triple.builder, numVectors, &breakdown);
 
 			/*
 			 * The three components cross a C ABI from the SVS library. A
@@ -682,7 +681,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 		}
 
 		buildCtx = (VamanaSVSBuildContext) {
-			.builder = builder,
+			.builder = triple.builder,
 			.flatData = flatData,
 			.numVectors = numVectors,
 			.graph_degree = params->graph_degree,
@@ -693,9 +692,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 	}
 	PG_FINALLY();
 	{
-		SVSFreeBuilder(builder);
-		SVSFreeStorage(storage);
-		SVSFreeAlgorithm(algorithm);
+		SVSFreeAlgorithmBuilderTriple(&triple);
 	}
 	PG_END_TRY();
 
@@ -898,36 +895,33 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		/*
 		 * Synchronous warm-up: send a LOAD slot to the BGW so the index is in
-		 * the worker cache before this transaction commits.  We read the
-		 * authoritative values back from the metapage rather than using
-		 * buildstate fields directly, because
-		 * SerializeIndexToPages may have adjusted counters.
-		 *
-		 * leanvec_dims and distance_type are not stored on the metapage; read
-		 * them from storage options / the AM support function.
+		 * the worker cache before this transaction commits. Reads the
+		 * metapage's own counters rather than buildstate's, since
+		 * SerializeIndexToPages may have adjusted them.
 		 */
 		{
 			VamanaMetaPageData meta;
-			VamanaOptions  *opts = (VamanaOptions *) index->rd_options;
+			SVSBuildConfig config;
 
 			VamanaReadMetaPage(index, &meta);
+			config = VamanaAssembleBuildConfig(index, (int) meta.numVectors, NULL);
 
 			if (VamanaWorkerIsAvailable())
 			{
 				INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
 				if (!VamanaWorkerSubmitLoad(
 						relid,
-						(int) meta.dimensions,
-						(int) meta.graph_degree,
-						(int) meta.alpha,
-						VamanaResolveSearchWindowSize(opts),
-						(opts && opts->build_window_size > 0) ? opts->build_window_size : 0,
-						(int) meta.compression_type,
-						(int) meta.compression_primary,
-						(int) meta.compression_secondary,
-						opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS,
-						(int) VamanaGetDistanceMetric(index),
-						(int) buildstate.typeInfo->dataType,
+						config.dimensions,
+						config.graph_degree,
+						config.alpha,
+						config.search_window_size,
+						config.build_window_size,
+						config.compression_type,
+						config.compression_primary,
+						config.compression_secondary,
+						config.leanvec_dims,
+						(int) config.distance_type,
+						(int) config.data_type,
 						(int) meta.numVectors,
 						(int) meta.tidMappingCapacity,
 						meta.nextExternalId,
@@ -1040,7 +1034,6 @@ VamanaRebuildFromTable(Relation index)
 	HeapTuple	tuple;
 	TupleDesc	tupdesc;
 	SVSIndexHandle volatile svsIndex;
-	VamanaOptions *opts;
 	const		VamanaTypeInfo *typeInfo;
 	int			dimensions;
 	int			graph_degree;
@@ -1064,21 +1057,22 @@ VamanaRebuildFromTable(Relation index)
 	ereport(LOG,
 			(errmsg("rebuilding vamana index from table data")));
 
-	opts = (VamanaOptions *) index->rd_options;
 	typeInfo = VamanaGetTypeInfo(index);
-	dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
-	graph_degree = opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE;
-	alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	buildWindow = (opts && opts->build_window_size > 0) ?
-		opts->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(graph_degree);
-	searchWindow = VamanaResolveSearchWindowSize(opts);
-	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
-	compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
-	compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_COMPRESSION_PRIMARY;
-	compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_COMPRESSION_SECONDARY;
-	leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 
-	distanceType = VamanaGetDistanceMetric(index);
+	{
+		SVSBuildConfig config = VamanaAssembleBuildConfig(index, 0, &useSearchHistory);
+
+		dimensions = config.dimensions;
+		graph_degree = config.graph_degree;
+		alpha = config.alpha;
+		buildWindow = config.build_window_size;
+		searchWindow = config.search_window_size;
+		compression_type = config.compression_type;
+		compression_primary = config.compression_primary;
+		compression_secondary = config.compression_secondary;
+		leanvec_dims = config.leanvec_dims;
+		distanceType = config.distance_type;
+	}
 
 	/*
 	 * Acquire AccessShareLock on the heap non-blocking.  The BGW must never
@@ -1309,12 +1303,31 @@ VamanaRebuildFromTable(Relation index)
 		 * path does not repeat either call.
 		 */
 		INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
-		VamanaCacheIndex(relid, svsIndex, dimensions,
-						 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
-						 numVectors,	/* tidMappingCapacity (fresh rebuild, no
-										 * holes) */
-						 (uint64) numVectors,	/* nextExternalId */
-						 0);		/* numDeleted */
+		{
+			SVSBuildConfig config = {
+				.graph_degree = graph_degree,
+				.alpha = alpha,
+				.search_window_size = searchWindow,
+				.compression_type = compression_type,
+				.compression_primary = compression_primary,
+				.compression_secondary = compression_secondary,
+				.distance_type = distanceType,
+				.data_type = typeInfo->dataType,
+				.dimensions = dimensions,
+				.leanvec_dims = leanvec_dims,
+				.build_window_size = buildWindow,
+				.search_num_threads = 0,
+				.numVectors = numVectors,
+			};
+
+			VamanaCacheIndex(relid, svsIndex, dimensions,
+							 graph_degree, VAMANA_ALPHA_TO_FLOAT(alpha), tidMapping, numVectors,
+							 numVectors,	/* tidMappingCapacity (fresh rebuild, no
+											 * holes) */
+							 (uint64) numVectors,	/* nextExternalId */
+							 0,			/* numDeleted */
+							 SVSComputeCapacityHeadroomVectors(&config));
+		}
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(SvsBuildAbortCleanup, ObjectIdGetDatum(relid));
 

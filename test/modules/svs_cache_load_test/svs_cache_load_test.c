@@ -159,7 +159,7 @@ FindFakeReservation(Oid relid)
 }
 
 bool
-SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes)
+SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes, uint64 capacityHeadroomVectors)
 {
 	FakeReservation *reservation = FindFakeReservation(relid);
 
@@ -202,7 +202,7 @@ svs_cache_load_test_fake_load(PG_FUNCTION_ARGS)
 
 	EnsureFakeWorkerContext();
 	VamanaCacheIndex(relid, (SVSIndexHandle) (intptr_t) measuredBytes,
-					 4, 64, 1.2f, NULL, 0, 0, 1, 0);
+					 4, 64, 1.2f, NULL, 0, 0, 1, 0, 0);
 	PG_RETURN_VOID();
 }
 

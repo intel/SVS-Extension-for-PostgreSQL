@@ -41,7 +41,6 @@ LoadIndexFromPages(Relation index)
 	SVSIndexHandle svsIndex;
 	char		savepath[MAXPGPATH];
 	Oid			relid = RelationGetRelid(index);
-	VamanaOptions *opts;
 	ItemPointerData *tidMapping = NULL;
 	struct stat st;
 	uint32		tidMappingCapacity;
@@ -81,21 +80,7 @@ LoadIndexFromPages(Relation index)
 	nextExternalId = meta.nextExternalId;
 	numDeleted = meta.numDeleted;
 
-	/* Reconstruct SVSBuildConfig from metapage + index options */
-	opts = (VamanaOptions *) index->rd_options;
-	config.graph_degree = meta.graph_degree;
-	config.alpha = meta.alpha;
-	config.search_window_size = VamanaResolveSearchWindowSize(opts);
-	config.build_window_size = (opts && opts->build_window_size > 0) ?
-		opts->build_window_size : 0;
-	config.compression_type = meta.compression_type;
-	config.compression_primary = meta.compression_primary;
-	config.compression_secondary = meta.compression_secondary;
-	config.distance_type = VamanaGetDistanceMetric(index);
-	config.data_type = VamanaGetTypeInfo(index)->dataType;
-	config.dimensions = (int) meta.dimensions;
-	config.numVectors = (int) meta.numVectors;
-	config.leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
+	config = VamanaAssembleBuildConfig(index, (int) meta.numVectors, NULL);
 	config.search_num_threads = SvsCurrentSearchGrant();
 
 	ereport(LOG,
@@ -154,11 +139,12 @@ LoadIndexFromPages(Relation index)
 	}
 
 	VamanaCacheIndex(relid, svsIndex,
-					 meta.dimensions, meta.graph_degree,
-					 VAMANA_ALPHA_TO_FLOAT(meta.alpha),
+					 config.dimensions, config.graph_degree,
+					 VAMANA_ALPHA_TO_FLOAT(config.alpha),
 					 tidMapping, meta.numVectors,
 					 (int) tidMappingCapacity,
-					 nextExternalId, (int) numDeleted);
+					 nextExternalId, (int) numDeleted,
+					 SVSComputeCapacityHeadroomVectors(&config));
 
 	if (tidMapping)
 		pfree(tidMapping);

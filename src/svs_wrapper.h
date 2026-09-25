@@ -74,6 +74,48 @@ void		SVSBuilderSetStorage(SVSBuilderHandle builder, SVSStorageHandle storage);
 void		SVSBuilderSetThreadpool(SVSBuilderHandle builder, int num_threads);
 int			SVSDefaultBuildThreads(void);
 
+/*
+ * The algorithm/storage/builder handles are always created and freed
+ * together: the builder holds a reference to the other two, and every
+ * caller wants either all three alive or none of them.  Grouping them
+ * as one value gives that lifetime a single owner instead of leaving
+ * each caller to free three handles by hand on every exit path.
+ */
+typedef struct SVSAlgorithmBuilderSpec
+{
+	int				graph_degree;
+	int				build_window_size;	/* 0 = derive from graph_degree */
+	int				search_window_size;
+	int				alpha;
+	bool			use_search_history;
+	SVSDistanceType	distance_type;
+	SVSDType		data_type;
+	int				dimensions;
+	int				leanvec_dims;
+	int				compression_type;
+	int				compression_primary;
+	int				compression_secondary;
+}			SVSAlgorithmBuilderSpec;
+
+typedef struct SVSAlgorithmBuilderTriple
+{
+	SVSAlgorithmHandle	algorithm;
+	SVSStorageHandle	storage;
+	SVSBuilderHandle	builder;
+}			SVSAlgorithmBuilderTriple;
+
+SVSAlgorithmBuilderTriple SVSCreateAlgorithmBuilderTriple(const SVSAlgorithmBuilderSpec *spec);
+void		SVSFreeAlgorithmBuilderTriple(SVSAlgorithmBuilderTriple *triple);
+
+/*
+ * SVSBuildConfig carries the same shape plus fields the triple has no use
+ * for (search_num_threads, numVectors) and lacks use_search_history, so
+ * callers that already hold a config pass it here instead of restating its
+ * fields one by one.
+ */
+SVSAlgorithmBuilderSpec SVSAlgorithmBuilderSpecFromConfig(const SVSBuildConfig *config,
+														   bool use_search_history);
+
 void		SVSSetIndexSearchThreads(SVSIndexHandle index, int num_threads);
 void		SVSFreeIndex(SVSIndexHandle index);
 
@@ -102,6 +144,7 @@ typedef struct SVSMemoryBreakdown
 uint64		SVSGetIndexMemoryUsage(SVSIndexHandle index);
 void		SVSGetIndexMemoryBreakdown(SVSIndexHandle index, SVSMemoryBreakdown *out);
 void		SVSEstimateBuildMemory(SVSBuilderHandle builder, int numVectors, SVSMemoryBreakdown *out);
+uint64		SVSComputeCapacityHeadroomVectors(const SVSBuildConfig *config);
 uint64		SVSEstimateSearchMemory(SVSBuilderHandle builder, int searchWindowSize, int numQueries, int numNeighbors,
 									int numVectors);
 

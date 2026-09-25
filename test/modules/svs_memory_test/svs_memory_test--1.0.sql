@@ -23,7 +23,8 @@ CREATE FUNCTION svs_memory_test_reservations(
     OUT measured_bytes bigint,
     OUT build_peak_bytes bigint,
     OUT search_scratch_bytes_per_query bigint,
-    OUT prior_resident_bytes bigint
+    OUT prior_resident_bytes bigint,
+    OUT capacity_headroom_vectors bigint
 ) RETURNS SETOF record
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
@@ -102,7 +103,8 @@ CREATE FUNCTION svs_memory_abort_build(db_oid oid, relid oid)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
-CREATE FUNCTION svs_memory_reconcile_load(db_oid oid, relid oid, measured_bytes bigint)
+CREATE FUNCTION svs_memory_reconcile_load(
+    db_oid oid, relid oid, measured_bytes bigint, capacity_headroom_vectors bigint DEFAULT 0)
 RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
@@ -115,6 +117,11 @@ RETURNS boolean
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
 CREATE FUNCTION svs_memory_reanchor_insert(db_oid oid, relid oid, measured_bytes bigint)
+RETURNS void
+AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+
+CREATE FUNCTION svs_memory_reconcile_resident(
+    db_oid oid, relid oid, measured_bytes bigint, capacity_headroom_vectors bigint DEFAULT 0)
 RETURNS void
 AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
 
