@@ -102,6 +102,9 @@ CreateMetaPage(VamanaBuildState * buildstate)
 	metap->compression_type = buildstate->compression_type;
 	metap->compression_primary = buildstate->compression_primary;
 	metap->compression_secondary = buildstate->compression_secondary;
+	metap->leanvec_dims = buildstate->leanvec_dims;
+	metap->build_window_size = buildstate->build_window_size;
+	metap->use_search_history = buildstate->use_search_history;
 	metap->indexDataBlkno = InvalidBlockNumber;
 	metap->indexDataSize = 0;
 	metap->numVectors = 0;
@@ -874,36 +877,33 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 		/*
 		 * Synchronous warm-up: send a LOAD slot to the BGW so the index is in
-		 * the worker cache before this transaction commits.  We read the
-		 * authoritative values back from the metapage rather than using
-		 * buildstate fields directly, because
-		 * SerializeIndexToPages may have adjusted counters.
-		 *
-		 * leanvec_dims and distance_type are not stored on the metapage; read
-		 * them from storage options / the AM support function.
+		 * the worker cache before this transaction commits. Reads the
+		 * metapage's own counters rather than buildstate's, since
+		 * SerializeIndexToPages may have adjusted them.
 		 */
 		{
 			VamanaMetaPageData meta;
-			VamanaOptions  *opts = (VamanaOptions *) index->rd_options;
+			SVSBuildConfig config;
 
 			VamanaReadMetaPage(index, &meta);
+			config = VamanaAssembleBuildConfig(index, (int) meta.numVectors, NULL);
 
 			if (VamanaWorkerIsAvailable())
 			{
 				INJECTION_POINT("vamana-build-governed-pre-handoff", NULL);
 				if (!VamanaWorkerSubmitLoad(
 						relid,
-						(int) meta.dimensions,
-						(int) meta.graph_degree,
-						(int) meta.alpha,
-						VamanaResolveSearchWindowSize(opts),
-						(opts && opts->build_window_size > 0) ? opts->build_window_size : 0,
-						(int) meta.compression_type,
-						(int) meta.compression_primary,
-						(int) meta.compression_secondary,
-						opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS,
-						(int) VamanaGetDistanceMetric(index),
-						(int) buildstate.typeInfo->dataType,
+						config.dimensions,
+						config.graph_degree,
+						config.alpha,
+						config.search_window_size,
+						config.build_window_size,
+						config.compression_type,
+						config.compression_primary,
+						config.compression_secondary,
+						config.leanvec_dims,
+						(int) config.distance_type,
+						(int) config.data_type,
 						(int) meta.numVectors,
 						(int) meta.tidMappingCapacity,
 						meta.nextExternalId,
@@ -1016,7 +1016,6 @@ VamanaRebuildFromTable(Relation index)
 	HeapTuple	tuple;
 	TupleDesc	tupdesc;
 	SVSIndexHandle volatile svsIndex;
-	VamanaOptions *opts;
 	const		VamanaTypeInfo *typeInfo;
 	int			dimensions;
 	int			graph_degree;
@@ -1040,21 +1039,22 @@ VamanaRebuildFromTable(Relation index)
 	ereport(LOG,
 			(errmsg("rebuilding vamana index from table data")));
 
-	opts = (VamanaOptions *) index->rd_options;
 	typeInfo = VamanaGetTypeInfo(index);
-	dimensions = TupleDescAttr(index->rd_att, 0)->atttypmod;
-	graph_degree = opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE;
-	alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	buildWindow = (opts && opts->build_window_size > 0) ?
-		opts->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(graph_degree);
-	searchWindow = VamanaResolveSearchWindowSize(opts);
-	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
-	compression_type = opts ? opts->compression_type : VAMANA_DEFAULT_COMPRESSION_TYPE;
-	compression_primary = opts ? opts->compression_primary : VAMANA_DEFAULT_COMPRESSION_PRIMARY;
-	compression_secondary = opts ? opts->compression_secondary : VAMANA_DEFAULT_COMPRESSION_SECONDARY;
-	leanvec_dims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
 
-	distanceType = VamanaGetDistanceMetric(index);
+	{
+		SVSBuildConfig config = VamanaAssembleBuildConfig(index, 0, &useSearchHistory);
+
+		dimensions = config.dimensions;
+		graph_degree = config.graph_degree;
+		alpha = config.alpha;
+		buildWindow = config.build_window_size;
+		searchWindow = config.search_window_size;
+		compression_type = config.compression_type;
+		compression_primary = config.compression_primary;
+		compression_secondary = config.compression_secondary;
+		leanvec_dims = config.leanvec_dims;
+		distanceType = config.distance_type;
+	}
 
 	/*
 	 * Acquire AccessShareLock on the heap non-blocking.  The BGW must never

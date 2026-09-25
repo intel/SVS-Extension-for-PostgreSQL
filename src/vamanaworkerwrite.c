@@ -96,81 +96,30 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	SVSIndexHandle	svsIndex;
 	int				errorCode = 0;
 	size_t			externalId = 0;
-	int				buildWindow;
 	MemoryContext	oldCtx;
 	Relation		indexRel;
-	VamanaOptions  *opts;
-	VamanaMetaPageData meta;
-	int				rawAlpha;
-	SVSDistanceType distanceType;
-	SVSDType		dataType;
-	int				searchWindowSize;
 	bool			useSearchHistory;
-	int				compressionType;
-	int				compressionPrimary;
-	int				compressionSecondary;
-	int				leanvecDims;
+	SVSBuildConfig	config;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	indexRel = index_open(relid, AccessShareLock);
 
-	opts = (VamanaOptions *) indexRel->rd_options;
-	rawAlpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	buildWindow = (opts && opts->build_window_size > 0)
-		? opts->build_window_size
-		: VAMANA_BUILD_WINDOW_FROM_DEGREE(cache->graph_degree);
-	distanceType = VamanaGetDistanceMetric(indexRel);
-	dataType = VamanaGetTypeInfo(indexRel)->dataType;
-	searchWindowSize = VamanaResolveSearchWindowSize(opts);
-	useSearchHistory = opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY;
-
-	/*
-	 * Compression comes from the metapage, as it does in LoadIndexFromPages:
-	 * the metapage is what the load path after a restart will read, so
-	 * sourcing it here is what makes this build's spec and that load's spec
-	 * agree even if reloptions were altered since CREATE INDEX.  leanvec_dims
-	 * is the exception -- the metapage does not store it.
-	 */
-	VamanaReadMetaPage(indexRel, &meta);
-	compressionType = meta.compression_type;
-	compressionPrimary = meta.compression_primary;
-	compressionSecondary = meta.compression_secondary;
-	leanvecDims = opts ? opts->leanvec_dims : VAMANA_DEFAULT_LEANVEC_DIMS;
+	config = VamanaAssembleBuildConfig(indexRel, cache->numVectors, &useSearchHistory);
 
 	index_close(indexRel, AccessShareLock);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	{
-		/*
-		 * An index created on an empty table is first populated here, so
-		 * this is the one build path that must honour compression too: a
-		 * simple-storage build under an LVQ or LeanVec metapage produces a
-		 * file the load path cannot read, and the worker then silently
-		 * rebuilds from the table.
-		 */
-		SVSAlgorithmBuilderSpec spec = {
-			.graph_degree = cache->graph_degree,
-			.build_window_size = buildWindow,
-			.search_window_size = searchWindowSize,
-			.alpha = rawAlpha,
-			.use_search_history = useSearchHistory,
-			.distance_type = distanceType,
-			.data_type = dataType,
-			.dimensions = cache->dimensions,
-			.leanvec_dims = leanvecDims,
-			.compression_type = compressionType,
-			.compression_primary = compressionPrimary,
-			.compression_secondary = compressionSecondary,
-		};
+		SVSAlgorithmBuilderSpec spec = SVSAlgorithmBuilderSpecFromConfig(&config, useSearchHistory);
 		SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 
 		PG_TRY();
 		{
 			svsIndex = SVSBuildDynamicIndex(triple.builder, vec, &externalId, 1,
-											 cache->graph_degree, cache->dimensions, &errorCode);
+											 config.graph_degree, config.dimensions, &errorCode);
 		}
 		PG_CATCH();
 		{
@@ -191,6 +140,7 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	}
 
 	cache->numVectors = 1;
+	config.numVectors = cache->numVectors;
 
 	/*
 	 * cache already holds a RESIDENT reservation at 0 bytes, from the
@@ -200,21 +150,6 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	 */
 	{
 		uint64		measuredBytes = SVSGetIndexMemoryUsage(svsIndex);
-		SVSBuildConfig config = {
-			.graph_degree = cache->graph_degree,
-			.alpha = rawAlpha,
-			.search_window_size = searchWindowSize,
-			.compression_type = compressionType,
-			.compression_primary = compressionPrimary,
-			.compression_secondary = compressionSecondary,
-			.distance_type = distanceType,
-			.data_type = dataType,
-			.dimensions = cache->dimensions,
-			.leanvec_dims = leanvecDims,
-			.build_window_size = buildWindow,
-			.search_num_threads = 0,
-			.numVectors = cache->numVectors,
-		};
 		uint64		headroomVectors = SVSComputeCapacityHeadroomVectors(&config);
 
 		if (!SvsMemoryReconcileLoad(MyDatabaseId, relid, measuredBytes, headroomVectors))
@@ -286,9 +221,7 @@ VamanaComputeCapacityHeadroomVectors(Oid relid, VamanaIndexCache *cache)
 	PushActiveSnapshot(GetTransactionSnapshot());
 	indexRel = index_open(relid, AccessShareLock);
 
-	headroomVectors = VamanaRefreshIndexCapacityHeadroom(indexRel, cache->dimensions,
-														  cache->graph_degree, cache->numVectors,
-														  (VamanaOptions *) indexRel->rd_options);
+	headroomVectors = VamanaRefreshIndexCapacityHeadroom(indexRel, cache->numVectors);
 
 	index_close(indexRel, AccessShareLock);
 	PopActiveSnapshot();

@@ -253,64 +253,79 @@ VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config, b
 }
 
 /*
- * The one place that builds an SVSBuildConfig, so every caller agrees.
- * Takes dimensions/graph_degree/numVectors as plain values rather than a
- * VamanaIndexCache -- callers assembling a config to create that cache
- * entry (VamanaCacheIndex has not run yet) have no such entry to read.
+ * The one place that builds an SVSBuildConfig for an existing, already-built
+ * index, so every caller agrees on it. Everything except search_window_size
+ * comes from the metapage: SVS's own load path (load_dynamic_vamana_index)
+ * ignores whatever alpha/graph_degree/build_window_size/use_search_history/
+ * compression the caller passes and rebuilds its in-memory parameters
+ * entirely from its own saved config file, so those fields are frozen the
+ * moment the graph was last built -- a live reloption that has since
+ * diverged describes only what the *next* rebuild will use, never what this
+ * loaded index has now. search_window_size is the one exception: SVSSearch
+ * takes it as a direct per-call argument, so a change is live immediately,
+ * no rebuild needed.
+ *
+ * useSearchHistory is an out-param, not part of SVSBuildConfig, matching how
+ * every caller already threads it as a separate bool alongside the config.
+ * Pass NULL when the caller doesn't need it.
  */
 SVSBuildConfig
-VamanaAssembleBuildConfig(Relation indexRel, int dimensions, int graph_degree,
-						  int numVectors, const VamanaOptions *opts)
+VamanaAssembleBuildConfig(Relation indexRel, int numVectors, bool *useSearchHistory)
 {
-	SVSBuildConfig config;
+	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
 	VamanaMetaPageData meta;
+	SVSBuildConfig config;
 
 	VamanaReadMetaPage(indexRel, &meta);
 
-	config.graph_degree = graph_degree;
-	config.alpha = opts ? opts->alpha : VAMANA_DEFAULT_ALPHA;
-	config.search_window_size = VamanaResolveSearchWindowSize(opts);
+	config.dimensions = (int) meta.dimensions;
+	config.graph_degree = meta.graph_degree;
+	config.alpha = meta.alpha;
 	config.compression_type = meta.compression_type;
 	config.compression_primary = meta.compression_primary;
 	config.compression_secondary = meta.compression_secondary;
+	config.leanvec_dims = meta.leanvec_dims;
+	config.build_window_size = (meta.build_window_size > 0)
+		? meta.build_window_size
+		: VAMANA_BUILD_WINDOW_FROM_DEGREE(meta.graph_degree);
+
+	config.search_window_size = VamanaResolveSearchWindowSize(opts);
+
 	config.distance_type = VamanaGetDistanceMetric(indexRel);
 	config.data_type = VamanaGetTypeInfo(indexRel)->dataType;
-	config.dimensions = dimensions;
-	config.leanvec_dims = opts ? opts->leanvec_dims : -1;
-	config.build_window_size = opts ? opts->build_window_size : 0;
+
 	config.search_num_threads = 0;
 	config.numVectors = numVectors;
+
+	if (useSearchHistory)
+		*useSearchHistory = meta.use_search_history;
 
 	return config;
 }
 
 /*
- * Adapter for callers holding an open Relation and its current reloptions
- * (a load or reload, where nothing has resolved these into an SVSBuildConfig
- * already). Assembles one and delegates to the shared core.
+ * Adapter for callers holding an open Relation (a load or reload, where
+ * nothing has resolved its config into an SVSBuildConfig already).
+ * Assembles one and delegates to the shared core.
  */
 void
-VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCache *cache,
-									 const VamanaOptions *opts)
+VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid, VamanaIndexCache *cache)
 {
 	SVSBuildConfig config;
+	bool		useSearchHistory;
 
 	if (cache == NULL)
 		return;
 
-	config = VamanaAssembleBuildConfig(indexRel, cache->dimensions, cache->graph_degree,
-										cache->numVectors, opts);
+	config = VamanaAssembleBuildConfig(indexRel, cache->numVectors, &useSearchHistory);
 
-	VamanaSeedSearchScratchCostFromConfig(relid, &config,
-										   opts ? opts->use_search_history : VAMANA_DEFAULT_USE_SEARCH_HISTORY);
+	VamanaSeedSearchScratchCostFromConfig(relid, &config, useSearchHistory);
 }
 
 uint64
-VamanaRefreshIndexCapacityHeadroom(Relation indexRel, int dimensions, int graph_degree,
-									int numVectors, const VamanaOptions *opts)
+VamanaRefreshIndexCapacityHeadroom(Relation indexRel, int numVectors)
 {
-	SVSBuildConfig config = VamanaAssembleBuildConfig(indexRel, dimensions, graph_degree,
-													   numVectors, opts);
+	SVSBuildConfig config = VamanaAssembleBuildConfig(indexRel, numVectors, NULL);
 
 	return SVSComputeCapacityHeadroomVectors(&config);
 }
@@ -334,8 +349,7 @@ VamanaWorkerRefreshSearchScratchCosts(void)
 		PushActiveSnapshot(GetTransactionSnapshot());
 
 		indexRel = index_open(relid, AccessShareLock);
-		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
-											 (VamanaOptions *) indexRel->rd_options);
+		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache);
 		index_close(indexRel, AccessShareLock);
 
 		PopActiveSnapshot();
@@ -374,8 +388,7 @@ VamanaWorkerEnsureSearchScratchCostComputed(Oid relid)
 		PushActiveSnapshot(GetTransactionSnapshot());
 
 		indexRel = index_open(relid, AccessShareLock);
-		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache,
-											 (VamanaOptions *) indexRel->rd_options);
+		VamanaRefreshIndexSearchScratchCost(indexRel, relid, cache);
 		index_close(indexRel, AccessShareLock);
 
 		PopActiveSnapshot();
@@ -418,8 +431,7 @@ GetOrLoadIndexBody(void *arg)
 	 * not before the two calls above, since either can process that
 	 * invalidation and free the relcache entry's prior rd_options.
 	 */
-	VamanaRefreshIndexSearchScratchCost(indexRel, a->relid, VamanaGetCache(a->relid),
-										 (VamanaOptions *) indexRel->rd_options);
+	VamanaRefreshIndexSearchScratchCost(indexRel, a->relid, VamanaGetCache(a->relid));
 
 	index_close(indexRel, AccessShareLock);
 }

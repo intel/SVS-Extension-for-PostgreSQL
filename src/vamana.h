@@ -28,7 +28,7 @@
 #define VAMANA_NORM_PROC 2
 #define VAMANA_TYPE_INFO_PROC 3
 
-#define VAMANA_MAGIC_NUMBER 0xA954A954
+#define VAMANA_MAGIC_NUMBER 0xA954A955
 #define VAMANA_PAGE_ID	0xFF91
 
 /* Preserved page numbers */
@@ -201,10 +201,13 @@ typedef struct VamanaMetaPageData
 	uint32		magicNumber;
 	uint32		dimensions;
 	uint16		graph_degree;
-	uint16		alpha;
+	int16		alpha;
 	uint8		compression_type;	/* 0=none, 1=leanvec, 2=lvq */
 	int8		compression_primary;	/* primary quantization (signed for type encoding) */
 	int8		compression_secondary;	/* LeanVec secondary / LVQ residual (0 = none) */
+	int32		leanvec_dims;	/* LeanVec reduced dimensions (unused unless compression_type=leanvec) */
+	int32		build_window_size;	/* Raw reloption value at build time; <= 0 means "2 * graph_degree" */
+	bool		use_search_history;
 	BlockNumber indexDataBlkno; /* Start of SVS index data */
 	Size		indexDataSize;	/* Size in bytes */
 	uint32		numVectors;
@@ -216,13 +219,19 @@ typedef struct VamanaMetaPageData
 
 typedef VamanaMetaPageData * VamanaMetaPage;
 
-StaticAssertDecl(offsetof(VamanaMetaPageData, nextExternalId) == 40,
+StaticAssertDecl(offsetof(VamanaMetaPageData, leanvec_dims) == 16,
+				 "VamanaMetaPageData.leanvec_dims offset changed — on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, build_window_size) == 20,
+				 "VamanaMetaPageData.build_window_size offset changed — on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, use_search_history) == 24,
+				 "VamanaMetaPageData.use_search_history offset changed — on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, nextExternalId) == 48,
 				 "VamanaMetaPageData.nextExternalId offset changed — on-disk compatibility broken");
-StaticAssertDecl(offsetof(VamanaMetaPageData, numDeleted) == 48,
+StaticAssertDecl(offsetof(VamanaMetaPageData, numDeleted) == 56,
 				 "VamanaMetaPageData.numDeleted offset changed — on-disk compatibility broken");
-StaticAssertDecl(offsetof(VamanaMetaPageData, tidMappingCapacity) == 52,
+StaticAssertDecl(offsetof(VamanaMetaPageData, tidMappingCapacity) == 60,
 				 "VamanaMetaPageData.tidMappingCapacity offset changed — on-disk compatibility broken");
-StaticAssertDecl(sizeof(VamanaMetaPageData) == 56,
+StaticAssertDecl(sizeof(VamanaMetaPageData) == 64,
 				 "VamanaMetaPageData size changed — update readers/writers");
 
 typedef struct VamanaPageOpaqueData
@@ -326,7 +335,6 @@ typedef VamanaScanOpaqueData * VamanaScanOpaque;
 
 /* Methods */
 int			VamanaGetGraphDegree(Relation index);
-int			VamanaGetAlpha(Relation index);
 FmgrInfo   *VamanaOptionalProcInfo(Relation index, uint16 procnum);
 void		VamanaInitSupport(VamanaSupport * support, Relation index);
 Buffer		VamanaNewBuffer(Relation index, ForkNumber forkNum);
@@ -384,13 +392,12 @@ List	   *VamanaGetAllCachedRelids(void);
 void		VamanaWorkerRefreshSearchScratchCosts(void);
 void		VamanaWorkerEnsureSearchScratchCostComputed(Oid relid);
 void		VamanaRefreshIndexSearchScratchCost(Relation indexRel, Oid relid,
-												 VamanaIndexCache *cache, const VamanaOptions *opts);
+												 VamanaIndexCache *cache);
 void		VamanaSeedSearchScratchCostFromConfig(Oid relid, const SVSBuildConfig *config,
 												   bool useSearchHistory);
-SVSBuildConfig VamanaAssembleBuildConfig(Relation indexRel, int dimensions, int graph_degree,
-										  int numVectors, const VamanaOptions *opts);
-uint64		VamanaRefreshIndexCapacityHeadroom(Relation indexRel, int dimensions, int graph_degree,
-												int numVectors, const VamanaOptions *opts);
+SVSBuildConfig VamanaAssembleBuildConfig(Relation indexRel, int numVectors,
+										  bool *useSearchHistory);
+uint64		VamanaRefreshIndexCapacityHeadroom(Relation indexRel, int numVectors);
 void		VamanaCacheSetNeedsSave(Oid indexRelid, bool flag);
 bool		VamanaCacheGetNeedsSave(Oid indexRelid);
 SVSIndexHandle VamanaRebuildFromTable(Relation index);

@@ -428,17 +428,6 @@ VamanaGetGraphDegree(Relation index)
 	return VAMANA_DEFAULT_GRAPH_DEGREE;
 }
 
-int
-VamanaGetAlpha(Relation index)
-{
-	VamanaOptions *opts = (VamanaOptions *) index->rd_options;
-
-	if (opts)
-		return opts->alpha;
-
-	return VAMANA_DEFAULT_ALPHA;
-}
-
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vamanahandler);
 Datum
 vamanahandler(PG_FUNCTION_ARGS)
