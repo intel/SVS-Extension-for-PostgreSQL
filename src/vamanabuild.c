@@ -407,21 +407,18 @@ typedef struct VamanaSVSIndexParams
  * SVSEstimateBuildMemory's residency breakdown does not account for and
  * that does not scale with rawBuffer, the only fixed-cost term in the
  * build-peak estimate. Scales with vector dimensionality, not
- * compression_type. Refitted on the single-growable-buffer vector-collection
- * path (capacity-priced rawBuffer, no separate scan-block allocation):
- * compression none, LeanVec and LVQ, both vector and halfvec storage, row
- * counts 10k/100k/500k, graph_degree 32/128, tables freshly VACUUM ANALYZEd
- * so buffer capacity matches the row count exactly, measured at exactly the
- * three dimensions below; see SvsDimBaselineBytes for how an unmeasured
- * dimension is charged. This term is not explained by a fresh idle
- * backend's own RSS (an order of magnitude smaller): it is real SVS/MKL
- * build-time working set, not per-backend connection overhead, and the fit
- * cannot separate the two further from three measured dimensions.
- * The worst observed ratio of measured peak RSS to predicted buildPeak
- * (residency + rawBuffer + this baseline + the two multiplier terms below,
- * before the margin) across every measured configuration is 1.0000: this
- * table's values are each the maximum shortfall observed at that
- * dimension, so the baseline alone is already an exact upper bound with no
+ * compression_type. Measured on the single growable vector buffer, priced
+ * by allocated capacity: compression none, LeanVec and LVQ, both vector
+ * and halfvec storage, row counts 10k/100k/500k, graph_degree 32/128,
+ * tables freshly VACUUM ANALYZEd so buffer capacity matches the row count
+ * exactly, at exactly the three dimensions below; see SvsDimBaselineBytes
+ * for how an unmeasured dimension is charged. This term is an order of
+ * magnitude larger than a fresh idle backend's own RSS, so it is real
+ * SVS/MKL build-time working set, not per-backend connection overhead;
+ * three measured dimensions cannot separate the two further. Each value is
+ * the largest shortfall (measured peak RSS minus residency plus rawBuffer)
+ * observed at that dimension, so the baseline alone is already an exact
+ * upper bound (worst measured ratio 1.0000, before margin) with no
  * adjustment needed, and cannot under-predict at a dimension it measured.
  */
 static const struct { int dims; double baseline_mb; } SvsDimBaselineTable[] = {
@@ -432,13 +429,12 @@ static const struct { int dims; double baseline_mb; } SvsDimBaselineTable[] = {
 
 /*
  * Dimension-dependent adjustment to rawBuffer, shared by every
- * compression_type. Refitted alongside SvsDimBaselineTable: at every
- * measured dimension the baseline term alone already upper-bounds every
- * measured configuration, so the fitted slope is zero or negative at all
- * three points and clamps to zero throughout. Kept as a table, rather than
- * removed, so a future dimension whose shortfall genuinely grows with
- * rawBuffer has somewhere to record a nonzero value without changing the
- * estimate's shape.
+ * compression_type. At every measured dimension the baseline term alone
+ * already upper-bounds every measured configuration, so this multiplier
+ * is zero at all three points. Kept as a table, rather than removed, so a
+ * future dimension whose shortfall genuinely grows with rawBuffer has
+ * somewhere to record a nonzero value without changing the estimate's
+ * shape.
  */
 static const struct { int dims; double raw_multiplier; } SvsDimAdjustmentTable[] = {
 	{ 128,  0.0 },			/* fitted <= 0, clamped to zero */
@@ -450,16 +446,16 @@ static const struct { int dims; double raw_multiplier; } SvsDimAdjustmentTable[]
  * LeanVec's extra full-precision working copy of the input, needed to
  * derive its reduced-dimension representation, as a multiple of
  * rawBuffer. Applied only when compression_type is
- * VAMANA_COMPRESSION_LEANVEC. Refitted from the same sweep as
+ * VAMANA_COMPRESSION_LEANVEC. Measured from the same sweep as
  * SvsDimBaselineTable: each value is the largest (shortfall - baseline) /
  * rawBuffer ratio observed for LeanVec at that dimension, so baseline plus
  * this multiplier times rawBuffer upper-bounds every measured LeanVec
- * configuration exactly. At dim=128 the baseline term alone already covers
- * every measured LeanVec configuration, so the fitted multiplier clamps to
- * zero; LeanVec's footprint there ignores leanvec_dims and
- * compression_primary in this SVS build, so it reflects a fixed library
- * fallback, not a tuned trade-off. Same source as SvsDimBaselineTable
- * above.
+ * configuration exactly (worst measured ratio 1.0000, before margin). At
+ * dim=128 the baseline term alone already covers every measured LeanVec
+ * configuration, so this multiplier is zero there; LeanVec's footprint at
+ * that dimension ignores leanvec_dims and compression_primary in this SVS
+ * build, so it reflects a fixed library fallback, not a tuned trade-off.
+ * Same source as SvsDimBaselineTable above.
  */
 static const struct { int dims; double raw_multiplier; } SvsLeanVecExtraTable[] = {
 	{ 128,  0.0 },			/* fitted <= 0, clamped to zero */
@@ -469,16 +465,15 @@ static const struct { int dims; double raw_multiplier; } SvsLeanVecExtraTable[] 
 
 /*
  * Only 128, 768 and 1536 dimensions were measured, and interpolation across
- * three points is not supported by the data: a linear fit of the baseline
- * table misses the measured 768 point by 12%, because the true progression
- * decelerates and three points cannot distinguish a curve from noise. So an
- * unmeasured dimension is charged the maximum value in the table rather than
- * the nearest neighbour or an interpolated one, on every one of these three
- * tables independently. That upper envelope is the only rule available from
- * three points that cannot under-predict at a dimension none of them
- * measured; it is conservative by construction, not by tuning, and it
- * should be replaced by real measurements at additional dimensions rather
- * than by a fitted curve.
+ * three points is not supported by the data: the true progression across
+ * dimensions decelerates, and three points cannot distinguish a curve from
+ * noise well enough to fit one safely. So an unmeasured dimension is
+ * charged the maximum value in the table rather than the nearest neighbour
+ * or an interpolated one, on every one of these three tables independently.
+ * That upper envelope is the only rule available from three points that
+ * cannot under-predict at a dimension none of them measured; it is
+ * conservative by construction, not by tuning, and it should be replaced by
+ * real measurements at additional dimensions rather than by a fitted curve.
  */
 static double
 SvsDimBaselineBytes(int dimensions)

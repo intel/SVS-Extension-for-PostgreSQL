@@ -13,7 +13,7 @@ SvsVectorBufferInit(SvsVectorBuffer *buf, int64 estimatedRows, int dimensions)
 	buf->capacity = estimatedRows > 0 ? estimatedRows : SVS_VECTOR_BUFFER_DEFAULT_CAPACITY;
 	buf->count = 0;
 	buf->dimensions = dimensions;
-	buf->data = MemoryContextAllocHuge(CurrentMemoryContext, buf->capacity * dimensions * sizeof(float));
+	buf->data = palloc(buf->capacity * dimensions * sizeof(float));
 }
 
 void
@@ -22,7 +22,7 @@ SvsVectorBufferAppend(SvsVectorBuffer *buf, const float *vec)
 	if (buf->count >= buf->capacity)
 	{
 		buf->capacity *= 2;
-		buf->data = repalloc_huge(buf->data,
+		buf->data = repalloc(buf->data,
 							  buf->capacity * buf->dimensions * sizeof(float));
 	}
 
