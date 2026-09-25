@@ -347,6 +347,12 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
  * LW_EXCLUSIVE lock across the INSERT/DELETE/MAINTENANCE paths.  Every failure
  * throws; the caller's guard releases all locks and converts it to a slot
  * error.
+ *
+ * Anything that opens a transaction or takes a heavyweight relation lock
+ * (e.g. the post-COMPACT capacity headroom recompute) must run after rwlock
+ * is released below, never inside the switch, or a concurrent search batch
+ * waiting on rwlock LW_SHARED queues behind whatever that heavyweight lock
+ * is waiting on too.
  */
 static void
 VamanaWorkerExecuteWriteSlot(int slotIdx)
@@ -355,6 +361,7 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	Oid			relid = slot->indexRelid;
 	LWLock	   *rwlock;
 	SVSIndexHandle index;
+	VamanaIndexCache *cache;
 	bool		needsRebuild;
 
 	/* Load and catch up the index if it is not already warm. */
@@ -380,6 +387,8 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 		return;
 	}
 
+	cache = VamanaGetCache(relid);
+
 	/* Acquire LW_EXCLUSIVE — blocks until all shared (search) holders exit. */
 	rwlock = VamanaGetIndexLock(VamanaWorkerShmemPtr, relid);
 	if (rwlock != NULL)
@@ -396,7 +405,6 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				 * Allocate the next external ID from the cached nextExternalId,
 				 * then call SVSAddPoints.
 				 */
-				VamanaIndexCache *cache = VamanaGetCache(relid);
 				size_t		externalId;
 				int			added;
 				float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
@@ -465,10 +473,6 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				VamanaWorkerPersistMetaCounters(relid, cache);
 
 				slot->numResults = 1;
-				cache->opsSinceCheckpoint++;
-				cache->lastWriteTime = GetCurrentTimestamp();
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 				break;
 			}
 
@@ -482,7 +486,6 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				int			nIds = slot->numResults;
 				size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
 				int			deleted;
-				VamanaIndexCache *cache = VamanaGetCache(relid);
 
 				deleted = SVSDeletePoints(index, ids, nIds);
 
@@ -504,20 +507,11 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 				}
 
 				slot->numResults = deleted;
-				if (cache != NULL)
-				{
-					cache->opsSinceCheckpoint++;
-					cache->lastWriteTime = GetCurrentTimestamp();
-				}
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 				break;
 			}
 
 		case VAMANA_SLOTKIND_MAINTENANCE:
 			{
-				VamanaIndexCache *cache = VamanaGetCache(relid);
-
 				if (slot->maintenanceOp == VAMANA_MAINTENANCE_CONSOLIDATE)
 				{
 					if (!SVSConsolidate(index))
@@ -533,25 +527,12 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 										relid)));
 					if (cache != NULL)
 					{
-						uint64		headroomVectors;
-
 						cache->numDeleted = 0;
 						cache->residentBytes = SVSGetIndexMemoryUsage(index);
-						headroomVectors = VamanaComputeCapacityHeadroomVectors(relid, cache);
-						SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes,
-													headroomVectors);
 					}
 				}
 
-				if (cache != NULL)
-				{
-					cache->opsSinceCheckpoint++;
-					cache->lastWriteTime = GetCurrentTimestamp();
-				}
-
 				slot->numResults = 0;
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 				break;
 			}
 
@@ -565,6 +546,25 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 
 	if (rwlock != NULL)
 		LWLockRelease(rwlock);
+
+	if (slot->slotKind == VAMANA_SLOTKIND_MAINTENANCE &&
+		slot->maintenanceOp == VAMANA_MAINTENANCE_COMPACT &&
+		cache != NULL)
+	{
+		uint64		headroomVectors;
+
+		headroomVectors = VamanaComputeCapacityHeadroomVectors(relid, cache);
+		SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes,
+									headroomVectors);
+	}
+
+	if (cache != NULL)
+	{
+		cache->opsSinceCheckpoint++;
+		cache->lastWriteTime = GetCurrentTimestamp();
+	}
+	pg_write_barrier();
+	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
 }
 
 /*
