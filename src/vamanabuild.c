@@ -537,27 +537,23 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 							 int64 bufferCapacity,
 							 int *errorCodeOut, uint64 *buildPeakOut)
 {
-	SVSAlgorithmHandle algorithm;
-	SVSStorageHandle storage;
-	SVSBuilderHandle builder;
+	SVSAlgorithmBuilderSpec spec = {
+		.graph_degree = params->graph_degree,
+		.build_window_size = params->build_window_size,
+		.search_window_size = params->search_window_size,
+		.alpha = params->alpha,
+		.use_search_history = params->use_search_history,
+		.distance_type = params->distance_type,
+		.data_type = params->data_type,
+		.dimensions = params->dimensions,
+		.leanvec_dims = params->leanvec_dims,
+		.compression_type = params->compression_type,
+		.compression_primary = params->compression_primary,
+		.compression_secondary = params->compression_secondary,
+	};
+	SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 	VamanaSVSBuildContext buildCtx;
 	Size		dataSize;
-	int			buildWindow = params->build_window_size > 0 ?
-		params->build_window_size : VAMANA_BUILD_WINDOW_FROM_DEGREE(params->graph_degree);
-
-	algorithm = SVSCreateAlgorithm(params->graph_degree, buildWindow,
-									params->search_window_size, params->alpha,
-									params->use_search_history);
-
-	storage = SVSCreateStorageForCompression(params->compression_type,
-											 params->data_type,
-											 params->dimensions,
-											 params->leanvec_dims,
-											 params->compression_primary,
-											 params->compression_secondary);
-
-	builder = SVSCreateBuilder(params->distance_type, params->dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
 
 	PG_TRY();
 	{
@@ -605,7 +601,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 			uint64		buildPeak;
 			uint64		term;
 
-			SVSEstimateBuildMemory(builder, numVectors, &breakdown);
+			SVSEstimateBuildMemory(triple.builder, numVectors, &breakdown);
 
 			/*
 			 * The three components cross a C ABI from the SVS library. A
@@ -664,7 +660,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 		}
 
 		buildCtx = (VamanaSVSBuildContext) {
-			.builder = builder,
+			.builder = triple.builder,
 			.flatData = flatData,
 			.numVectors = numVectors,
 			.graph_degree = params->graph_degree,
@@ -675,9 +671,7 @@ VamanaBuildSVSIndexGoverned(const VamanaSVSIndexParams *params,
 	}
 	PG_FINALLY();
 	{
-		SVSFreeBuilder(builder);
-		SVSFreeStorage(storage);
-		SVSFreeAlgorithm(algorithm);
+		SVSFreeAlgorithmBuilderTriple(&triple);
 	}
 	PG_END_TRY();
 

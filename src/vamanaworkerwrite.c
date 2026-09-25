@@ -93,9 +93,6 @@ static SVSIndexHandle
 VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 							 float *vec, ItemPointer heapTid)
 {
-	SVSAlgorithmHandle algorithm;
-	SVSStorageHandle storage;
-	SVSBuilderHandle builder;
 	SVSIndexHandle	svsIndex;
 	int				errorCode = 0;
 	size_t			externalId = 0;
@@ -146,29 +143,44 @@ VamanaWorkerBuildFirstInsert(Oid relid, VamanaIndexCache *cache,
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 
-	algorithm = SVSCreateAlgorithm(cache->graph_degree, buildWindow,
-								   searchWindowSize,
-								   rawAlpha, useSearchHistory);
+	{
+		/*
+		 * An index created on an empty table is first populated here, so
+		 * this is the one build path that must honour compression too: a
+		 * simple-storage build under an LVQ or LeanVec metapage produces a
+		 * file the load path cannot read, and the worker then silently
+		 * rebuilds from the table.
+		 */
+		SVSAlgorithmBuilderSpec spec = {
+			.graph_degree = cache->graph_degree,
+			.build_window_size = buildWindow,
+			.search_window_size = searchWindowSize,
+			.alpha = rawAlpha,
+			.use_search_history = useSearchHistory,
+			.distance_type = distanceType,
+			.data_type = dataType,
+			.dimensions = cache->dimensions,
+			.leanvec_dims = leanvecDims,
+			.compression_type = compressionType,
+			.compression_primary = compressionPrimary,
+			.compression_secondary = compressionSecondary,
+		};
+		SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 
-	/*
-	 * An index created on an empty table is first populated here, so this is
-	 * the one build path that must honour compression too: a simple-storage
-	 * build under an LVQ or LeanVec metapage produces a file the load path
-	 * cannot read, and the worker then silently rebuilds from the table.
-	 */
-	storage = SVSCreateStorageForCompression(compressionType, dataType,
-											 cache->dimensions, leanvecDims,
-											 compressionPrimary,
-											 compressionSecondary);
-	builder = SVSCreateBuilder(distanceType, cache->dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
+		PG_TRY();
+		{
+			svsIndex = SVSBuildDynamicIndex(triple.builder, vec, &externalId, 1,
+											 cache->graph_degree, cache->dimensions, &errorCode);
+		}
+		PG_CATCH();
+		{
+			SVSFreeAlgorithmBuilderTriple(&triple);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 
-	svsIndex = SVSBuildDynamicIndex(builder, vec, &externalId, 1,
-									 cache->graph_degree, cache->dimensions, &errorCode);
-
-	SVSFreeBuilder(builder);
-	SVSFreeStorage(storage);
-	SVSFreeAlgorithm(algorithm);
+		SVSFreeAlgorithmBuilderTriple(&triple);
+	}
 
 	if (svsIndex == NULL || errorCode != 0)
 	{

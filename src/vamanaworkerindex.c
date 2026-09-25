@@ -205,38 +205,24 @@ VamanaResidencyRefusedError(void)
 static uint64
 ComputeSearchScratchBytesPerQuery(const SVSBuildConfig *config, bool useSearchHistory)
 {
-	int			buildWindow = (config->build_window_size > 0)
-		? config->build_window_size
-		: VAMANA_BUILD_WINDOW_FROM_DEGREE(config->graph_degree);
-	SVSAlgorithmHandle algorithm;
-	SVSStorageHandle storage;
-	SVSBuilderHandle builder;
+	SVSAlgorithmBuilderSpec spec = SVSAlgorithmBuilderSpecFromConfig(config, useSearchHistory);
+	SVSAlgorithmBuilderTriple triple = SVSCreateAlgorithmBuilderTriple(&spec);
 	uint64		bytesPerQuery;
 
-	algorithm = SVSCreateAlgorithm(config->graph_degree, buildWindow, config->search_window_size,
-									config->alpha, useSearchHistory);
+	PG_TRY();
+	{
+		bytesPerQuery = SVSEstimateSearchMemory(triple.builder, config->search_window_size, 1,
+												 config->search_window_size,
+												 config->numVectors);
+	}
+	PG_CATCH();
+	{
+		SVSFreeAlgorithmBuilderTriple(&triple);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	/*
-	 * Must be the same selector the build and load paths use: an LVQ index
-	 * estimated against simple storage is estimated against the wrong spec.
-	 */
-	storage = SVSCreateStorageForCompression(config->compression_type,
-											  config->data_type,
-											  config->dimensions,
-											  config->leanvec_dims,
-											  config->compression_primary,
-											  config->compression_secondary);
-
-	builder = SVSCreateBuilder(config->distance_type, config->dimensions, algorithm);
-	SVSBuilderSetStorage(builder, storage);
-
-	bytesPerQuery = SVSEstimateSearchMemory(builder, config->search_window_size, 1,
-											 config->search_window_size,
-											 config->numVectors);
-
-	SVSFreeBuilder(builder);
-	SVSFreeStorage(storage);
-	SVSFreeAlgorithm(algorithm);
+	SVSFreeAlgorithmBuilderTriple(&triple);
 
 	return bytesPerQuery;
 }
