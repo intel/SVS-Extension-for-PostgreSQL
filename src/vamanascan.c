@@ -116,7 +116,7 @@ LoadIndexFromPages(Relation index)
 	 */
 	if (tidMappingCapacity > 0)
 	{
-		tidMapping = (ItemPointerData *) palloc(
+		tidMapping = (ItemPointerData *) MemoryContextAllocHuge(CurrentMemoryContext,
 												(Size) tidMappingCapacity * sizeof(ItemPointerData));
 
 		ereport(LOG,
