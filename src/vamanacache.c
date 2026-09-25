@@ -208,7 +208,7 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 		Size		tidMappingSize = (Size) capacity * sizeof(ItemPointerData);
 
 		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
-		entry->tidMapping = palloc(tidMappingSize);
+		entry->tidMapping = MemoryContextAllocHuge(TopMemoryContext, tidMappingSize);
 		memcpy(entry->tidMapping, tidMapping, tidMappingSize);
 		MemoryContextSwitchTo(oldCtx);
 	}

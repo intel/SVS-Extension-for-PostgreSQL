@@ -10,6 +10,11 @@
 
 #define SVS_VECTOR_BUFFER_DEFAULT_CAPACITY 1000
 
+/*
+ * Holds every vector of a build in one flat array, which routinely exceeds
+ * MaxAllocSize; allocated and grown through the huge-allocation API rather
+ * than plain palloc/repalloc.
+ */
 typedef struct SvsVectorBuffer
 {
 	float	   *data;

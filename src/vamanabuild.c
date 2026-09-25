@@ -72,7 +72,7 @@ BuildCallback(Relation index, ItemPointer tid, Datum *values,
 	if (buildstate->tidBufferCapacity < buildstate->vectors.capacity)
 	{
 		buildstate->tidBufferCapacity = buildstate->vectors.capacity;
-		buildstate->tidBuffer = repalloc(buildstate->tidBuffer,
+		buildstate->tidBuffer = repalloc_huge(buildstate->tidBuffer,
 										 buildstate->tidBufferCapacity * sizeof(ItemPointerData));
 	}
 	ItemPointerCopy(tid, &buildstate->tidBuffer[buildstate->vectors.count - 1]);
@@ -357,7 +357,7 @@ static void
 VamanaRunSVSBuild(int grantedThreads, void *context)
 {
 	VamanaSVSBuildContext *ctx = (VamanaSVSBuildContext *) context;
-	size_t	   *ids = palloc((size_t) ctx->numVectors * sizeof(size_t));
+	size_t	   *ids = MemoryContextAllocHuge(CurrentMemoryContext, (size_t) ctx->numVectors * sizeof(size_t));
 
 	for (int i = 0; i < ctx->numVectors; i++)
 		ids[i] = (size_t) i;
@@ -733,7 +733,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	SvsVectorBufferInit(&buildstate.vectors, heap->rd_rel->reltuples, buildstate.dimensions);
 	buildstate.tidBufferCapacity = buildstate.vectors.capacity;
-	buildstate.tidBuffer = palloc(buildstate.tidBufferCapacity * sizeof(ItemPointerData));
+	buildstate.tidBuffer = MemoryContextAllocHuge(CurrentMemoryContext, buildstate.tidBufferCapacity * sizeof(ItemPointerData));
 
 	CreateMetaPage(&buildstate);
 
@@ -1084,7 +1084,7 @@ VamanaRebuildFromTable(Relation index)
 
 	SvsVectorBufferInit(&vectors, heap->rd_rel->reltuples, dimensions);
 	tidBufferCapacity = vectors.capacity;
-	tidMapping = palloc(tidBufferCapacity * sizeof(ItemPointerData));
+	tidMapping = MemoryContextAllocHuge(CurrentMemoryContext, tidBufferCapacity * sizeof(ItemPointerData));
 
 	/*
 	 * Scan table to collect vectors - use an MVCC snapshot to exclude dead
@@ -1131,7 +1131,7 @@ VamanaRebuildFromTable(Relation index)
 			if (tidBufferCapacity < vectors.capacity)
 			{
 				tidBufferCapacity = vectors.capacity;
-				tidMapping = repalloc(tidMapping,
+				tidMapping = repalloc_huge(tidMapping,
 									  tidBufferCapacity * sizeof(ItemPointerData));
 			}
 			ItemPointerCopy(&tuple->t_self, &tidMapping[vectors.count - 1]);
