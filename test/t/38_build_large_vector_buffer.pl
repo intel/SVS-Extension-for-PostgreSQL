@@ -14,6 +14,16 @@
 # build-memory admission gate runs only after the heap scan has filled the
 # buffer, its refusal (naming svs.max_build_memory, not an alloc-size error)
 # is itself the proof that the scan, and the repalloc inside it, completed.
+#
+# This file exercises only the vector buffer (SvsVectorBufferInit/Append),
+# the one conversion reachable at a testable row count. The huge-allocation
+# fix applies the same change to five other row-scaled sites (the TID
+# buffer/mapping at four call sites, and the id array in
+# VamanaRunSVSBuild), which only cross MaxAllocSize at 130 million or more
+# rows. Those five are not exercised by any test here or elsewhere; their
+# correctness rests on code reading and on sharing the identical
+# MemoryContextAllocHuge/repalloc_huge pattern verified by this file, not on
+# an observed failure or a passing test at their own scale.
 
 use strict;
 use warnings FATAL => 'all';
