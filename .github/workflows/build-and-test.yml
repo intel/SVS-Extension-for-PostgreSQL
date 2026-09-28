@@ -1,0 +1,102 @@
+name: Build and test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "ci-01*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SVS_COMMIT: ffe9cec02864e78b980e7ae66c73bd4a6a4aa11f
+  PGVECTOR_TAG: v0.8.2
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            cc: gcc-11
+            cxx: g++-11
+            pg_version: REL_18_1
+            run_tap: false
+          - runner: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            pg_version: REL_18_1
+            run_tap: true
+    runs-on: ${{ matrix.runner }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      PG_VERSION: ${{ matrix.pg_version }}
+      WORKDIR: ${{ github.workspace }}/ci/.workdir
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compiler package (non-default only)
+        if: matrix.cc != 'gcc'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "${{ matrix.cc }}" "${{ matrix.cxx }}"
+
+      - name: Cache PostgreSQL install
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKDIR }}/pgsql_install
+          key: pg-${{ matrix.runner }}-${{ matrix.cc }}-${{ matrix.pg_version }}-v1
+
+      - name: Cache SVS install
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WORKDIR }}/svs_install
+          key: svs-${{ matrix.runner }}-${{ matrix.cc }}-${{ env.SVS_COMMIT }}-v1
+
+      - name: deps
+        run: ci/build_and_test.sh deps
+
+      - name: build-postgres
+        run: ci/build_and_test.sh build-postgres
+
+      - name: build-svs
+        run: ci/build_and_test.sh build-svs
+
+      - name: build-pgvector
+        run: ci/build_and_test.sh build-pgvector
+
+      - name: build-extension
+        run: ci/build_and_test.sh build-extension
+
+      - name: build-modules
+        run: ci/build_and_test.sh build-modules
+
+      - name: hardening-check
+        run: ci/build_and_test.sh hardening-check
+
+      - name: test-sql
+        run: ci/build_and_test.sh test-sql
+
+      - name: test-tap
+        if: matrix.run_tap
+        run: ci/build_and_test.sh test-tap
+        env:
+          PROVE_FLAGS: -j2
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.runner }}
+          path: |
+            regression.diffs
+            regression.out
+            results/
+            tmp_check/log/
+            ci/.workdir/postgres.log
+          if-no-files-found: ignore
+          retention-days: 7

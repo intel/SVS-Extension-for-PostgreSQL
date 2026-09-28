@@ -110,7 +110,12 @@ ifeq (,$(wildcard $(SVS_INSTALL)/lib/libsvs_c_api.so))
 $(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run build_svs_public.sh first or set SVS_INSTALL correctly)
 endif
 
-PG_CPPFLAGS += -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
+# -isystem, not -I, for the SVS C API headers: they are a third-party
+# dependency this project does not control, and svs_c.h trips
+# -Wdeclaration-after-statement (part of pg_config's own --cflags). -isystem
+# suppresses warnings from headers found through it, so WERROR=1 in CI is not
+# tripped by someone else's header.
+PG_CPPFLAGS += -isystem $(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
 SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib $(HARDENING_LDFLAGS)
 
 PG_CONFIG ?= pg_config
@@ -133,7 +138,49 @@ endif
 # for Postgres < 15
 PROVE_FLAGS += -I ./test/perl
 
-prove_installcheck:
+# ---------------------------------------------------------------------------
+# Stale-install guard
+#
+# 'installcheck' and 'prove_installcheck' run against whatever is already
+# installed in pkglibdir, not against what was just built: neither target
+# depends on 'install'. That means a tree that fails to build, or one whose
+# source changed since the last 'make install', can still report a full test
+# pass, because the tests never look at the tree. This guard closes that gap
+# by refusing to run either target when the built and installed shlib differ.
+#
+# It deliberately does not add 'install' as a prerequisite: testing an
+# already-installed build is a normal developer workflow, and an implicit
+# install would write into a system directory without being asked.
+# ---------------------------------------------------------------------------
+.PHONY: guard-fresh-install
+guard-fresh-install:
+	@if [ ! -f '$(DESTDIR)$(pkglibdir)/$(shlib)' ]; then \
+		echo "error: $(shlib) is not installed at $(DESTDIR)$(pkglibdir)/$(shlib)."; \
+		echo "  Run 'make install' first."; \
+		exit 1; \
+	fi
+	@if ! cmp -s '$(CURDIR)/$(shlib)' '$(DESTDIR)$(pkglibdir)/$(shlib)'; then \
+		echo "error: built $(CURDIR)/$(shlib) differs from installed $(DESTDIR)$(pkglibdir)/$(shlib)."; \
+		echo "  Run 'make install' to test what was just built."; \
+		exit 1; \
+	fi
+
+installcheck: guard-fresh-install
+
+# ---------------------------------------------------------------------------
+# Hardening verification (SDL429 evidence)
+#
+# Confirms the protections in HARDENING_CFLAGS/HARDENING_LDFLAGS actually took
+# effect in the built svs.so, using only readelf and nm from binutils, which
+# the build already requires. Checks svs.so only: the SVS C API library it
+# links against is a dependency this project does not build or release.
+# ---------------------------------------------------------------------------
+.PHONY: hardening-check
+SVS_SO ?= $(CURDIR)/$(shlib)
+hardening-check:
+	@sh $(CURDIR)/ci/hardening_check.sh '$(SVS_SO)'
+
+prove_installcheck: guard-fresh-install
 	rm -rf $(CURDIR)/tmp_check
 	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" LD_LIBRARY_PATH="$(shell $(PG_CONFIG) --libdir):$$LD_LIBRARY_PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),test/t/*.pl)
 

@@ -66,12 +66,16 @@ The extension implements a PostgreSQL index access method backed by a per-databa
 
 ## Running Tests
 
-```bash
-# SQL regression tests
-make installcheck
+Build, install, and run both suites in one chain, so the tests always exercise
+what was just built rather than whatever `svs.so` happens to already be
+installed:
 
-# Perl TAP tests (background worker, persistence)
-make prove_installcheck
+```bash
+make && make install && make installcheck && make prove_installcheck
 ```
+
+`installcheck` and `prove_installcheck` refuse to run if the installed
+`svs.so` differs from the one just built; run `make install` first if you see
+that error.
 
 Test files are in `test/sql/` and `test/t/`.
