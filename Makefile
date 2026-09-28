@@ -43,7 +43,11 @@ OBJS = src/svs.o \
        src/vamana_warmup.o
 HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h src/svs_cpu_budget.h src/svs_memory.h src/svs_index_residency.h src/svs_slot_naming.h src/svs_cpu_slots.h src/svs_capacity_search.h src/svs_vector_buffer.h
 
-TESTS = $(wildcard test/sql/*.sql)
+# halfvec_compression/vector_compression build real LeanVec and LVQ indexes,
+# which require hardware most CI runners lack. Excluded from TESTS/REGRESS so
+# plain 'make installcheck' never attempts them; run via 'make installcheck-hw'.
+HW_TESTS = halfvec_compression vector_compression
+TESTS = $(filter-out $(addprefix test/sql/,$(addsuffix .sql,$(HW_TESTS))),$(wildcard test/sql/*.sql))
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 # Load pgvector first (for vector/halfvec types), then this extension
 REGRESS_OPTS = --inputdir=test --load-extension=vector --load-extension=$(EXTENSION)
@@ -166,6 +170,18 @@ guard-fresh-install:
 	fi
 
 installcheck: guard-fresh-install
+
+# ---------------------------------------------------------------------------
+# Hardware-dependent regression tests
+#
+# halfvec_compression.sql and vector_compression.sql build real LeanVec and
+# LVQ compressed indexes via SVS, which require hardware most CI runners
+# lack. Run this target explicitly on hardware that supports it; it is not
+# part of plain 'installcheck'.
+# ---------------------------------------------------------------------------
+.PHONY: installcheck-hw
+installcheck-hw: guard-fresh-install
+	$(MAKE) installcheck REGRESS="$(HW_TESTS)"
 
 # ---------------------------------------------------------------------------
 # Hardening verification (SDL429 evidence)

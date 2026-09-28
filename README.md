@@ -78,4 +78,12 @@ make && make install && make installcheck && make prove_installcheck
 `svs.so` differs from the one just built; run `make install` first if you see
 that error.
 
+`installcheck` excludes tests that build real LeanVec or LVQ compressed
+indexes, since those require hardware most CI runners lack. Run them
+separately, on hardware that supports it:
+
+```bash
+make installcheck-hw
+```
+
 Test files are in `test/sql/` and `test/t/`.
