@@ -246,9 +246,25 @@ static void ReconcileLedgerLiveness(List *rows, TimestampTz now);
 static void TerminateDisabledWorkers(List *rows);
 static void ReconcileRestartConvergence(List *rows, TimestampTz now);
 static void PublishEnabledState(List *rows);
+
+/*
+ * Accumulator for CollectReservedDbOids, sized to capacity up front so the
+ * callback never allocates under VamanaWorkerForEachReserved's header lock --
+ * the same discipline VamanaWorkerHydrateCb (vamanaworkerstats.c) follows for
+ * the same lock.
+ */
+typedef struct VamanaReservedOidCollector
+{
+	Oid		   *oids;
+	int			count;
+	int			capacity;
+} VamanaReservedOidCollector;
+
 static void CollectReservedDbOids(VamanaWorkerShmem *entry, void *ctx);
-static long ReleaseOrphanedReservedSlots(List *rows, TimestampTz now);
-static long ReconcileUnledgeredWorkers(List *rows);
+static bool ReservedOidsContains(const Oid *oids, int count, Oid dbOid);
+static long ReleaseOrphanedReservedSlots(List *rows, TimestampTz now,
+										  const Oid *reservedOids, int reservedCount);
+static long ReconcileUnledgeredWorkers(List *rows, const Oid *reservedOids, int reservedCount);
 static long BackoffThresholdMs(uint32 consecutiveFailures);
 static long BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now);
 
@@ -417,9 +433,23 @@ VamanaLauncherReconcileWorkers(void)
 	if (WorkerLedger != NIL)
 		ReconcileRestartConvergence(rows, now);
 
-	naptime = Min(naptime, ReconcileUnledgeredWorkers(rows));
+	/*
+	 * Collected once per cycle and shared by both passes below: each would
+	 * otherwise call VamanaWorkerForEachReserved independently, walking the
+	 * reserved array under the header lock twice for the same result.
+	 */
+	{
+		VamanaReservedOidCollector collector;
 
-	naptime = Min(naptime, ReleaseOrphanedReservedSlots(rows, now));
+		collector.capacity = VamanaWorkerSlotCapacity();
+		collector.oids = palloc(sizeof(Oid) * collector.capacity);
+		collector.count = 0;
+
+		VamanaWorkerForEachReserved(CollectReservedDbOids, &collector);
+
+		naptime = Min(naptime, ReconcileUnledgeredWorkers(rows, collector.oids, collector.count));
+		naptime = Min(naptime, ReleaseOrphanedReservedSlots(rows, now, collector.oids, collector.count));
+	}
 
 	PublishCpuGrants(rows);
 	PublishMemoryOverrides(rows);
@@ -1589,13 +1619,24 @@ ReconcileRestartConvergence(List *rows, TimestampTz now)
 	}
 }
 
-/* Collect every reserved control block's dbOid, under VamanaWorkerForEachReserved's lock. */
+/* Writes into the pre-sized VamanaReservedOidCollector; see its own comment above. */
 static void
-CollectReservedDbOids(VamanaWorkerShmem *entry, void *ctx)
+CollectReservedDbOids(VamanaWorkerShmem *entry, void *ctxArg)
 {
-	List	  **reserved = (List **) ctx;
+	VamanaReservedOidCollector *ctx = (VamanaReservedOidCollector *) ctxArg;
 
-	*reserved = lappend_oid(*reserved, entry->dbOid);
+	Assert(ctx->count < ctx->capacity);
+	ctx->oids[ctx->count++] = entry->dbOid;
+}
+
+/* dbOid is among the first count entries of oids, linearly; count is bounded by svs.max_databases. */
+static bool
+ReservedOidsContains(const Oid *oids, int count, Oid dbOid)
+{
+	for (int i = 0; i < count; i++)
+		if (oids[i] == dbOid)
+			return true;
+	return false;
 }
 
 /*
@@ -1619,16 +1660,18 @@ CollectReservedDbOids(VamanaWorkerShmem *entry, void *ctx)
  * Returns the naptime contribution: milliseconds until the earliest
  * surviving candidate clears its grace period, or the launcher's normal
  * naptime if there are none, so a pending release is not made to oversleep.
+ *
+ * reservedOids/reservedCount is the caller's single collection for this
+ * cycle (ReconcileUnledgeredWorkers shares it too), not re-collected here:
+ * one walk of the reserved array under the header lock per cycle, not two.
  */
 static long
-ReleaseOrphanedReservedSlots(List *rows, TimestampTz now)
+ReleaseOrphanedReservedSlots(List *rows, TimestampTz now,
+							  const Oid *reservedOids, int reservedCount)
 {
-	List	   *reserved = NIL;
 	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
 	MemoryContext oldCtx;
 	ListCell   *lc;
-
-	VamanaWorkerForEachReserved(CollectReservedDbOids, &reserved);
 
 	/*
 	 * OrphanCandidates, like WorkerLedger, must outlive this cycle's context;
@@ -1641,15 +1684,17 @@ ReleaseOrphanedReservedSlots(List *rows, TimestampTz now)
 	{
 		VamanaOrphanCandidate *c = (VamanaOrphanCandidate *) lfirst(lc);
 
-		if (FindDatabaseRow(rows, c->dbOid) != NULL || !list_member_oid(reserved, c->dbOid))
+		if (FindDatabaseRow(rows, c->dbOid) != NULL ||
+			!ReservedOidsContains(reservedOids, reservedCount, c->dbOid))
 		{
 			OrphanCandidates = foreach_delete_current(OrphanCandidates, lc);
 			pfree(c);
 		}
 	}
 
-	foreach_oid(dbOid, reserved)
+	for (int i = 0; i < reservedCount; i++)
 	{
+		Oid			dbOid = reservedOids[i];
 		VamanaOrphanCandidate *candidate = NULL;
 		long		remaining;
 
@@ -1735,17 +1780,31 @@ ReleaseOrphanedReservedSlots(List *rows, TimestampTz now)
  * requested, since this survivor's bgw_notify_pid names the launcher
  * instance that registered it, not this one, so nothing else wakes this
  * launcher when it actually stops; the launcher's normal naptime otherwise.
+ *
+ * reservedOids/reservedCount is the caller's single collection for this
+ * cycle (shared with ReleaseOrphanedReservedSlots), not re-collected here.
+ *
+ * Known gap, pre-existing and not specific to this pass: a survivor that
+ * crashes on its own, rather than being asked to stop, never gets a ledger
+ * entry either way, so ReconcileLedgerLiveness's STOP_CRASH arm -- the only
+ * caller of VamanaWorkerBackoffRecordDeath -- never sees that death. The
+ * ordinary spawn-diff loop below still respawns it (backoff-gated, since
+ * BackoffRemainingMs is checked there regardless of ledger membership), but
+ * with no failure recorded for this crash, so it gets one free, unthrottled
+ * respawn before backoff starts applying on a second consecutive failure.
+ * The survivor scenario itself predates this pass (the pre-existing "don't
+ * spawn into an already-live worker's slot" guard); this pass is only the
+ * first to deliberately manage survivors, which is why the gap is noted
+ * here rather than fixed here.
  */
 static long
-ReconcileUnledgeredWorkers(List *rows)
+ReconcileUnledgeredWorkers(List *rows, const Oid *reservedOids, int reservedCount)
 {
-	List	   *reserved = NIL;
 	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
 
-	VamanaWorkerForEachReserved(CollectReservedDbOids, &reserved);
-
-	foreach_oid(dbOid, reserved)
+	for (int i = 0; i < reservedCount; i++)
 	{
+		Oid			dbOid = reservedOids[i];
 		VamanaWorkerShmem *entry;
 		VamanaDatabaseRow *db;
 		bool		wantStop;

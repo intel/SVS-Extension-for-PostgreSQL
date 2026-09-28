@@ -1582,6 +1582,27 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 
 		VamanaWorkerAssertDatabase();
 
+		/*
+		 * Re-check dbEnabled every iteration, not just before the loop: a
+		 * database disabled after the up-front check but before the wait
+		 * completes would otherwise spin the full timeout with no one
+		 * noticing, since a pause deliberately keeps the slot reserved (see
+		 * F1/F2's design), so nothing else in this loop reacts to it. This
+		 * closes that window down to one 200ms tick instead of the full
+		 * vamana_worker_startup_timeout_ms.
+		 */
+		{
+			VamanaWorkerShmem *entryNow = VamanaWorkerLookupSlot(MyDatabaseId);
+
+			if (entryNow != NULL && pg_atomic_read_u32(&entryNow->dbEnabled) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("vamana background worker unavailable; cannot %s index %u",
+								operation, indexRelid),
+						 errdetail("The database is not currently enabled for vamana."),
+						 errhint("Enable it by updating its row in vamana_databases.")));
+		}
+
 		if (VamanaWorkerFindActiveSlot() != NULL)
 			return;
 
