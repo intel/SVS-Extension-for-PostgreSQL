@@ -925,6 +925,15 @@ VamanaWorkerDrainAndStop(void)
 	else
 		VamanaWorkerDrainAllSlots();
 
+	/*
+	 * Zero the heartbeat now that draining is done, so a backend that reaches
+	 * VamanaWorkerWaitUntilAvailable during the window before the replacement
+	 * worker publishes its own pid sees "never beaten" rather than a heartbeat
+	 * that ages into looking stale the longer this deliberate stop's window
+	 * stays open.
+	 */
+	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
+
 	DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
 	proc_exit(0);
 }
@@ -1096,7 +1105,8 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 
 	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
 
-	while (!worker_got_sigterm)
+	while (!worker_got_sigterm &&
+		   !pg_atomic_read_u32(&VamanaWorkerShmemPtr->stopRequested))
 	{
 		int			rc;
 		const VamanaReplayRole *role = VamanaGetReplayRole();
@@ -1120,7 +1130,13 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 			proc_exit(1);
 		}
 
-		if (worker_got_sigterm)
+		/*
+		 * stopRequested is the launcher's way of asking a worker it holds no
+		 * BackgroundWorkerHandle for (one inherited live across the
+		 * launcher's own restart) to stop: no signal is delivered, only this
+		 * shared flag, so it is checked here the same as worker_got_sigterm.
+		 */
+		if (worker_got_sigterm || pg_atomic_read_u32(&VamanaWorkerShmemPtr->stopRequested))
 			break;
 
 		CHECK_FOR_INTERRUPTS();
@@ -1260,6 +1276,16 @@ VamanaWorkerMain(Datum main_arg)
 	VamanaWorkerShmemPtr->workerPid = 0;
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->searchScratchBytesInFlight, 0);
+
+	/*
+	 * stopRequested is the launcher's ask, not the worker's: a previous
+	 * instance stopping because it saw this flag set already exited, so a
+	 * stale 1 here belongs to nothing running.  Left uncleared, a fresh
+	 * worker would read it on its very first loop iteration and stop itself
+	 * immediately, with no crash and no signal to explain why.
+	 */
+	pg_atomic_write_u32(&VamanaWorkerShmemPtr->stopRequested, 0);
+
 	InitSharedLatch(&VamanaWorkerShmemPtr->workerLatch);
 	OwnLatch(&VamanaWorkerShmemPtr->workerLatch);
 
@@ -1505,13 +1531,36 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 		return;
 
 	/*
-	 * A non-zero heartbeat with no live pid means the worker ran, then hung or
-	 * died — fail immediately rather than spinning for startup_timeout_ms.  A
-	 * stale-tolerant read: it only decides between erroring now and waiting, and
-	 * this backend is about to wait anyway.
+	 * Two independent reasons to fail immediately rather than spin for
+	 * startup_timeout_ms, checked before any waiting begins:
+	 *
+	 * Not enabled: a disabled (paused) or removed database's worker is not
+	 * coming back, ever, so waiting out the full timeout only delays an
+	 * outcome that is already certain.  This must be checked separately from
+	 * heartbeat staleness, not inferred from it: a worker stopping through
+	 * any deliberate path (restart, pause, respawn) clears heartbeat_ts on
+	 * its way out, so a paused database's cleared heartbeat looks identical
+	 * to a mid-restart one's -- only the catalog's enabled flag, mirrored
+	 * here via dbEnabled, tells them apart.
+	 *
+	 * Stale heartbeat: a non-zero heartbeat that has aged past
+	 * VAMANA_HEARTBEAT_STALE_MS with no live pid means the worker ran, then
+	 * hung or died, while the database is still enabled -- there is no
+	 * deliberate stop to explain the gap.  A stale-tolerant read: it only
+	 * decides between erroring now and waiting, and this backend is about to
+	 * wait anyway.
 	 */
 	entry = VamanaWorkerLookupSlot(MyDatabaseId);
-	if (entry != NULL && pg_atomic_read_u64(&entry->heartbeat_ts) != 0)
+	if (entry != NULL && pg_atomic_read_u32(&entry->dbEnabled) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("vamana background worker unavailable; cannot %s index %u",
+						operation, indexRelid),
+				 errdetail("The database is not currently enabled for vamana."),
+				 errhint("Enable it by updating its row in vamana_databases.")));
+
+	if (entry != NULL && VamanaHeartbeatIsStale(pg_atomic_read_u64(&entry->heartbeat_ts),
+												GetCurrentTimestamp()))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("vamana background worker unavailable; cannot %s index %u",
@@ -1532,6 +1581,27 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 		CHECK_FOR_INTERRUPTS();
 
 		VamanaWorkerAssertDatabase();
+
+		/*
+		 * Re-check dbEnabled every iteration, not just before the loop: a
+		 * database disabled after the up-front check but before the wait
+		 * completes would otherwise spin the full timeout with no one
+		 * noticing, since a pause deliberately keeps the slot reserved (see
+		 * F1/F2's design), so nothing else in this loop reacts to it. This
+		 * closes that window down to one 200ms tick instead of the full
+		 * vamana_worker_startup_timeout_ms.
+		 */
+		{
+			VamanaWorkerShmem *entryNow = VamanaWorkerLookupSlot(MyDatabaseId);
+
+			if (entryNow != NULL && pg_atomic_read_u32(&entryNow->dbEnabled) == 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("vamana background worker unavailable; cannot %s index %u",
+								operation, indexRelid),
+						 errdetail("The database is not currently enabled for vamana."),
+						 errhint("Enable it by updating its row in vamana_databases.")));
+		}
 
 		if (VamanaWorkerFindActiveSlot() != NULL)
 			return;
