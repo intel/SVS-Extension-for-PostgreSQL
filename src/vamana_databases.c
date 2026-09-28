@@ -35,6 +35,7 @@
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -452,6 +453,15 @@ ReserveSlotsForEnabledEntries(void)
 		SvsMemoryAdmitDatabase(entry->dbOid, residencyBudget, entry->durableResidencyFloorBytes);
 	}
 
+	/*
+	 * Every slot this transaction is going to reserve is reserved by this
+	 * point, but the transaction has not yet committed and its row is not
+	 * yet visible to any other backend's snapshot -- exactly the window a
+	 * test needs to hold open to prove the launcher's orphan-release pass
+	 * does not race an in-flight enrollment.
+	 */
+	INJECTION_POINT("vamana-databases-reserved-precommit", NULL);
+
 	MemoryContextSwitchTo(oldContext);
 }
 
@@ -509,6 +519,19 @@ char *
 SvsDatabasesQualifiedName(void)
 {
 	return SvsExtensionQualifiedRelationName("vamana_databases");
+}
+
+Oid
+SvsDatabasesRelid(void)
+{
+	Oid			extOid = get_extension_oid("svs", true);
+	Oid			nspOid;
+
+	if (!OidIsValid(extOid))
+		return InvalidOid;
+
+	nspOid = get_extension_schema(extOid);
+	return get_relname_relid("vamana_databases", nspOid);
 }
 
 int32

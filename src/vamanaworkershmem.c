@@ -199,6 +199,9 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 	pg_atomic_write_u32(&entry->accepting, 0);
 	pg_atomic_write_u32(&entry->evict_all, 0);
 	pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+	pg_atomic_write_u32(&entry->dbEnabled, 1);
+	pg_atomic_write_u32(&entry->stopRequested, 0);
+	entry->servicedRestartGeneration = 0;
 	pg_atomic_write_u32(&entry->indexCount, 0);
 	pg_atomic_write_u32(&entry->desiredSearchThreads, 0);
 	pg_atomic_write_u32(&entry->grantedSearchThreads, 0);
@@ -861,6 +864,30 @@ VamanaWorkerSetMemoryOverrides(Oid dbOid, int residencyMemoryMbOverride,
 		entry->residencyMemoryMbOverride = residencyMemoryMbOverride;
 		entry->searchWorkMemMbOverride = searchWorkMemMbOverride;
 	}
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+}
+
+/*
+ * Record the restart_generation the worker just (re)spawned for dbOid is
+ * serving.  Called by the launcher at spawn and respawn time, alongside the
+ * ledger's own restart_state.serviced_generation: this durable mirror is
+ * what lets a launcher with no ledger entry for a live worker (one it
+ * inherited across its own restart) still tell a stale instance from a
+ * current one.  A no-op if dbOid has no reserved entry.
+ */
+void
+VamanaWorkerSetServicedRestartGeneration(Oid dbOid, int64 generation)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_EXCLUSIVE);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL)
+		entry->servicedRestartGeneration = generation;
 	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
 }
 

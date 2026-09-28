@@ -270,6 +270,43 @@ typedef struct VamanaWorkerShmem
 	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
 
 	/*
+	 * Mirrors this database's current vamana_databases.enabled, published by
+	 * the launcher every reconcile pass.  A backend waiting for a worker
+	 * needs this to tell "disabled, no replacement is ever coming" apart
+	 * from "enabled, a replacement just hasn't published its pid yet" --
+	 * heartbeat staleness alone cannot make that distinction, since a
+	 * deliberately-stopped worker's heartbeat is cleared (0, not stale)
+	 * regardless of which of the two is true.  Defaults to 1 (true) on
+	 * reservation and release, since a slot is only ever reserved for a
+	 * database that is enabled or about to be.
+	 */
+	pg_atomic_uint32 dbEnabled;
+
+	/*
+	 * Launcher-to-worker deliberate-stop signal, for a worker this launcher
+	 * process holds no BackgroundWorkerHandle for (one it inherited live
+	 * across its own restart): a handle-based TerminateBackgroundWorker is
+	 * not available for that case, but this shared control block always is.
+	 * The worker checks this every loop iteration alongside worker_got_sigterm
+	 * and, on seeing it set, drains and stops exactly as it would for a
+	 * SIGTERM.  Reset to 0 by the worker itself at startup, since a stale 1
+	 * in a reused block would otherwise stop the next worker before it ever
+	 * serves a request.
+	 */
+	pg_atomic_uint32 stopRequested;
+
+	/*
+	 * The restart_generation this control block's current worker instance is
+	 * serving, mirrored into shared memory (rather than kept only in the
+	 * launcher-local ledger) so a launcher that inherited this worker live
+	 * across its own restart can still tell a stale instance from a current
+	 * one.  Written by the launcher at spawn/respawn time, alongside the
+	 * ledger's own restart_state.serviced_generation; never written by the
+	 * worker.  Meaningless while dbOid == InvalidOid.
+	 */
+	int64		servicedRestartGeneration;
+
+	/*
 	 * Live Vamana indexes in this database.  Maintained with plain atomics
 	 * (no array-wide lock) by the backend performing CREATE/DROP INDEX; read
 	 * by the DELETE guard and the pg_stat_vamana_worker view.
@@ -534,6 +571,9 @@ void	VamanaWorkerForEachReserved(VamanaReservedEntryCb cb, void *ctx);
  */
 void	VamanaWorkerSetMemoryOverrides(Oid dbOid, int residencyMemoryMbOverride,
 									   int searchWorkMemMbOverride);
+
+/* See the field's own comment on VamanaWorkerShmem for what this is for. */
+void	VamanaWorkerSetServicedRestartGeneration(Oid dbOid, int64 generation);
 
 /* vamanaworkershmem.c: launcher-owned crash-backoff state (header lock) */
 bool	VamanaWorkerBackoffSnapshot(Oid dbOid, VamanaLauncherBackoff *out);

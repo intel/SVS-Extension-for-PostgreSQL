@@ -43,6 +43,16 @@ extern char *SvsExtensionQualifiedRelationName(const char *relname);
 /* Schema-qualified "vamana_databases". Equivalent to the call above for that one relation. */
 extern char *SvsDatabasesQualifiedName(void);
 
+/*
+ * vamana_databases' relid, or InvalidOid if the extension (and therefore the
+ * relation) doesn't exist yet in this database.  Callers that need to detect
+ * a concurrent writer -- any INSERT/UPDATE/DELETE holds RowExclusiveLock on
+ * this relation for its whole transaction -- probe with
+ * ConditionalLockRelationOid() against this Oid rather than resolving it
+ * themselves.
+ */
+extern Oid SvsDatabasesRelid(void);
+
 /* NULL means "follow the GUC default"; the calculator's sentinel for that is -1. */
 extern int32 SvsResolveNullableThreadCount(bool isNull, int32 value);
 

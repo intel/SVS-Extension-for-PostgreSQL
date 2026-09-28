@@ -33,6 +33,7 @@
 #include "vamanaworker.h"
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "commands/async.h"
 #include "commands/dbcommands.h"
 #include "commands/extension.h"
@@ -42,6 +43,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/lmgr.h"
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
@@ -72,6 +74,17 @@
 
 /* Naptime floor: a near-zero backoff remainder must not wake a busy re-scan. */
 #define VAMANA_LAUNCHER_MIN_NAPTIME_MS		1000L
+
+/*
+ * How long a reserved control block must be seen with no matching
+ * vamana_databases row, across successive reconcile cycles, before it is
+ * treated as orphaned rather than an enrollment whose reserving transaction
+ * has not yet become visible.  Reservation happens at that transaction's
+ * PRE_COMMIT, a moment before its row is visible to this launcher's own
+ * snapshot; this margin is comfortably above that gap and far below
+ * VAMANA_BACKOFF_DWELL_RESET_MS.
+ */
+#define VAMANA_ORPHAN_SLOT_GRACE_MS			5000L
 
 /*
  * One tracked per-database worker: the handle returned by
@@ -190,11 +203,27 @@ typedef struct VamanaDatabaseRow
  */
 static List *WorkerLedger = NIL;
 
+/*
+ * One reserved control block seen with no matching row, and when that was
+ * first observed.  Launcher-local and independent of WorkerLedger: a slot can
+ * be orphaned with no ledger entry at all, which is exactly the case a paused
+ * (STOP_DISABLED) database's slot is in once its row is later deleted -- the
+ * ledger entry is already gone by then, dropped the cycle the worker stopped.
+ */
+typedef struct VamanaOrphanCandidate
+{
+	Oid			dbOid;
+	TimestampTz firstSeenOrphaned;
+} VamanaOrphanCandidate;
+
+/* In TopMemoryContext, same lifetime rationale as WorkerLedger. */
+static List *OrphanCandidates = NIL;
+
 static void ClearLauncherPidOnExit(int code, Datum arg);
 static void PublishCpuGrants(List *rows);
 static void PublishMemoryOverrides(List *rows);
 static long VamanaLauncherReconcileWorkers(void);
-static List *ReadDatabaseRows(void);
+static List *ReadDatabaseRows(bool *ok);
 static List *EnabledRowsOf(List *rows);
 static void MaterializeInitialConfig(void);
 static bool VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname);
@@ -216,6 +245,10 @@ static bool RespawnWorker(VamanaLauncherWorker *w, const VamanaDatabaseRow *db,
 static void ReconcileLedgerLiveness(List *rows, TimestampTz now);
 static void TerminateDisabledWorkers(List *rows);
 static void ReconcileRestartConvergence(List *rows, TimestampTz now);
+static void PublishEnabledState(List *rows);
+static void CollectReservedDbOids(VamanaWorkerShmem *entry, void *ctx);
+static long ReleaseOrphanedReservedSlots(List *rows, TimestampTz now);
+static long ReconcileUnledgeredWorkers(List *rows);
 static long BackoffThresholdMs(uint32 consecutiveFailures);
 static long BackoffRemainingMs(const VamanaLauncherBackoff *backoff, TimestampTz now);
 
@@ -354,18 +387,39 @@ VamanaLauncherReconcileWorkers(void)
 	ListCell   *lc;
 	TimestampTz now = GetCurrentTimestamp();
 	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
+	bool		ok;
 
 	cycleCtx = AllocSetContextCreate(TopMemoryContext,
 									 "vamana launcher reconcile",
 									 ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(cycleCtx);
 
-	rows = ReadDatabaseRows();
+	rows = ReadDatabaseRows(&ok);
+
+	if (!ok)
+	{
+		/*
+		 * A failed read is not ground truth: every currently-tracked worker
+		 * and reserved slot would otherwise read as "its database left the
+		 * enabled set," and this cycle would tear all of them down on what
+		 * may be a transient failure (already logged by ReadDatabaseRows).
+		 * Skip reconciling entirely and retry soon.
+		 */
+		MemoryContextSwitchTo(oldCtx);
+		MemoryContextDelete(cycleCtx);
+		return VAMANA_LAUNCHER_MIN_NAPTIME_MS;
+	}
+
+	PublishEnabledState(rows);
 
 	ReconcileLedgerLiveness(rows, now);
 	TerminateDisabledWorkers(rows);
 	if (WorkerLedger != NIL)
 		ReconcileRestartConvergence(rows, now);
+
+	naptime = Min(naptime, ReconcileUnledgeredWorkers(rows));
+
+	naptime = Min(naptime, ReleaseOrphanedReservedSlots(rows, now));
 
 	PublishCpuGrants(rows);
 	PublishMemoryOverrides(rows);
@@ -447,13 +501,20 @@ MaterializeInitialConfig(void)
 	MemoryContext oldCtx;
 	List	   *rows;
 	ListCell   *lc;
+	bool		ok;
 
 	scanCtx = AllocSetContextCreate(TopMemoryContext,
 									"vamana launcher initial scan",
 									ALLOCSET_DEFAULT_SIZES);
 	oldCtx = MemoryContextSwitchTo(scanCtx);
 
-	rows = ReadDatabaseRows();
+	/*
+	 * A failed read here only means fewer slots get pre-reserved at startup,
+	 * the same outcome as a legitimately empty table; each one is reserved
+	 * again idempotently once ReadDatabaseRows succeeds on the launcher's
+	 * first reconcile pass, so the failure is not specially handled here.
+	 */
+	rows = ReadDatabaseRows(&ok);
 
 	foreach(lc, EnabledRowsOf(rows))
 	{
@@ -522,15 +583,67 @@ ResolveReservedFloor(bool isNull, int32 value)
  * the enabled subset filter with EnabledRowsOf(), and callers that need to
  * distinguish "disabled" from "removed" (no row at all) can only do so by
  * having the full set to check membership against.
+ *
+ * *ok is set to false on a failed read (SPI_connect failure, or a caught
+ * SPI_execute error) and true otherwise, including the legitimate "table has
+ * no rows yet" and "extension not created yet" cases.  This distinction
+ * matters to the caller: an empty result from a failed read is not ground
+ * truth and must not be reconciled against as though it were -- every row
+ * missing its own database would otherwise read as "disabled" or "removed."
  */
 static List *
-ReadDatabaseRows(void)
+ReadDatabaseRows(bool *ok)
 {
-	List	   *result = NIL;
+	/*
+	 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(), so it
+	 * must survive the longjmp back to the PG_TRY() setjmp point
+	 * (-Wclobbered).
+	 */
+	List * volatile result = NIL;
 	MemoryContext callerCtx = CurrentMemoryContext;
+
+	*ok = true;
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
+
+	/*
+	 * An enrolling transaction reserves its slot at PRE_COMMIT, before its
+	 * row is visible to the snapshot this function is about to take; that
+	 * transaction's own INSERT/UPDATE/DELETE already holds RowExclusiveLock
+	 * on vamana_databases for as long as it remains open, so a conflicting
+	 * conditional probe here is a reliable, non-blocking way to tell "no
+	 * matching row because none exists" apart from "no matching row yet,
+	 * because a writer is still mid-transaction."  Deferring the whole cycle
+	 * on a miss, rather than only the orphan-release pass, keeps this one
+	 * fact in one place rather than threading it through every consumer of
+	 * the row set.
+	 *
+	 * Primary only. A standby never runs the write transaction this probe
+	 * defends against -- reservation is a PRE_COMMIT callback on a live
+	 * INSERT/UPDATE, and nothing executes DML during WAL replay -- so there
+	 * is nothing here to detect. Skipping it in recovery matters beyond
+	 * being merely redundant: a standby backend holding even a briefly-held,
+	 * conditional lock on a relation being replayed can stall the startup
+	 * process behind hot standby's recovery-conflict wait, which is exactly
+	 * the kind of interference a standby-side reconcile pass must not cause.
+	 */
+	if (!RecoveryInProgress())
+	{
+		Oid			relid = SvsDatabasesRelid();
+
+		if (OidIsValid(relid))
+		{
+			if (!ConditionalLockRelationOid(relid, ShareLock))
+			{
+				AbortCurrentTransaction();
+				*ok = false;
+				return NIL;
+			}
+			UnlockRelationOid(relid, ShareLock);
+		}
+	}
+
 	PushActiveSnapshot(GetTransactionSnapshot());
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -538,9 +651,19 @@ ReadDatabaseRows(void)
 		PopActiveSnapshot();
 		AbortCurrentTransaction();
 		ereport(WARNING, (errmsg("vamana launcher: SPI_connect failed")));
+		*ok = false;
 		return NIL;
 	}
 
+	/*
+	 * SPI_execute ereports ERROR rather than returning a bad status for a
+	 * failing query (a dropped column, a lock conflict, ...); without this
+	 * PG_TRY that error unwinds out of the caller's main loop and the
+	 * launcher exits, which the postmaster respawns into the same failure
+	 * forever. Catching it here degrades to the WARNING below and lets the
+	 * next wake retry.
+	 */
+	PG_TRY();
 	{
 		char	   *qualifiedName = SvsDatabasesQualifiedName();
 
@@ -611,11 +734,47 @@ ReadDatabaseRows(void)
 										   restart_generation, enabled, &cpu, &memory, callerCtx);
 			}
 		}
-	}
 
-	SPI_finish();
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+		SPI_finish();
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		/*
+		 * PG_TRY/PG_CATCH save and restore only PG_exception_stack and
+		 * error_context_stack; CurrentMemoryContext is left wherever the
+		 * error occurred (inside SPI's own execution context), so it must be
+		 * restored here before anything is allocated, or the caller resumes
+		 * in a context SPI_finish() -- called via AtEOXact_SPI() below -- is
+		 * about to tear down.
+		 */
+		MemoryContextSwitchTo(callerCtx);
+
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		/*
+		 * AbortCurrentTransaction runs AtEOXact_SPI(false), which pops any
+		 * SPI connection left open by the failing SPI_execute; there is no
+		 * separate SPI_finish() to call here.
+		 */
+		if (ActiveSnapshotSet())
+			PopActiveSnapshot();
+		if (IsTransactionState())
+			AbortCurrentTransaction();
+
+		ereport(WARNING,
+				(errmsg("vamana launcher: failed to read vamana_databases: %s",
+						edata->message)));
+		FreeErrorData(edata);
+
+		result = NIL;
+		*ok = false;
+	}
+	PG_END_TRY();
 
 	return result;
 }
@@ -1170,6 +1329,8 @@ SpawnWorker(const VamanaDatabaseRow *db, TimestampTz now)
 	entry->restart_state.wait_started = 0;
 	WorkerLedger = lappend(WorkerLedger, entry);
 	MemoryContextSwitchTo(oldCtx);
+
+	VamanaWorkerSetServicedRestartGeneration(db->dbOid, db->restart_generation);
 }
 
 /*
@@ -1195,6 +1356,9 @@ RespawnWorker(VamanaLauncherWorker *w, const VamanaDatabaseRow *db,
 	w->restart_state.restarting = false;
 	w->restart_state.serviced_generation = w->restart_state.target_generation;
 	w->restart_state.wait_started = 0;
+
+	VamanaWorkerSetServicedRestartGeneration(db->dbOid, w->restart_state.serviced_generation);
+
 	return true;
 }
 
@@ -1230,6 +1394,32 @@ DropSlotsAbandonedByStoppedWorker(Oid dbOid)
 					(errmsg("vamana launcher: replication slot of removed index %u in database %u is still held",
 							relids[i], dbOid),
 					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+	}
+}
+
+/*
+ * Mirror every reserved database's current enabled flag into its control
+ * block.  This is what lets a backend waiting for a worker (see
+ * VamanaWorkerWaitUntilAvailable) tell "disabled, no replacement is ever
+ * coming" apart from "enabled, a replacement just hasn't published its pid
+ * yet": heartbeat staleness alone cannot make that distinction once
+ * heartbeat_ts is cleared uniformly on every deliberate stop. A database with
+ * no row at all is left untouched here; F1's orphan-release pass owns that
+ * case, and a released slot's baseline default (true) is irrelevant until
+ * some future reservation republishes it.
+ */
+static void
+PublishEnabledState(List *rows)
+{
+	ListCell   *lc;
+
+	foreach(lc, rows)
+	{
+		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
+		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
+
+		if (entry != NULL)
+			pg_atomic_write_u32(&entry->dbEnabled, db->enabled ? 1 : 0);
 	}
 }
 
@@ -1271,7 +1461,24 @@ ReconcileLedgerLiveness(List *rows, TimestampTz now)
 		switch (ClassifyWorkerStop(rows, w))
 		{
 			case STOP_RESTART_DRAIN:
-				/* Convergence owns this handle; do not touch it. */
+				{
+					/*
+					 * Convergence owns this handle and will respawn it; do
+					 * not drop the entry. But do clear heartbeat_ts here,
+					 * the one point that knows this stop is a restart (as
+					 * opposed to STOP_DISABLED, where nothing will ever
+					 * spawn a replacement): otherwise a backend reaching
+					 * VamanaWorkerWaitUntilAvailable during the window
+					 * before the replacement publishes its own pid would
+					 * see a heartbeat that ages into looking stale the
+					 * longer this window stays open, defeating the bounded
+					 * wait for exactly the case it exists to cover.
+					 */
+					VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(w->dbOid);
+
+					if (entry != NULL)
+						pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+				}
 				continue;
 
 			case STOP_DISABLED:
@@ -1380,4 +1587,195 @@ ReconcileRestartConvergence(List *rows, TimestampTz now)
 
 		ExecuteRestartAction(action, ledger_entry, db, now);
 	}
+}
+
+/* Collect every reserved control block's dbOid, under VamanaWorkerForEachReserved's lock. */
+static void
+CollectReservedDbOids(VamanaWorkerShmem *entry, void *ctx)
+{
+	List	  **reserved = (List **) ctx;
+
+	*reserved = lappend_oid(*reserved, entry->dbOid);
+}
+
+/*
+ * Release any reserved control block whose database matches no row in the
+ * table at all, independent of WorkerLedger.  This is the pass a paused
+ * (STOP_DISABLED) database's slot needs once its row is later deleted: by
+ * then the ledger entry is long gone, correctly dropped the cycle its worker
+ * stopped for the disable, so ClassifyWorkerStop never gets a second look
+ * with both "handle observed stopped" and "row already gone" true at once.
+ * The same gap strands a database dropped without ever being disabled first.
+ *
+ * A slot reserved for an enrollment whose transaction has not yet committed
+ * looks identical, briefly, to a genuinely orphaned one: reservation happens
+ * at that transaction's PRE_COMMIT, a moment before its row becomes visible
+ * to this launcher's own snapshot.  So a slot is not released the first
+ * cycle it is found with no matching row; it is tracked in OrphanCandidates
+ * and only released once that state has persisted for at least
+ * VAMANA_ORPHAN_SLOT_GRACE_MS.  A candidate that regains a row, or stops
+ * being reserved, before then is simply dropped with no side effect.
+ *
+ * Returns the naptime contribution: milliseconds until the earliest
+ * surviving candidate clears its grace period, or the launcher's normal
+ * naptime if there are none, so a pending release is not made to oversleep.
+ */
+static long
+ReleaseOrphanedReservedSlots(List *rows, TimestampTz now)
+{
+	List	   *reserved = NIL;
+	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
+	MemoryContext oldCtx;
+	ListCell   *lc;
+
+	VamanaWorkerForEachReserved(CollectReservedDbOids, &reserved);
+
+	/*
+	 * OrphanCandidates, like WorkerLedger, must outlive this cycle's context;
+	 * every mutation of it happens in TopMemoryContext.
+	 */
+	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+
+	/* A candidate that regained a row or is no longer reserved starts over if it orphans again. */
+	foreach(lc, OrphanCandidates)
+	{
+		VamanaOrphanCandidate *c = (VamanaOrphanCandidate *) lfirst(lc);
+
+		if (FindDatabaseRow(rows, c->dbOid) != NULL || !list_member_oid(reserved, c->dbOid))
+		{
+			OrphanCandidates = foreach_delete_current(OrphanCandidates, lc);
+			pfree(c);
+		}
+	}
+
+	foreach_oid(dbOid, reserved)
+	{
+		VamanaOrphanCandidate *candidate = NULL;
+		long		remaining;
+
+		if (FindDatabaseRow(rows, dbOid) != NULL)
+			continue;
+
+		foreach(lc, OrphanCandidates)
+		{
+			VamanaOrphanCandidate *c = (VamanaOrphanCandidate *) lfirst(lc);
+
+			if (c->dbOid == dbOid)
+			{
+				candidate = c;
+				break;
+			}
+		}
+
+		if (candidate == NULL)
+		{
+			candidate = palloc(sizeof(VamanaOrphanCandidate));
+			candidate->dbOid = dbOid;
+			candidate->firstSeenOrphaned = now;
+			OrphanCandidates = lappend(OrphanCandidates, candidate);
+		}
+
+		if (TimestampDifferenceExceeds(candidate->firstSeenOrphaned, now,
+										VAMANA_ORPHAN_SLOT_GRACE_MS))
+		{
+			VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+
+			/*
+			 * A live worker with no row and no ledger entry is exactly the
+			 * survivor ReconcileUnledgeredWorkers is asking to stop, in this
+			 * same cycle, via stopRequested; releasing its slot out from
+			 * under it here would hand a still-running process's control
+			 * block to whatever reserves it next. Wait for that ask to take
+			 * effect instead of racing it.
+			 */
+			if (entry == NULL || !VamanaWorkerEntryIsLive(entry))
+			{
+				DropSlotsAbandonedByStoppedWorker(dbOid);
+				VamanaWorkerReleaseSlot(dbOid);
+				OrphanCandidates = list_delete_ptr(OrphanCandidates, candidate);
+				pfree(candidate);
+				continue;
+			}
+
+			naptime = Min(naptime, VAMANA_LAUNCHER_MIN_NAPTIME_MS);
+			continue;
+		}
+
+		remaining = VAMANA_ORPHAN_SLOT_GRACE_MS -
+			TimestampDifferenceMilliseconds(candidate->firstSeenOrphaned, now);
+		naptime = Min(naptime, remaining);
+	}
+
+	MemoryContextSwitchTo(oldCtx);
+
+	return naptime;
+}
+
+/*
+ * Ask a live, reserved worker with no ledger entry to stop, when its database
+ * is disabled or removed, or its row's restart_generation no longer matches
+ * what this control block records as served.  This is the survivor case: a
+ * worker inherited live across this launcher's own restart has no ledger
+ * entry (the ledger is rebuilt empty on every launcher restart) and so no
+ * BackgroundWorkerHandle either, which rules out TerminateBackgroundWorker.
+ * The shared control block is not opaque the way a handle is, so it is the
+ * channel used instead: set stopRequested and wake the worker's own latch
+ * directly, no handle needed.
+ *
+ * This pass owns only the ask. Once the worker actually stops,
+ * VamanaWorkerEntryIsLive turns false and the ordinary spawn-diff loop in
+ * VamanaLauncherReconcileWorkers picks the database back up exactly like any
+ * other missing worker, registering it (and a fresh ledger entry) for the
+ * first time -- there is no separate respawn path for this case.
+ *
+ * Idempotent to repeat every cycle until the worker exits: setting an
+ * already-set flag and waking an already-woken latch cost nothing.
+ *
+ * Returns the naptime contribution: a short retry whenever a stop was just
+ * requested, since this survivor's bgw_notify_pid names the launcher
+ * instance that registered it, not this one, so nothing else wakes this
+ * launcher when it actually stops; the launcher's normal naptime otherwise.
+ */
+static long
+ReconcileUnledgeredWorkers(List *rows)
+{
+	List	   *reserved = NIL;
+	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
+
+	VamanaWorkerForEachReserved(CollectReservedDbOids, &reserved);
+
+	foreach_oid(dbOid, reserved)
+	{
+		VamanaWorkerShmem *entry;
+		VamanaDatabaseRow *db;
+		bool		wantStop;
+
+		if (FindLedgerEntry(dbOid) != NULL)
+			continue;
+
+		entry = VamanaWorkerLookupSlot(dbOid);
+		if (entry == NULL || !VamanaWorkerEntryIsLive(entry))
+			continue;
+
+		db = FindEnabledDatabase(rows, dbOid);
+		wantStop = (db == NULL) || (db->restart_generation != entry->servicedRestartGeneration);
+
+		if (wantStop)
+		{
+			pg_atomic_write_u32(&entry->stopRequested, 1);
+			SetLatch(&entry->workerLatch);
+
+			/*
+			 * This survivor was registered by a launcher instance that no
+			 * longer exists, so its bgw_notify_pid names a dead process:
+			 * nothing wakes this launcher when it actually stops. Fold in a
+			 * short retry so the spawn-diff loop below picks up the
+			 * replacement soon after, rather than waiting out the full
+			 * naptime (backoff-remaining aside).
+			 */
+			naptime = Min(naptime, VAMANA_LAUNCHER_MIN_NAPTIME_MS);
+		}
+	}
+
+	return naptime;
 }
