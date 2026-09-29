@@ -13,10 +13,18 @@ PG_CONFIG=${PGSQL_INSTALL_DIR}/bin/pg_config
 
 # ── SVS library ───────────────────────────────────────────────────────────────
 SVS_REPO=https://github.com/intel/ScalableVectorSearch.git
-SVS_BRANCH=dev/c-api
+# dev/c-api was deleted upstream (confirmed 2026-09-29: "Remote branch dev/c-api
+# not found in upstream origin"). main is the maintained integration branch.
+SVS_BRANCH=main
 SVS_SRC_DIR=${BASE_DIR}/ScalableVectorSearch
 SVS_BUILD_DIR=${SVS_SRC_DIR}/build
 SVS_INSTALL_DIR=${BASE_DIR}/svs_install
+# Overrides bindings/c/CMakeLists.txt's own SVS_URL default for the LVQ/LeanVec
+# fetch. Blank means "defer to upstream's default" -- which is currently a
+# v0.4.0 archive that predates MemoryBreakdown and fails to compile against
+# main's current bindings/c on anything but GCC 11.2 exactly (confirmed
+# 2026-09-29). Set this to a current nightly if you hit that; CI sets it.
+SVS_URL=${SVS_URL:-}
 
 # ── vanilla pgvector (provides vector/halfvec types) ─────────────────────────
 PGV_VANILLA_REPO=https://github.com/pgvector/pgvector.git
