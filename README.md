@@ -70,6 +70,7 @@ Build, install, and run both suites in one chain, so the tests always exercise
 what was just built rather than whatever `svs.so` happens to already be
 installed:
 
+### SQL regression tests
 ```bash
 make && make install && make installcheck && make prove_installcheck
 ```
@@ -86,6 +87,7 @@ separately, on hardware that supports it:
 make installcheck-hw
 ```
 
+### Perl TAP tests (background worker, persistence)
 `prove_installcheck` has the same exclusion on the TAP side, for the same
 reason: `39_persistence_compression.pl` and
 `44_build_memory_calibration_compression.pl` build real LeanVec/LVQ indexes.
