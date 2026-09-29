@@ -40,10 +40,9 @@ jobs:
     # timeout keeps a hung dependency build from consuming the 6 hour default.
     timeout-minutes: 180
     env:
-      # config's own SVS_URL default is blank (defer to upstream); this pins
-      # the nightly known to compile against the main bindings/c this workflow
-      # builds. See docs/build_guide/config for why the default alone isn't
-      # enough on anything but GCC 11.2 exactly.
+      # config's own SVS_URL default is blank (defer to upstream, see
+      # docs/build_guide/config); pin a nightly here so CI's build is
+      # reproducible rather than tracking upstream's own default fetch.
       SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
     permissions:
       # required for all workflows
