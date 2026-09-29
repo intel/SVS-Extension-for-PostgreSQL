@@ -20,6 +20,13 @@ on:
   schedule:
     - cron: '40 3 * * 4'
 
+# A cold-cache run rebuilds PostgreSQL, SVS, and pgvector from source (up to
+# the 180-minute timeout below), so a superseded run on the same ref is
+# cancelled rather than left to run to completion alongside its replacement.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -28,7 +35,7 @@ jobs:
     #   - https://gh.io/supported-runners-and-hardware-resources
     #   - https://gh.io/using-larger-runners (GitHub.com only)
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     # Cold-cache runs build PostgreSQL and the SVS library from source; the
     # timeout keeps a hung dependency build from consuming the 6 hour default.
     timeout-minutes: 180
@@ -111,12 +118,8 @@ jobs:
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-
         # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
+        queries: security-and-quality
 
     # Build only the extension, so this is the compilation CodeQL traces.
     # docs/build_guide/config is the single source of truth for PG_CONFIG and
@@ -134,15 +137,16 @@ jobs:
       with:
         category: "/language:${{matrix.language}}"
         
+    # Report only on a manual run, never on push/PR/schedule.
     - name: Generate Security Report
-      if: github.event_name != 'pull_request'
+      if: github.event_name == 'workflow_dispatch'
       uses: rsdmike/github-security-report-action@v3.0.4
       with:
         template: report
         token: ${{ secrets.GITHUB_TOKEN }}
-        
+
     - name: GitHub Upload Release Artifacts
-      if: github.event_name != 'pull_request'
+      if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
         name: report
