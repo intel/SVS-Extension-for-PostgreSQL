@@ -39,6 +39,12 @@ jobs:
     # Cold-cache runs build PostgreSQL and the SVS library from source; the
     # timeout keeps a hung dependency build from consuming the 6 hour default.
     timeout-minutes: 180
+    env:
+      # config's own SVS_URL default is blank (defer to upstream); this pins
+      # the nightly known to compile against the main bindings/c this workflow
+      # builds. See docs/build_guide/config for why the default alone isn't
+      # enough on anything but GCC 11.2 exactly.
+      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
     permissions:
       # required for all workflows
       security-events: write
@@ -91,7 +97,7 @@ jobs:
         path: |
           docs/build_guide/pgsql_install
           docs/build_guide/svs_install
-        key: svs-deps-${{ runner.os }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
+        key: svs-deps-${{ runner.os }}-${{ env.SVS_URL }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
 
     - name: Build PostgreSQL
       if: steps.deps-cache.outputs.cache-hit != 'true'
