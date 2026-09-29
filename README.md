@@ -86,4 +86,13 @@ separately, on hardware that supports it:
 make installcheck-hw
 ```
 
+`prove_installcheck` has the same exclusion on the TAP side, for the same
+reason: `39_persistence_compression.pl` and
+`44_build_memory_calibration_compression.pl` build real LeanVec/LVQ indexes.
+Run them separately, on hardware that supports it:
+
+```bash
+make prove_installcheck-hw
+```
+
 Test files are in `test/sql/` and `test/t/`.

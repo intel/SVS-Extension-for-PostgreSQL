@@ -48,6 +48,11 @@ HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalaunch
 # plain 'make installcheck' never attempts them; run via 'make installcheck-hw'.
 HW_TESTS = halfvec_compression vector_compression
 TESTS = $(filter-out $(addprefix test/sql/,$(addsuffix .sql,$(HW_TESTS))),$(wildcard test/sql/*.sql))
+
+# Same hardware limitation, TAP side: these files build real LeanVec/LVQ
+# indexes. Excluded from the default 'prove_installcheck' file list so it
+# never attempts them; run via 'make prove_installcheck-hw'.
+HW_TAP_TESTS = test/t/39_persistence_compression.pl test/t/44_build_memory_calibration_compression.pl
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 # Load pgvector first (for vector/halfvec types), then this extension
 REGRESS_OPTS = --inputdir=test --load-extension=vector --load-extension=$(EXTENSION)
@@ -198,7 +203,19 @@ hardening-check:
 
 prove_installcheck: guard-fresh-install
 	rm -rf $(CURDIR)/tmp_check
-	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" LD_LIBRARY_PATH="$(shell $(PG_CONFIG) --libdir):$$LD_LIBRARY_PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),test/t/*.pl)
+	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" LD_LIBRARY_PATH="$(shell $(PG_CONFIG) --libdir):$$LD_LIBRARY_PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),$(filter-out $(HW_TAP_TESTS),$(wildcard test/t/*.pl)))
+
+# ---------------------------------------------------------------------------
+# Hardware-dependent TAP tests
+#
+# 39_persistence_compression.pl and 44_build_memory_calibration_compression.pl
+# build real LeanVec and LVQ compressed indexes via SVS, which require
+# hardware most CI runners lack. Run this target explicitly on hardware that
+# supports it; it is not part of plain 'prove_installcheck'.
+# ---------------------------------------------------------------------------
+.PHONY: prove_installcheck-hw
+prove_installcheck-hw: guard-fresh-install
+	$(MAKE) prove_installcheck PROVE_TESTS="$(HW_TAP_TESTS)"
 
 # ---------------------------------------------------------------------------
 # Coverage report targets
