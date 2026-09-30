@@ -178,6 +178,13 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  * the on-disk checkpoint (not a heap rebuild): such a handle predates any
  * post-checkpoint commit still pending in the replication slot.
  *
+ * A disk load whose replication slot never reached its initial CONSISTENT
+ * point is silently promoted to a heap rebuild internally, regardless of
+ * whether the caller passed loadedFromDisk (is#191/R9) -- see the comment
+ * where this is checked, below.  loadedFromDisk still reports what actually
+ * happened: false after that promotion, since the caller ends up with a
+ * rebuilt handle.
+ *
  * When propagateResidencyRefusal is true, a residency-budget refusal
  * (ERRCODE_OUT_OF_MEMORY) is re-thrown rather than swallowed; the
  * AccessShareLock below is released either way. All other errors are
@@ -408,6 +415,7 @@ typedef struct GetOrLoadIndexArgs
 {
 	Oid			relid;
 	bool	   *loadedFromDisk;
+	bool		actuallyLoadedFromDisk;	/* set regardless of loadedFromDisk being NULL */
 	SVSIndexHandle index;		/* output */
 } GetOrLoadIndexArgs;
 
@@ -420,7 +428,9 @@ GetOrLoadIndexBody(void *arg)
 	/* Test hook: TAP forces a failure while indexRel/lock are held. */
 	INJECTION_POINT("vamana-get-or-load-index-error", NULL);
 
-	a->index = LoadIndexFromDiskOrRebuild(indexRel, a->relid, a->loadedFromDisk);
+	a->index = LoadIndexFromDiskOrRebuild(indexRel, a->relid, &a->actuallyLoadedFromDisk);
+	if (a->loadedFromDisk != NULL)
+		*a->loadedFromDisk = a->actuallyLoadedFromDisk;
 	FinalizeIndexCacheEntry(indexRel, a->relid);
 
 	/*
@@ -468,6 +478,7 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateReside
 
 	args.relid = relid;
 	args.loadedFromDisk = loadedFromDisk;
+	args.actuallyLoadedFromDisk = false;
 	args.index = NULL;
 
 	/*
@@ -489,7 +500,47 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateReside
 	PG_END_TRY();
 
 	if (result.succeeded)
+	{
+		/*
+		 * A slot that never reached its initial CONSISTENT point cannot be
+		 * trusted for the one-time post-load drain its caller is about to run
+		 * (is#191/R9): a live primary applies inserts to the graph through a
+		 * synchronous write-IPC path, not through slot decode, so a slot
+		 * sitting short of CONSISTENT is invisible right up until a crash
+		 * forces the reload this function just performed.  Logical decoding
+		 * does not redeliver row-level changes for transactions that
+		 * committed before CONSISTENT was reached, so draining such a slot
+		 * would silently make no progress on them.  Rebuild from the heap
+		 * instead -- it already reflects every committed row and creates a
+		 * fresh slot as part of its own normal path -- then retry once.  The
+		 * retry's own load is a rebuild, not a disk load, so this cannot
+		 * recurse more than once.  Checked unconditionally on every disk
+		 * load (not just the first one for a given relid): REINDEX, the
+		 * first insert into an empty-table index, a standby, and the rebuild
+		 * this very check can trigger all create a fresh slot with its own
+		 * new consistency window, and a later crash can land in any of them.
+		 * Reaching CONSISTENT is a one-way ratchet per slot (confirmed by
+		 * test/t/45_vamana_slot_consistency_post_consistency_safe.pl), so nothing needs to
+		 * re-check a slot once it has passed this once.
+		 */
+		if (args.actuallyLoadedFromDisk &&
+			!VamanaReplicationSlotIsConsistent(VamanaWorkerShmemPtr->dbOid, relid))
+		{
+			ereport(LOG,
+					(errmsg("vamana index %u: replication slot never reached consistency; "
+							"rebuilding from the heap instead of replaying from the slot",
+							relid),
+					 errdetail_log("A crash landed while the slot's initial snapshot build was "
+								   "still in progress, so rows applied through the write-IPC "
+								   "path during that window cannot be recovered by replay.")));
+
+			VamanaForceHeapRebuild(relid);
+
+			return VamanaWorkerGetOrLoadIndex(relid, loadedFromDisk, propagateResidencyRefusal);
+		}
+
 		return args.index;
+	}
 
 	UnlockRelationOid(relid, AccessShareLock);
 	ereport(WARNING,
