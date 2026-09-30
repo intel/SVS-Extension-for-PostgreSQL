@@ -10,13 +10,21 @@ else
     git clone --recurse-submodules --branch "$SVS_BRANCH" "$SVS_REPO" "$SVS_SRC_DIR"
 fi
 
-mkdir -p "$SVS_BUILD_DIR"
+# Configure from scratch. SVS_URL is a CACHE STRING and the fetched tree
+# persists in _deps/svs-src, so a stale cache would keep the previous SVS_URL
+# (and its archive) even after you change it, making the change look like it
+# had no effect.
+rm -rf "$SVS_BUILD_DIR"
+
+SVS_URL_ARGS=()
+[[ -n "$SVS_URL" ]] && SVS_URL_ARGS=(-DSVS_URL="$SVS_URL")
 
 cmake -S "${SVS_SRC_DIR}/bindings/c" \
       -B "$SVS_BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DSVS_RUNTIME_ENABLE_LVQ_LEANVEC=ON \
+      "${SVS_URL_ARGS[@]}" \
       -DCMAKE_INSTALL_PREFIX="$SVS_INSTALL_DIR"
 
 cmake --build "$SVS_BUILD_DIR" -j"$(nproc)"

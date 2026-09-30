@@ -20,6 +20,13 @@ on:
   schedule:
     - cron: '40 3 * * 4'
 
+# A cold-cache run rebuilds PostgreSQL, SVS, and pgvector from source (up to
+# the 180-minute timeout below), so a superseded run on the same ref is
+# cancelled rather than left to run to completion alongside its replacement.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -28,7 +35,15 @@ jobs:
     #   - https://gh.io/supported-runners-and-hardware-resources
     #   - https://gh.io/using-larger-runners (GitHub.com only)
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
+    # Cold-cache runs build PostgreSQL and the SVS library from source; the
+    # timeout keeps a hung dependency build from consuming the 6 hour default.
+    timeout-minutes: 180
+    env:
+      # config's own SVS_URL default is blank (defer to upstream, see
+      # docs/build_guide/config); pin a nightly here so CI's build is
+      # reproducible rather than tracking upstream's own default fetch.
+      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
     permissions:
       # required for all workflows
       security-events: write
@@ -45,7 +60,10 @@ jobs:
       matrix:
         include:
         - language: c-cpp
-          build-mode: none
+          # 'manual' rather than 'none': this extension only compiles against
+          # PostgreSQL, SVS and pgvector headers, so buildless extraction cannot
+          # resolve its macros and types.
+          build-mode: manual
         # CodeQL supports the following values keywords for 'language': 'actions', 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
         # Use 'java-kotlin' to analyze code written in Java, Kotlin or both
@@ -58,11 +76,39 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v7
 
-    # Add any setup steps before running the `github/codeql-action/init` action.
-    # This includes steps like installing compilers or runtimes (`actions/setup-node`
-    # or others). This is typically only required for manual builds.
-    # - name: Setup runtime (example)
-    #   uses: actions/setup-example@v1
+    # The dependency builds below deliberately run *before* `init` so that the
+    # CodeQL tracer only wraps this repository's `make`. Building PostgreSQL and
+    # the SVS C++ library after `init` would extract them into the database too.
+    # See docs/build_guide/README.md for the equivalent local build.
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential cmake git bison flex pkg-config \
+          libreadline-dev zlib1g-dev libicu-dev
+
+    # pgvector installs into the PostgreSQL prefix, so caching pgsql_install
+    # also caches the vector/halfvec headers the Makefile compiles against.
+    - name: Restore PostgreSQL and SVS builds
+      id: deps-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          docs/build_guide/pgsql_install
+          docs/build_guide/svs_install
+        key: svs-deps-${{ runner.os }}-${{ env.SVS_URL }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
+
+    - name: Build PostgreSQL
+      if: steps.deps-cache.outputs.cache-hit != 'true'
+      run: bash docs/build_guide/install_postgres.sh
+
+    - name: Build SVS library
+      if: steps.deps-cache.outputs.cache-hit != 'true'
+      run: bash docs/build_guide/build_svs.sh
+
+    - name: Build and install vanilla pgvector
+      if: steps.deps-cache.outputs.cache-hit != 'true'
+      run: bash docs/build_guide/build_pgvector_vanilla.sh
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
@@ -70,44 +116,37 @@ jobs:
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-
         # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
+        queries: security-and-quality
 
-    # If the analyze step fails for one of the languages you are analyzing with
-    # "We were unable to automatically build your code", modify the matrix above
-    # to set the build mode to "manual" for that language. Then modify this step
-    # to build your code.
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
+    # Build only the extension, so this is the compilation CodeQL traces.
+    # docs/build_guide/config is the single source of truth for PG_CONFIG and
+    # SVS_INSTALL_DIR. PG_CONFIG is exported rather than passed on the command
+    # line, matching build_svs_extension.sh's own convention, so the two don't
+    # drift into different patterns for the same variable.
     - name: Run manual build steps
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
-        echo 'If you are using a "manual" build mode for one or more of the' \
-          'languages you are analyzing, replace this with the commands to build' \
-          'your code, for example:'
-        echo '  make bootstrap'
-        echo '  make release'
-        exit 1
+        source docs/build_guide/config
+        export PG_CONFIG
+        make -j"$(nproc)" SVS_INSTALL="$SVS_INSTALL_DIR"
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
       with:
         category: "/language:${{matrix.language}}"
         
+    # Report only on a manual run, never on push/PR/schedule.
     - name: Generate Security Report
-      if: github.event_name != 'pull_request'
+      if: github.event_name == 'workflow_dispatch'
       uses: rsdmike/github-security-report-action@v3.0.4
       with:
         template: report
         token: ${{ secrets.GITHUB_TOKEN }}
-        
+
     - name: GitHub Upload Release Artifacts
-      if: github.event_name != 'pull_request'
+      if: github.event_name == 'workflow_dispatch'
       uses: actions/upload-artifact@v4
       with:
         name: report
