@@ -1,16 +1,16 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 28_build_memory_calibration.pl — regression guard for the resident-bytes
-# measurement path, uncompressed storage only. A built-and-loaded index must
-# report a plausible non-zero resident_bytes, and that figure must grow with
-# row count in the expected direction. This does not assert anything about a
-# memory estimate: nothing in the extension computes one yet.
+# 40_build_memory_calibration_compression.pl -- regression guard for the
+# resident-bytes measurement path, LeanVec and LVQ storage types. Split out
+# of 28_build_memory_calibration.pl because SVS refuses to build LeanVec or
+# LVQ storage on hardware that lacks the required instruction set; run this
+# file only on hardware that supports it.
 #
-# The LeanVec and LVQ storage-type cases live in
-# 40_build_memory_calibration_compression.pl, since they build real
-# compressed indexes SVS refuses on hardware that lacks the required
-# instruction set.
+# For each storage type, a built-and-loaded index must report a plausible
+# non-zero resident_bytes, and that figure must grow with row count in the
+# expected direction. This does not assert anything about a memory estimate:
+# nothing in the extension computes one yet.
 
 use strict;
 use warnings FATAL => 'all';
@@ -22,7 +22,7 @@ use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
 
-my $node = PostgreSQL::Test::Cluster->new('build_memory_calibration');
+my $node = PostgreSQL::Test::Cluster->new('build_memory_calibration_compression');
 $node->init;
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
 $node->append_conf('postgresql.conf', "wal_level = logical");
@@ -63,15 +63,26 @@ sub resident_bytes_for
     return $bytes;
 }
 
-# Storage type 0 (no compression): a plausible non-zero footprint at small
-# scale, and growth with row count in the expected direction.
+# Storage type 1 (LeanVec): trips the recall WARNING at this scale, which is
+# expected and not a failure; the build must still succeed and report a
+# plausible non-zero, growing resident_bytes.
 {
-    my $small = resident_bytes_for(0, 500, 'none_small');
-    my $large = resident_bytes_for(0, 2000, 'none_large');
+    my $small = resident_bytes_for(1, 500, 'leanvec_small');
+    my $large = resident_bytes_for(1, 2000, 'leanvec_large');
 
-    cmp_ok($small, '>', 0, 'compression_type=0: small build reports non-zero resident_bytes');
+    cmp_ok($small, '>', 0, 'compression_type=1 (LeanVec): small build reports non-zero resident_bytes');
     cmp_ok($large, '>', $small,
-        'compression_type=0: resident_bytes grows with row count');
+        'compression_type=1 (LeanVec): resident_bytes grows with row count');
+}
+
+# Storage type 2 (LVQ): also trips its own recall WARNING at this scale.
+{
+    my $small = resident_bytes_for(2, 500, 'lvq_small');
+    my $large = resident_bytes_for(2, 2000, 'lvq_large');
+
+    cmp_ok($small, '>', 0, 'compression_type=2 (LVQ): small build reports non-zero resident_bytes');
+    cmp_ok($large, '>', $small,
+        'compression_type=2 (LVQ): resident_bytes grows with row count');
 }
 
 $node->stop;

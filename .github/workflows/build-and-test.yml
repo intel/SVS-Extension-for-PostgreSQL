@@ -1,0 +1,115 @@
+name: Build and test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "ci-01*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# docs/build_guide/config is the single source of truth for PG_CONFIG,
+# SVS_INSTALL_DIR and every other dependency install path; nothing here
+# overrides them.
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            cc: gcc-11
+            cxx: g++-11
+            pg_version: REL_18_1
+            run_tap: false
+          - runner: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            pg_version: REL_18_1
+            run_tap: true
+    runs-on: ${{ matrix.runner }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+      # This job needs TAP support and injection points for its own test
+      # suites, unlike codeql.yml's build (which never runs tests); baking
+      # the flags into the cache key below means a flag change invalidates
+      # the cache instead of silently reusing a non-TAP-enabled install.
+      PG_CONFIGURE_EXTRA_ARGS: "--enable-tap-tests --enable-injection-points"
+      # Pinned nightly SVS release tarball; keep in sync with the
+      # DEFAULT_SVS_URL in ci/build_and_test.sh so the cache key below
+      # invalidates whenever the pin changes.
+      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compiler package (non-default only)
+        if: matrix.cc != 'gcc'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "${{ matrix.cc }}" "${{ matrix.cxx }}"
+
+      # docs/build_guide's own scripts write to fixed paths under
+      # docs/build_guide/ (pgsql_install, svs_install); this cache key is
+      # matrix-based and keyed on our own configure flags, distinct in shape
+      # from codeql.yml's single 'svs-deps-...' key, so there is no collision
+      # between the two workflows' caches even though both cache the same
+      # directories.
+      - name: Cache PostgreSQL install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/pgsql_install
+          key: pg-${{ matrix.runner }}-${{ matrix.cc }}-${{ matrix.pg_version }}-${{ env.PG_CONFIGURE_EXTRA_ARGS }}-v1
+
+      - name: Cache SVS install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/svs_install
+          key: svs-${{ matrix.runner }}-${{ matrix.cc }}-${{ env.SVS_URL }}-v1
+
+      - name: deps
+        run: ci/build_and_test.sh deps
+
+      - name: build-postgres
+        run: ci/build_and_test.sh build-postgres
+
+      - name: build-svs
+        run: ci/build_and_test.sh build-svs
+
+      - name: build-pgvector
+        run: ci/build_and_test.sh build-pgvector
+
+      - name: build-extension
+        run: ci/build_and_test.sh build-extension
+
+      - name: build-modules
+        run: ci/build_and_test.sh build-modules
+
+      - name: hardening-check
+        run: ci/build_and_test.sh hardening-check
+
+      - name: test-sql
+        run: ci/build_and_test.sh test-sql
+
+      - name: test-tap
+        if: matrix.run_tap
+        run: ci/build_and_test.sh test-tap
+        env:
+          PROVE_FLAGS: -j2
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.runner }}
+          path: |
+            regression.diffs
+            regression.out
+            results/
+            tmp_check/log/
+            ci/.workdir/postgres.log
+          if-no-files-found: ignore
+          retention-days: 7

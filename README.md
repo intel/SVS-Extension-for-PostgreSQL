@@ -66,12 +66,35 @@ The extension implements a PostgreSQL index access method backed by a per-databa
 
 ## Running Tests
 
-```bash
-# SQL regression tests
-make installcheck
+Build, install, and run both suites in one chain, so the tests always exercise
+what was just built rather than whatever `svs.so` happens to already be
+installed:
 
-# Perl TAP tests (background worker, persistence)
-make prove_installcheck
+### SQL regression tests
+```bash
+make && make install && make installcheck && make prove_installcheck
+```
+
+`installcheck` and `prove_installcheck` refuse to run if the installed
+`svs.so` differs from the one just built; run `make install` first if you see
+that error.
+
+`installcheck` excludes tests that build real LeanVec or LVQ compressed
+indexes, since those require hardware most CI runners lack. Run them
+separately, on hardware that supports it:
+
+```bash
+make installcheck-hw
+```
+
+### Perl TAP tests (background worker, persistence)
+`prove_installcheck` has the same exclusion on the TAP side, for the same
+reason: `39_persistence_compression.pl` and
+`44_build_memory_calibration_compression.pl` build real LeanVec/LVQ indexes.
+Run them separately, on hardware that supports it:
+
+```bash
+make prove_installcheck-hw
 ```
 
 Test files are in `test/sql/` and `test/t/`.

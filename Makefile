@@ -43,7 +43,16 @@ OBJS = src/svs.o \
        src/vamana_warmup.o
 HEADERS = src/vamana.h src/svs_wrapper.h src/vamana_databases.h src/vamanalauncher.h src/svs_cpu_budget.h src/svs_memory.h src/svs_index_residency.h src/svs_slot_naming.h src/svs_cpu_slots.h src/svs_capacity_search.h src/svs_vector_buffer.h
 
-TESTS = $(wildcard test/sql/*.sql)
+# halfvec_compression/vector_compression build real LeanVec and LVQ indexes,
+# which require hardware most CI runners lack. Excluded from TESTS/REGRESS so
+# plain 'make installcheck' never attempts them; run via 'make installcheck-hw'.
+HW_TESTS = halfvec_compression vector_compression
+TESTS = $(filter-out $(addprefix test/sql/,$(addsuffix .sql,$(HW_TESTS))),$(wildcard test/sql/*.sql))
+
+# Same hardware limitation, TAP side: these files build real LeanVec/LVQ
+# indexes. Excluded from the default 'prove_installcheck' file list so it
+# never attempts them; run via 'make prove_installcheck-hw'.
+HW_TAP_TESTS = test/t/39_persistence_compression.pl test/t/44_build_memory_calibration_compression.pl
 REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 # Load pgvector first (for vector/halfvec types), then this extension
 REGRESS_OPTS = --inputdir=test --load-extension=vector --load-extension=$(EXTENSION)
@@ -110,7 +119,12 @@ ifeq (,$(wildcard $(SVS_INSTALL)/lib/libsvs_c_api.so))
 $(error SVS library not found at $(SVS_INSTALL)/lib/libsvs_c_api.so. Run build_svs_public.sh first or set SVS_INSTALL correctly)
 endif
 
-PG_CPPFLAGS += -I$(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
+# -isystem, not -I, for the SVS C API headers: they are a third-party
+# dependency this project does not control, and svs_c.h trips
+# -Wdeclaration-after-statement (part of pg_config's own --cflags). -isystem
+# suppresses warnings from headers found through it, so WERROR=1 in CI is not
+# tripped by someone else's header.
+PG_CPPFLAGS += -isystem $(SVS_INSTALL)/include -I$(shell $(PG_CONFIG) --includedir-server)/extension/vector
 SHLIB_LINK += -L$(SVS_INSTALL)/lib -lsvs_c_api -Wl,-rpath,$(SVS_INSTALL)/lib $(HARDENING_LDFLAGS)
 
 PG_CONFIG ?= pg_config
@@ -133,9 +147,75 @@ endif
 # for Postgres < 15
 PROVE_FLAGS += -I ./test/perl
 
-prove_installcheck:
+# ---------------------------------------------------------------------------
+# Stale-install guard
+#
+# 'installcheck' and 'prove_installcheck' run against whatever is already
+# installed in pkglibdir, not against what was just built: neither target
+# depends on 'install'. That means a tree that fails to build, or one whose
+# source changed since the last 'make install', can still report a full test
+# pass, because the tests never look at the tree. This guard closes that gap
+# by refusing to run either target when the built and installed shlib differ.
+#
+# It deliberately does not add 'install' as a prerequisite: testing an
+# already-installed build is a normal developer workflow, and an implicit
+# install would write into a system directory without being asked.
+# ---------------------------------------------------------------------------
+.PHONY: guard-fresh-install
+guard-fresh-install:
+	@if [ ! -f '$(DESTDIR)$(pkglibdir)/$(shlib)' ]; then \
+		echo "error: $(shlib) is not installed at $(DESTDIR)$(pkglibdir)/$(shlib)."; \
+		echo "  Run 'make install' first."; \
+		exit 1; \
+	fi
+	@if ! cmp -s '$(CURDIR)/$(shlib)' '$(DESTDIR)$(pkglibdir)/$(shlib)'; then \
+		echo "error: built $(CURDIR)/$(shlib) differs from installed $(DESTDIR)$(pkglibdir)/$(shlib)."; \
+		echo "  Run 'make install' to test what was just built."; \
+		exit 1; \
+	fi
+
+installcheck: guard-fresh-install
+
+# ---------------------------------------------------------------------------
+# Hardware-dependent regression tests
+#
+# halfvec_compression.sql and vector_compression.sql build real LeanVec and
+# LVQ compressed indexes via SVS, which require hardware most CI runners
+# lack. Run this target explicitly on hardware that supports it; it is not
+# part of plain 'installcheck'.
+# ---------------------------------------------------------------------------
+.PHONY: installcheck-hw
+installcheck-hw: guard-fresh-install
+	$(MAKE) installcheck REGRESS="$(HW_TESTS)"
+
+# ---------------------------------------------------------------------------
+# Hardening verification (SDL429 evidence)
+#
+# Confirms the protections in HARDENING_CFLAGS/HARDENING_LDFLAGS actually took
+# effect in the built svs.so, using only readelf and nm from binutils, which
+# the build already requires. Checks svs.so only: the SVS C API library it
+# links against is a dependency this project does not build or release.
+# ---------------------------------------------------------------------------
+.PHONY: hardening-check
+SVS_SO ?= $(CURDIR)/$(shlib)
+hardening-check:
+	@sh $(CURDIR)/ci/hardening_check.sh '$(SVS_SO)'
+
+prove_installcheck: guard-fresh-install
 	rm -rf $(CURDIR)/tmp_check
-	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" LD_LIBRARY_PATH="$(shell $(PG_CONFIG) --libdir):$$LD_LIBRARY_PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),test/t/*.pl)
+	cd $(srcdir) && TESTDIR='$(CURDIR)' PATH="$(bindir):$$PATH" LD_LIBRARY_PATH="$(shell $(PG_CONFIG) --libdir):$$LD_LIBRARY_PATH" PGPORT='6$(DEF_PGPORT)' PG_REGRESS='$(top_builddir)/src/test/regress/pg_regress' $(PROVE) $(PG_PROVE_FLAGS) $(PROVE_FLAGS) $(if $(PROVE_TESTS),$(PROVE_TESTS),$(filter-out $(HW_TAP_TESTS),$(wildcard test/t/*.pl)))
+
+# ---------------------------------------------------------------------------
+# Hardware-dependent TAP tests
+#
+# 39_persistence_compression.pl and 44_build_memory_calibration_compression.pl
+# build real LeanVec and LVQ compressed indexes via SVS, which require
+# hardware most CI runners lack. Run this target explicitly on hardware that
+# supports it; it is not part of plain 'prove_installcheck'.
+# ---------------------------------------------------------------------------
+.PHONY: prove_installcheck-hw
+prove_installcheck-hw: guard-fresh-install
+	$(MAKE) prove_installcheck PROVE_TESTS="$(HW_TAP_TESTS)"
 
 # ---------------------------------------------------------------------------
 # Coverage report targets

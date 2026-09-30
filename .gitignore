@@ -20,3 +20,6 @@ coverage_reports/
 
 .vscode/
 .local/
+
+# scratch space for ci/build_and_test.sh; never committed
+/ci/.workdir/
