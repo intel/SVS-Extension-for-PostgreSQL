@@ -96,7 +96,16 @@ step_build_postgres() {
 	fi
 	# CREATE EXTENSION injection_points needs this test module. Neither
 	# install_postgres.sh nor a plain top-level 'make install' builds or
-	# installs src/test/modules; it is specific to our TAP needs.
+	# installs src/test/modules; it is specific to our TAP needs. Its
+	# install lands inside pkglibdir, which is what actions/cache restores
+	# on a warm run; PGSQL_SRC_DIR (the source checkout) is not cached and
+	# will not exist on a cache hit, so skip rebuilding once the module is
+	# already installed rather than unconditionally reaching into a source
+	# tree that may no longer be there.
+	if [ -f "${PGSQL_INSTALL_DIR}/lib/injection_points.so" ]; then
+		echo "found existing injection_points module at ${PGSQL_INSTALL_DIR}/lib, skipping build"
+		return 0
+	fi
 	make -C "${PGSQL_SRC_DIR}/src/test/modules/injection_points"
 	make -C "${PGSQL_SRC_DIR}/src/test/modules/injection_points" install
 }
