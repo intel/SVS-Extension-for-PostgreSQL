@@ -121,14 +121,16 @@ jobs:
 
     # Build only the extension, so this is the compilation CodeQL traces.
     # docs/build_guide/config is the single source of truth for PG_CONFIG and
-    # SVS_INSTALL_DIR; both are passed on the command line because the Makefile
-    # reads them as make variables and config does not export them.
+    # SVS_INSTALL_DIR. PG_CONFIG is exported rather than passed on the command
+    # line, matching build_svs_extension.sh's own convention, so the two don't
+    # drift into different patterns for the same variable.
     - name: Run manual build steps
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
         source docs/build_guide/config
-        make -j"$(nproc)" PG_CONFIG="$PG_CONFIG" SVS_INSTALL="$SVS_INSTALL_DIR"
+        export PG_CONFIG
+        make -j"$(nproc)" SVS_INSTALL="$SVS_INSTALL_DIR"
 
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@v4
