@@ -1,9 +1,9 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 #
-# 49_vamana_slot_consistency_repeat_crash.pl — regression test for is#191
-# (R9): a second crash landing in the fresh, not-yet-consistent slot that the
-# fix's own heap rebuild creates.
+# 49_vamana_slot_consistency_repeat_crash.pl — regression test: a second
+# crash landing in the fresh, not-yet-consistent slot that the fix's own
+# heap rebuild creates.
 #
 # The fix in VamanaWorkerGetOrLoadIndex (src/vamanaworkerindex.c) recovers a
 # crash that landed before the original slot reached CONSISTENT by rebuilding

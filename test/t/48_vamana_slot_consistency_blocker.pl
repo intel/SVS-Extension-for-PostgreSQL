@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 #
-# 48_vamana_slot_consistency_blocker.pl — regression test for is#191 (R9).
+# 48_vamana_slot_consistency_blocker.pl — regression test.
 #
 # VamanaRunningXactsRecordWouldBlock defers slot-consistency-building while
 # any unrelated transaction is in progress (src/vamana_replication.c), so an
@@ -13,8 +13,8 @@
 # The fix in VamanaWorkerGetOrLoadIndex (src/vamanaworkerindex.c) detects a
 # slot that never reached CONSISTENT on the first post-crash load and
 # rebuilds from the heap, recovering every batch regardless of how long the
-# window was open. See
-# ~/workspace/pgv-svs-dev-scripts/docs/r9-fix/phase1-root-cause.md §2.4.
+# window was open. See the comment above VamanaWorkerGetOrLoadIndex in
+# src/vamanaworkerindex.c for the full mechanism.
 
 use strict;
 use warnings FATAL => 'all';
