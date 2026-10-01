@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: PostgreSQL
 
 # 04_bgw_robustness.pl — BGW robustness: cold-cache vacuum, error
-# recovery, save lock, relcache invalidation, index lock slot leak,
-# and stale slot cleanup on BGW restart.
+# recovery, save lock, metapage write failure, relcache invalidation,
+# index lock slot leak, and stale slot cleanup on BGW restart.
 
 use strict;
 use warnings FATAL => 'all';
@@ -516,6 +516,98 @@ SKIP: {
         'worker survives the injected save failure');
 
     $node->stop;
+}
+
+# ===========================================================================
+# Metapage write failure: the release handler must leave interrupts intact
+#
+# VamanaFinishAndReleaseBuffer releases its buffer's content lock from a
+# PG_CATCH, after errfinish() has zeroed InterruptHoldoffCount.  The worker
+# swallows the error and keeps running, so a release that leaves the count
+# unbalanced either trips an assertion or leaves the worker deaf to
+# interrupts.  ProcSignalBarriers are interrupts, and DROP DATABASE waits
+# for every backend to absorb one, so a deaf worker hangs it forever.
+# ===========================================================================
+SKIP: {
+    skip 'server not built with --enable-injection-points', 5
+        if (($ENV{enable_injection_points} // 'no') ne 'yes');
+
+    my $node = PostgreSQL::Test::Cluster->new('vamana_finish_release_error');
+    $node->init;
+    $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
+    $node->append_conf('postgresql.conf', "max_replication_slots = 10");
+    $node->append_conf('postgresql.conf', "max_wal_senders = 10");
+    $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->start;
+    $node->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
+    $node->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    $node->safe_psql('postgres', "CREATE DATABASE finish_release_scratch;");
+    wait_for_worker_db($node, 'postgres', 40);
+
+    $node->safe_psql('postgres', qq(
+        CREATE TABLE finish_err_tbl (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO finish_err_tbl (val)
+            SELECT ARRAY[$array_sql]::vector
+            FROM generate_series(1, 50) i;
+        CREATE INDEX finish_err_idx ON finish_err_tbl USING vamana (val vector_l2_ops);
+    ));
+
+    my $relid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_class WHERE relname = 'finish_err_idx';");
+    chomp $relid;
+
+    # A cold load with the saved copy gone writes the metapage at least once.
+    my $worker_pid = restart_worker($node, 'postgres');
+    remove_tree(vamana_save_dir($node, 'postgres', $relid));
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-finish-release-buffer-error', 'error');");
+    my $log_pos = length($node->log_content());
+    $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM finish_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    like(substr($node->log_content(), $log_pos),
+        qr/error triggered for injection point vamana-finish-release-buffer-error/,
+        'the injected metapage write failure fires in the worker');
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-finish-release-buffer-error');");
+
+    is(wait_for_worker_db($node, 'postgres', 10), $worker_pid,
+        'worker survives the failed metapage write');
+
+    # Fire-and-forget: a barrier wait ignores statement_timeout.
+    my $dropper = $node->background_psql('postgres');
+    my $dropper_pid = $dropper->query('SELECT pg_backend_pid();');
+    chomp $dropper_pid;
+    $dropper->query_until(qr//, "DROP DATABASE finish_release_scratch;\n");
+
+    my $dropped = '';
+    for (1 .. 100) {    # up to 10s
+        usleep(100_000);
+        my $n = $node->safe_psql('postgres',
+            "SELECT count(*) FROM pg_database WHERE datname = 'finish_release_scratch';");
+        if ($n eq '0') { $dropped = 1; last; }
+    }
+    ok($dropped, 'DROP DATABASE completes: the worker still absorbs barriers');
+    if ($dropped) {
+        $dropper->quit;
+    } else {
+        $node->safe_psql('postgres', "SELECT pg_terminate_backend($dropper_pid);");
+    }
+
+    my ($ret, $stdout) = $node->psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT id FROM finish_err_tbl ORDER BY val <-> '[$query_sql]' LIMIT 5;
+    ));
+    ok($ret == 0 && $stdout =~ /^\d+$/m,
+        'the index serves searches once the failure is cleared');
+
+    $node->stop('immediate');
 }
 
 # ===========================================================================
