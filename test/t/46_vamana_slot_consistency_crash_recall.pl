@@ -12,11 +12,12 @@
 # a reload -- logical decoding does not redeliver row-level changes for
 # transactions that committed before CONSISTENT was reached. Round 1 (the
 # first insert right after CREATE INDEX, before the slot has ever reached
-# consistency) reproduced this 11/11 with aggressive checkpoint GUCs. The
-# fix detects a slot that never reached CONSISTENT on the first post-crash
-# load and rebuilds from the heap instead of trusting a replay that cannot
-# recover that window; see the comment above VamanaWorkerGetOrLoadIndex in
-# src/vamanaworkerindex.c for the full mechanism.
+# consistency) exercises exactly this window under aggressive checkpoint
+# GUCs. The fix detects a slot that never reached CONSISTENT on the first
+# post-crash load and rebuilds from the heap instead of trusting a replay
+# that cannot recover that window; see the comment above
+# VamanaWorkerGetOrLoadIndex in src/vamanaworkerindex.c for the full
+# mechanism.
 #
 # This test derives from an earlier checkpoint-durability test's "Repeated
 # crashes" block, which asserted only 0 < distinct <= rows after each round
