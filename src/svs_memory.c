@@ -32,7 +32,7 @@
 #include "svs_memory.h"
 #include "vamanaworker.h"
 
-int			vamana_max_build_memory_mb = 100;
+int			vamana_max_build_memory_mb = 4096;
 int			vamana_max_residency_memory_mb = 100;
 int			vamana_default_residency_memory_mb = 100;
 int			vamana_max_search_work_mem_mb = 100;
