@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "vamana.h"
+#include "vamana_replication.h"
 #include "vamanaworker.h"
 #include "svs_wrapper.h"
 
@@ -69,8 +70,14 @@ LoadIndexFromPages(Relation index)
 		 * Clear stale flag so future reads skip the check.  MAIN_FORKNUM is
 		 * safe here: temp relations are never serialized to vamana_indexes/,
 		 * so this recovery path is unreachable for temp indexes.
+		 *
+		 * A standby cannot write WAL, and the save directory is plain files
+		 * that never replicate, so a replayed flag routinely outlives its
+		 * directory there.  The flag belongs to the primary: leave it, and
+		 * rebuild from the heap like any other missing saved copy.
 		 */
-		VamanaSetHasSavedIndex(index, false, MAIN_FORKNUM);
+		if (VamanaGetReplayRole()->persists_index)
+			VamanaSetHasSavedIndex(index, false, MAIN_FORKNUM);
 		ereport(DEBUG1,
 				(errmsg("vamana index %u: saved directory absent, will rebuild", relid)));
 		return NULL;
