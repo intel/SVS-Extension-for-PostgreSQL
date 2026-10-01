@@ -1,17 +1,12 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 #
-# 45_vamana_slot_consistency_post_consistency_safe.pl -- R9 (is#191) Phase 2 pre-check: once a
+# 45_vamana_slot_consistency_post_consistency_safe.pl -- pre-check: once a
 # vamana index's replication slot has reached its initial CONSISTENT point
 # (confirmed_flush_lsn populated), does a transaction started AFTERWARDS make
-# it unsafe again? Phase 1's report asserted no but did not test it -- Matt
-# asked for this to be confirmed before coding the Option A fix, since the
-# answer changes the fix's scope (if unsafe, detecting "was ever consistent"
-# once at load time is not enough; the fix would need to detect the *current*
-# state each time instead).
-#
-# Session c448081b-a0f1-4b22-9a90-953099db16e5. TAP 55 assigned by
-# sdl03-threat-model-v0.4.
+# it unsafe again? This test confirms it does not: checking once, at load
+# time, whether the slot was ever consistent is enough; the check does
+# not need to re-derive the *current* state on every load.
 
 use strict;
 use warnings FATAL => 'all';

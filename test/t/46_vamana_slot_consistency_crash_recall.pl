@@ -1,9 +1,9 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 46_vamana_slot_consistency_crash_recall.pl — regression test for is#191
-# (R9): three rounds of insert-then-immediate-crash must never permanently
-# drop rows from a vamana index's search results.
+# 46_vamana_slot_consistency_crash_recall.pl — regression test: three rounds
+# of insert-then-immediate-crash must never permanently drop rows from a
+# vamana index's search results.
 #
 # Before the fix in VamanaWorkerGetOrLoadIndex (src/vamanaworkerindex.c): an
 # insert applied through the primary's write-IPC path while the index's
@@ -12,24 +12,24 @@
 # a reload -- logical decoding does not redeliver row-level changes for
 # transactions that committed before CONSISTENT was reached. Round 1 (the
 # first insert right after CREATE INDEX, before the slot has ever reached
-# consistency) reproduced this 11/11 with aggressive checkpoint GUCs; see
-# ~/workspace/pgv-svs-dev-scripts/docs/r9-fix/phase1-root-cause.md for the
-# full investigation. The fix detects a slot that never reached CONSISTENT on
-# the first post-crash load and rebuilds from the heap instead of trusting a
-# replay that cannot recover that window.
+# consistency) exercises exactly this window under aggressive checkpoint
+# GUCs. The fix detects a slot that never reached CONSISTENT on the first
+# post-crash load and rebuilds from the heap instead of trusting a replay
+# that cannot recover that window; see the comment above
+# VamanaWorkerGetOrLoadIndex in src/vamanaworkerindex.c for the full
+# mechanism.
 #
-# Ported from the August SDL 211 WI153 evidence tree
-# (~/workspace/pgvector-sdl211-wi153-durable-rename/test/t/12_vamana_checkpoint_durability.pl,
-# "Repeated crashes" block). That test asserted only
-# 0 < distinct <= rows after each round and never polled for replay to
-# converge. This version polls the index count for up to 60s per round before
-# judging it, and records the set of missing ids so a real defect and a
-# "replay not caught up yet" false alarm are distinguishable.
+# This test derives from an earlier checkpoint-durability test's "Repeated
+# crashes" block, which asserted only 0 < distinct <= rows after each round
+# and never polled for replay to converge. This version polls the index
+# count for up to 60s per round before judging it, and records the set of
+# missing ids so a real defect and a "replay not caught up yet" false alarm
+# are distinguishable.
 #
-# GUC/layout differences from the August tree: svs.worker_database was
-# removed; enrollment is now via svs.launcher_database (default 'postgres')
-# plus an INSERT into vamana_databases. The save path also moved from
-# vamana_indexes/<relid>/ to vamana_indexes/<dboid>/<relid>/.
+# svs.worker_database was removed; enrollment is now via
+# svs.launcher_database (default 'postgres') plus an INSERT into
+# vamana_databases. The save path also moved from vamana_indexes/<relid>/
+# to vamana_indexes/<dboid>/<relid>/.
 
 use strict;
 use warnings FATAL => 'all';

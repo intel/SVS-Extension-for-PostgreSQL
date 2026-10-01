@@ -1,22 +1,23 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 #
-# 47_vamana_slot_consistency_guc_variants.pl — regression test for is#191
-# (R9): confirms the fix in VamanaWorkerGetOrLoadIndex (src/vamanaworkerindex.c)
-# holds at default checkpoint GUCs, not just under the aggressive settings
+# 47_vamana_slot_consistency_guc_variants.pl — regression test: confirms the
+# fix in VamanaWorkerGetOrLoadIndex (src/vamanaworkerindex.c) holds at
+# default checkpoint GUCs, not just under the aggressive settings
 # 46_vamana_slot_consistency_crash_recall.pl uses. Before the fix, a crash
 # right after an insert lost rows even with svs.checkpoint_min_ops at its
 # default of 10000 and svs.checkpoint_debounce_window at its default of 300s
 # -- i.e. with zero checkpoint activity of any kind, because the loss is
 # caused by the index's replication slot not yet having reached its initial
-# CONSISTENT point, not by anything checkpoint-related. See
-# ~/workspace/pgv-svs-dev-scripts/docs/r9-fix/phase1-root-cause.md §1/§2.
+# CONSISTENT point, not by anything checkpoint-related. See the comment
+# above VamanaWorkerGetOrLoadIndex in src/vamanaworkerindex.c for the full
+# mechanism.
 #
 # D1: true defaults, insert 5 rows, crash immediately (no wait).
 # D2: checkpoint_debounce_window=1 alone (min_ops stays default 10000):
-#     insert 5 rows, wait past the 1s debounce, crash. (Fixed from Phase 1's
-#     draft, which used 10005 rows and blew past the default ~100-row search
-#     window, making its own assertions unable to detect loss.)
+#     insert 5 rows, wait past the 1s debounce, crash. Uses 5 rows, not a
+#     count near the default ~100-row search window, so the assertions
+#     can actually detect loss.
 # D3: checkpoint_min_ops=1 alone (debounce stays default 300s): insert 5
 #     rows, crash immediately (no wait).
 

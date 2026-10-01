@@ -180,10 +180,10 @@ FinalizeIndexCacheEntry(Relation indexRel, Oid relid)
  *
  * A disk load whose replication slot never reached its initial CONSISTENT
  * point is silently promoted to a heap rebuild internally, regardless of
- * whether the caller passed loadedFromDisk (is#191/R9) -- see the comment
- * where this is checked, below.  loadedFromDisk still reports what actually
- * happened: false after that promotion, since the caller ends up with a
- * rebuilt handle.
+ * whether the caller passed loadedFromDisk -- see the comment where this is
+ * checked, below.  loadedFromDisk still reports what actually happened:
+ * false after that promotion, since the caller ends up with a rebuilt
+ * handle.
  *
  * When propagateResidencyRefusal is true, a residency-budget refusal
  * (ERRCODE_OUT_OF_MEMORY) is re-thrown rather than swallowed; the
@@ -503,8 +503,8 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateReside
 	{
 		/*
 		 * A slot that never reached its initial CONSISTENT point cannot be
-		 * trusted for the one-time post-load drain its caller is about to run
-		 * (is#191/R9): a live primary applies inserts to the graph through a
+		 * trusted for the one-time post-load drain its caller is about to
+		 * run: a live primary applies inserts to the graph through a
 		 * synchronous write-IPC path, not through slot decode, so a slot
 		 * sitting short of CONSISTENT is invisible right up until a crash
 		 * forces the reload this function just performed.  Logical decoding
