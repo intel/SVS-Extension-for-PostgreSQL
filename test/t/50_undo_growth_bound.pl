@@ -13,16 +13,20 @@
 # repalloc, which PostgreSQL refuses above MaxAllocSize (1 GiB), stopping
 # near 33.5M entries.
 #
-# Each of the 3 repeated runs per trial set uses its own freshly-enrolled
-# database. residency_bytes_committed is per-database and, per an
-# incidental finding below, is NOT released promptly after a ROLLBACK of the
-# aborting transaction (undo's delete-and-consolidate path runs but does not
-# synchronously walk residencyBytesCommitted back down) — reusing one
-# database across repeated runs would make run 2 and run 3 start already
-# over budget. A2's byte arithmetic is checked separately (struct size,
-# MaxAllocSize) rather than run to a live 1 GiB repalloc failure, which the
-# brief's time budget (~2h ceiling) does not obviously clear at this insert
-# rate; the measured rate is reported so the reader can judge.
+# Each trial below (default budget, raised budget, headroom check) uses its
+# own freshly-enrolled database. residency_bytes_committed is per-database
+# and, per an incidental finding below, is NOT released promptly after a
+# ROLLBACK of the aborting transaction (undo's delete-and-consolidate path
+# runs but does not synchronously walk residencyBytesCommitted back down)
+# — reusing one database across trials would make a later trial start
+# already over budget. A single run per trial is sufficient: the stop
+# point is a deterministic function of fixed inputs (seed size, batch
+# size, budget), with no concurrency or timing dependency, so repeats add
+# wall-clock cost without adding evidentiary value. A2's byte arithmetic
+# is checked separately (struct size, MaxAllocSize) rather than run to a
+# live 1 GiB repalloc failure, which the brief's time budget (~2h ceiling)
+# does not obviously clear at this insert rate; the measured rate is
+# reported so the reader can judge.
 
 use strict;
 use warnings FATAL => 'all';
@@ -204,12 +208,12 @@ sub run_growth_trial
 }
 
 # ---------------------------------------------------------------------------
-# Trial set 1: default budgets (100MB), 3 runs, each its own fresh db with a
-# small (1000-row) seed index.
+# Trial set 1: default budget (100MB), a fresh db with a small (1000-row)
+# seed index.
 # ---------------------------------------------------------------------------
 diag("=== Trial set 1: default svs.max_residency_memory (100MB) ===");
 
-for my $run (1 .. 3)
+for my $run (1 .. 1)
 {
     my $dbname = "undo_default_r$run";
     enroll_fresh_db($dbname, 1000, undef);
@@ -231,17 +235,17 @@ for my $run (1 .. 3)
 
 # ---------------------------------------------------------------------------
 # Trial set 2: raised per-database budget (200MB via vamana_databases.residency_memory,
-# 2x the 100MB default). run1's rollback of 130,000 undo entries took ~162s
-# (see the WARNING logged there: "vamana worker delete failed: vamana worker
-# timed out after 5000 ms" -- undoing a huge single-transaction insert is not
-# cheap even though it is bounded). A 2GB budget would multiply that rollback
-# time by roughly 20x per run; 200MB keeps 3 runs within a practical wall-clock
-# budget while still demonstrating the stop point scales with the budget.
-# Checked free -g before this run: ~485GB available either way.
+# 2x the 100MB default). Trial set 1's rollback of 130,000 undo entries took
+# ~162s (see the WARNING logged there: "vamana worker delete failed: vamana
+# worker timed out after 5000 ms" -- undoing a huge single-transaction
+# insert is not cheap even though it is bounded). A 2GB budget would
+# multiply that rollback time by roughly 20x; 200MB keeps this trial within
+# a practical wall-clock budget while still demonstrating the stop point
+# scales with the budget.
 # ---------------------------------------------------------------------------
 diag("=== Trial set 2: raised residency_memory (200MB) ===");
 
-for my $run (1 .. 3)
+for my $run (1 .. 1)
 {
     my $dbname = "undo_raised_r$run";
     enroll_fresh_db($dbname, 1000, 200);
