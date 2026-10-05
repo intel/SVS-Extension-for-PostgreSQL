@@ -125,12 +125,12 @@ jobs:
         # dependency trees. None of this is our source (confirmed: none of it
         # is in `git ls-files`), so findings in someone else's vendored code
         # are excluded rather than triaged.
-        paths-ignore:
-          - docs/build_guide/postgres
-          - docs/build_guide/pgsql_install
-          - docs/build_guide/ScalableVectorSearch
-          - docs/build_guide/svs_install
-          - docs/build_guide/pgvector-vanilla
+        paths-ignore: |
+          docs/build_guide/postgres
+          docs/build_guide/pgsql_install
+          docs/build_guide/ScalableVectorSearch
+          docs/build_guide/svs_install
+          docs/build_guide/pgvector-vanilla
 
     # Build only the extension, so this is the compilation CodeQL traces.
     # docs/build_guide/config is the single source of truth for PG_CONFIG and
