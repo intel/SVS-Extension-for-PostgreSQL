@@ -434,10 +434,18 @@ VamanaFinishAndReleaseBuffer(GenericXLogState *state, Buffer buf)
 {
 	PG_TRY();
 	{
+		/* Test hook: TAP forces a failure that lands in the handler below. */
+		INJECTION_POINT("vamana-finish-release-buffer-error", NULL);
 		GenericXLogFinish(state);
 	}
 	PG_CATCH();
 	{
+		/*
+		 * errfinish() zeroed InterruptHoldoffCount, including the hold the
+		 * content lock's acquisition took.  Re-take it so the lock release's
+		 * RESUME_INTERRUPTS() has one to consume, as LWLockReleaseAll() does.
+		 */
+		HOLD_INTERRUPTS();
 		UnlockReleaseBuffer(buf);
 		PG_RE_THROW();
 	}

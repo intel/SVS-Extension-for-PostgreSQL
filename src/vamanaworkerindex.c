@@ -519,6 +519,10 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateReside
 		 * first insert into an empty-table index, a standby, and the rebuild
 		 * this very check can trigger all create a fresh slot with its own
 		 * new consistency window, and a later crash can land in any of them.
+		 * A standby needs the check on its very first load, crash or not: it
+		 * creates its slot only at load, after every row committed since the
+		 * saved copy was written, so draining that slot would never deliver
+		 * those rows either.
 		 * Reaching CONSISTENT is a one-way ratchet per slot (confirmed by
 		 * test/t/45_vamana_slot_consistency_post_consistency_safe.pl), so nothing needs to
 		 * re-check a slot once it has passed this once.
