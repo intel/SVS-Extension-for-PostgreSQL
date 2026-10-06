@@ -43,7 +43,7 @@ SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <-> (SELECT NULL::halfvec)) t
 SELECT COUNT(*) FROM t;
  count 
 -------
-     0
+     5
 (1 row)
 
 TRUNCATE t;

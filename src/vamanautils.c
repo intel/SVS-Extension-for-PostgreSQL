@@ -29,6 +29,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -435,6 +436,24 @@ vamanacostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 				   double *indexPages)
 {
 	GenericCosts costs;
+
+	/*
+	 * A vamana scan with no ORDER BY has no query vector to search with, so
+	 * vamanagettuple cannot return real results (see its own guard). Make
+	 * such a path look infinitely expensive so the planner never prefers it
+	 * over a seqscan, mirroring pgvector's hnswcostestimate/ivfflatcostestimate.
+	 */
+	if (path->indexorderbys == NIL)
+	{
+		*indexStartupCost = get_float8_infinity();
+		*indexTotalCost = get_float8_infinity();
+		*indexSelectivity = 0;
+		*indexCorrelation = 0;
+		*indexPages = 0;
+		/* See "On disable_cost" thread on pgsql-hackers. */
+		path->path.disabled_nodes = 2;
+		return;
+	}
 
 	MemSet(&costs, 0, sizeof(costs));
 	genericcostestimate(root, path, loop_count, &costs);
