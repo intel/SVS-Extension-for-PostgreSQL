@@ -1,0 +1,152 @@
+name: Assert build
+
+# Periodic, non-blocking coverage with assertions enabled. This never runs on
+# pull_request or push and must never become a required status check: it is
+# deliberately lenient about one specific, already-known assertion trap (see
+# the classify step below), so a red run here means something new, not a
+# merge-blocking regression.
+on:
+  schedule:
+    - cron: "0 7 * * 1" # weekly, Monday 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# docs/build_guide/config is the single source of truth for PG_CONFIG,
+# SVS_INSTALL_DIR and every other dependency install path; nothing here
+# overrides them.
+
+jobs:
+  assert-build:
+    runs-on: ubuntu-24.04
+    env:
+      CC: gcc
+      CXX: g++
+      # --enable-cassert turns on every Assert() in the tree; the extra
+      # --enable-debug plus a debug-friendly CFLAGS make a trapped assertion
+      # easier to read in the uploaded logs. This value differs from the
+      # regular build-and-test.yml job's PG_CONFIGURE_EXTRA_ARGS, so the
+      # cache key below produces a separate cache entry rather than reusing
+      # (or clobbering) that job's non-assert install.
+      PG_CONFIGURE_EXTRA_ARGS: "--enable-debug --enable-cassert --enable-injection-points --enable-tap-tests"
+      CFLAGS: "-Og -g3 -fno-omit-frame-pointer"
+      # Same pin build-and-test.yml uses, so a warm SVS cache can be shared
+      # between the two jobs; see ci/build_and_test.sh's own comment on why
+      # SVS_BRANCH=main can drift ahead of this tarball's bindings/c API.
+      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PostgreSQL install (assert build)
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/pgsql_install
+          key: pg-assert-${{ runner.os }}-ubuntu-24.04-${{ env.CC }}-${{ env.PG_CONFIGURE_EXTRA_ARGS }}-${{ env.CFLAGS }}-v1
+
+      - name: Cache SVS install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/svs_install
+          key: svs-ubuntu-24.04-${{ env.CC }}-${{ env.SVS_URL }}-v1
+
+      - name: build-postgres
+        run: ci/build_and_test.sh build-postgres
+
+      - name: build-svs
+        run: ci/build_and_test.sh build-svs
+
+      - name: build-pgvector
+        run: ci/build_and_test.sh build-pgvector
+
+      - name: build-extension
+        run: ci/build_and_test.sh build-extension
+
+      - name: build-modules
+        run: ci/build_and_test.sh build-modules
+
+      # A build/config problem here is a different kind of failure than
+      # anything the test suites would report, and would otherwise be
+      # buried under a page of resulting test noise; fail fast and clearly
+      # instead.
+      - name: canary - assert-enabled server starts cleanly
+        run: |
+          set -euo pipefail
+          source docs/build_guide/config
+          CANARY_DIR="$(mktemp -d)"
+          "${PGSQL_INSTALL_DIR}/bin/initdb" -D "${CANARY_DIR}/data" -U postgres -A trust
+          cp ci/test_server.conf "${CANARY_DIR}/data/postgresql.conf"
+          "${PGSQL_INSTALL_DIR}/bin/pg_ctl" -D "${CANARY_DIR}/data" -l "${CANARY_DIR}/pg.log" -o "-p 55433" -w start || {
+            echo "::error::canary server failed to start with svs in shared_preload_libraries"
+            cat "${CANARY_DIR}/pg.log"
+            exit 1
+          }
+          ASSERTIONS_ON="$("${PGSQL_INSTALL_DIR}/bin/psql" -p 55433 -U postgres -h localhost -tA -c 'SHOW debug_assertions;')"
+          "${PGSQL_INSTALL_DIR}/bin/psql" -p 55433 -U postgres -h localhost -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION injection_points;' postgres
+          "${PGSQL_INSTALL_DIR}/bin/pg_ctl" -D "${CANARY_DIR}/data" -m immediate stop
+          if [[ "${ASSERTIONS_ON}" != "on" ]]; then
+            echo "::error::debug_assertions reported '${ASSERTIONS_ON}', not 'on' -- this is not actually an assert-enabled build"
+            exit 1
+          fi
+          echo "canary ok: server started, debug_assertions=on, injection_points created"
+          {
+            echo "CANARY_DEBUG_ASSERTIONS=${ASSERTIONS_ON}"
+          } >> "${GITHUB_ENV}"
+
+      - name: test-sql
+        id: test_sql
+        run: |
+          set +e
+          ci/build_and_test.sh test-sql
+          echo "exit_code=$?" >> "${GITHUB_OUTPUT}"
+
+      - name: test-tap
+        id: test_tap
+        env:
+          PROVE_FLAGS: -j2
+        run: |
+          set +e
+          ci/build_and_test.sh test-tap > /tmp/tap-output.log 2>&1
+          echo "exit_code=$?" >> "${GITHUB_OUTPUT}"
+          cat /tmp/tap-output.log
+
+      - name: classify assertion traps and crashes
+        run: |
+          set +e -o pipefail
+          ci/classify_assert_results.sh \
+            "${{ steps.test_sql.outputs.exit_code }}" ci/.workdir/postgres.log \
+            "${{ steps.test_tap.outputs.exit_code }}" /tmp/tap-output.log log \
+            | tee /tmp/classification.txt
+          classify_rc="${PIPESTATUS[0]}"
+          pg_version="$(docs/build_guide/pgsql_install/bin/pg_config --version 2>/dev/null || echo unknown)"
+          configure_flags="$(docs/build_guide/pgsql_install/bin/pg_config --configure 2>/dev/null || echo unknown)"
+          {
+            echo "## Assert-build summary"
+            echo
+            echo "- PostgreSQL: ${pg_version}"
+            echo "- Configure flags: ${configure_flags}"
+            echo "- Extension git SHA: \`${GITHUB_SHA}\`"
+            echo "- SVS library: \`${SVS_URL}\`"
+            echo "- Canary: debug_assertions=${CANARY_DEBUG_ASSERTIONS:-unknown}, injection_points extension created ok"
+            echo
+            echo '```'
+            cat /tmp/classification.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          exit "${classify_rc}"
+
+      - name: Upload full logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: assert-build-logs
+          path: |
+            ci/.workdir/postgres.log
+            /tmp/tap-output.log
+            regression.diffs
+            regression.out
+            results/
+            log/
+            tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 14
