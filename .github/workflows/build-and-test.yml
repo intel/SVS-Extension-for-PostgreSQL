@@ -30,10 +30,19 @@ jobs:
             cxx: g++
             pg_version: REL_18_1
             run_tap: true
+          - runner: ubuntu-24.04
+            cc: gcc
+            cxx: g++
+            pg_version: REL_17_0
+            run_tap: true
     runs-on: ${{ matrix.runner }}
     env:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
+      # Threaded through to docs/build_guide/config, which only honors this
+      # as an override (PGSQL_VERSION=${PGSQL_VERSION:-REL_18_1}); without
+      # exporting it here every matrix leg would silently build REL_18_1.
+      PGSQL_VERSION: ${{ matrix.pg_version }}
       # This job needs TAP support and injection points for its own test
       # suites, unlike codeql.yml's build (which never runs tests); baking
       # the flags into the cache key below means a flag change invalidates
@@ -104,7 +113,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.runner }}
+          name: test-results-${{ matrix.runner }}-${{ matrix.pg_version }}
           path: |
             regression.diffs
             regression.out
