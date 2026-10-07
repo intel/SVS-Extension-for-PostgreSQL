@@ -111,7 +111,7 @@ ShouldCheckpoint(VamanaIndexCache *cache)
 bool
 PerformCheckpoint(VamanaIndexCache *cache)
 {
-	Relation	indexRel;
+	Relation volatile indexRel;
 	XLogRecPtr	checkpoint_lsn;
 	bool		slotAdvanced;
 
