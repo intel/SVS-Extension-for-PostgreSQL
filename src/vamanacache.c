@@ -260,7 +260,7 @@ VamanaCacheIndex(Oid indexRelid, SVSIndexHandle svsIndex, int dimensions,
 
 		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 		entry->tidToExternalId = hash_create("vamana tidToExternalId",
-											 capacity > 0 ? capacity : 64,
+											 capacity,
 											 &hctl,
 											 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		MemoryContextSwitchTo(oldCtx);

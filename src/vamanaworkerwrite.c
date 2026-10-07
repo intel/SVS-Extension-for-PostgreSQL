@@ -284,6 +284,156 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
 }
 
 /*
+ * The query vector and heap_tid are already in the slot.  Allocate the next
+ * external ID from the cached nextExternalId, then call SVSAddPoints.
+ */
+static void
+VamanaWorkerExecuteInsertSlot(int slotIdx, SVSIndexHandle index, VamanaIndexCache *cache)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Oid			relid = slot->indexRelid;
+	size_t		externalId;
+	int			added;
+	float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
+
+	if (cache == NULL)
+		ereport(ERROR,
+				(errmsg("vamana worker: no cache entry for insert on index %u",
+						relid)));
+
+	externalId = (size_t) cache->nextExternalId;
+	added = SVSAddPoints(index, vec, &externalId, 1);
+
+	if (added <= 0)
+		ereport(ERROR,
+				(errmsg("vamana worker: SVSAddPoints failed for index %u",
+						relid)));
+
+	cache->residentBytes = SVSGetIndexMemoryUsage(index);
+	SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes);
+
+	/* Grow tidMapping if needed. */
+	if ((int) externalId >= cache->tidMappingCapacity)
+	{
+		int			newCap = cache->tidMappingCapacity > 0 ?
+			cache->tidMappingCapacity * 2 : 1024;
+		MemoryContext oldCtx;
+
+		if (newCap <= (int) externalId)
+			newCap = (int) externalId + 1;
+
+		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+		cache->tidMapping = repalloc(cache->tidMapping,
+									 (Size) newCap * sizeof(ItemPointerData));
+		MemSet(cache->tidMapping + cache->tidMappingCapacity, 0,
+			   (Size) (newCap - cache->tidMappingCapacity) *
+			   sizeof(ItemPointerData));
+		MemoryContextSwitchTo(oldCtx);
+		cache->tidMappingCapacity = newCap;
+	}
+
+	ItemPointerCopy(&slot->writeHeapTid,
+					&cache->tidMapping[externalId]);
+
+	/* Keep reverse hash in sync. */
+	if (cache->tidToExternalId != NULL)
+	{
+		bool	found;
+		uint64	eid = (uint64) externalId;
+		char   *hentry = (char *) hash_search(
+			cache->tidToExternalId,
+			&slot->writeHeapTid,
+			HASH_ENTER,
+			&found);
+
+		if (!found)
+			memcpy(hentry + sizeof(ItemPointerData),
+				   &eid, sizeof(uint64));
+	}
+
+	cache->nextExternalId = externalId + 1;
+	cache->numVectors++;
+	/* Return the allocated external ID to the backend. */
+	slot->writeExternalId = (uint64) externalId;
+	slot->writeSlotCreated = false;
+
+	VamanaWorkerPersistMetaCounters(relid, cache);
+
+	slot->numResults = 1;
+}
+
+/*
+ * The backend wrote the count of IDs into slot->numResults and packed the
+ * size_t IDs into the query-vector buffer (reused for input; float[] is
+ * naturally aligned for size_t).
+ */
+static void
+VamanaWorkerExecuteDeleteSlot(int slotIdx, SVSIndexHandle index, VamanaIndexCache *cache)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Oid			relid = slot->indexRelid;
+	int			nIds = slot->numResults;
+	size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
+	int			deleted;
+
+	deleted = SVSDeletePoints(index, ids, nIds);
+
+	if (deleted < 0)
+		ereport(ERROR,
+				(errmsg("vamana worker: SVSDeletePoints failed for index %u",
+						relid)));
+
+	if (cache != NULL)
+	{
+		for (int i = 0; i < nIds; i++)
+			VamanaCacheForgetExternalId(cache, ids[i]);
+
+		cache->numDeleted += deleted;
+		cache->numVectors = (cache->numVectors > deleted) ?
+			cache->numVectors - deleted : 0;
+
+		VamanaWorkerPersistMetaCounters(relid, cache);
+	}
+
+	slot->numResults = deleted;
+}
+
+/*
+ * Runs the requested maintenance op (consolidate frees deleted slots inside
+ * SVS's own storage; compact additionally reclaims the index's resident
+ * memory, so it also resets this cache's deleted count and resident-bytes
+ * estimate).
+ */
+static void
+VamanaWorkerExecuteMaintenanceSlot(int slotIdx, SVSIndexHandle index, VamanaIndexCache *cache)
+{
+	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
+	Oid			relid = slot->indexRelid;
+
+	if (slot->maintenanceOp == VAMANA_MAINTENANCE_CONSOLIDATE)
+	{
+		if (!SVSConsolidate(index))
+			ereport(ERROR,
+					(errmsg("vamana worker: SVSConsolidate failed for index %u",
+							relid)));
+	}
+	else if (slot->maintenanceOp == VAMANA_MAINTENANCE_COMPACT)
+	{
+		if (!SVSCompact(index, 0))
+			ereport(ERROR,
+					(errmsg("vamana worker: SVSCompact failed for index %u",
+							relid)));
+		if (cache != NULL)
+		{
+			cache->numDeleted = 0;
+			cache->residentBytes = SVSGetIndexMemoryUsage(index);
+		}
+	}
+
+	slot->numResults = 0;
+}
+
+/*
  * Resolve the index and run the requested write, holding the per-index
  * LW_EXCLUSIVE lock across the INSERT/DELETE/MAINTENANCE paths.  Every failure
  * throws; the caller's guard releases all locks and converts it to a slot
@@ -420,64 +570,12 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 			}
 
 		case VAMANA_SLOTKIND_DELETE:
-			{
-				/*
-				 * The backend wrote the count of IDs into slot->numResults and
-				 * packed the size_t IDs into the query-vector buffer (reused for
-				 * input; float[] is naturally aligned for size_t).
-				 */
-				int			nIds = slot->numResults;
-				size_t	   *ids = (size_t *) VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
-				int			deleted;
-
-				deleted = SVSDeletePoints(index, ids, nIds);
-
-				if (deleted < 0)
-					ereport(ERROR,
-							(errmsg("vamana worker: SVSDeletePoints failed for index %u",
-									relid)));
-
-				if (cache != NULL)
-				{
-					for (int i = 0; i < nIds; i++)
-						VamanaCacheForgetExternalId(cache, ids[i]);
-
-					cache->numDeleted += deleted;
-					cache->numVectors = (cache->numVectors > deleted) ?
-						cache->numVectors - deleted : 0;
-
-					VamanaWorkerPersistMetaCounters(relid, cache);
-				}
-
-				slot->numResults = deleted;
-				break;
-			}
+			VamanaWorkerExecuteDeleteSlot(slotIdx, index, cache);
+			break;
 
 		case VAMANA_SLOTKIND_MAINTENANCE:
-			{
-				if (slot->maintenanceOp == VAMANA_MAINTENANCE_CONSOLIDATE)
-				{
-					if (!SVSConsolidate(index))
-						ereport(ERROR,
-								(errmsg("vamana worker: SVSConsolidate failed for index %u",
-										relid)));
-				}
-				else if (slot->maintenanceOp == VAMANA_MAINTENANCE_COMPACT)
-				{
-					if (!SVSCompact(index, 0))
-						ereport(ERROR,
-								(errmsg("vamana worker: SVSCompact failed for index %u",
-										relid)));
-					if (cache != NULL)
-					{
-						cache->numDeleted = 0;
-						cache->residentBytes = SVSGetIndexMemoryUsage(index);
-					}
-				}
-
-				slot->numResults = 0;
-				break;
-			}
+			VamanaWorkerExecuteMaintenanceSlot(slotIdx, index, cache);
+			break;
 
 		default:
 			ereport(ERROR,
