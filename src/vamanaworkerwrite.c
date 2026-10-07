@@ -258,6 +258,14 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
 	/* Seed vector is already indexed by the build; no external ID to return. */
 	slot->writeExternalId = 0;
 
+	/*
+	 * This path builds the whole index from this one row; an abort must
+	 * never refund it as if it were ordinary insert growth into an
+	 * already-resident graph.
+	 */
+	slot->writeGrowthBytes = 0;
+	slot->writeResidentGeneration = 0;
+
 	slot->writeSlotCreated = (cache->replicationSlot == NULL);
 	if (slot->writeSlotCreated)
 	{
@@ -356,7 +364,9 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 									relid)));
 
 				cache->residentBytes = SVSGetIndexMemoryUsage(index);
-				SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes);
+				SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes,
+										 &slot->writeGrowthBytes,
+										 &slot->writeResidentGeneration);
 
 				/* Grow tidMapping if needed. */
 				if ((int) externalId >= cache->tidMappingCapacity)

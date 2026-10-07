@@ -1980,7 +1980,8 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 bool
 VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						 int dimensions, ItemPointer heap_tid,
-						 uint64 *externalId_out, bool *slotCreated_out)
+						 uint64 *externalId_out, bool *slotCreated_out,
+						 uint64 *growthBytes_out, uint32 *generation_out)
 {
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
@@ -2023,6 +2024,8 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 	pg_read_barrier();
 	*externalId_out = slot->writeExternalId;
 	*slotCreated_out = slot->writeSlotCreated;
+	*growthBytes_out = slot->writeGrowthBytes;
+	*generation_out = slot->writeResidentGeneration;
 	return true;
 }
 
