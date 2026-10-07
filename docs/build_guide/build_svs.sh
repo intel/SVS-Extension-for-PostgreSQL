@@ -10,6 +10,12 @@ else
     git clone --recurse-submodules --branch "$SVS_BRANCH" "$SVS_REPO" "$SVS_SRC_DIR"
 fi
 
+# SVS_COMMIT pins bindings/c to the exact commit SVS_URL's tarball was built
+# from, overriding SVS_BRANCH's floating tip so the two can't drift apart.
+if [[ -n "$SVS_COMMIT" ]]; then
+    (cd "$SVS_SRC_DIR" && git checkout "$SVS_COMMIT" && git submodule update --init --recursive)
+fi
+
 # Configure from scratch. SVS_URL is a CACHE STRING and the fetched tree
 # persists in _deps/svs-src, so a stale cache would keep the previous SVS_URL
 # (and its archive) even after you change it, making the change look like it
