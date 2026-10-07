@@ -19,7 +19,7 @@ A PostgreSQL extension that adds the **Vamana** approximate nearest neighbor (AN
 
 | Dependency | Version |
 |---|---|
-| PostgreSQL | 17+ |
+| PostgreSQL | 18.1+ |
 | pgvector extension | latest |
 | Intel SVS C API (`libsvs_c_api.so`) | see [build guide](docs/build_guide/README.md) |
 | GCC | 11+ |
