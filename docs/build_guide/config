@@ -6,7 +6,7 @@ BASE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Set PG_CONFIG to an existing pg_config binary to skip building PostgreSQL.
 # If PG_CONFIG is unset, install_postgres.sh will build it from source.
 PGSQL_REPO=https://github.com/postgres/postgres.git
-PGSQL_VERSION=${PGSQL_VERSION:-REL_18_1}
+PGSQL_VERSION=REL_18_1
 PGSQL_SRC_DIR=${BASE_DIR}/postgres
 PGSQL_INSTALL_DIR=${BASE_DIR}/pgsql_install
 PG_CONFIG=${PGSQL_INSTALL_DIR}/bin/pg_config
