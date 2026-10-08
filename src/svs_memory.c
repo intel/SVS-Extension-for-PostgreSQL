@@ -583,6 +583,18 @@ SvsMemoryCheckEstimatedBuildSize(double reltuples, int dimensions)
 						   (unsigned long long) BuildMemoryCeilingBytes())));
 }
 
+void
+SvsMemoryCheckGrowthSize(uint64 requestedBytes)
+{
+	if (requestedBytes > BuildMemoryCeilingBytes())
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("build buffer growth exceeds svs.max_build_memory"),
+				 errdetail("Requested %llu bytes against the %llu byte ceiling.",
+						   (unsigned long long) requestedBytes,
+						   (unsigned long long) BuildMemoryCeilingBytes())));
+}
+
 bool
 SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredResidencyBytes)
 {
