@@ -10,6 +10,46 @@
 #include "access/htup.h"
 #include "storage/itemptr.h"
 
+/*
+ * Trusted-caller buffer-sizing contracts
+ *
+ * Functions in this header pass raw pointers to the SVS C API. The SVS library
+ * does not bounds-check these buffers; callers MUST satisfy the sizing
+ * invariants below. Violation causes out-of-bounds reads/writes in the
+ * background worker address space.
+ *
+ * Input buffers:
+ *   SVSSearch(query, dimensions, ...)
+ *       query: dimensions * sizeof(float) bytes.
+ *
+ *   SVSBatchSearch(queryData, numQueries, dimensions, ...)
+ *       queryData: numQueries * dimensions * sizeof(float) bytes.
+ *
+ *   SVSAddPoints(points, ids, num_vectors)
+ *       points: num_vectors * dimensions * sizeof(float) bytes.
+ *       ids:    num_vectors * sizeof(size_t) bytes.
+ *
+ *   SVSBuildDynamicIndex(builder, data, ids, num_vectors, graph_degree, dimensions, ...)
+ *       data: num_vectors * dimensions * sizeof(float) bytes, where dimensions
+ *             is the caller-supplied parameter (not inferred from builder).
+ *       ids:  num_vectors * sizeof(size_t) bytes.
+ *
+ *   SVSDeletePoints(ids, num_ids)
+ *       ids: num_ids * sizeof(size_t) bytes.
+ *
+ * Output buffers (caller-allocated):
+ *   SVSSearch:      results[k], distances[k].
+ *   SVSBatchSearch: results[numQueries * k], distances[numQueries * k],
+ *                   numResultsPerQuery[numQueries] (if non-NULL).
+ *
+ * Error handling - CheckSVSError (defined in svs_wrapper.c):
+ *   Unconditionally calls ereport(ERROR) when the SVS error handle indicates
+ *   failure. It never returns to the caller on error. The svs_error_free()
+ *   calls that follow CheckSVSError in each call site are success-path cleanup
+ *   only; they are unreachable on the error path because ereport(ERROR) unwinds
+ *   via longjmp.
+ */
+
 typedef void *SVSIndexHandle;
 typedef void *SVSAlgorithmHandle;
 typedef void *SVSStorageHandle;
