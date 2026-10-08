@@ -51,6 +51,8 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	int			dim;
 	uint64		externalId;
 	bool		slotCreated;
+	uint64		growthBytes;
+	uint32		generation;
 
 	if (isnull[0])
 		return false;
@@ -67,11 +69,11 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 						dim, TupleDescAttr(index->rd_att, 0)->atttypmod)));
 
 	{
-		uint64		growthBytes = VamanaEstimateInsertGrowthBytes(dim,
-																	typeInfo->elementSize,
-																	VamanaGetGraphDegree(index));
+		uint64		growthEstimateBytes = VamanaEstimateInsertGrowthBytes(dim,
+																			typeInfo->elementSize,
+																			VamanaGetGraphDegree(index));
 
-		if (!SvsMemoryReserveInsert(MyDatabaseId, relid, growthBytes))
+		if (!SvsMemoryReserveInsert(MyDatabaseId, relid, growthEstimateBytes))
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("insert into index \"%s\" would exceed its database's residency budget",
@@ -82,7 +84,8 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 		PG_TRY();
 		{
 			VamanaWorkerSubmitInsert(relid, floats, dim, heap_tid,
-									 &externalId, &slotCreated);
+									 &externalId, &slotCreated,
+									 &growthBytes, &generation);
 		}
 		PG_CATCH();
 		{
@@ -94,8 +97,13 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 
 	pfree(floats);
 
-	/* Record (relid, externalId) so we can roll back on transaction abort. */
-	VamanaUndoAppend(relid, externalId);
+	/*
+	 * Record (relid, externalId), plus how much raw memory this insert's
+	 * apply grew the graph by and which measured generation that growth
+	 * belongs to, so a later ROLLBACK can credit exactly this growth back
+	 * as reclaimable rather than leaving it stranded against the budget.
+	 */
+	VamanaUndoAppend(relid, externalId, growthBytes, generation);
 
 	if (slotCreated)
 		VamanaReplicationQueueRetireOnAbort(MyDatabaseId, relid);

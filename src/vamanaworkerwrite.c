@@ -258,6 +258,14 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
 	/* Seed vector is already indexed by the build; no external ID to return. */
 	slot->writeExternalId = 0;
 
+	/*
+	 * This path builds the whole index from this one row; an abort must
+	 * never refund it as if it were ordinary insert growth into an
+	 * already-resident graph.
+	 */
+	slot->writeGrowthBytes = 0;
+	slot->writeResidentGeneration = 0;
+
 	slot->writeSlotCreated = (cache->replicationSlot == NULL);
 	if (slot->writeSlotCreated)
 	{
@@ -273,85 +281,6 @@ VamanaWorkerBuildEmptyTableIndex(int slotIdx)
 	cache->lastWriteTime = GetCurrentTimestamp();
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
-}
-
-/*
- * The query vector and heap_tid are already in the slot.  Allocate the next
- * external ID from the cached nextExternalId, then call SVSAddPoints.
- */
-static void
-VamanaWorkerExecuteInsertSlot(int slotIdx, SVSIndexHandle index, VamanaIndexCache *cache)
-{
-	VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdx];
-	Oid			relid = slot->indexRelid;
-	size_t		externalId;
-	int			added;
-	float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
-
-	if (cache == NULL)
-		ereport(ERROR,
-				(errmsg("vamana worker: no cache entry for insert on index %u",
-						relid)));
-
-	externalId = (size_t) cache->nextExternalId;
-	added = SVSAddPoints(index, vec, &externalId, 1);
-
-	if (added <= 0)
-		ereport(ERROR,
-				(errmsg("vamana worker: SVSAddPoints failed for index %u",
-						relid)));
-
-	cache->residentBytes = SVSGetIndexMemoryUsage(index);
-	SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes);
-
-	/* Grow tidMapping if needed. */
-	if ((int) externalId >= cache->tidMappingCapacity)
-	{
-		int			newCap = cache->tidMappingCapacity > 0 ?
-			cache->tidMappingCapacity * 2 : 1024;
-		MemoryContext oldCtx;
-
-		if (newCap <= (int) externalId)
-			newCap = (int) externalId + 1;
-
-		oldCtx = MemoryContextSwitchTo(TopMemoryContext);
-		cache->tidMapping = repalloc(cache->tidMapping,
-									 (Size) newCap * sizeof(ItemPointerData));
-		MemSet(cache->tidMapping + cache->tidMappingCapacity, 0,
-			   (Size) (newCap - cache->tidMappingCapacity) *
-			   sizeof(ItemPointerData));
-		MemoryContextSwitchTo(oldCtx);
-		cache->tidMappingCapacity = newCap;
-	}
-
-	ItemPointerCopy(&slot->writeHeapTid,
-					&cache->tidMapping[externalId]);
-
-	/* Keep reverse hash in sync. */
-	if (cache->tidToExternalId != NULL)
-	{
-		bool	found;
-		uint64	eid = (uint64) externalId;
-		char   *hentry = (char *) hash_search(
-			cache->tidToExternalId,
-			&slot->writeHeapTid,
-			HASH_ENTER,
-			&found);
-
-		if (!found)
-			memcpy(hentry + sizeof(ItemPointerData),
-				   &eid, sizeof(uint64));
-	}
-
-	cache->nextExternalId = externalId + 1;
-	cache->numVectors++;
-	/* Return the allocated external ID to the backend. */
-	slot->writeExternalId = (uint64) externalId;
-	slot->writeSlotCreated = false;
-
-	VamanaWorkerPersistMetaCounters(relid, cache);
-
-	slot->numResults = 1;
 }
 
 /*
@@ -482,8 +411,84 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 	switch (slot->slotKind)
 	{
 		case VAMANA_SLOTKIND_INSERT:
-			VamanaWorkerExecuteInsertSlot(slotIdx, index, cache);
-			break;
+			{
+				/*
+				 * The query vector and heap_tid are already in the slot.
+				 * Allocate the next external ID from the cached nextExternalId,
+				 * then call SVSAddPoints.
+				 */
+				size_t		externalId;
+				int			added;
+				float	   *vec = VamanaWorkerSlotQueryVec(VamanaWorkerShmemPtr, slotIdx);
+
+				if (cache == NULL)
+					ereport(ERROR,
+							(errmsg("vamana worker: no cache entry for insert on index %u",
+									relid)));
+
+				externalId = (size_t) cache->nextExternalId;
+				added = SVSAddPoints(index, vec, &externalId, 1);
+
+				if (added <= 0)
+					ereport(ERROR,
+							(errmsg("vamana worker: SVSAddPoints failed for index %u",
+									relid)));
+
+				cache->residentBytes = SVSGetIndexMemoryUsage(index);
+				SvsMemoryReanchorInsert(MyDatabaseId, relid, cache->residentBytes,
+										 &slot->writeGrowthBytes,
+										 &slot->writeResidentGeneration);
+
+				/* Grow tidMapping if needed. */
+				if ((int) externalId >= cache->tidMappingCapacity)
+				{
+					int			newCap = cache->tidMappingCapacity > 0 ?
+						cache->tidMappingCapacity * 2 : 1024;
+					MemoryContext oldCtx;
+
+					if (newCap <= (int) externalId)
+						newCap = (int) externalId + 1;
+
+					oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+					cache->tidMapping = repalloc(cache->tidMapping,
+												 (Size) newCap * sizeof(ItemPointerData));
+					MemSet(cache->tidMapping + cache->tidMappingCapacity, 0,
+						   (Size) (newCap - cache->tidMappingCapacity) *
+						   sizeof(ItemPointerData));
+					MemoryContextSwitchTo(oldCtx);
+					cache->tidMappingCapacity = newCap;
+				}
+
+				ItemPointerCopy(&slot->writeHeapTid,
+								&cache->tidMapping[externalId]);
+
+				/* Keep reverse hash in sync. */
+				if (cache->tidToExternalId != NULL)
+				{
+					bool	found;
+					uint64	eid = (uint64) externalId;
+					char   *hentry = (char *) hash_search(
+						cache->tidToExternalId,
+						&slot->writeHeapTid,
+						HASH_ENTER,
+						&found);
+
+					if (!found)
+						memcpy(hentry + sizeof(ItemPointerData),
+							   &eid, sizeof(uint64));
+				}
+
+				cache->nextExternalId = externalId + 1;
+				cache->numVectors++;
+				/* Return the allocated external ID to the backend. */
+				slot->writeExternalId = (uint64) externalId;
+				slot->writeSlotCreated = false;
+
+				VamanaWorkerPersistMetaCounters(relid, cache);
+
+				slot->numResults = 1;
+				break;
+			}
 
 		case VAMANA_SLOTKIND_DELETE:
 			VamanaWorkerExecuteDeleteSlot(slotIdx, index, cache);
@@ -512,7 +517,7 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 
 		headroomVectors = VamanaComputeCapacityHeadroomVectors(relid, cache);
 		SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes,
-									headroomVectors);
+									&headroomVectors);
 	}
 
 	if (cache != NULL)

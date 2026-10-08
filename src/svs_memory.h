@@ -57,6 +57,16 @@ extern PGDLLIMPORT int vamana_default_residency_memory_mb;
 extern PGDLLIMPORT int vamana_max_search_work_mem_mb;
 extern PGDLLIMPORT int vamana_default_search_work_mem_mb;
 
+/*
+ * Owned and registered by vamana.c; declared here too (rather than pulling
+ * in the much heavier vamana.h, which test/modules/svs_memory_test compiles
+ * this module without) because SvsMemoryCreditAbortedInserts reads it
+ * directly: svs.compact_threshold_pct doubles as this module's "how much
+ * reclaimable debt to carry before forcing a compact" cap, not just
+ * VACUUM's own compact trigger.
+ */
+extern PGDLLIMPORT int vamana_compact_threshold_pct;
+
 typedef enum SvsMemReservationState
 {
 	SVS_MEM_RESERVED,
@@ -126,6 +136,35 @@ typedef struct SvsMemReservation
 	 * insert never applies.
 	 */
 	uint64		capacityHeadroomVectors;
+
+	/*
+	 * Bytes contributed by inserts that were later rolled back, still
+	 * physically resident in the SVS graph until the next compaction (SVS
+	 * never reuses a deleted row's slot). Meaningful only in RESIDENT and
+	 * REBUILDING; zero otherwise. The invariant this field exists to hold:
+	 *
+	 *     measuredBytes + reclaimableBytes == the last raw SVSGetIndexMemoryUsage()
+	 *     taken for this reservation.
+	 *
+	 * measuredBytes is therefore the net figure the residency budget gate
+	 * reads; reclaimableBytes is the bounded, visible gap between that net
+	 * figure and real SVS memory. Zeroed whenever a fresh measurement
+	 * already reflects a compaction: SvsMemoryReconcileResident,
+	 * SvsMemoryReconcileLoad, and a successful SvsMemoryConfirmBuild.
+	 */
+	uint64		reclaimableBytes;
+
+	/*
+	 * Monotonic stamp of which measured graph this reservation currently
+	 * holds, assigned from the database's nextResidentGeneration counter by
+	 * SvsMemoryReconcileLoad and SvsMemoryConfirmBuild -- the two places a
+	 * fresh graph is measured -- and never by a compaction. Lets
+	 * SvsMemoryCreditAbortedInserts tell "this abort's growth belongs to the
+	 * graph still resident" from "the graph was reloaded or rebuilt since,
+	 * and the undo entry's growth figure no longer means anything," so a
+	 * stale credit is skipped rather than applied to the wrong graph.
+	 */
+	uint32		residentGeneration;
 } SvsMemReservation;
 
 /*
@@ -294,16 +333,68 @@ extern bool SvsMemoryReserveInsert(Oid dbOid, Oid relid, uint64 deltaBytes);
 /*
  * Worker, after applying an insert batch under the index's write lock.
  * Folds the oldest pending insert reservation for relid, plus relid's prior
- * committed size, into the single fresh exact measurement measuredBytes.
+ * committed size, into the single fresh exact measurement measuredBytes,
+ * net of whatever this reservation's reclaimableBytes debt already covers
+ * (see SvsMemReservation's invariant). *growthBytesOut receives how much of
+ * measuredBytes, relative to the reservation's last raw measurement, this
+ * particular reanchor added -- 0 if the index shrank or stayed the same.
+ * *generationOut receives the reservation's current residentGeneration.
+ * The caller carries both through to the undo log so a later abort of this
+ * same insert can credit exactly this growth back as reclaimableBytes, via
+ * SvsMemoryCreditAbortedInserts. Either output pointer may be NULL.
  */
-extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes);
+extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes,
+									 uint64 *growthBytesOut, uint32 *generationOut);
 
 /*
  * Like SvsMemoryReanchorInsert, but never touches pending insert
  * reservations for relid -- those belong to unrelated, unapplied inserts.
+ * Contract: measuredBytes must already be a raw measurement taken after a
+ * compaction (the COMPACT maintenance path, or a checkpoint's save, both of
+ * which compact the live graph before this is called), never a delete- or
+ * insert-driven re-measurement. This zeroes the reservation's
+ * reclaimableBytes to match: once a compaction has run, every byte SVS
+ * still holds is counted, net, with nothing left to call reclaimable.
+ *
+ * capacityHeadroomVectors, if not NULL, replaces the reservation's cached
+ * figure. Pass NULL when the caller cannot safely recompute it (e.g. a
+ * checkpoint's error path, where re-reading the metapage to refresh
+ * headroom could re-lock a buffer the failure left exclusively locked);
+ * compaction alone never changes vector count, so the existing figure is
+ * still correct in that case.
  */
 extern void SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
-										uint64 capacityHeadroomVectors);
+										uint64 *capacityHeadroomVectors);
+
+/*
+ * Worker or backend abort path, once an aborted insert's rows are confirmed
+ * deleted from the graph (VamanaWorkerSubmitDelete returned true for the
+ * undo batch that covered them). Moves min(growthBytes,
+ * reservation->measuredBytes) from the net committed figure into
+ * reclaimableBytes, so the aborted bytes stop counting against the budget
+ * without claiming memory that was never really freed: SVS does not reuse a
+ * deleted row's slot before a compaction, so the bytes stay physically
+ * resident until one runs.
+ *
+ * generation must match the reservation's current residentGeneration or
+ * this is a no-op: the graph has been reloaded or rebuilt since the insert
+ * applied, and growthBytes no longer describes anything live in it (see
+ * SvsMemReservation.residentGeneration). Also a no-op if there is no slot,
+ * no reservation, the reservation is not RESIDENT, or
+ * svs.compact_threshold_pct is 100 (the operator's existing way to say
+ * "never compact," which this treats as "never refund either" -- no
+ * reclaim backstop means no uncompacted debt is safe to carry). Never
+ * errors, the same contract SvsMemoryRestoreResidencyBudget follows for a
+ * call reached from an abort path.
+ *
+ * Returns true if, after crediting, dbOid's total reclaimable bytes across
+ * every reservation exceed svs.compact_threshold_pct of its residency
+ * budget -- the caller's signal to request a COMPACT for relid once its
+ * batch finishes, which is the only thing that ever reduces this total back
+ * down.
+ */
+extern bool SvsMemoryCreditAbortedInserts(Oid dbOid, Oid relid, uint32 generation,
+										   uint64 growthBytes);
 
 /*
  * Worker, on the empty-table first-insert build path: relid's reservation
@@ -351,6 +442,14 @@ typedef struct SvsMemoryStats
 	uint64		residencyBudget;
 	uint64		residencyBytesCommitted;
 	uint64		buildBytesCommitted;
+
+	/*
+	 * Sum of every reservation's reclaimableBytes: real SVS memory this
+	 * database holds beyond residencyBytesCommitted, from aborted inserts
+	 * not yet reclaimed by a compaction. Bounded by svs.compact_threshold_pct
+	 * of residencyBudget; see SvsMemoryCreditAbortedInserts.
+	 */
+	uint64		residencyBytesReclaimable;
 } SvsMemoryStats;
 
 /*

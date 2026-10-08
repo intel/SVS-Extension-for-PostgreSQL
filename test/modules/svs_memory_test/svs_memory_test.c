@@ -385,7 +385,8 @@ Datum
 svs_memory_reanchor_insert(PG_FUNCTION_ARGS)
 {
 	SvsMemoryReanchorInsert(PG_GETARG_OID(0), PG_GETARG_OID(1),
-							 GetNonNegativeArgAsUint64(fcinfo, 2));
+							 GetNonNegativeArgAsUint64(fcinfo, 2),
+							 NULL, NULL);
 	PG_RETURN_VOID();
 }
 
