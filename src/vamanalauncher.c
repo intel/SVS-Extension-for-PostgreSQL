@@ -503,13 +503,16 @@ VamanaLauncherReconcileWorkers(void)
 static bool
 VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname)
 {
+	char		safeDatname[NAMEDATALEN * 4];
+
 	if (VamanaWorkerReserveSlot(dbOid, NULL) != NULL)
 		return true;
 
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), datname);
 	ereport(LOG,
 			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 			 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
-					datname),
+					safeDatname),
 			 errhint("Increase svs.max_databases and restart.")));
 	return false;
 }
