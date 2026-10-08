@@ -26,7 +26,9 @@
  *       queryData: numQueries * dimensions * sizeof(float) bytes.
  *
  *   SVSAddPoints(points, ids, num_vectors)
- *       points: num_vectors * dimensions * sizeof(float) bytes.
+ *       points: num_vectors * index's fixed dimensionality * sizeof(float)
+ *               bytes. dimensions is not a parameter here; it was fixed
+ *               when the index was built.
  *       ids:    num_vectors * sizeof(size_t) bytes.
  *
  *   SVSBuildDynamicIndex(builder, data, ids, num_vectors, graph_degree, dimensions, ...)
