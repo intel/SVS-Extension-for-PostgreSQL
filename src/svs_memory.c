@@ -1056,7 +1056,7 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes,
 
 void
 SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
-						   uint64 capacityHeadroomVectors)
+						   uint64 *capacityHeadroomVectors)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
@@ -1079,7 +1079,8 @@ SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
 					"an index's pre-reconcile residency");
 	entry->residencyBytesCommitted += measuredBytes;
 	reservation->measuredBytes = measuredBytes;
-	reservation->capacityHeadroomVectors = capacityHeadroomVectors;
+	if (capacityHeadroomVectors != NULL)
+		reservation->capacityHeadroomVectors = *capacityHeadroomVectors;
 
 	/*
 	 * measuredBytes here is always a post-compaction raw measurement (see

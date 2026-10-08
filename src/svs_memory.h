@@ -355,9 +355,16 @@ extern void SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes,
  * insert-driven re-measurement. This zeroes the reservation's
  * reclaimableBytes to match: once a compaction has run, every byte SVS
  * still holds is counted, net, with nothing left to call reclaimable.
+ *
+ * capacityHeadroomVectors, if not NULL, replaces the reservation's cached
+ * figure. Pass NULL when the caller cannot safely recompute it (e.g. a
+ * checkpoint's error path, where re-reading the metapage to refresh
+ * headroom could re-lock a buffer the failure left exclusively locked);
+ * compaction alone never changes vector count, so the existing figure is
+ * still correct in that case.
  */
 extern void SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
-										uint64 capacityHeadroomVectors);
+										uint64 *capacityHeadroomVectors);
 
 /*
  * Worker or backend abort path, once an aborted insert's rows are confirmed

@@ -10,7 +10,7 @@
 # moves that growth from residency_bytes_committed into
 # residency_bytes_reclaimable, bounded by svs.compact_threshold_pct of the
 # database's budget, with a COMPACT reclaiming the debt once the cap is
-# crossed and a checkpoint's own compaction reclaiming it too. Ten cases:
+# crossed and a checkpoint's own compaction reclaiming it too. Eleven cases:
 #
 #   T1  single-session rollback credits exactly its own growth back
 #   T2  a rollback-then-commit ends up within the credited gap of a plain
@@ -31,12 +31,16 @@
 #       compacts the index, with no later insert needed
 #   T10 two interleaved sessions: one commits, the other aborts; the sum of
 #       committed and reclaimable bytes is unmoved by the abort
+#   T11 a checkpoint that fails after SVSSaveIndex already compacted the
+#       live graph reconciles immediately in its own PG_CATCH, rather than
+#       leaving accounting stale until an unrelated later write self-corrects
+#       it (requires --enable-injection-points; skipped otherwise)
 #
 # Execution order below groups cases by which database/GUC state they need,
-# not the T1..T10 reading order: T3 and T8 get their own tightly-pinned
+# not the T1..T11 reading order: T3 and T8 get their own tightly-pinned
 # database so a tiny budget doesn't interfere with the main database's
-# cases, and T9 is last because it changes svs.checkpoint_operations for the
-# rest of the file.
+# cases, and T9/T11 are last because they change svs.checkpoint_operations
+# for the rest of the file.
 #
 # Row-counting trap: an unqualified count(*) on a vamana-indexed table can
 # be planned as a key-less Index Only Scan and silently return 0 regardless
@@ -647,6 +651,59 @@ diag("=== T9: a below-cap rollback is reclaimed by the next checkpoint ===");
 
     $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.checkpoint_operations;");
     $node->safe_psql('postgres', "SELECT pg_reload_conf();");
+}
+
+# ---------------------------------------------------------------------------
+# T11: a checkpoint that fails *after* SVSSaveIndex has already compacted
+# the live graph (here: VamanaMarkIndexSaved fails, right after SVSSaveIndex
+# and the TID-map write both succeeded) must not leave numDeleted/residency
+# stale until some unrelated later write happens to self-correct it.
+# PerformCheckpoint's PG_CATCH only restores the pre-attempt baseline when
+# the compaction itself never ran; otherwise it reconciles with a fresh
+# measurement before re-throwing, so the failed checkpoint's own log line is
+# enough -- no further insert should be needed to see correct figures.
+# ---------------------------------------------------------------------------
+diag("=== T11: a checkpoint failing after SVS has already compacted reconciles immediately ===");
+SKIP: {
+    skip "server not built with --enable-injection-points", 3
+        unless ($ENV{enable_injection_points} // 'no') eq 'yes';
+
+    $node->safe_psql('postgres', "CREATE EXTENSION IF NOT EXISTS injection_points;");
+
+    my $a = $node->background_psql('postgres');
+    $a->query_safe("BEGIN;");
+    $a->query_safe(
+        "INSERT INTO t SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 100);");
+    $a->query_safe("ROLLBACK;");
+    $a->quit;
+
+    my ($c0, $r0) = committed_reclaimable();
+    ok($r0 > 0, "T11: the rollback is credited as reclaimable before the failed checkpoint");
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-mark-index-saved-error', 'error');");
+    $node->safe_psql('postgres', "ALTER SYSTEM SET svs.checkpoint_operations = 1;");
+    $node->safe_psql('postgres', "SELECT pg_reload_conf();");
+
+    my $log_pos = length($node->log_content());
+    # One more write to trip the now-tiny checkpoint debounce; the checkpoint
+    # attempt this triggers is what hits the injection point.
+    $node->safe_psql('postgres',
+        "INSERT INTO t SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 1);");
+    $node->wait_for_log(qr/not checkpointed this cycle, will retry/, $log_pos);
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-mark-index-saved-error');");
+    $node->safe_psql('postgres', "ALTER SYSTEM RESET svs.checkpoint_operations;");
+    $node->safe_psql('postgres', "SELECT pg_reload_conf();");
+
+    my ($c1, $r1) = committed_reclaimable();
+    diag(sprintf("T11: c0=%d r0=%d c1=%d r1=%d", $c0, $r0, $c1, $r1));
+
+    is($r1, 0,
+        "T11: reclaimable is already reconciled to 0 right after the failed checkpoint, no later insert needed");
+    cmp_ok($c1, '<=', $c0 + 65536,
+        "T11: committed is already close to the compacted baseline right after the failed checkpoint");
 }
 
 $node->stop;

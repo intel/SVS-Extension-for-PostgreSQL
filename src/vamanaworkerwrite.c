@@ -517,7 +517,7 @@ VamanaWorkerExecuteWriteSlot(int slotIdx)
 
 		headroomVectors = VamanaComputeCapacityHeadroomVectors(relid, cache);
 		SvsMemoryReconcileResident(MyDatabaseId, relid, cache->residentBytes,
-									headroomVectors);
+									&headroomVectors);
 	}
 
 	if (cache != NULL)
