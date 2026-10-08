@@ -89,6 +89,7 @@ typedef struct VamanaWorkerSnapshot
 	bool		residencyAdmitted;
 	uint64		residencyBudgetBytes;
 	uint64		residencyBytesCommitted;
+	uint64		residencyBytesReclaimable;
 	uint64		buildBytesCommitted;
 } VamanaWorkerSnapshot;
 
@@ -162,7 +163,7 @@ VamanaStatVisibilityForCaller(void)
 /* -----------------------------------------------------------------------
  * pg_stat_vamana_worker(): one row per reserved database (worker grain).
  *
- * Column layout (16 columns):
+ * Column layout (17 columns):
  *   0  db_oid                         oid
  *   1  worker_pid                     int4         (0 -> NULL)
  *   2  worker_state                   text         (see VamanaWorkerStateName)
@@ -170,21 +171,27 @@ VamanaStatVisibilityForCaller(void)
  *   4  evict_all                      bool
  *   5  heartbeat_ts                   timestamptz  (0 -> NULL)
  *   6  residency_bytes_committed      int8         (NULL if never admitted)
- *   7  build_bytes_committed          int8         (NULL if never admitted)
- *   8  residency_memory_limit         int8         (NULL if never admitted)
- *   9  search_work_mem_limit          int8
- *  10  search_scratch_bytes_in_flight int8
- *  11  search_threads_desired         int4         (resolved, clamped ask; 0 when not live)
- *  12  search_threads_granted         int4         (pool-arbitrated grant; 0 when not live)
- *  13  search_threads_reserved        int4         (floor actually honored; 0 when not live)
- *  14  search_slots_registered        int4         (slots actually held after resize; 0 when not live)
- *  15  max_search_threads_per_db      int4         (resolved ceiling; not per-entry, no lock needed)
+ *   7  residency_bytes_reclaimable    int8         (NULL if never admitted)
+ *   8  build_bytes_committed          int8         (NULL if never admitted)
+ *   9  residency_memory_limit         int8         (NULL if never admitted)
+ *  10  search_work_mem_limit          int8
+ *  11  search_scratch_bytes_in_flight int8
+ *  12  search_threads_desired         int4         (resolved, clamped ask; 0 when not live)
+ *  13  search_threads_granted         int4         (pool-arbitrated grant; 0 when not live)
+ *  14  search_threads_reserved        int4         (floor actually honored; 0 when not live)
+ *  15  search_slots_registered        int4         (slots actually held after resize; 0 when not live)
+ *  16  max_search_threads_per_db      int4         (resolved ceiling; not per-entry, no lock needed)
+ *
+ * residency_bytes_reclaimable is real SVS memory this database still holds
+ * from aborted inserts, over and above residency_bytes_committed, not yet
+ * given back by a compaction -- see SvsMemoryCreditAbortedInserts. Bounded
+ * by svs.compact_threshold_pct of residency_memory_limit.
  *
  * residency_drift is not a column here: it needs svs_index_residency, a
  * catalog table, which this function never touches. The CREATE VIEW joins
  * it in instead -- see sql/svs--0.1.0.sql.
  *
- * Unlike index_count, columns 11-13 are populated on a standby: PublishCpuGrants
+ * Unlike index_count, columns 12-14 are populated on a standby: PublishCpuGrants
  * runs unconditionally on every launcher reconcile, primary or standby, and
  * ReadDatabaseRows is a read-only SPI SELECT that works fine under recovery.
  * index_count differs because VamanaIndexCountIsMaintained() is specifically
@@ -193,7 +200,7 @@ VamanaStatVisibilityForCaller(void)
  * the launcher actually published.
  * ----------------------------------------------------------------------- */
 
-#define PG_STAT_VAMANA_WORKER_COLS 16
+#define PG_STAT_VAMANA_WORKER_COLS 17
 
 typedef struct VamanaWorkerHydrateCtx
 {
@@ -278,6 +285,7 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 		{
 			snap->residencyBudgetBytes = stats.residencyBudget;
 			snap->residencyBytesCommitted = stats.residencyBytesCommitted;
+			snap->residencyBytesReclaimable = stats.residencyBytesReclaimable;
 			snap->buildBytesCommitted = stats.buildBytesCommitted;
 		}
 	}
@@ -328,24 +336,26 @@ pg_stat_vamana_worker(PG_FUNCTION_ARGS)
 		if (snap->residencyAdmitted)
 		{
 			values[6] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBytesCommitted));
-			values[7] = Int64GetDatum(VamanaStatBytesDatum(snap->buildBytesCommitted));
-			values[8] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBudgetBytes));
+			values[7] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBytesReclaimable));
+			values[8] = Int64GetDatum(VamanaStatBytesDatum(snap->buildBytesCommitted));
+			values[9] = Int64GetDatum(VamanaStatBytesDatum(snap->residencyBudgetBytes));
 		}
 		else
 		{
 			nulls[6] = true;
 			nulls[7] = true;
 			nulls[8] = true;
+			nulls[9] = true;
 		}
 
-		values[9] = Int64GetDatum(VamanaStatBytesDatum(snap->searchWorkMemLimitBytes));
-		values[10] = Int64GetDatum(VamanaStatBytesDatum(snap->searchScratchBytesInFlight));
+		values[10] = Int64GetDatum(VamanaStatBytesDatum(snap->searchWorkMemLimitBytes));
+		values[11] = Int64GetDatum(VamanaStatBytesDatum(snap->searchScratchBytesInFlight));
 
-		values[11] = Int32GetDatum((int32) snap->searchThreadsDesired);
-		values[12] = Int32GetDatum((int32) snap->searchThreadsGranted);
-		values[13] = Int32GetDatum((int32) snap->searchThreadsReserved);
-		values[14] = Int32GetDatum((int32) snap->searchSlotsRegistered);
-		values[15] = Int32GetDatum(maxSearchThreadsPerDb);
+		values[12] = Int32GetDatum((int32) snap->searchThreadsDesired);
+		values[13] = Int32GetDatum((int32) snap->searchThreadsGranted);
+		values[14] = Int32GetDatum((int32) snap->searchThreadsReserved);
+		values[15] = Int32GetDatum((int32) snap->searchSlotsRegistered);
+		values[16] = Int32GetDatum(maxSearchThreadsPerDb);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}

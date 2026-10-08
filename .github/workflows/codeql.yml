@@ -40,10 +40,15 @@ jobs:
     # timeout keeps a hung dependency build from consuming the 6 hour default.
     timeout-minutes: 180
     env:
-      # config's own SVS_URL default is blank (defer to upstream, see
-      # docs/build_guide/config); pin a nightly here so CI's build is
-      # reproducible rather than tracking upstream's own default fetch.
+      # config's own SVS_URL/SVS_COMMIT defaults are blank (defer to
+      # upstream, see docs/build_guide/config); pin both here, side by side,
+      # so CI's build is reproducible. SVS_COMMIT must be the exact SVS_REPO
+      # commit SVS_URL's tarball was built from: SVS_BRANCH is a moving
+      # branch, and without SVS_COMMIT pinning bindings/c to match, it drifts
+      # ahead of the tarball's API and fails to compile. Update both together
+      # whenever SVS_URL is bumped to a newer nightly.
       SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
+      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
     permissions:
       # required for all workflows
       security-events: write
@@ -114,7 +119,7 @@ jobs:
         path: |
           ${{ runner.temp }}/build_guide/pgsql_install
           ${{ runner.temp }}/build_guide/svs_install
-        key: svs-deps-${{ runner.os }}-${{ env.SVS_URL }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
+        key: svs-deps-${{ runner.os }}-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
 
     - name: Build PostgreSQL
       if: steps.deps-cache.outputs.cache-hit != 'true'

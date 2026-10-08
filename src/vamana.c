@@ -249,7 +249,12 @@ VamanaInit(void)
 							"0 = compact on every VACUUM with pending deletes. "
 							"100 = disable compact (consolidate still runs). "
 							"Higher values reduce compact frequency and memory reclamation; "
-							"lower values keep the index tighter at the cost of more frequent compacts.",
+							"lower values keep the index tighter at the cost of more frequent compacts. "
+							"Also governs a second, independent threshold: a rolled-back INSERT's "
+							"bytes are credited back as reclaimable residency rather than left "
+							"stranded against the budget, up to this percentage of a database's "
+							"residency budget before a compact is forced to reclaim them; 100 "
+							"disables that credit the same way it disables VACUUM's own compacts.",
 							&vamana_compact_threshold_pct,
 							10, 0, 100,
 							PGC_USERSET,

@@ -1,0 +1,103 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+-- Regression test for a key-less index-only scan on a vamana index: without
+-- an ORDER BY, there is no query vector to search with, and the planner must
+-- never be tempted to use the index anyway once VACUUM makes the table
+-- all-visible (vamanacostestimate must make such a path look infinitely
+-- expensive), and the executor must error rather than silently return zero
+-- rows if a plan reaches it anyway (vamanagettuple's defense-in-depth guard).
+--
+-- No other index exists on this table, so the vamana index is the only
+-- scan path under consideration -- isolating the assertions to vamana's own
+-- behavior rather than any interaction with a second index.
+INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true)
+	ON CONFLICT (datname) DO NOTHING;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+CREATE TABLE vamana_keyless_tbl (id int, val vector(3));
+INSERT INTO vamana_keyless_tbl (id, val)
+	SELECT i, ARRAY[(i % 100)::float4, (i % 50)::float4, (i % 30)::float4]::vector
+	FROM generate_series(1, 1100) AS i;
+SET client_min_messages = error;
+CREATE INDEX vamana_keyless_idx ON vamana_keyless_tbl USING vamana (val vector_l2_ops);
+RESET client_min_messages;
+-- All-visible: this is what makes an index-only scan look attractive.
+VACUUM vamana_keyless_tbl;
+-- Part A: a key-less count(*)/EXISTS must use a Seq Scan, not the vamana
+-- index, and must return the real row count rather than a silent 0.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vamana_keyless_tbl;
+              QUERY PLAN              
+--------------------------------------
+ Aggregate
+   ->  Seq Scan on vamana_keyless_tbl
+(2 rows)
+
+SELECT count(*) FROM vamana_keyless_tbl;
+ count 
+-------
+  1100
+(1 row)
+
+SELECT EXISTS (SELECT 1 FROM vamana_keyless_tbl);
+ exists 
+--------
+ t
+(1 row)
+
+-- Part B: a user trying to coerce index usage by disabling other scan
+-- types must not get a wrong answer either. vamanacostestimate's
+-- disabled_nodes = 2 (matching pgvector) makes the keyless vamana path
+-- strictly worse than even a GUC-disabled Seq Scan, so the planner still
+-- falls back to the (disabled but available) Seq Scan rather than ever
+-- reaching vamanagettuple's ERROR backstop -- that backstop is defense in
+-- depth for a path this cost model keeps unreachable through ordinary
+-- planning, not something a plain SQL test can force.
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vamana_keyless_tbl;
+              QUERY PLAN              
+--------------------------------------
+ Aggregate
+   ->  Seq Scan on vamana_keyless_tbl
+         Disabled: true
+(3 rows)
+
+SELECT count(*) FROM vamana_keyless_tbl;
+ count 
+-------
+  1100
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+-- Part C: ordinary k-NN search is unaffected by either change -- the path
+-- has an ORDER BY operator, so vamanacostestimate's new early-out never
+-- triggers, and the plan/result are unchanged.
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT id FROM vamana_keyless_tbl
+	ORDER BY val <-> '[1,1,1]' LIMIT 5;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Index Scan using vamana_keyless_idx on vamana_keyless_tbl
+         Order By: (val <-> '[1,1,1]'::vector)
+(3 rows)
+
+SELECT count(*) FROM (
+	SELECT id FROM vamana_keyless_tbl ORDER BY val <-> '[1,1,1]' LIMIT 5
+) s;
+ count 
+-------
+     5
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE vamana_keyless_tbl;

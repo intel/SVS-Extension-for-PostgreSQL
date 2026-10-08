@@ -156,6 +156,17 @@ typedef struct VamanaWorkerSlot
 	ItemPointerData writeHeapTid;	/* heap TID for INSERT */
 	uint64			writeExternalId; /* allocated external ID returned to backend */
 	bool			writeSlotCreated; /* INSERT lazily created the index's replication slot */
+
+	/*
+	 * INSERT only: how many bytes this apply grew the index's raw measured
+	 * size by (0 on the empty-table first-insert build path, which must
+	 * never be refunded on abort), and which residentGeneration the growth
+	 * was measured against. The backend carries both into its undo log via
+	 * VamanaUndoAppend, for SvsMemoryCreditAbortedInserts to use if this
+	 * insert is later rolled back. See SvsMemoryReanchorInsert.
+	 */
+	uint64			writeGrowthBytes;
+	uint32			writeResidentGeneration;
 } VamanaWorkerSlot;
 
 /*
@@ -362,6 +373,16 @@ typedef struct VamanaWorkerShmem
 	uint64		buildBytesCommitted;
 
 	/*
+	 * Monotonic counter stamping which measured graph each reservation
+	 * currently holds; see SvsMemReservation.residentGeneration. Bumped
+	 * only by SvsMemoryReconcileLoad and a successful SvsMemoryConfirmBuild,
+	 * never by SvsMemoryResetDatabaseAccounting -- a released slot's next
+	 * occupant must not collide with a generation an in-flight undo entry
+	 * might still cite.
+	 */
+	uint32		nextResidentGeneration;
+
+	/*
 	 * Live sum of this database's currently-dispatched search batches'
 	 * scratch cost. Its own atomic, never memLock: it must not contend with
 	 * a build gate or a load reconcile.
@@ -369,7 +390,8 @@ typedef struct VamanaWorkerShmem
 	pg_atomic_uint64 searchScratchBytesInFlight;
 
 	/* Guards residencyBudget, residencyBytesCommitted, buildBytesCommitted,
-	 * reservations, and insertReservations as one check-then-add unit. */
+	 * nextResidentGeneration, reservations, and insertReservations as one
+	 * check-then-add unit. */
 	LWLock			memLock;
 
 	/*
@@ -710,7 +732,8 @@ int		VamanaWorkerSubmitSearch(Oid indexRelid,
 								 ItemPointer results, float *distances);
 bool	VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 								 int dimensions, ItemPointer heap_tid,
-								 uint64 *externalId_out, bool *slotCreated_out);
+								 uint64 *externalId_out, bool *slotCreated_out,
+								 uint64 *growthBytes_out, uint32 *generation_out);
 bool	VamanaWorkerSubmitDelete(Oid indexRelid,
 								 const size_t *externalIds, int nIds);
 bool	VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op);

@@ -222,6 +222,25 @@ FreeReservation(SvsMemReservation *reservation)
 }
 
 /*
+ * Call under entry->memLock (shared or exclusive). Total real memory this
+ * database holds beyond residencyBytesCommitted, from aborted inserts not
+ * yet reclaimed by a compaction. A plain scan, not a second counter to keep
+ * in step: VAMANA_MAX_INDEXES is small and this is only read on the
+ * abort/credit path and the stats view.
+ */
+static uint64
+SumReclaimableBytes(VamanaWorkerShmem *entry)
+{
+	uint64		total = 0;
+
+	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)
+		if (entry->reservations[i].relid != InvalidOid)
+			total += entry->reservations[i].reclaimableBytes;
+
+	return total;
+}
+
+/*
  * Returns a REBUILDING reservation to RESIDENT at exactly the size it held
  * before the rebuild began, on every path off of REBUILDING other than a
  * successful confirm. residencyBytesCommitted already counts these bytes as
@@ -382,7 +401,8 @@ SvsMemoryAdmitDatabase(Oid dbOid, uint64 residencyBudget, uint64 durableCommitte
 	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
 
 	{
-		uint64		committedFloor = Max(entry->residencyBytesCommitted, durableCommittedFloor);
+		uint64		realUsage = entry->residencyBytesCommitted + SumReclaimableBytes(entry);
+		uint64		committedFloor = Max(realUsage, durableCommittedFloor);
 
 		if (residencyBudget < committedFloor)
 		{
@@ -437,7 +457,8 @@ SvsMemoryRestoreResidencyBudget(Oid dbOid, uint64 priorBudget)
 
 	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
 
-	restoredBudget = Max(priorBudget, entry->residencyBytesCommitted);
+	restoredBudget = Max(priorBudget,
+						  entry->residencyBytesCommitted + SumReclaimableBytes(entry));
 	if (restoredBudget != priorBudget)
 		ereport(WARNING,
 				(errmsg("SVS memory accounting: database %u's residency budget restored to %llu bytes on transaction abort, not its pre-transaction %llu, to cover bytes already committed under the aborted value",
@@ -651,6 +672,14 @@ SvsMemoryConfirmBuild(Oid dbOid, Oid relid, uint64 buildPeak, uint64 measuredRes
 		reservation->state = SVS_MEM_CONFIRMED;
 		reservation->measuredBytes = measuredResidencyBytes;
 		reservation->priorResidentBytes = 0;
+
+		/*
+		 * A freshly confirmed build or rebuild is a newly measured graph
+		 * with no aborted-insert history of its own; any debt the old
+		 * graph was carrying (isRebuild) does not apply to it.
+		 */
+		reservation->reclaimableBytes = 0;
+		reservation->residentGeneration = ++entry->nextResidentGeneration;
 	}
 	else if (isRebuild)
 	{
@@ -820,6 +849,10 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes, uint64 capaci
 			reservation->capacityHeadroomVectors = capacityHeadroomVectors;
 			reservation->priorResidentBytes = 0;
 			reservation->buildPeakBytes = 0;
+
+			/* A freshly loaded graph starts with no aborted-insert debt. */
+			reservation->reclaimableBytes = 0;
+			reservation->residentGeneration = ++entry->nextResidentGeneration;
 		}
 	}
 	else
@@ -835,6 +868,7 @@ SvsMemoryReconcileLoad(Oid dbOid, Oid relid, uint64 measuredBytes, uint64 capaci
 			reservation->estimateBytes = measuredBytes;
 			reservation->measuredBytes = measuredBytes;
 			reservation->capacityHeadroomVectors = capacityHeadroomVectors;
+			reservation->residentGeneration = ++entry->nextResidentGeneration;
 
 			entry->residencyBytesCommitted += measuredBytes;
 		}
@@ -971,10 +1005,14 @@ WarnIfResidencyOverBudget(VamanaWorkerShmem *entry, Oid dbOid, Oid relid, const 
 }
 
 void
-SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
+SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes,
+						 uint64 *growthBytesOut, uint32 *generationOut)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
+	uint64		oldRaw;
+	uint64		growth;
+	uint64		newNet;
 
 	Assert(OidIsValid(relid));
 
@@ -982,20 +1020,43 @@ SvsMemoryReanchorInsert(Oid dbOid, Oid relid, uint64 measuredBytes)
 
 	reservation = FindResidentReservationOrError(entry, dbOid, relid, "reanchor");
 
+	/*
+	 * oldRaw is the last raw measurement this reservation stood for (net
+	 * figure plus whatever was already reclaimable); growth is however much
+	 * larger the fresh raw measurement is than that. A delete-driven drop
+	 * (SVS frees only a little before compaction, but not never) clamps the
+	 * debt down to the new raw total rather than going negative; it never
+	 * grows the debt here -- only SvsMemoryCreditAbortedInserts does that.
+	 */
+	oldRaw = reservation->measuredBytes + reservation->reclaimableBytes;
+	growth = (measuredBytes > oldRaw) ? (measuredBytes - oldRaw) : 0;
+
+	if (measuredBytes < reservation->reclaimableBytes)
+		reservation->reclaimableBytes = measuredBytes;
+
+	newNet = measuredBytes - reservation->reclaimableBytes;
+
 	SubtractFloored(&entry->residencyBytesCommitted, reservation->measuredBytes,
 					"an index's pre-reanchor residency");
 	ReleaseOldestInsertReservation(entry, relid);
-	entry->residencyBytesCommitted += measuredBytes;
-	reservation->measuredBytes = measuredBytes;
+	entry->residencyBytesCommitted += newNet;
+	reservation->measuredBytes = newNet;
+
+	Assert(reservation->measuredBytes + reservation->reclaimableBytes == measuredBytes);
 
 	WarnIfResidencyOverBudget(entry, dbOid, relid, "an insert into");
+
+	if (growthBytesOut != NULL)
+		*growthBytesOut = growth;
+	if (generationOut != NULL)
+		*generationOut = reservation->residentGeneration;
 
 	LWLockRelease(&entry->memLock);
 }
 
 void
 SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
-						   uint64 capacityHeadroomVectors)
+						   uint64 *capacityHeadroomVectors)
 {
 	VamanaWorkerShmem *entry = LookupEntryOrError(dbOid);
 	SvsMemReservation *reservation;
@@ -1018,7 +1079,15 @@ SvsMemoryReconcileResident(Oid dbOid, Oid relid, uint64 measuredBytes,
 					"an index's pre-reconcile residency");
 	entry->residencyBytesCommitted += measuredBytes;
 	reservation->measuredBytes = measuredBytes;
-	reservation->capacityHeadroomVectors = capacityHeadroomVectors;
+	if (capacityHeadroomVectors != NULL)
+		reservation->capacityHeadroomVectors = *capacityHeadroomVectors;
+
+	/*
+	 * measuredBytes here is always a post-compaction raw measurement (see
+	 * the contract on this function in svs_memory.h): every byte SVS still
+	 * holds is counted above, net, so nothing is left to call reclaimable.
+	 */
+	reservation->reclaimableBytes = 0;
 
 	WarnIfResidencyOverBudget(entry, dbOid, relid, "a compact of");
 
@@ -1069,6 +1138,45 @@ SvsMemoryAbortInsert(Oid dbOid, Oid relid)
 	}
 
 	LWLockRelease(&entry->memLock);
+}
+
+bool
+SvsMemoryCreditAbortedInserts(Oid dbOid, Oid relid, uint32 generation, uint64 growthBytes)
+{
+	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+	SvsMemReservation *reservation;
+	bool		overCap = false;
+
+	Assert(OidIsValid(relid));
+
+	if (entry == NULL)
+		return false;
+
+	LWLockAcquire(&entry->memLock, LW_EXCLUSIVE);
+
+	reservation = FindReservation(entry, relid);
+
+	if (reservation != NULL &&
+		reservation->state == SVS_MEM_RESIDENT &&
+		reservation->residentGeneration == generation &&
+		vamana_compact_threshold_pct < 100)
+	{
+		uint64		credit = Min(growthBytes, reservation->measuredBytes);
+		uint64		cap;
+
+		SubtractFloored(&entry->residencyBytesCommitted, credit,
+						 "an aborted insert's credited growth");
+		SubtractFloored(&reservation->measuredBytes, credit,
+						 "an aborted insert's reservation contribution");
+		reservation->reclaimableBytes += credit;
+
+		cap = (entry->residencyBudget * (uint64) vamana_compact_threshold_pct) / 100;
+		overCap = SumReclaimableBytes(entry) > cap;
+	}
+
+	LWLockRelease(&entry->memLock);
+
+	return overCap;
 }
 
 /*
@@ -1288,6 +1396,7 @@ SvsMemoryReadStats(Oid dbOid, SvsMemoryStats *out)
 	out->residencyBudget = entry->residencyBudget;
 	out->residencyBytesCommitted = entry->residencyBytesCommitted;
 	out->buildBytesCommitted = entry->buildBytesCommitted;
+	out->residencyBytesReclaimable = SumReclaimableBytes(entry);
 
 	LWLockRelease(&entry->memLock);
 
@@ -1453,6 +1562,9 @@ SvsMemoryResetDatabaseAccounting(VamanaWorkerShmem *entry)
 	entry->residencyBudget = 0;
 	entry->residencyBytesCommitted = 0;
 	entry->buildBytesCommitted = 0;
+	/* nextResidentGeneration is deliberately not reset here: a released
+	 * slot's next occupant must not collide with a generation some
+	 * backend's in-flight undo entry still cites. */
 	pg_atomic_write_u64(&entry->searchScratchBytesInFlight, 0);
 
 	for (int i = 0; i < VAMANA_MAX_INDEXES; i++)

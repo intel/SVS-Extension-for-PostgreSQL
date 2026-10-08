@@ -45,7 +45,7 @@ SaveAfterRebuildBody(void *arg)
 {
 	SaveAfterRebuildArgs *a = (SaveAfterRebuildArgs *) arg;
 
-	VamanaSaveIndexToDisk(a->indexRel, a->index, MAIN_FORKNUM, a->cache);
+	VamanaSaveIndexToDisk(a->indexRel, a->index, MAIN_FORKNUM, a->cache, NULL);
 }
 
 /* Swallow save failures — the waiting backend's query must not fail due to a BGW-side I/O problem. */

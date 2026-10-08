@@ -142,7 +142,7 @@ SerializeIndexToPages(VamanaBuildState * buildstate, SVSIndexHandle svsIndex)
 	meta.numDeleted = 0;
 	meta.needsSave = false;
 
-	VamanaSaveIndexToDisk(buildstate->index, svsIndex, buildstate->forkNum, &meta);
+	VamanaSaveIndexToDisk(buildstate->index, svsIndex, buildstate->forkNum, &meta, NULL);
 }
 
 /* Valid compression values; used only in this file */

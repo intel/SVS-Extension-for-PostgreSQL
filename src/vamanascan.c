@@ -275,6 +275,16 @@ vamanagettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	VamanaScanOpaque so = (VamanaScanOpaque) scan->opaque;
 
+	/*
+	 * A scan with no ORDER BY key has no query vector, so there is nothing
+	 * to search for. vamanacostestimate makes this path look infinitely
+	 * expensive, which keeps the planner from ever choosing it; this is a
+	 * defense-in-depth guard against reaching here some other way. Error
+	 * rather than silently returning zero rows, matching HNSW/IVFFlat.
+	 */
+	if (scan->orderByData == NULL)
+		elog(ERROR, "cannot scan vamana index without order");
+
 	/* Handle backward scan (not supported) */
 	if (ScanDirectionIsBackward(dir))
 		elog(ERROR, "vamana index does not support backward scan");

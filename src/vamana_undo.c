@@ -20,11 +20,13 @@
 
 #include "postgres.h"
 
+#include "svs_memory.h"
 #include "vamana_undo.h"
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
 
 #include "access/xact.h"
+#include "miscadmin.h"
 #include "utils/memutils.h"
 
 /* -----------------------------------------------------------------------
@@ -36,6 +38,16 @@ typedef struct VamanaUndoEntry
 	Oid			indexRelid;
 	uint64		externalId;
 	SubTransactionId subxid;
+
+	/*
+	 * This insert's own contribution to its index's raw measured size, and
+	 * which residentGeneration it was measured against -- both copied
+	 * straight from SvsMemoryReanchorInsert's outputs at apply time. Fed to
+	 * SvsMemoryCreditAbortedInserts if this entry is ever undone, so the
+	 * credit matches exactly what this insert actually grew, no more.
+	 */
+	uint64		growthBytes;
+	uint32		generation;
 }			VamanaUndoEntry;
 
 /* Per-backend (per-transaction) log; reset to NULL at transaction end. */
@@ -88,7 +100,7 @@ EnsureCallbacksRegistered(void)
  * inserting transaction is still open.
  */
 void
-VamanaUndoAppend(Oid indexRelid, uint64 externalId)
+VamanaUndoAppend(Oid indexRelid, uint64 externalId, uint64 growthBytes, uint32 generation)
 {
 	VamanaUndoEntry *entry;
 
@@ -96,6 +108,8 @@ VamanaUndoAppend(Oid indexRelid, uint64 externalId)
 	entry = VamanaSubxidPendingArrayAppend(GetOrCreateUndoLog());
 	entry->indexRelid = indexRelid;
 	entry->externalId = externalId;
+	entry->growthBytes = growthBytes;
+	entry->generation = generation;
 }
 
 /* -----------------------------------------------------------------------
@@ -111,12 +125,20 @@ undo_entry_cmp_by_relid(const void *a, const void *b)
 	return (ra > rb) - (ra < rb);
 }
 
-static void
+/*
+ * Returns true only if VamanaWorkerSubmitDelete itself reported success.
+ * The caller uses this to gate SvsMemoryCreditAbortedInserts: a failed or
+ * timed-out delete leaves the rows Valid in the graph, and crediting them
+ * back would understate memory that is still genuinely live.
+ */
+static bool
 undo_flush_batch(Oid relid, const size_t *ids, int count)
 {
+	bool		ok = false;
+
 	PG_TRY();
 	{
-		(void) VamanaWorkerSubmitDelete(relid, ids, count);
+		ok = VamanaWorkerSubmitDelete(relid, ids, count);
 	}
 	PG_CATCH();
 	{
@@ -124,8 +146,11 @@ undo_flush_batch(Oid relid, const size_t *ids, int count)
 		ereport(WARNING,
 				(errmsg("vamana undo: failed to delete %d entries from index %u",
 						count, relid)));
+		ok = false;
 	}
 	PG_END_TRY();
+
+	return ok;
 }
 
 /*
@@ -144,8 +169,28 @@ typedef struct ConsolidatingUndoBatch
 	Oid			currentRelid;
 	size_t		batchIds[VAMANA_MAX_DELETE_IDS];
 	int			batchCount;
+
+	/*
+	 * Growth to credit for currentRelid's accumulating batch, and which
+	 * generation it belongs to. Entries whose generation is lower than the
+	 * highest seen so far for this relid are stale (the graph was reloaded
+	 * or rebuilt since they applied) and are left out of batchGrowth
+	 * entirely -- see the comment on ConsolidatingUndoBatchAdd. This
+	 * converges to "sum of entries at the group's true maximum generation"
+	 * regardless of the order entries are fed in, which matters because the
+	 * full-abort callback feeds them in qsort (by relid only, not stable)
+	 * order.
+	 */
+	uint64		batchGrowth;
+	uint32		batchGeneration;
+
 	Oid			consolidateRelids[VAMANA_MAX_INDEXES];
 	int			nConsolidate;
+
+	/* Relids SvsMemoryCreditAbortedInserts reported as over the reclaim
+	 * cap; COMPACT is requested for each, once, after every CONSOLIDATE. */
+	Oid			compactRelids[VAMANA_MAX_INDEXES];
+	int			nCompact;
 }			ConsolidatingUndoBatch;
 
 static void
@@ -153,21 +198,60 @@ ConsolidatingUndoBatchInit(ConsolidatingUndoBatch *batch)
 {
 	batch->currentRelid = InvalidOid;
 	batch->batchCount = 0;
+	batch->batchGrowth = 0;
+	batch->batchGeneration = 0;
 	batch->nConsolidate = 0;
+	batch->nCompact = 0;
+}
+
+static void
+ConsolidatingUndoBatchTrackRelid(Oid *relids, int *nRelids, Oid relid)
+{
+	if (!OidIsValid(relid))
+		return;
+
+	for (int i = 0; i < *nRelids; i++)
+		if (relids[i] == relid)
+			return;
+
+	if (*nRelids < VAMANA_MAX_INDEXES)
+		relids[(*nRelids)++] = relid;
 }
 
 static void
 ConsolidatingUndoBatchTrackConsolidate(ConsolidatingUndoBatch *batch, Oid relid)
 {
-	if (!OidIsValid(relid))
+	ConsolidatingUndoBatchTrackRelid(batch->consolidateRelids, &batch->nConsolidate, relid);
+}
+
+static void
+ConsolidatingUndoBatchTrackCompact(ConsolidatingUndoBatch *batch, Oid relid)
+{
+	ConsolidatingUndoBatchTrackRelid(batch->compactRelids, &batch->nCompact, relid);
+}
+
+/*
+ * Flush the batch accumulated for batch->currentRelid, if any, crediting
+ * its growth back once the delete is confirmed and flagging it for a
+ * follow-up COMPACT if that credit pushed the database over its reclaim
+ * cap. Shared by the relid-change branch of ConsolidatingUndoBatchAdd and
+ * by ConsolidatingUndoBatchFinish.
+ */
+static void
+ConsolidatingUndoBatchFlushCurrent(ConsolidatingUndoBatch *batch)
+{
+	if (batch->batchCount == 0)
 		return;
 
-	if (batch->nConsolidate > 0 &&
-		batch->consolidateRelids[batch->nConsolidate - 1] == relid)
-		return;
+	if (undo_flush_batch(batch->currentRelid, batch->batchIds, batch->batchCount) &&
+		batch->batchGrowth > 0)
+	{
+		if (SvsMemoryCreditAbortedInserts(MyDatabaseId, batch->currentRelid,
+										   batch->batchGeneration, batch->batchGrowth))
+			ConsolidatingUndoBatchTrackCompact(batch, batch->currentRelid);
+	}
 
-	if (batch->nConsolidate < VAMANA_MAX_INDEXES)
-		batch->consolidateRelids[batch->nConsolidate++] = relid;
+	ConsolidatingUndoBatchTrackConsolidate(batch, batch->currentRelid);
 }
 
 /*
@@ -181,30 +265,44 @@ ConsolidatingUndoBatchAdd(ConsolidatingUndoBatch *batch, const VamanaUndoEntry *
 	if (entry->indexRelid != batch->currentRelid ||
 		batch->batchCount >= (int) VAMANA_MAX_DELETE_IDS)
 	{
-		if (batch->batchCount > 0)
-			undo_flush_batch(batch->currentRelid, batch->batchIds, batch->batchCount);
-
-		ConsolidatingUndoBatchTrackConsolidate(batch, batch->currentRelid);
+		ConsolidatingUndoBatchFlushCurrent(batch);
 
 		batch->currentRelid = entry->indexRelid;
 		batch->batchCount = 0;
+		batch->batchGrowth = 0;
+		batch->batchGeneration = 0;
 	}
 	batch->batchIds[batch->batchCount++] = (size_t) entry->externalId;
+
+	/*
+	 * Keep only the growth belonging to the highest generation seen so far
+	 * for this relid's batch; an entry from an older generation is simply
+	 * dropped from the sum (not credited at all), which leaves the budget
+	 * honestly over-counted rather than crediting bytes against a graph
+	 * that no longer matches what was measured. See the struct comment.
+	 */
+	if (entry->generation > batch->batchGeneration)
+	{
+		batch->batchGeneration = entry->generation;
+		batch->batchGrowth = entry->growthBytes;
+	}
+	else if (entry->generation == batch->batchGeneration)
+		batch->batchGrowth += entry->growthBytes;
 }
 
-/* Flush whatever is still pending, then consolidate every affected index. */
+/* Flush whatever is still pending, then consolidate and compact every affected index. */
 static void
 ConsolidatingUndoBatchFinish(ConsolidatingUndoBatch *batch)
 {
-	if (batch->batchCount > 0)
-	{
-		undo_flush_batch(batch->currentRelid, batch->batchIds, batch->batchCount);
-		ConsolidatingUndoBatchTrackConsolidate(batch, batch->currentRelid);
-	}
+	ConsolidatingUndoBatchFlushCurrent(batch);
 
 	for (int i = 0; i < batch->nConsolidate; i++)
 		VamanaWorkerSubmitMaintenance(batch->consolidateRelids[i],
 									  VAMANA_MAINTENANCE_CONSOLIDATE);
+
+	for (int i = 0; i < batch->nCompact; i++)
+		VamanaWorkerSubmitMaintenance(batch->compactRelids[i],
+									  VAMANA_MAINTENANCE_COMPACT);
 }
 
 /* -----------------------------------------------------------------------

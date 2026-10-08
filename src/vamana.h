@@ -362,7 +362,7 @@ void		VamanaGetIndexSavePath(Oid dboid, Oid relid, char *buf, size_t bufsz);
 void		VamanaEnsureSaveDir(Oid dboid, Oid relid);
 void		VamanaDeleteSaveDir(Oid dboid, Oid relid);
 void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum,
-								  const VamanaIndexCache *meta);
+								  const VamanaIndexCache *meta, bool volatile *compactedOut);
 bool		VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
 void		VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count);
 void		VamanaInstallObjectAccessHook(void);

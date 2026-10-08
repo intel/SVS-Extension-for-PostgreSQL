@@ -513,10 +513,17 @@ VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache 
  *
  * On failure: cleans up the partial save directory and re-raises the error.
  * The caller is responsible for error handling policy.
+ *
+ * compactedOut, if not NULL, is set to true as soon as SVSSaveIndex succeeds.
+ * SVSSaveIndex compacts the live in-memory graph as a side effect before
+ * writing anything, so a caller that tracks compaction-driven accounting
+ * (e.g. a checkpoint's residency reconciliation) needs to know whether that
+ * happened even when a later step in this function (the TID-map write, or
+ * VamanaMarkIndexSaved after this function's own PG_TRY) still fails.
  */
 void
 VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum,
-					  const VamanaIndexCache *meta)
+					  const VamanaIndexCache *meta, bool volatile *compactedOut)
 {
 	char		savepath[MAXPGPATH];
 	Oid			relid = RelationGetRelid(index);
@@ -535,6 +542,9 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 				 errdetail_log("Path: \"%s\".", savepath)));
 
 		SVSSaveIndex(svsIndex, savepath);
+
+		if (compactedOut != NULL)
+			*compactedOut = true;
 
 		/*
 		 * Build-time TID order must be preserved: a heap re-scan after VACUUM
