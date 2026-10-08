@@ -26,6 +26,7 @@
 #include "svs_cpu_budget.h"
 #include "svs_index_residency.h"
 #include "svs_memory.h"
+#include "svs_slot_naming.h"
 #include "vamana.h"
 #include "vamana_databases.h"
 #include "vamana_replication.h"
@@ -1290,12 +1291,14 @@ RegisterDatabaseWorker(const VamanaDatabaseRow *db, TimestampTz now)
 	BackgroundWorker bgw;
 	BackgroundWorkerHandle *handle;
 	MemoryContext oldCtx;
+	char		safeDatname[BGW_MAXLEN];
 
 	if (!VamanaWorkerReserveSlotOrLog(db->dbOid, db->datname))
 		return NULL;
 
 	memset(&bgw, 0, sizeof(bgw));
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana worker: %s", db->datname);
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), db->datname);
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana worker: %s", safeDatname);
 	snprintf(bgw.bgw_type, BGW_MAXLEN, "vamana worker");
 	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "svs");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "VamanaWorkerMain");
