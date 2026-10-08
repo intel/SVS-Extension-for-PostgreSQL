@@ -15,15 +15,17 @@
 #
 #   A2  svs.so's run-time library search path contains no absolute paths from
 #       the machine that built it (developer home directories, scratch
-#       filesystems). Such a path is attacker-writable on a customer host --
-#       often it does not exist at all, so an unprivileged user can create it
-#       and plant a substitute libsvs_c_api.so. The shipping value must be
-#       relative to the loading object ($ORIGIN) or empty.
+#       filesystems), and is otherwise $ORIGIN-relative or empty. Such a path
+#       is attacker-writable on a customer host -- often it does not exist at
+#       all, so an unprivileged user can create it and plant a substitute
+#       libsvs_c_api.so.
 #
-#   A3  libsvs_c_api.so's run-time library search path contains no leftover
-#       MKL build-environment paths (an expanded or unexpanded $MKLROOT, an
-#       oneAPI toolkit prefix). These are build-host artifacts and have the
-#       same substitution exposure as A2.
+#   A3  libsvs_c_api.so's run-time library search path gets the same two
+#       checks as A2 (no build-machine paths, $ORIGIN-relative or empty),
+#       plus a check for leftover MKL build-environment paths (an expanded or
+#       unexpanded $MKLROOT, an oneAPI toolkit prefix). Both objects ship to
+#       the same customer host and have the same substitution exposure, so
+#       neither gets a narrower check than the other.
 #
 # IMPORTANT -- run this against the PACKAGED artifact, never a local build.
 # A developer build deliberately carries an absolute -Wl,-rpath to the
@@ -315,18 +317,34 @@ check_a2_svs_so_rpath() {
 }
 
 check_a3_capi_rpath() {
-    local so=$1 rpath bad
+    local so=$1 rpath bad_dev bad_rel bad_mkl
     require_elf "$so" A3
 
     rpath=$(read_rpath "$so")
     log "INFO A3 run path of ${so}: [${rpath}]"
 
-    bad=$(mklroot_violations "$rpath")
-    if [[ -n "$bad" ]]; then
-        result_fail A3 "MKL/oneAPI build-environment path in run path of $(basename "$so")"
-        printf '%s\n' "$bad" | sed 's/^/FAIL   offending entry: /'
+    bad_dev=$(devpath_violations "$rpath")
+    if [[ -n "$bad_dev" ]]; then
+        result_fail A3a "build-machine path in run path of $(basename "$so"); attacker-writable on a customer host"
+        printf '%s\n' "$bad_dev" | sed 's/^/FAIL   offending entry: /'
     else
-        result_pass A3 "no MKL/oneAPI build-environment paths in run path of $(basename "$so")"
+        result_pass A3a "no build-machine paths in run path of $(basename "$so")"
+    fi
+
+    bad_rel=$(nonrelative_rpath_violations "$rpath")
+    if [[ -n "$bad_rel" ]]; then
+        result_fail A3b "run path of $(basename "$so") must be \$ORIGIN-relative or empty; found absolute entries"
+        printf '%s\n' "$bad_rel" | sed 's/^/FAIL   offending entry: /'
+    else
+        result_pass A3b "run path of $(basename "$so") is \$ORIGIN-relative or empty"
+    fi
+
+    bad_mkl=$(mklroot_violations "$rpath")
+    if [[ -n "$bad_mkl" ]]; then
+        result_fail A3c "MKL/oneAPI build-environment path in run path of $(basename "$so")"
+        printf '%s\n' "$bad_mkl" | sed 's/^/FAIL   offending entry: /'
+    else
+        result_pass A3c "no MKL/oneAPI build-environment paths in run path of $(basename "$so")"
     fi
 }
 
@@ -422,14 +440,27 @@ self_test() {
     expect_clean     A2b-braced   nonrelative_rpath_violations '${ORIGIN}/../lib'
     expect_clean     A2b-empty    nonrelative_rpath_violations ''
 
-    # -- A3: MKL build-environment paths ------------------------------------
-    expect_violation A3-unexpanded mklroot_violations '$MKLROOT/lib/intel64'
-    expect_violation A3-braced     mklroot_violations '${MKLROOT}/lib'
-    expect_violation A3-oneapi     mklroot_violations '/opt/intel/oneapi/mkl/2024.1/lib/intel64'
-    expect_violation A3-mkldir     mklroot_violations '/usr/local/mkl/lib'
-    expect_violation A3-mixed      mklroot_violations '$ORIGIN/../lib:/opt/intel/oneapi/compiler/latest/lib'
-    expect_clean     A3-origin     mklroot_violations '$ORIGIN/../lib'
-    expect_clean     A3-empty      mklroot_violations ''
+    # -- A3a/A3b: libsvs_c_api.so gets the same build-machine-path and
+    # $ORIGIN-relative checks as svs.so (A2a/A2b above). A non-MKL absolute
+    # path here used to slip through uncaught, since the old A3 only ran
+    # mklroot_violations; these fixtures pin that it no longer does.
+    expect_violation A3a-home    devpath_violations '/home/builder/svs/lib'
+    expect_violation A3a-data    devpath_violations '/data1/someuser/svs_install/lib'
+    expect_clean     A3a-origin  devpath_violations '$ORIGIN/../lib'
+    expect_clean     A3a-empty   devpath_violations ''
+
+    expect_violation A3b-abs     nonrelative_rpath_violations '/home/builder/svs/lib'
+    expect_clean     A3b-origin  nonrelative_rpath_violations '$ORIGIN/../lib'
+    expect_clean     A3b-empty   nonrelative_rpath_violations ''
+
+    # -- A3c: MKL build-environment paths ------------------------------------
+    expect_violation A3c-unexpanded mklroot_violations '$MKLROOT/lib/intel64'
+    expect_violation A3c-braced     mklroot_violations '${MKLROOT}/lib'
+    expect_violation A3c-oneapi     mklroot_violations '/opt/intel/oneapi/mkl/2024.1/lib/intel64'
+    expect_violation A3c-mkldir     mklroot_violations '/usr/local/mkl/lib'
+    expect_violation A3c-mixed      mklroot_violations '$ORIGIN/../lib:/opt/intel/oneapi/compiler/latest/lib'
+    expect_clean     A3c-origin     mklroot_violations '$ORIGIN/../lib'
+    expect_clean     A3c-empty      mklroot_violations ''
 
     # -- dynamic-tag parsing ------------------------------------------------
     # The false-pass trap: a developer path recorded in the legacy DT_RPATH is
