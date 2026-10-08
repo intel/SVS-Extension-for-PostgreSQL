@@ -128,7 +128,6 @@ for test_file in "${!tap_failed_count[@]}"; do
 		# in the logs.
 		unexpected_count=$((unexpected_count + 1))
 		summary_lines+=("  UNEXPECTED (test-logic failure): ${test_file} reported ${failed} failed assertion(s)")
-		continue
 	fi
 
 	found_any=0
@@ -138,9 +137,11 @@ for test_file in "${!tap_failed_count[@]}"; do
 			found_any=1
 		fi
 	done
-	if [[ "${found_any}" -eq 0 ]]; then
+	if [[ "${failed}" -eq 0 && "${found_any}" -eq 0 ]]; then
 		# Dubious exit, no trap or crash signal found in its node logs:
 		# still a real finding, just not one this script can label further.
+		# (Skipped when failed>0: that case already has an identified cause
+		# above, so a generic "no trap found" message would be misleading.)
 		unexpected_count=$((unexpected_count + 1))
 		summary_lines+=("  UNEXPECTED (dubious exit, no trap found): ${test_file} exited abnormally with no TRAP/signal in its node logs -- investigate directly")
 	fi
