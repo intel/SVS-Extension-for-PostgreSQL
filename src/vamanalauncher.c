@@ -1423,7 +1423,6 @@ DropSlotsAbandonedByStoppedWorker(Oid dbOid)
 	{
 		VamanaSlotDropResult result = VamanaReplicationDropIfExists(dbOid, relids[i]);
 
-		/* FAILED is not reported here: the try-drop already logged the error. */
 		if (result == VAMANA_SLOT_DROP_DONE)
 			ereport(LOG,
 					(errmsg("vamana launcher: dropped replication slot of removed index %u in database %u",
@@ -1433,6 +1432,22 @@ DropSlotsAbandonedByStoppedWorker(Oid dbOid)
 					(errmsg("vamana launcher: replication slot of removed index %u in database %u is still held",
 							relids[i], dbOid),
 					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+		else
+		{
+			/*
+			 * FAILED: TryDropSlot already logged the underlying error. There
+			 * is no worker left to hand this back to -- the entry's dead
+			 * worker's queue is what we just drained, and its shmem slot is
+			 * about to be released -- so unlike the BUSY case this will not
+			 * be retried automatically. Say so explicitly rather than letting
+			 * the one earlier WARNING be the only trace.
+			 */
+			ereport(WARNING,
+					(errmsg("vamana launcher: could not drop replication slot of removed index %u in database %u",
+							relids[i], dbOid),
+					 errdetail("The worker that owned this request is gone and nothing will retry the drop automatically."),
+					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+		}
 	}
 }
 
