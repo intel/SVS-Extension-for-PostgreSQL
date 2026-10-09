@@ -298,17 +298,15 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 				 errdetail_log("Path: \"%s\".", tidmaptmp)));
 	}
 
-	if (rename(tidmaptmp, tidmappath) != 0)
-	{
-		int			save_errno = errno;
-
-		unlink(tidmaptmp);		/* do not leave the temp file behind */
-		errno = save_errno;
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not save TID map for vamana index %u: %m", relid),
-				 errdetail_log("Rename \"%s\" to \"%s\".", tidmaptmp, tidmappath)));
-	}
+	/*
+	 * durable_rename fsyncs the temporary file, then the renamed file and its
+	 * containing directory, before returning.  A plain rename(2) leaves both
+	 * the file contents and the new directory entry in the kernel's page cache,
+	 * so a host-level crash could lose the entry and leave the index pointing
+	 * at a TID map that was reported saved.  Raises ERROR on failure, which the
+	 * caller's PG_TRY turns into a full save-directory cleanup.
+	 */
+	durable_rename(tidmaptmp, tidmappath, ERROR);
 }
 
 /*
