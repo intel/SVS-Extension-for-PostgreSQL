@@ -425,12 +425,11 @@ VamanaInit(void)
 int
 VamanaGetGraphDegree(Relation index)
 {
-	VamanaOptions *opts = (VamanaOptions *) index->rd_options;
+	VamanaMetaPageData meta;
 
-	if (opts)
-		return opts->graph_degree;
+	VamanaReadMetaPage(index, &meta);
 
-	return VAMANA_DEFAULT_GRAPH_DEGREE;
+	return meta.graph_degree;
 }
 
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vamanahandler);
