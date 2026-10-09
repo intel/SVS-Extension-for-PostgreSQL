@@ -24,6 +24,7 @@
 #include "vamana_replication.h"
 #include "vamana_subxact_guard.h"
 #include "svs_index_residency.h"
+#include "svs_slot_naming.h"
 #include "vamanaworker.h"
 #include "svs_cpu_slots.h"
 #include "svs_wrapper.h"
@@ -650,9 +651,12 @@ VamanaWorkerMaybeWarnZeroIndex(VamanaZeroIndexState *state)
 	{
 		if (!state->warned)
 		{
+			char		safeDatname[NAMEDATALEN * 4];
+
+			CopySanitizedDatname(safeDatname, sizeof(safeDatname), state->dbname);
 			ereport(LOG,
 					(errmsg("vamana worker for database \"%s\" has no Vamana indexes",
-							state->dbname),
+							safeDatname),
 					 errhint("consider removing its row from vamana_databases")));
 			state->warned = true;
 		}
@@ -994,12 +998,15 @@ VamanaStandbyActivateSlotBounded(Oid relid)
 static void
 VamanaWorkerRunStartupTransaction(VamanaZeroIndexState *zeroIndexState, char *datname)
 {
+	char		safeDatname[NAMEDATALEN * 4];
+
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	zeroIndexState->dbname = datname;
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), zeroIndexState->dbname);
 	ereport(LOG, (errmsg("vamana background worker started for database \"%s\"",
-						 zeroIndexState->dbname)));
+						 safeDatname)));
 	VamanaWorkerReconcileResidencyOnStartup();
 	if (VamanaIndexCountIsMaintained())
 		VamanaWorkerSeedIndexCount();

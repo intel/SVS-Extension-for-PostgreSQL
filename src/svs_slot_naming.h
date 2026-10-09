@@ -18,6 +18,23 @@ typedef enum SvsSlotKind
 extern const char *SvsSlotKindBgwType(SvsSlotKind kind);
 
 /*
+ * Copy datname into dst, run through core's pg_clean_ascii() first.
+ * datname is chosen by anyone with CREATEDB and can reach line-oriented
+ * consumers (application_name, bgw_name, log lines), so it must not carry
+ * a byte that could inject a line break; pg_clean_ascii() is the same
+ * function core's own backend_startup.c uses to sanitize application_name
+ * from a startup packet.
+ *
+ * pg_clean_ascii()'s escaped output can run up to 4x the length of
+ * datname, so strlcpy() into a dst smaller than that can truncate
+ * mid-escape-sequence (e.g. "\x0a" cut to "\x0"). That is cosmetic, not a
+ * safety issue: pg_clean_ascii()'s output is pure printable ASCII by
+ * construction, so no truncation point can reintroduce a raw control byte.
+ */
+extern void CopySanitizedDatname(char *dst, size_t dstsize,
+								  const char *datname);
+
+/*
  * Name of the wait event a parked search slot reports while blocked in its
  * park loop, registered with WaitEventExtensionNew().  Search slots only:
  * a build slot's park loop is untouched and still waits on plain

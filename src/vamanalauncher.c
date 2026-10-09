@@ -26,6 +26,7 @@
 #include "svs_cpu_budget.h"
 #include "svs_index_residency.h"
 #include "svs_memory.h"
+#include "svs_slot_naming.h"
 #include "vamana.h"
 #include "vamana_databases.h"
 #include "vamana_replication.h"
@@ -502,13 +503,16 @@ VamanaLauncherReconcileWorkers(void)
 static bool
 VamanaWorkerReserveSlotOrLog(Oid dbOid, const char *datname)
 {
+	char		safeDatname[NAMEDATALEN * 4];
+
 	if (VamanaWorkerReserveSlot(dbOid, NULL) != NULL)
 		return true;
 
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), datname);
 	ereport(LOG,
 			(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 			 errmsg("vamana launcher could not reserve a slot for database \"%s\"",
-					datname),
+					safeDatname),
 			 errhint("Increase svs.max_databases and restart.")));
 	return false;
 }
@@ -747,9 +751,12 @@ ReadDatabaseRows(bool *ok)
 				dbOid = get_database_oid(NameStr(*datname), true);
 				if (!OidIsValid(dbOid))
 				{
+					char		safeDatname[NAMEDATALEN * 4];
+
+					CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(*datname));
 					ereport(LOG,
 							(errmsg("vamana launcher: database \"%s\" does not exist; skipping",
-									NameStr(*datname))));
+									safeDatname)));
 					continue;
 				}
 
@@ -1290,12 +1297,14 @@ RegisterDatabaseWorker(const VamanaDatabaseRow *db, TimestampTz now)
 	BackgroundWorker bgw;
 	BackgroundWorkerHandle *handle;
 	MemoryContext oldCtx;
+	char		safeDatname[BGW_MAXLEN];
 
 	if (!VamanaWorkerReserveSlotOrLog(db->dbOid, db->datname))
 		return NULL;
 
 	memset(&bgw, 0, sizeof(bgw));
-	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana worker: %s", db->datname);
+	CopySanitizedDatname(safeDatname, sizeof(safeDatname), db->datname);
+	snprintf(bgw.bgw_name, BGW_MAXLEN, "vamana worker: %s", safeDatname);
 	snprintf(bgw.bgw_type, BGW_MAXLEN, "vamana worker");
 	snprintf(bgw.bgw_library_name, BGW_MAXLEN, "svs");
 	snprintf(bgw.bgw_function_name, BGW_MAXLEN, "VamanaWorkerMain");
@@ -1313,7 +1322,7 @@ RegisterDatabaseWorker(const VamanaDatabaseRow *db, TimestampTz now)
 		MemoryContextSwitchTo(oldCtx);
 		ereport(LOG,
 				(errmsg("vamana launcher could not register worker for database \"%s\"",
-						db->datname),
+						safeDatname),
 				 errhint("Consider increasing max_worker_processes.")));
 		return NULL;
 	}
@@ -1580,10 +1589,15 @@ ExecuteRestartAction(VamanaRestartAction action, VamanaLauncherWorker *ledger,
 			break;
 
 		case RESTART_WAIT_TIMEOUT:
-			ereport(WARNING,
-					(errmsg("vamana launcher: worker for database \"%s\" did not stop within %d ms",
-							db->datname, vamana_worker_stop_timeout_ms),
-					 errhint("Restart remains pending until worker exits.")));
+			{
+				char		safeDatname[NAMEDATALEN * 4];
+
+				CopySanitizedDatname(safeDatname, sizeof(safeDatname), db->datname);
+				ereport(WARNING,
+						(errmsg("vamana launcher: worker for database \"%s\" did not stop within %d ms",
+								safeDatname, vamana_worker_stop_timeout_ms),
+						 errhint("Restart remains pending until worker exits.")));
+			}
 			break;
 
 		case RESTART_RESPAWN:
