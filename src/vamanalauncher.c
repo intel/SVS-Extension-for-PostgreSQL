@@ -1049,11 +1049,18 @@ PublishCpuGrants(List *rows)
  * or svs.max_residency_memory via SIGHUP. One rejection is caught and
  * logged so it can't stop the rest of this cycle's databases from
  * reconciling.
+ *
+ * SvsMemoryAdmitDatabase runs after CommitTransactionCommand() below, so an
+ * error it throws fires with no open transaction: AbortCurrentTransaction()
+ * in the catch is a no-op and never performs its usual side effect of
+ * switching back to the caller's memory context. oldcontext restores it
+ * explicitly instead.
  */
 static void
 ReconcileResidencyAdmission(Oid dbOid)
 {
 	VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(dbOid);
+	MemoryContext oldcontext = CurrentMemoryContext;
 
 	if (entry == NULL)
 		return;
@@ -1076,6 +1083,7 @@ ReconcileResidencyAdmission(Oid dbOid)
 	{
 		if (IsTransactionState())
 			AbortCurrentTransaction();
+		MemoryContextSwitchTo(oldcontext);
 		EmitErrorReport();
 		FlushErrorState();
 	}
@@ -1104,6 +1112,7 @@ PublishMemoryOverrides(List *rows)
 										db->memory.searchWorkMemMbOverride);
 
 		ReconcileResidencyAdmission(db->dbOid);
+		Assert(CurrentMemoryContext != ErrorContext);
 	}
 }
 
