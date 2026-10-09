@@ -81,6 +81,24 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v7
 
+    # A CodeQL build-mode:manual analysis reports on everything built during
+    # the trace, with no path-based filtering -- paths/paths-ignore do not
+    # apply to a compiled language analyzed with build-mode: manual/autobuild
+    # (see "Alerts found in generated code" in GitHub's code-scanning docs).
+    # The only way to keep the vendored PostgreSQL/SVS/pgvector dependency
+    # trees out of this analysis is to build them outside the checkout root
+    # entirely, so the extractor never attributes anything in them to this
+    # repository. $RUNNER_TEMP is a sibling of the checkout, not under it.
+    #
+    # Copying docs/build_guide/ there, rather than overriding its scripts'
+    # directory variables, needs no changes to docs/build_guide/config at
+    # all: every path in it is already derived from BASE_DIR, which the
+    # scripts compute from their own invocation path
+    # ($(dirname "${BASH_SOURCE[0]}")). Invoking the copies makes BASE_DIR
+    # -- and everything under it -- land under $RUNNER_TEMP for free.
+    - name: Copy build_guide outside the checkout root
+      run: cp -r docs/build_guide "${RUNNER_TEMP}/build_guide"
+
     # The dependency builds below deliberately run *before* `init` so that the
     # CodeQL tracer only wraps this repository's `make`. Building PostgreSQL and
     # the SVS C++ library after `init` would extract them into the database too.
@@ -99,21 +117,21 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          docs/build_guide/pgsql_install
-          docs/build_guide/svs_install
+          ${{ runner.temp }}/build_guide/pgsql_install
+          ${{ runner.temp }}/build_guide/svs_install
         key: svs-deps-${{ runner.os }}-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
 
     - name: Build PostgreSQL
       if: steps.deps-cache.outputs.cache-hit != 'true'
-      run: bash docs/build_guide/install_postgres.sh
+      run: bash "${RUNNER_TEMP}/build_guide/install_postgres.sh"
 
     - name: Build SVS library
       if: steps.deps-cache.outputs.cache-hit != 'true'
-      run: bash docs/build_guide/build_svs.sh
+      run: bash "${RUNNER_TEMP}/build_guide/build_svs.sh"
 
     - name: Build and install vanilla pgvector
       if: steps.deps-cache.outputs.cache-hit != 'true'
-      run: bash docs/build_guide/build_pgvector_vanilla.sh
+      run: bash "${RUNNER_TEMP}/build_guide/build_pgvector_vanilla.sh"
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
@@ -123,17 +141,28 @@ jobs:
         build-mode: ${{ matrix.build-mode }}
         # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
         queries: security-and-quality
+        # No paths-ignore here: it does not apply to a build-mode:manual
+        # analysis (see the "Copy build_guide outside the checkout root"
+        # step above, which is what actually keeps the vendored PostgreSQL/
+        # SVS/pgvector dependency trees out of this analysis). An earlier
+        # version of this workflow had a paths-ignore block here; it was
+        # syntactically valid but had no effect on the scan results and was
+        # removed rather than left as misleading dead configuration.
 
     # Build only the extension, so this is the compilation CodeQL traces.
-    # docs/build_guide/config is the single source of truth for PG_CONFIG and
-    # SVS_INSTALL_DIR. PG_CONFIG is exported rather than passed on the command
-    # line, matching build_svs_extension.sh's own convention, so the two don't
-    # drift into different patterns for the same variable.
+    # Source the copy under $RUNNER_TEMP, not docs/build_guide/config itself:
+    # that is where install_postgres.sh/build_svs.sh actually installed to
+    # (see "Copy build_guide outside the checkout root" above), and PG_CONFIG/
+    # SVS_INSTALL_DIR are derived from the same BASE_DIR either copy resolves
+    # for itself, so sourcing the in-tree config here would point at empty
+    # directories instead. PG_CONFIG is exported rather than passed on the
+    # command line, matching build_svs_extension.sh's own convention, so the
+    # two don't drift into different patterns for the same variable.
     - name: Run manual build steps
       if: matrix.build-mode == 'manual'
       shell: bash
       run: |
-        source docs/build_guide/config
+        source "${RUNNER_TEMP}/build_guide/config"
         export PG_CONFIG
         make -j"$(nproc)" SVS_INSTALL="$SVS_INSTALL_DIR"
 
