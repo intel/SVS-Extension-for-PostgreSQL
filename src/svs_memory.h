@@ -242,6 +242,15 @@ extern void SvsMemoryReserveBuild(Oid dbOid, Oid relid,
 extern void SvsMemoryCheckEstimatedBuildSize(double reltuples, int dimensions);
 
 /*
+ * Errors if requestedBytes exceeds svs.max_build_memory. Unlike
+ * SvsMemoryCheckEstimatedBuildSize, this has no reltuples-based skip
+ * condition: it is meant to be called at the point a build-time buffer is
+ * about to grow, so it applies regardless of whether the table has ever
+ * been analyzed.
+ */
+extern void SvsMemoryCheckGrowthSize(uint64 requestedBytes);
+
+/*
  * Backend, after a successful build and before serializing to disk.
  * Releases buildPeak unconditionally and reconciles the residency
  * reservation from estimate to measuredResidencyBytes (RESERVED ->

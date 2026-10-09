@@ -5,6 +5,7 @@
 
 #include "postgres.h"
 
+#include "svs_memory.h"
 #include "svs_vector_buffer.h"
 
 void
@@ -21,9 +22,13 @@ SvsVectorBufferAppend(SvsVectorBuffer *buf, const float *vec)
 {
 	if (buf->count >= buf->capacity)
 	{
-		buf->capacity *= 2;
-		buf->data = repalloc_huge(buf->data,
-							  buf->capacity * buf->dimensions * sizeof(float));
+		int64		newCapacity = buf->capacity * 2;
+		uint64		newBytes = (uint64) newCapacity * buf->dimensions * sizeof(float);
+
+		SvsMemoryCheckGrowthSize(newBytes);
+
+		buf->capacity = newCapacity;
+		buf->data = repalloc_huge(buf->data, newBytes);
 	}
 
 	memcpy(buf->data + buf->count * buf->dimensions, vec,
