@@ -800,13 +800,20 @@ VamanaWorkerStopAccepting(void)
  * VamanaTryCheckpointCachedIndex
  *
  * Attempt one index's checkpoint, absorbing any error so a single bad index
- * cannot take its caller down with it. On failure the current transaction is
- * aborted and the error is reported but not re-raised; the caller decides
- * what, if anything, to log about the skip.
+ * cannot take its caller down with it. On failure, any open transaction is
+ * aborted, the error is reported but not re-raised, and the caller's memory
+ * context is restored explicitly. The explicit restore matters because an
+ * error raised before VamanaCheckpointCachedIndex starts its transaction
+ * leaves CurrentMemoryContext pointing at ErrorContext, and in that case
+ * AbortCurrentTransaction() is a no-op (nothing is open to abort), so it
+ * never performs its usual side effect of switching back to the caller's
+ * context. The caller decides what, if anything, to log about the skip.
  */
 static bool
 VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
 {
+	MemoryContext oldcontext = CurrentMemoryContext;
+
 	/*
 	 * volatile: read after PG_END_TRY() but assigned inside PG_CATCH(), so
 	 * it must survive the longjmp back to the PG_TRY() setjmp point
@@ -823,7 +830,9 @@ VamanaTryCheckpointCachedIndex(VamanaIndexCache *cache)
 	{
 		EmitErrorReport();
 		FlushErrorState();
-		AbortCurrentTransaction();
+		if (IsTransactionState())
+			AbortCurrentTransaction();
+		MemoryContextSwitchTo(oldcontext);
 		succeeded = false;
 	}
 	PG_END_TRY();
@@ -1110,6 +1119,15 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 	{
 		int			rc;
 		const VamanaReplayRole *role = VamanaGetReplayRole();
+
+		/*
+		 * An error-absorbing PG_CATCH that forgets to restore the caller's
+		 * memory context leaves us in ErrorContext; the next
+		 * FlushErrorState() anywhere in the worker would then free live
+		 * loop data. Catch that here, at the next heartbeat, rather than as
+		 * a wild read far from the cause.
+		 */
+		Assert(CurrentMemoryContext != ErrorContext);
 
 		rc = WaitLatch(&VamanaWorkerShmemPtr->workerLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,

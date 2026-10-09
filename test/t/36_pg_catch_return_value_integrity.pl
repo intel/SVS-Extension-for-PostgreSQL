@@ -94,6 +94,26 @@ sub wait_for_log_line
     return 0;
 }
 
+# Issues pg_log_backend_memory_contexts() for $pid, then polls the log from
+# $offset for that backend's ErrorContext line and returns its "used" figure.
+# Returns undef on timeout.
+sub get_error_context_used
+{
+    my ($node, $pid, $offset, $timeout_s) = @_;
+    $timeout_s //= 10;
+    $node->safe_psql('postgres', "SELECT pg_log_backend_memory_contexts($pid);");
+    for (1 .. $timeout_s * 2)
+    {
+        my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $offset);
+        if ($log =~ /\[$pid\].*ErrorContext: \d+ total in \d+ blocks; \d+ free \(\d+ chunks\); (\d+) used/)
+        {
+            return $1;
+        }
+        usleep(500_000);
+    }
+    return undef;
+}
+
 # Starts pg_recvlogical against $slot_name and blocks until active_pid is set
 # to something other than $excluded_pid.  Returns the IPC::Run handle; caller
 # must kill_kill it.  Copied from 07_replication_slots.pl's helper of the same
@@ -221,6 +241,16 @@ sub hold_slot_externally
 # it holds the same value regardless of whether succeeded survives the
 # longjmp correctly.  The "will retry" LOG line is the one signal that
 # actually depends on the read.
+#
+# This block also proves a second, independent property of the same catch: it
+# must leave the caller's memory context exactly as it found it.  A single
+# failure here lands before the checkpoint's own transaction starts, so there
+# is no transaction abort to restore the context as a side effect; only a
+# second consecutive failure actually frees live data out from under the
+# caller, so the injection point is held across two full cycles rather than
+# one.  The same worker (not a replacement after a crash) must survive both,
+# with no signal termination; and even where no crash occurs, the worker's
+# ErrorContext must not keep growing once checkpoints resume succeeding.
 # ---------------------------------------------------------------------------
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_pg_catch_checkpoint');
@@ -241,7 +271,8 @@ sub hold_slot_externally
     $node->safe_psql('postgres',
         "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
 
-    wait_for_worker($node, 30);
+    my $worker_pid = wait_for_worker($node, 30);
+    ok($worker_pid ne '', 'the worker starts for the postgres database');
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE ckpt_err_tbl (id serial PRIMARY KEY, val vector($dim));
@@ -274,11 +305,35 @@ sub hold_slot_externally
             $log_offset, 10),
         'succeeded read back false: the worker logged the failure-only "will retry" line');
 
-    ok(wait_for_worker($node, 10),
-        'the worker survives a checkpoint that fails inside PG_TRY()');
+    # One failure only poisons CurrentMemoryContext; it takes a second failure,
+    # with the injection point still attached, to free live loop data out from
+    # under the checkpoint sweep and crash an assert build.  Hold the injection
+    # point open across both cycles rather than detaching after the first.
+    my $second_fail_offset = -s $node->logfile;
+
+    ok(wait_for_log_line($node,
+            qr/vamana checkpoint: index $ioid not checkpointed this cycle, will retry/,
+            $second_fail_offset, 10),
+        'a second consecutive pre-transaction failure also logs the failure-only line');
 
     $node->safe_psql('postgres',
         "SELECT injection_points_detach('vamana-checkpoint-cached-index-error');");
+
+    # The crash, when it happens, lands within milliseconds of the second
+    # failure (about 780 ms observed with core dumps enabled).  Give the
+    # worker one full heartbeat past that point before touching the server
+    # with SQL: on unfixed code the node is down by then, and any safe_psql
+    # call croaks instead of failing a test.  log_contains only reads the
+    # file, so it is safe to use even if the server already died.
+    usleep(1_500_000);
+
+    ok(!$node->log_contains(
+            qr/terminated by signal|server process .* was terminated/,
+            $log_offset),
+        'the worker was not killed by a signal after two consecutive pre-transaction checkpoint failures');
+
+    is(wait_for_worker($node, 10), $worker_pid,
+        'the same worker (not a restart) survives both checkpoint failures');
 
     $log_offset = -s $node->logfile;
 
@@ -292,6 +347,26 @@ sub hold_slot_externally
             qr/vamana checkpoint: index $ioid not checkpointed this cycle, will retry/,
             $log_offset),
         'succeeded read back true: no failure-only line for the successful attempt');
+
+    # The crash reproduces reliably only on an assert build (CLOBBER_FREED_MEMORY
+    # makes the stale List read garbage).  On a release build the same bug
+    # leaves the worker's CurrentMemoryContext stuck on ErrorContext with no
+    # crash at all, and the only observable symptom is that ErrorContext keeps
+    # growing every heartbeat even once checkpoints are succeeding (nothing
+    # should accumulate there with no error in flight).  This is the one check
+    # in the file that catches the bug on a release build.
+    my $mc_offset1 = -s $node->logfile;
+    my $used1 = get_error_context_used($node, $worker_pid, $mc_offset1, 10);
+    ok(defined $used1, 'got the worker\'s ErrorContext usage after the recovered checkpoint');
+
+    sleep(4);
+
+    my $mc_offset2 = -s $node->logfile;
+    my $used2 = get_error_context_used($node, $worker_pid, $mc_offset2, 10);
+    ok(defined $used2, 'got the worker\'s ErrorContext usage a few heartbeats later');
+
+    cmp_ok($used2, '<=', $used1,
+        "ErrorContext usage does not grow across heartbeats with no error in flight ($used1 -> $used2)");
 
     $node->stop;
 }
