@@ -296,14 +296,15 @@ VamanaWorkerProcessRequests(void)
  * pass, so the drop cannot lose the race it was handed.  The cache entry goes
  * first because it owns a handle naming the slot.
  *
- * A FAILED result is left queued instead of cleared, so it is retried rather
- * than silently abandoned.  nextDropRetryAt throttles that per-slot retry
- * independently of the main loop's own cadence, which, per
- * VamanaWorkerActivateSnapshotsIncremental's comment above, cannot be trusted
- * to space calls out; without it a persistently-failing drop (a foreign slot
- * TryDropSlot now refuses, say) would re-attempt and re-log thousands of
- * times a second.  Local to this process: only this worker ever consumes its
- * own queue, so it needs no shared-memory counterpart.
+ * A FAILED or BUSY result is left queued instead of cleared, so it is
+ * retried rather than silently abandoned after one attempt.  nextDropRetryAt
+ * throttles that per-slot retry independently of the main loop's own
+ * cadence, which, per VamanaWorkerActivateSnapshotsIncremental's comment
+ * above, cannot be trusted to space calls out; without it a
+ * persistently-failing drop (a foreign slot TryDropSlot now refuses, or a
+ * slot someone else holds indefinitely) would re-attempt and re-log
+ * thousands of times a second.  Local to this process: only this worker
+ * ever consumes its own queue, so it needs no shared-memory counterpart.
  */
 static TimestampTz nextDropRetryAt[VAMANA_MAX_SLOT_DROP_QUEUE];
 
@@ -339,20 +340,27 @@ VamanaWorkerProcessSlotDrops(void)
 
 		result = VamanaReplicationDropIfExists(VamanaWorkerShmemPtr->dbOid, relid);
 
-		if (result == VAMANA_SLOT_DROP_FAILED)
+		if (result == VAMANA_SLOT_DROP_FAILED || result == VAMANA_SLOT_DROP_BUSY)
 		{
 			/*
-			 * TryDropSlot already logged the underlying error.  Leave the
-			 * entry queued (a producer only ever claims a zeroed entry, so
-			 * this one stays ours) and retry on a later pass instead of
-			 * discarding it; the alternative is a slot that leaks WAL
-			 * forever with no further warning after this one.
+			 * TryDropSlot (FAILED) or ReplicationSlotDrop itself (BUSY)
+			 * already logged the underlying reason.  Leave the entry queued
+			 * (a producer only ever claims a zeroed entry, so this one stays
+			 * ours) and retry on a later pass instead of discarding it after
+			 * one attempt; the alternative is a slot that leaks WAL forever
+			 * with no further warning after this one.
 			 */
 			nextDropRetryAt[i] = TimestampTzPlusMilliseconds(now,
 								VAMANA_SLOT_DROP_RETRY_INTERVAL_MS);
-			ereport(WARNING,
-					(errmsg("vamana worker: could not drop replication slot of removed index %u; will retry",
-							relid)));
+			if (result == VAMANA_SLOT_DROP_BUSY)
+				ereport(WARNING,
+						(errmsg("vamana worker: replication slot of removed index %u is still held; will retry",
+								relid),
+						 errhint("Drop it with pg_drop_replication_slot() once it is inactive, or let the retry pick it up.")));
+			else
+				ereport(WARNING,
+						(errmsg("vamana worker: could not drop replication slot of removed index %u; will retry",
+								relid)));
 			continue;
 		}
 
@@ -368,15 +376,9 @@ VamanaWorkerProcessSlotDrops(void)
 		pg_atomic_write_u32(
 							&VamanaWorkerShmemPtr->pendingSlotDrops[i].relid, 0);
 
-		if (result == VAMANA_SLOT_DROP_DONE)
-			ereport(LOG,
-					(errmsg("vamana worker: dropped replication slot of removed index %u",
-							relid)));
-		else if (result == VAMANA_SLOT_DROP_BUSY)
-			ereport(WARNING,
-					(errmsg("vamana worker: replication slot of removed index %u is still held",
-							relid),
-					 errhint("Drop it with pg_drop_replication_slot() once it is inactive.")));
+		ereport(LOG,
+				(errmsg("vamana worker: dropped replication slot of removed index %u",
+						relid)));
 	}
 }
 

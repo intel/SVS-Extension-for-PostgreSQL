@@ -227,11 +227,13 @@ sub hold_slot_externally
 
     $held->kill_kill;
 
-    # Both the backend's and the worker's single retry are now spent (neither
-    # queues another attempt), so nothing will drop this slot on its own; drop
-    # it directly so the cluster doesn't shut down holding a slot open.
-    $node->safe_psql('postgres',
-        "SELECT pg_drop_replication_slot('$slot_name');");
+    # The worker now keeps retrying a BUSY drop on a throttled cadence rather
+    # than giving up after the one hand-off, so once the external holder is
+    # gone the next retry succeeds on its own; no manual cleanup needed.
+    ok(wait_for_log_line($node,
+            qr/dropped replication slot of removed index $ioid\b/,
+            $log_offset, 15),
+        'once the external holder is gone, the worker\'s own retry succeeds and drops the slot');
 
     $node->stop;
 }
