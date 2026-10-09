@@ -14,10 +14,13 @@
 # assigned value surviving to the read, rather than on a side effect (like
 # LSN advancement, or the command committing) that every possible clobbered
 # value produces identically.  For TryDropSlot, that signal is the BUSY arm
-# specifically: TryDropSlot's other non-BUSY outcomes (DONE, FAILED) are
-# indistinguishable to every caller in this codebase (VAMANA_SLOT_DROP_FAILED
-# is written but never read anywhere), so only a genuinely-busy slot exercises
-# a caller branch that depends on the value.  For VamanaTryCheckpointCachedIndex,
+# specifically: BUSY and FAILED both drive the same worker hand-off, so only
+# DONE is distinguishable from them, and forcing DONE proves nothing about
+# surviving the longjmp (it is also this function's zero-initialized default,
+# so a clobbered read that happens to land on DONE looks identical to a
+# correct one).  BUSY is reliably reproducible from outside the server
+# (externally holding the slot); FAILED is not, without an injection point.
+# For VamanaTryCheckpointCachedIndex,
 # that signal is the "will retry" LOG line its callers emit on failure and
 # only on failure -- not LSN state, which is decided inside PerformCheckpoint
 # before succeeded is ever read.
@@ -142,13 +145,14 @@ sub hold_slot_externally
 # ---------------------------------------------------------------------------
 # TryDropSlot: the BUSY switch arm, and the hand-off it gates.
 #
-# ApplyPendingSlotDrops (the DROP INDEX commit-time caller) branches only on
-# result != VAMANA_SLOT_DROP_BUSY: DONE and FAILED both just "continue" with
-# no further action, so a test that only forces FAILED cannot tell a correct
-# read from a clobbered one -- every value that isn't BUSY looks identical to
-# every caller.  BUSY is the one value with a caller-visible, value-dependent
-# effect: it alone drives VamanaWorkerRequestSlotDrop, handing the drop to the
-# worker instead of abandoning it.
+# VamanaRetireIndexArtifacts (the DROP INDEX commit-time caller, via
+# ApplyPendingSlotDrops) returns early only on DONE; both BUSY and FAILED
+# fall through to VamanaWorkerRequestSlotDrop, handing the drop to the worker
+# instead of abandoning it.  A test that only forces FAILED still cannot tell
+# a correct read from one clobbered to DONE, since that is this path's only
+# other outcome and its own zero-initialized default; BUSY is reproducible
+# from outside the server without an injection point, so it remains the
+# signal this test forces.
 #
 # Externally holding the slot with pg_recvlogical (rather than racing the
 # worker's own transient use, as the non-deterministic test in
@@ -223,11 +227,13 @@ sub hold_slot_externally
 
     $held->kill_kill;
 
-    # Both the backend's and the worker's single retry are now spent (neither
-    # queues another attempt), so nothing will drop this slot on its own; drop
-    # it directly so the cluster doesn't shut down holding a slot open.
-    $node->safe_psql('postgres',
-        "SELECT pg_drop_replication_slot('$slot_name');");
+    # The worker now keeps retrying a BUSY drop on a throttled cadence rather
+    # than giving up after the one hand-off, so once the external holder is
+    # gone the next retry succeeds on its own; no manual cleanup needed.
+    ok(wait_for_log_line($node,
+            qr/dropped replication slot of removed index $ioid\b/,
+            $log_offset, 15),
+        'once the external holder is gone, the worker\'s own retry succeeds and drops the slot');
 
     $node->stop;
 }
