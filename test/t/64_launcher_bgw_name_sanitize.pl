@@ -281,4 +281,76 @@ $node3->safe_psql('postgres',
 
 $node3->stop;
 
+# ---------------------------------------------------------------------------
+# ReserveSlotsForEnabledEntries() (src/vamana_databases.c) raises its
+# "cannot enable database" error, with datname interpolated, in the
+# enrolling transaction's own pre-commit trigger -- no restart needed, just
+# an ordinary INSERT once svs.max_databases is already exhausted by an
+# earlier enabled row.
+# ---------------------------------------------------------------------------
+my $node4 = PostgreSQL::Test::Cluster->new('launcher_bgw_name_sanitize_ceiling');
+$node4->init;
+$node4->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+$node4->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+$node4->append_conf('postgresql.conf', "wal_level = logical");
+$node4->append_conf('postgresql.conf', "max_wal_senders = 4");
+$node4->append_conf('postgresql.conf', "svs.max_databases = 1");
+# The filler database alone must not trip the (unrelated) memory ceiling
+# before the max_databases ceiling this scenario is actually testing.
+$node4->append_conf('postgresql.conf', "svs.max_search_work_mem = '400MB'");
+$node4->append_conf('postgresql.conf', "svs.max_residency_memory = '400MB'");
+$node4->start;
+
+$node4->safe_psql('postgres', "CREATE EXTENSION vector;");
+$node4->safe_psql('postgres', "CREATE EXTENSION svs;");
+
+$node4->safe_psql('postgres', "CREATE DATABASE filler;");
+$node4->safe_psql('postgres',
+    "INSERT INTO vamana_databases (datname, enabled) VALUES ('filler', true);");
+
+$node4->safe_psql('postgres', qq(CREATE DATABASE "$rawname";));
+my ($enable_rc, undef, $enable_stderr) = $node4->psql('postgres',
+    "INSERT INTO vamana_databases (datname, enabled) VALUES ('$rawname', true);");
+isnt($enable_rc, 0,
+    'enabling a second database once svs.max_databases = 1 is already spent is rejected');
+
+like($enable_stderr,
+    qr/\Qcannot enable database "$sanitized": svs.max_databases (1) already reached\E/,
+    'the enable-time ceiling error carries the sanitized, single-line datname');
+
+$node4->stop;
+
+# ---------------------------------------------------------------------------
+# LogShortfallTransition() (src/svs_cpu_slots.c) logs set->datname, which
+# comes from get_database_name() of whichever database is connected -- the
+# same attacker-settable value as every other sink, just reached through
+# the standalone svs_cpu_slots_test module (test/modules/svs_cpu_slots_test)
+# rather than through a live vamana worker, so neither the launcher nor the
+# svs extension itself is needed here. max_parallel_workers is PGC_USERSET,
+# so the shortfall is forced within one session with no restart.
+# ---------------------------------------------------------------------------
+my $node5 = PostgreSQL::Test::Cluster->new('launcher_bgw_name_sanitize_shortfall');
+$node5->init;
+$node5->start;
+
+$node5->safe_psql('postgres', qq(CREATE DATABASE "$rawname";));
+$node5->safe_psql($rawname, "CREATE EXTENSION svs_cpu_slots_test;");
+
+my $shortfall_offset = -s $node5->logfile;
+$node5->safe_psql($rawname,
+    "SET max_parallel_workers = 1; SELECT svs_slot_resize(4);");
+
+like(slurp_file($node5->logfile),
+    qr/\Qsvs cpu slots: holding 1 of 4 requested vamana search slot slots for database "$sanitized"\E/,
+    'the shortfall-entered log line carries the sanitized, single-line datname')
+  or diag(substr(slurp_file($node5->logfile), $shortfall_offset));
+
+$node5->safe_psql($rawname, "SELECT svs_slot_resize(0);");
+
+like(slurp_file($node5->logfile),
+    qr/\Qsvs cpu slots: shortfall cleared, holding 0 of 0 requested vamana search slot slots for database "$sanitized"\E/,
+    'the shortfall-cleared log line carries the sanitized, single-line datname');
+
+$node5->stop;
+
 done_testing();
