@@ -106,13 +106,14 @@ VamanaWorkerResetStaleSlots(void)
 static void
 CacheEmptyTableIndex(Relation indexRel, Oid relid)
 {
-	VamanaOptions *opts = (VamanaOptions *) indexRel->rd_options;
+	VamanaMetaPageData meta;
 	int			dims = TupleDescAttr(indexRel->rd_att, 0)->atttypmod;
+
+	VamanaReadMetaPage(indexRel, &meta);
 
 	/* No SVS index exists yet, so it has no capacity and no headroom. */
 	VamanaCacheIndex(relid, NULL, dims,
-					  opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE,
-					  opts ? opts->alpha : VAMANA_DEFAULT_ALPHA,
+					  meta.graph_degree, VAMANA_ALPHA_TO_FLOAT(meta.alpha),
 					  NULL, 0, 0, 0, 0, 0);
 }
 
