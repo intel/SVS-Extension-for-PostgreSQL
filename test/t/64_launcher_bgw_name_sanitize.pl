@@ -139,6 +139,11 @@ like($log,
     qr/\Qunregistering background worker "vamana worker: $sanitized"\E/,
     'the worker stop log line carries the sanitized, single-line datname');
 
+like($log,
+    qr/\Qvamana background worker started for database "$sanitized"\E/,
+    'the worker-started log line (VamanaWorkerRunStartupTransaction) carries '
+  . 'the sanitized, single-line datname');
+
 $node->stop;
 
 # ---------------------------------------------------------------------------
@@ -196,5 +201,84 @@ like($capacity_log,
     'the capacity-exceeded log line carries the sanitized, single-line datname');
 
 $node2->stop;
+
+# ---------------------------------------------------------------------------
+# Two more sinks of the same bug, both reached without any resource
+# exhaustion or restart:
+#
+# vamana_databases_reject_delete_with_live_indexes() (src/vamana_databases.c)
+# rejects an ordinary DELETE FROM vamana_databases while the database still
+# has a live vamana index, and its ERROR message interpolates datname twice.
+#
+# ReadDatabaseRows() (src/vamanalauncher.c) logs "database ... does not
+# exist; skipping" on every reconcile cycle for a row whose database has
+# been dropped out from under it. DROP DATABASE requires no live
+# connections, so the row is disabled (stopping the worker) before the drop.
+# ---------------------------------------------------------------------------
+my $node3 = PostgreSQL::Test::Cluster->new('launcher_bgw_name_sanitize_misc');
+$node3->init;
+$node3->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
+$node3->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+$node3->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
+$node3->append_conf('postgresql.conf', "wal_level = logical");
+$node3->append_conf('postgresql.conf', "max_wal_senders = 4");
+$node3->start;
+
+$node3->safe_psql('postgres', "CREATE EXTENSION vector;");
+$node3->safe_psql('postgres', "CREATE EXTENSION svs;");
+
+$node3->safe_psql('postgres', qq(CREATE DATABASE "$rawname";));
+$node3->safe_psql('postgres',
+    "INSERT INTO vamana_databases (datname, enabled) VALUES ('$rawname', true);");
+
+my $oid3 = $node3->safe_psql('postgres',
+    "SELECT oid FROM pg_database WHERE datname = '$rawname';");
+chomp $oid3;
+my $pid3 = wait_for_worker_oid($node3, $oid3, 60);
+ok($pid3 =~ /^\d+$/, "worker started for the evil-named database on node3 (pid=$pid3)");
+
+$node3->safe_psql($rawname, "CREATE EXTENSION vector;");
+$node3->safe_psql($rawname, "CREATE EXTENSION svs;");
+$node3->safe_psql($rawname, "CREATE TABLE t (id bigint, v vector(4));");
+$node3->safe_psql($rawname,
+    "INSERT INTO t SELECT g, ARRAY[random(), random(), random(), random()]::vector(4) "
+  . "FROM generate_series(1, 10) g;");
+$node3->safe_psql($rawname, "CREATE INDEX t_idx ON t USING vamana (v vector_l2_ops);");
+
+my ($delete_rc, undef, $delete_stderr) = $node3->psql('postgres',
+    "DELETE FROM vamana_databases WHERE datname = '$rawname';");
+isnt($delete_rc, 0, 'deleting the row while a live vamana index exists is rejected');
+
+like($delete_stderr,
+    qr/\Qcannot remove "$sanitized" from vamana_databases:\E/,
+    'the delete-rejection error carries the sanitized, single-line datname');
+like($delete_stderr,
+    qr/\Qrun svs_teardown_database() in "$sanitized" first\E/,
+    'the delete-rejection errhint carries the sanitized, single-line datname');
+
+$node3->safe_psql('postgres',
+    "UPDATE vamana_databases SET enabled = false WHERE datname = '$rawname';");
+ok(wait_for_worker_oid_gone($node3, $oid3, 60),
+    'node3: worker stopped after the database was disabled');
+
+$node3->safe_psql('postgres', qq(DROP DATABASE "$rawname";));
+
+my $skip_log = '';
+for (1 .. 60)
+{
+    $skip_log = slurp_file($node3->logfile);
+    last if $skip_log =~ /does not exist; skipping/;
+    $node3->safe_psql('postgres', "SELECT pg_notify('vamana_databases_changed', '');");
+    usleep(500_000);
+}
+
+like($skip_log,
+    qr/\Qdatabase "$sanitized" does not exist; skipping\E/,
+    'the dropped-database skip log line carries the sanitized, single-line datname');
+
+$node3->safe_psql('postgres',
+    "DELETE FROM vamana_databases WHERE datname = '$rawname';");
+
+$node3->stop;
 
 done_testing();

@@ -412,15 +412,21 @@ LogShortfallTransition(SvsSlotSet *set, int target)
 
 	if (nowShort && !set->inShortfall)
 	{
+		char		safeDatname[NAMEDATALEN * 4];
+
+		CopySanitizedDatname(safeDatname, sizeof(safeDatname), set->datname);
 		ereport(LOG,
 				(errmsg("svs cpu slots: holding %d of %d requested %s slots for database \"%s\"",
-						set->count, target, SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH), set->datname)));
+						set->count, target, SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH), safeDatname)));
 	}
 	else if (!nowShort && set->inShortfall)
 	{
+		char		safeDatname[NAMEDATALEN * 4];
+
+		CopySanitizedDatname(safeDatname, sizeof(safeDatname), set->datname);
 		ereport(LOG,
 				(errmsg("svs cpu slots: shortfall cleared, holding %d of %d requested %s slots for database \"%s\"",
-						set->count, target, SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH), set->datname)));
+						set->count, target, SvsSlotKindBgwType(SVS_SLOT_KIND_SEARCH), safeDatname)));
 	}
 
 	set->inShortfall = nowShort;

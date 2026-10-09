@@ -22,6 +22,7 @@
 
 #include "svs_index_residency.h"
 #include "svs_memory.h"
+#include "svs_slot_naming.h"
 #include "vamana_databases.h"
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
@@ -285,6 +286,7 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 	Name		datname;
 	Oid			dbOid;
 	uint32		indexCount;
+	char		safeDatname[NAMEDATALEN * 4];
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "vamana_databases_reject_delete_with_live_indexes: not called by trigger manager");
@@ -319,13 +321,16 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 	(void) VamanaWorkerIndexCountSnapshot(dbOid, &indexCount);
 
 	if (indexCount > 0)
+	{
+		CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(*datname));
 		ereport(ERROR,
 				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 				 errmsg("cannot remove \"%s\" from vamana_databases: "
 						"%u vamana index(es) still exist in that database",
-						NameStr(*datname), indexCount),
+						safeDatname, indexCount),
 				 errhint("run svs_teardown_database() in \"%s\" first",
-						 NameStr(*datname))));
+						 safeDatname)));
+	}
 
 	return PointerGetDatum(trigdata->tg_trigtuple);
 }
@@ -426,11 +431,16 @@ ReserveSlotsForEnabledEntries(void)
 
 		slotEntry = VamanaWorkerReserveSlot(entry->dbOid, &created);
 		if (slotEntry == NULL)
+		{
+			char		safeDatname[NAMEDATALEN * 4];
+
+			CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(entry->datname));
 			ereport(ERROR,
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("cannot enable database \"%s\": svs.max_databases (%d) already reached",
-							NameStr(entry->datname), max_vamana_databases),
+							safeDatname, max_vamana_databases),
 					 errhint("Increase svs.max_databases and restart, or disable another database first.")));
+		}
 
 		/* A pre-existing live slot found by this idempotent reservation must survive this transaction's abort. */
 		if (created)
