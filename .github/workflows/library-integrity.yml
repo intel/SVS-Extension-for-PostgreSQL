@@ -1,0 +1,115 @@
+name: "Library integrity"
+
+# Run-time linking hygiene gate for the shared objects that ship to customers.
+#
+# Two jobs with deliberately different triggers:
+#
+#   checker-self-test  Runs on every push and pull request. It needs no build
+#                      artifact, so it can always run, and it proves the checks
+#                      still reject known-bad input. This is what stops
+#                      check-rpath.sh from decaying into a script that passes
+#                      everything.
+#
+#   packaged-artifact  Runs only when a caller hands it a real packaged
+#                      artifact. It is intentionally NOT wired to push or
+#                      pull_request: the assertions describe the packaged
+#                      artifact, and a development build legitimately fails
+#                      them, so pointing this job at a CI build would either
+#                      fail every run or, far worse, invite someone to relax
+#                      the assertions until a dev build passes.
+#
+# To use this as a release gate, call it from the publishing workflow BEFORE
+# the upload/publish step and let the dependency do the blocking:
+#
+#   jobs:
+#     integrity:
+#       uses: ./.github/workflows/library-integrity.yml
+#       with:
+#         artifact-name: svs-extension-package
+#     publish:
+#       needs: integrity        # publish cannot start unless integrity passed
+#       ...
+#
+# Do not add continue-on-error to either job, and do not append "|| true" to
+# the script invocation. A non-blocking integrity gate provides no assurance.
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      artifact-name:
+        description: "Name of an uploaded build artifact containing svs.so and libsvs_c_api.so"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: "Name of an uploaded build artifact containing svs.so and libsvs_c_api.so"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Guards the checker itself. Cheap, and it is the only part of this workflow
+  # that can run without a packaged artifact.
+  checker-self-test:
+    name: Checker self-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Verify inspection tools are present
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils patchelf
+          readelf --version | head -n 1
+          patchelf --version
+
+      - name: Self-test the integrity checks
+        run: ./docs/build_guide/check-rpath.sh --self-test
+
+      - name: Confirm the checker refuses to run without a named target
+        # Guards the property that matters most about this script: it has no
+        # default target, so it can never be pointed at a dev build by
+        # accident. Expect exit 2.
+        run: |
+          set +e
+          ./docs/build_guide/check-rpath.sh
+          status=$?
+          set -e
+          if [ "$status" -ne 2 ]; then
+            echo "::error::expected exit 2 when no target is named, got $status"
+            exit 1
+          fi
+          echo "ok: refuses to run without an explicit target (exit 2)"
+
+  # The real gate. Only runs when a caller supplies a packaged artifact.
+  packaged-artifact:
+    name: Packaged artifact integrity
+    runs-on: ubuntu-latest
+    if: inputs.artifact-name != ''
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils patchelf
+
+      - name: Download the packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: package
+
+      - name: Check run-time linking hygiene of the packaged artifact
+        # No continue-on-error and no "|| true": a non-zero exit must fail the
+        # job, and any job that depends on this one must not start.
+        run: ./docs/build_guide/check-rpath.sh --package-dir package
