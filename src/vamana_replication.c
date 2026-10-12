@@ -158,13 +158,30 @@ TryDropSlot(const char *slotName)
 	uint32		savedInterruptHoldoffCount = InterruptHoldoffCount;
 	uint32		savedQueryCancelHoldoffCount = QueryCancelHoldoffCount;
 	uint32		savedCritSectionCount = CritSectionCount;
+	ReplicationSlot *existing;
 
 	/* need_lock=true holds ReplicationSlotControlLock for the lookup */
-	if (SearchNamedReplicationSlot(slotName, true) == NULL)
+	existing = SearchNamedReplicationSlot(slotName, true);
+	if (existing == NULL)
 		return VAMANA_SLOT_DROP_DONE;
+
+	/*
+	 * The name alone does not prove ownership: a REPLICATION-privileged role
+	 * can pre-create a slot of this name with a different output plugin.
+	 * Dropping it anyway would destroy someone else's object; refuse instead
+	 * of acting on namespace collision alone.
+	 */
+	if (strcmp(NameStr(existing->data.plugin), "svs") != 0)
+	{
+		ereport(WARNING,
+				(errmsg("replication slot \"%s\" exists but belongs to plugin \"%s\", not \"svs\"; skipping drop",
+						slotName, NameStr(existing->data.plugin))));
+		return VAMANA_SLOT_DROP_FAILED;
+	}
 
 	PG_TRY();
 	{
+		INJECTION_POINT("vamana-slot-drop-fail", NULL);
 		ReplicationSlotDrop(slotName, /*nowait=*/ true);
 	}
 	PG_CATCH();
@@ -1406,18 +1423,22 @@ VamanaReplicationQueueDropAtCommit(Oid dboid, Oid indexRelid)
  * Signalling the BGW to evict its cache entry causes
  * VamanaWorkerProcessReloads to reload from the (now-absent) save
  * directory/catalog and fail cleanly.  The slot drop can lose the race to
- * whichever process holds the slot; that case is hand-off, not error, and
- * only escalates to a WARNING once the hand-off itself has no taker.
+ * whichever process holds the slot, or fail outright (disk full writing
+ * slot state, permission error, a foreign-owned slot of the same name);
+ * both cases are hand-off, not error, and only escalate to a WARNING once
+ * the hand-off itself has no taker.
  */
 static void
 VamanaRetireIndexArtifacts(Oid dbOid, Oid indexRelid, const char *reason)
 {
-	char		slotName[NAMEDATALEN];
+	char				 slotName[NAMEDATALEN];
+	VamanaSlotDropResult result;
 
 	if (!AmBackgroundWorkerProcess() && VamanaWorkerIsAvailable())
 		VamanaWorkerSignalReload(indexRelid);
 
-	if (VamanaReplicationDropIfExists(dbOid, indexRelid) != VAMANA_SLOT_DROP_BUSY)
+	result = VamanaReplicationDropIfExists(dbOid, indexRelid);
+	if (result == VAMANA_SLOT_DROP_DONE)
 		return;
 
 	if (VamanaWorkerRequestSlotDrop(dbOid, indexRelid))
