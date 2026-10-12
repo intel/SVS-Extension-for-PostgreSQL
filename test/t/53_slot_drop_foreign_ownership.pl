@@ -15,7 +15,7 @@
 # This test exercises the DROP INDEX path: build a real vamana index, drop
 # its own correctly-owned slot out from under it with
 # pg_drop_replication_slot(), then occupy the now-free name with a
-# test_decoding slot before DROP INDEX ever runs its own cleanup. The fixed
+# pgoutput slot before DROP INDEX ever runs its own cleanup. The fixed
 # TryDropSlot must notice the plugin mismatch, warn, and leave the foreign
 # slot alone rather than dropping it.
 
@@ -96,12 +96,12 @@ is($plugin, 'svs', 'the index\'s own slot is owned by the svs plugin');
 # to collide.
 $node->safe_psql('postgres', qq{
     SELECT pg_drop_replication_slot('$slot_name');
-    SELECT pg_create_logical_replication_slot('$slot_name', 'test_decoding');
+    SELECT pg_create_logical_replication_slot('$slot_name', 'pgoutput');
 });
 
 ($cnt, $plugin) = slot_info($node, $slot_name);
 is($cnt, 1, 'a foreign slot now occupies the name');
-is($plugin, 'test_decoding', 'the foreign slot is owned by test_decoding, not svs');
+is($plugin, 'pgoutput', 'the foreign slot is owned by pgoutput, not svs');
 
 my $log_offset = -s $node->logfile;
 
@@ -109,13 +109,13 @@ my $ret = $node->psql('postgres', "DROP INDEX foreign_slot_idx;");
 is($ret, 0, 'DROP INDEX still commits even though its slot cleanup is refused');
 
 ok(wait_for_log_line($node,
-        qr/replication slot "\Q$slot_name\E" exists but belongs to plugin "test_decoding", not "svs"; skipping drop/,
+        qr/replication slot "\Q$slot_name\E" exists but belongs to plugin "pgoutput", not "svs"; skipping drop/,
         $log_offset, 10),
     'TryDropSlot warns about the plugin mismatch instead of dropping the slot');
 
 ($cnt, $plugin) = slot_info($node, $slot_name);
 is($cnt, 1, 'the foreign slot was not dropped by DROP INDEX cleanup');
-is($plugin, 'test_decoding', 'the foreign slot still belongs to test_decoding');
+is($plugin, 'pgoutput', 'the foreign slot still belongs to pgoutput');
 
 ok(wait_for_worker($node, 10),
     'the worker is still alive after refusing the foreign-owned drop');
