@@ -14,8 +14,9 @@
 #   deps            install OS packages needed by every later step
 #   build-postgres  build and install PostgreSQL via docs/build_guide, with
 #                   TAP and injection points enabled, plus the
-#                   injection_points test module (needed by TAP, not
-#                   installed by docs/build_guide's own install)
+#                   injection_points test module and the test_decoding
+#                   contrib module (both needed by TAP, neither installed
+#                   by docs/build_guide's own install)
 #   build-svs       build the SVS C API bindings via docs/build_guide,
 #                   pinned to a known-good nightly release tarball
 #   build-pgvector  build and install vanilla pgvector via docs/build_guide
@@ -104,10 +105,22 @@ step_build_postgres() {
 	# tree that may no longer be there.
 	if [ -f "${PGSQL_INSTALL_DIR}/lib/injection_points.so" ]; then
 		echo "found existing injection_points module at ${PGSQL_INSTALL_DIR}/lib, skipping build"
-		return 0
+	else
+		make -C "${PGSQL_SRC_DIR}/src/test/modules/injection_points"
+		make -C "${PGSQL_SRC_DIR}/src/test/modules/injection_points" install
 	fi
-	make -C "${PGSQL_SRC_DIR}/src/test/modules/injection_points"
-	make -C "${PGSQL_SRC_DIR}/src/test/modules/injection_points" install
+	# test/t/53_slot_drop_foreign_ownership.pl creates a slot with the
+	# test_decoding output plugin to stand in for a foreign, non-svs slot.
+	# contrib modules are no more built by a plain top-level 'make install'
+	# than src/test/modules is; same cache-hit skip as injection_points
+	# above, checked independently since a cache hit on one module's .so
+	# says nothing about the other having been built in the same run.
+	if [ -f "${PGSQL_INSTALL_DIR}/lib/test_decoding.so" ]; then
+		echo "found existing test_decoding module at ${PGSQL_INSTALL_DIR}/lib, skipping build"
+	else
+		make -C "${PGSQL_SRC_DIR}/contrib/test_decoding"
+		make -C "${PGSQL_SRC_DIR}/contrib/test_decoding" install
+	fi
 }
 
 step_build_svs() {

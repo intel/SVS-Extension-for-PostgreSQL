@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 52_slot_drop_failure_retry.pl: a non-BUSY TryDropSlot failure is retried
+# 54_slot_drop_failure_retry.pl: a non-BUSY TryDropSlot failure is retried
 # instead of discarded.
 #
 # Before this fix, VamanaRetireIndexArtifacts only handed a drop to the
