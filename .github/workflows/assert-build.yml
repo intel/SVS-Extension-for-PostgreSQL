@@ -50,6 +50,9 @@ jobs:
           path: docs/build_guide/svs_install
           key: svs-ubuntu-24.04-${{ env.CC }}-${{ env.SVS_URL }}-v1
 
+      - name: deps
+        run: ci/build_and_test.sh deps
+
       - name: build-postgres
         run: ci/build_and_test.sh build-postgres
 
