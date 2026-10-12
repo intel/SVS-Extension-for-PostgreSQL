@@ -40,13 +40,13 @@ jobs:
     # timeout keeps a hung dependency build from consuming the 6 hour default.
     timeout-minutes: 180
     env:
-      # config's own SVS_URL/SVS_COMMIT defaults are blank (defer to
-      # upstream, see docs/build_guide/config); pin both here, side by side,
-      # so CI's build is reproducible. SVS_COMMIT must be the exact SVS_REPO
-      # commit SVS_URL's tarball was built from: SVS_BRANCH is a moving
-      # branch, and without SVS_COMMIT pinning bindings/c to match, it drifts
-      # ahead of the tarball's API and fails to compile. Update both together
-      # whenever SVS_URL is bumped to a newer nightly.
+      # Pin SVS_URL/SVS_COMMIT here, side by side, matching the defaults in
+      # docs/build_guide/config, so CI's build is reproducible. SVS_COMMIT
+      # must be the exact SVS_REPO commit SVS_URL's tarball was built from:
+      # SVS_BRANCH is a moving branch, and without SVS_COMMIT pinning
+      # bindings/c to match, it drifts ahead of the tarball's API and fails
+      # to compile. Update both together whenever SVS_URL is bumped to a
+      # newer nightly.
       SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
       SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
     permissions:
