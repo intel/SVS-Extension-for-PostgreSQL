@@ -1068,6 +1068,11 @@ RESET enable_seqscan;
 **Cause:** `compression_type` is outside `[0, 2]`.  
 **Fix:** Use `0` (none), `1` (leanvec), or `2` (lvq).
 
+### Error: `insert into index "X" would exceed svs.undo_log_max_entries`
+
+**Cause:** The current transaction has recorded `svs.undo_log_max_entries` undo entries (one per Vamana index insert, counted even for rows later undone by `ROLLBACK TO SAVEPOINT`) and the next insert would exceed it. This is a dedicated, budget-independent cap on per-transaction undo memory, separate from `svs.max_residency_memory`.  
+**Fix:** Commit in smaller batches, or have a superuser raise `svs.undo_log_max_entries` for the session (`SET svs.undo_log_max_entries = ...`) or cluster-wide (`postgresql.conf` + reload).
+
 ### Unexpected recall with large `leanvec_dims`
 
 **Cause:** `leanvec_dims` is not validated against the actual vector dimension at index creation time. If you set `leanvec_dims` to a value ≥ your vector dimension, the SVS library will receive that value and may behave unexpectedly.
@@ -1197,6 +1202,12 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 |-----|---------|-----|-----|-------|
 | `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
 | `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
+
+### Superuser-Settable GUC Parameters (`SET …`, superuser only; also settable in `postgresql.conf` + reload)
+
+| GUC | Default | Min | Max | Notes |
+|-----|---------|-----|-----|-------|
+| `svs.undo_log_max_entries` | `1048576` | `16` | `16777216` | Per-transaction cap on undo-log entries recorded for the BGW write path. Counted per index insert, not per heap row: a table with two Vamana indexes uses two entries per row. Bounds per-backend undo memory to roughly `entries * 40 bytes`, independent of residency and build-memory budgets. A non-superuser cannot raise it, but is still bound by it. |
 
 ### Server GUC Parameters (require restart — `postgresql.conf` only, `PGC_POSTMASTER`)
 

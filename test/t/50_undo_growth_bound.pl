@@ -11,7 +11,9 @@
 # single-transaction INSERT hits the residency-budget ERROR long before undo
 # memory grows large; (A2) the shared pending array grows via plain
 # repalloc, which PostgreSQL refuses above MaxAllocSize (1 GiB), stopping
-# near 33.5M entries.
+# near 16.7M entries at 40 bytes per entry. A dedicated, budget-independent
+# ceiling (svs.undo_log_max_entries, default 1,048,576) now also applies and
+# fires well before either of these; see 66_undo_log_entry_cap.pl.
 #
 # Each trial below (default budget, raised budget, headroom check) uses its
 # own freshly-enrolled database. residency_bytes_committed is per-database
@@ -203,7 +205,7 @@ sub run_growth_trial
         zero_charge_batches => $zero_charge_batches,
         final_residency     => $residency_series[-1] // 0,
         n_batches           => scalar(@rss_series),
-        undo_estimate_bytes => $rows_inserted * 24,
+        undo_estimate_bytes => $rows_inserted * 40,
     };
 }
 

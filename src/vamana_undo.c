@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include "svs_memory.h"
+#include "vamana.h"
 #include "vamana_undo.h"
 #include "vamanaworker.h"
 #include "vamana_subxid_pending_array.h"
@@ -28,6 +29,7 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 /* -----------------------------------------------------------------------
  * Data structures
@@ -49,6 +51,15 @@ typedef struct VamanaUndoEntry
 	uint64		growthBytes;
 	uint32		generation;
 }			VamanaUndoEntry;
+
+/*
+ * VAMANA_MAX_UNDO_LOG_MAX_ENTRIES is the GUC's compiled-in ceiling, chosen
+ * to stay under MaxAllocSize at this entry size. If a future field addition
+ * grows VamanaUndoEntry, this catches it at compile time instead of letting
+ * svs.undo_log_max_entries silently re-open the repalloc-at-MaxAllocSize gap.
+ */
+StaticAssertDecl(VAMANA_MAX_UNDO_LOG_MAX_ENTRIES * sizeof(VamanaUndoEntry) <= MaxAllocSize,
+				  "VAMANA_MAX_UNDO_LOG_MAX_ENTRIES * sizeof(VamanaUndoEntry) exceeds MaxAllocSize");
 
 /* Per-backend (per-transaction) log; reset to NULL at transaction end. */
 static VamanaSubxidPendingArray * CurrentUndoLog = NULL;
@@ -94,18 +105,53 @@ EnsureCallbacksRegistered(void)
  * ----------------------------------------------------------------------- */
 
 /*
+ * VamanaUndoReserve — enforce svs.undo_log_max_entries and guarantee the
+ * undo log has room for one more entry.
+ *
+ * Must be called before the insert is submitted to the worker: this is the
+ * only point in the insert path where rejecting the statement leaves no
+ * "applied in the graph but not recorded for undo" state. Every allocation
+ * and every possible ERROR in the undo path now happens here, so
+ * VamanaUndoAppend (called after the worker applies the insert) cannot
+ * ERROR.
+ */
+void
+VamanaUndoReserve(Relation index)
+{
+	VamanaSubxidPendingArray *log;
+
+	EnsureCallbacksRegistered();
+	log = GetOrCreateUndoLog();
+
+	if (log->count >= vamana_undo_log_max_entries)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("insert into index \"%s\" would exceed svs.undo_log_max_entries",
+						RelationGetRelationName(index)),
+				 errdetail("This transaction has recorded %d undo entries; the limit is %d.",
+						   log->count, vamana_undo_log_max_entries),
+				 errhint("Commit in smaller batches, or have a superuser raise svs.undo_log_max_entries.")));
+
+	VamanaSubxidPendingArrayEnsureSpace(log, vamana_undo_log_max_entries);
+}
+
+/*
  * VamanaUndoAppend — record one (relid, externalId) for undo on abort.
  *
  * Must be called immediately after the BGW confirms the insert, while the
- * inserting transaction is still open.
+ * inserting transaction is still open. VamanaUndoReserve must have already
+ * been called for this insert, so the array has guaranteed space and this
+ * cannot ERROR.
  */
 void
 VamanaUndoAppend(Oid indexRelid, uint64 externalId, uint64 growthBytes, uint32 generation)
 {
 	VamanaUndoEntry *entry;
+	VamanaSubxidPendingArray *log = GetOrCreateUndoLog();
 
-	EnsureCallbacksRegistered();
-	entry = VamanaSubxidPendingArrayAppend(GetOrCreateUndoLog());
+	Assert(log->count < log->capacity);
+
+	entry = VamanaSubxidPendingArrayAppend(log);
 	entry->indexRelid = indexRelid;
 	entry->externalId = externalId;
 	entry->growthBytes = growthBytes;

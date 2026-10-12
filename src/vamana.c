@@ -57,6 +57,8 @@ int			vamana_compact_threshold_pct = 10;
 int			svs_max_search_threads_per_db = 0;
 int			svs_max_total_search_threads = 0;
 
+int			vamana_undo_log_max_entries = VAMANA_DEFAULT_UNDO_LOG_MAX_ENTRIES;
+
 int			max_vamana_databases = 8;
 int			vamana_worker_timeout_ms = 5000;
 int			vamana_worker_startup_timeout_ms = 60000;
@@ -113,6 +115,22 @@ VamanaInit(void)
 							VAMANA_MIN_SEARCH_WINDOW,
 							VAMANA_MAX_SEARCH_WINDOW,
 							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("svs.undo_log_max_entries",
+							"Per-transaction cap on undo-log entries recorded for the BGW write path",
+							"Bounds a single transaction's per-backend undo memory to roughly "
+							"entries * 40 bytes, independent of residency and build-memory budgets. "
+							"A superuser may raise this for a deliberate bulk load; an unprivileged "
+							"role can neither raise it nor exceed it.",
+							&vamana_undo_log_max_entries,
+							VAMANA_DEFAULT_UNDO_LOG_MAX_ENTRIES,
+							VAMANA_MIN_UNDO_LOG_MAX_ENTRIES,
+							VAMANA_MAX_UNDO_LOG_MAX_ENTRIES,
+							PGC_SUSET,
 							0,
 							NULL,
 							NULL,

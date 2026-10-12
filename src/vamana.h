@@ -49,6 +49,9 @@
 #define VAMANA_MIN_SEARCH_WINDOW		10
 #define VAMANA_MAX_SEARCH_WINDOW		10000
 #define VAMANA_DEFAULT_USE_SEARCH_HISTORY	true
+#define VAMANA_DEFAULT_UNDO_LOG_MAX_ENTRIES	1048576
+#define VAMANA_MIN_UNDO_LOG_MAX_ENTRIES		16
+#define VAMANA_MAX_UNDO_LOG_MAX_ENTRIES		16777216
 
 /* Compression types (internal representation) */
 #define VAMANA_COMPRESSION_NONE			0
@@ -105,6 +108,7 @@ extern int	vamana_search_num_threads;
 extern int	vamana_compact_threshold_pct;
 extern int	svs_max_search_threads_per_db;
 extern int	svs_max_total_search_threads;
+extern int	vamana_undo_log_max_entries;
 
 /* Checkpoint and replication slot GUCs */
 extern int	vamana_checkpoint_debounce_window;
