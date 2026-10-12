@@ -410,6 +410,33 @@ VamanaWorkerLookupSlot(Oid dbOid)
 }
 
 /*
+ * Same as VamanaWorkerLookupSlot, but also hands back the entry's generation
+ * as read under the same locked section as the lookup itself.  A caller that
+ * keeps both past the lock release can re-verify, immediately before a write
+ * through the cached pointer, that the slot hasn't been released and
+ * re-reserved for a different database in the meantime: compare the caller's
+ * saved dbOid and generation against the entry's current ones under a
+ * re-acquired header lock.
+ */
+VamanaWorkerShmem *
+VamanaWorkerLookupSlotGeneration(Oid dbOid, uint32 *generation)
+{
+	VamanaWorkerShmem *entry;
+
+	Assert(OidIsValid(dbOid));
+
+	VamanaWorkerRequireShmemInitialized();
+
+	LWLockAcquire(VamanaWorkerShmemHeaderPtr->lock, LW_SHARED);
+	entry = VamanaWorkerFindSlot(dbOid);
+	if (entry != NULL && generation != NULL)
+		*generation = entry->generation;
+	LWLockRelease(VamanaWorkerShmemHeaderPtr->lock);
+
+	return entry;
+}
+
+/*
  * The header control block, for callers (svs_memory.c) that manage its
  * lock themselves rather than going through a per-field accessor.
  */
@@ -558,6 +585,7 @@ VamanaWorkerReserveSlot(Oid dbOid, bool *created)
 		if (entry != NULL)
 		{
 			entry->dbOid = dbOid;
+			entry->generation++;
 			VamanaWorkerShmemHeaderPtr->numActive++;
 			if (created)
 				*created = true;
@@ -1179,6 +1207,7 @@ VamanaWorkerReleaseSlot(Oid dbOid)
 	if (entry != NULL)
 	{
 		entry->dbOid = InvalidOid;
+		entry->generation++;
 		VamanaWorkerResetEntryState(entry);
 		VamanaWorkerShmemHeaderPtr->numActive--;
 	}

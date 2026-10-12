@@ -900,42 +900,68 @@ AppendPendingBuildRequests(SvsBuildCpuRequest *builds, int nbuilds,
  * Hand a build's grant back to the requester: publish requested/granted
  * before flipping status, mirroring VamanaWorkerSlot's write-then-publish
  * protocol, then wake the backend waiting on it.
+ *
+ * entry was looked up and cached before the budget was computed, so it is
+ * re-verified against dbOid/generation under the header lock before any
+ * field is written, closing the window described at vamanaworker.h's
+ * VamanaWorkerLookupSlot comment.  The wake happens only after that lock is
+ * dropped: SvsWakeBackend reaches ProcArrayLock, and holding the header lock
+ * across it would introduce a lock-ordering dependency that exists nowhere
+ * else in this code.
  */
 static void
-PublishBuildGrant(VamanaWorkerShmem *entry, const SvsBuildCpuGrant *grant)
+PublishBuildGrant(VamanaWorkerShmem *entry, Oid dbOid, uint32 generation,
+				   const SvsBuildCpuGrant *grant)
 {
-	for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
+	VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
+	pid_t		wakePid = 0;
+
+	LWLockAcquire(header->lock, LW_SHARED);
+
+	if (entry->dbOid == dbOid && entry->generation == generation)
 	{
-		SvsBuildRequest *req = &entry->buildRequests[i];
+		for (int i = 0; i < SVS_MAX_PENDING_BUILDS; i++)
+		{
+			SvsBuildRequest *req = &entry->buildRequests[i];
 
-		if ((pid_t) pg_atomic_read_u32(&req->pid) != grant->requestPid)
-			continue;
+			if ((pid_t) pg_atomic_read_u32(&req->pid) != grant->requestPid)
+				continue;
 
-		req->granted = grant->grantedThreads;
-		pg_write_barrier();
-		pg_atomic_write_u32(&req->status, SVS_BUILD_REQUEST_GRANTED);
-		SvsWakeBackend(grant->requestPid);
-		return;
+			req->granted = grant->grantedThreads;
+			pg_write_barrier();
+			pg_atomic_write_u32(&req->status, SVS_BUILD_REQUEST_GRANTED);
+			wakePid = grant->requestPid;
+			break;
+		}
 	}
+
+	LWLockRelease(header->lock);
+
+	if (wakePid != 0)
+		SvsWakeBackend(wakePid);
 }
 
 /* One enabled database's control-block pointer, as resolved while gathering
- * this reconcile's requests. Grant application below matches on dbOid, not
- * position: nothing guarantees budget->dbGrants/buildGrants track
- * enabledRows' order or count.
+ * this reconcile's requests, together with the slot generation observed at
+ * the same lookup.  Grant application below matches on dbOid, not position:
+ * nothing guarantees budget->dbGrants/buildGrants track enabledRows' order
+ * or count.  The generation lets the writeback loops detect a release-and-
+ * reserve that recycled this array slot for another database while the
+ * budget was being computed.
  */
 typedef struct GatheredDbEntry
 {
 	Oid					dbOid;
 	VamanaWorkerShmem  *entry;
+	uint32				generation;
 } GatheredDbEntry;
 
-static VamanaWorkerShmem *
+static const GatheredDbEntry *
 FindGatheredEntry(const GatheredDbEntry *entries, int nentries, Oid dbOid)
 {
 	for (int i = 0; i < nentries; i++)
 		if (entries[i].dbOid == dbOid)
-			return entries[i].entry;
+			return &entries[i];
 
 	return NULL;
 }
@@ -971,11 +997,13 @@ PublishCpuGrants(List *rows)
 	foreach(lc, enabledRows)
 	{
 		VamanaDatabaseRow *db = (VamanaDatabaseRow *) lfirst(lc);
-		VamanaWorkerShmem *entry = VamanaWorkerLookupSlot(db->dbOid);
+		uint32		generation = 0;
+		VamanaWorkerShmem *entry = VamanaWorkerLookupSlotGeneration(db->dbOid, &generation);
 		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
 
 		entries[i].dbOid = db->dbOid;
 		entries[i].entry = entry;
+		entries[i].generation = generation;
 
 		dbs[i].dbOid = db->dbOid;
 		dbs[i].live = live;
@@ -1009,31 +1037,45 @@ PublishCpuGrants(List *rows)
 	for (i = 0; i < budget->ndbGrants; i++)
 	{
 		const SvsDbCpuGrant *grant = &budget->dbGrants[i];
-		VamanaWorkerShmem *entry = FindGatheredEntry(entries, ndbs, grant->dbOid);
-		uint32		previousGranted;
+		const GatheredDbEntry *gathered = FindGatheredEntry(entries, ndbs, grant->dbOid);
+		VamanaWorkerShmemHeader *header;
+		bool		changed = false;
 
-		if (entry == NULL || entry->dbOid != grant->dbOid)
+		if (gathered == NULL || gathered->entry == NULL)
 			continue;
 
-		previousGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
+		header = VamanaWorkerHeader();
+		LWLockAcquire(header->lock, LW_SHARED);
 
-		pg_atomic_write_u32(&entry->desiredSearchThreads, (uint32) grant->desiredSearchThreads);
-		pg_atomic_write_u32(&entry->reservedSearchThreads, (uint32) grant->reservedSearchThreads);
-
-		if ((uint32) grant->grantedSearchThreads != previousGranted)
+		if (gathered->entry->dbOid == gathered->dbOid &&
+			gathered->entry->generation == gathered->generation)
 		{
-			pg_atomic_write_u32(&entry->grantedSearchThreads, (uint32) grant->grantedSearchThreads);
-			SetLatch(&entry->workerLatch);
+			VamanaWorkerShmem *entry = gathered->entry;
+			uint32		previousGranted = pg_atomic_read_u32(&entry->grantedSearchThreads);
+
+			pg_atomic_write_u32(&entry->desiredSearchThreads, (uint32) grant->desiredSearchThreads);
+			pg_atomic_write_u32(&entry->reservedSearchThreads, (uint32) grant->reservedSearchThreads);
+
+			if ((uint32) grant->grantedSearchThreads != previousGranted)
+			{
+				pg_atomic_write_u32(&entry->grantedSearchThreads, (uint32) grant->grantedSearchThreads);
+				changed = true;
+			}
 		}
+
+		LWLockRelease(header->lock);
+
+		if (changed)
+			SetLatch(&gathered->entry->workerLatch);
 	}
 
 	for (i = 0; i < budget->nbuildGrants; i++)
 	{
 		const SvsBuildCpuGrant *grant = &budget->buildGrants[i];
-		VamanaWorkerShmem *entry = FindGatheredEntry(entries, ndbs, grant->dbOid);
+		const GatheredDbEntry *gathered = FindGatheredEntry(entries, ndbs, grant->dbOid);
 
-		if (entry != NULL && entry->dbOid == grant->dbOid)
-			PublishBuildGrant(entry, grant);
+		if (gathered != NULL && gathered->entry != NULL)
+			PublishBuildGrant(gathered->entry, gathered->dbOid, gathered->generation, grant);
 	}
 
 	if (budget->reservedFloorsExceedPool)
