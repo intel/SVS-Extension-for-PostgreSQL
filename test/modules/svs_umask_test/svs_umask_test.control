@@ -1,0 +1,5 @@
+# svs_umask_test extension
+comment = 'Test-only backend umask control for SDL437 payload directory mode tests'
+default_version = '1.0'
+module_pathname = '$libdir/svs_umask_test'
+relocatable = true
