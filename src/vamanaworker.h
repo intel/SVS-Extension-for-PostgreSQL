@@ -252,6 +252,17 @@ typedef struct VamanaWorkerShmem
 {
 	Oid				dbOid;			/* database this worker serves; InvalidOid = free */
 
+	/*
+	 * Bumped under the header lock by both VamanaWorkerReserveSlot and
+	 * VamanaWorkerReleaseSlot, every time either changes dbOid.  Lets a
+	 * caller that cached this entry's pointer across an unlocked interval
+	 * (PublishCpuGrants) detect a release-and-reserve that recycled the
+	 * slot for another database in the meantime, even in the (currently
+	 * impossible, but not API-guaranteed) case where the new occupant has
+	 * the same dbOid as the old one.
+	 */
+	uint32			generation;
+
 	pid_t			workerPid;		/* 0 = no live worker for this entry */
 	Latch			workerLatch;	/* InitSharedLatch'd; worker owns this */
 
@@ -503,18 +514,17 @@ void	VamanaWorkerInstallHooks(void);		/* installs shmem hooks; called from _PG_i
  * confirmed the worker stopped, and the backend IPC claim path, whose request
  * spans a wake-up and a wait that no lock can be held across.
  *
- * One caller still writes through it and is not meant to: the launcher's
+ * One caller used to write through it without re-checking: the launcher's
  * CPU-grant pass (PublishCpuGrants), which caches entries across
- * SvsComputeCpuGrants and writes the grants afterwards.  Nothing can recycle an
- * entry underneath it today, but only because the launcher is the sole releaser
- * of a reserved one — a fact about the callers, not something this API
- * guarantees.  Its build-grant half cannot simply move under the callback
- * either: publishing a grant calls SvsWakeBackend, which reaches ProcArrayLock,
- * and the callback contract below forbids that.  Retiring it wants a generation
- * stamp owned by reserve and release, or a wake deferred until after the lock is
- * dropped, so it is left to its own change rather than patched here.
+ * SvsComputeCpuGrants and writes the grants afterwards.  It now re-verifies
+ * dbOid and generation under the header lock immediately before each write
+ * (VamanaWorkerLookupSlotGeneration below), closing the window without
+ * holding the header lock across SvsWakeBackend, which reaches ProcArrayLock
+ * and would otherwise create a lock-ordering hazard against the callback
+ * contract below.
  */
 VamanaWorkerShmem *VamanaWorkerLookupSlot(Oid dbOid);
+VamanaWorkerShmem *VamanaWorkerLookupSlotGeneration(Oid dbOid, uint32 *generation);
 VamanaWorkerShmem *VamanaWorkerReserveSlot(Oid dbOid, bool *created);
 void	VamanaWorkerReleaseSlot(Oid dbOid);
 void	VamanaWorkerClearDeadEntry(Oid dbOid);
