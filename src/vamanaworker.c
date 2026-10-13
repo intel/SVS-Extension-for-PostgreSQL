@@ -65,8 +65,8 @@
  * Signal flags (worker process only)
  * ----------------------------------------------------------------------- */
 
-volatile sig_atomic_t worker_got_sigterm = false;
-volatile sig_atomic_t worker_got_sighup = false;
+static volatile sig_atomic_t worker_got_sigterm = false;
+static volatile sig_atomic_t worker_got_sighup = false;
 
 /*
  * Suppresses VamanaRelcacheCallback-driven eviction for every relid, not just
@@ -87,7 +87,7 @@ bool		vamana_eviction_suppressed = false;
  * cleared by the main loop after it reconciles.  A standby has no other signal
  * that a vamana index was created or dropped on the primary.
  */
-bool		standbyRediscoverPending = false;
+static bool	standbyRediscoverPending = false;
 
 /*
  * The parked search-slot set this worker converges to its own published

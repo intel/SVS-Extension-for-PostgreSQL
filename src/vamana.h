@@ -39,11 +39,11 @@
 #define VAMANA_DEFAULT_GRAPH_DEGREE		64
 #define VAMANA_MIN_GRAPH_DEGREE			16
 #define VAMANA_MAX_GRAPH_DEGREE			256
-#define VAMANA_DEFAULT_ALPHA			-1  /* -1 = use SVS library default */
-#define VAMANA_MIN_ALPHA				-1
+#define VAMANA_DEFAULT_ALPHA			(-1)  /* -1 = use SVS library default */
+#define VAMANA_MIN_ALPHA				(-1)
 #define VAMANA_MAX_ALPHA				200 /* 2.0 * 100 */
-#define VAMANA_DEFAULT_BUILD_WINDOW		-1  /* -1 = 2 * graph_degree */
-#define VAMANA_MIN_BUILD_WINDOW			-1
+#define VAMANA_DEFAULT_BUILD_WINDOW		(-1)  /* -1 = 2 * graph_degree */
+#define VAMANA_MIN_BUILD_WINDOW			(-1)
 #define VAMANA_MAX_BUILD_WINDOW			1000
 #define VAMANA_DEFAULT_SEARCH_WINDOW	100
 #define VAMANA_MIN_SEARCH_WINDOW		10
@@ -64,9 +64,9 @@
 
 /* Quantization data types shared by LeanVec and LVQ (map to SVS data types) */
 #define VAMANA_LEANVEC_UINT4			4
-#define VAMANA_LEANVEC_INT4				-4
+#define VAMANA_LEANVEC_INT4				(-4)
 #define VAMANA_LEANVEC_UINT8			8
-#define VAMANA_LEANVEC_INT8				-8
+#define VAMANA_LEANVEC_INT8				(-8)
 
 /*
  * LVQ-only compression_secondary value: no residual.  Maps to
@@ -91,8 +91,8 @@
  */
 #define VAMANA_DEFAULT_COMPRESSION_PRIMARY		VAMANA_LEANVEC_UINT4
 #define VAMANA_DEFAULT_COMPRESSION_SECONDARY	VAMANA_LEANVEC_UINT8
-#define VAMANA_DEFAULT_LEANVEC_DIMS			-1	/* -1 = dimensions / 2 */
-#define VAMANA_MIN_LEANVEC_DIMS				-1
+#define VAMANA_DEFAULT_LEANVEC_DIMS			(-1)	/* -1 = dimensions / 2 */
+#define VAMANA_MIN_LEANVEC_DIMS				(-1)
 #define VAMANA_MAX_LEANVEC_DIMS				2000
 
 /* Build phases */

@@ -406,6 +406,7 @@ VamanaLauncherReconcileWorkers(void)
 	long		naptime = VAMANA_LAUNCHER_NAPTIME_MS;
 	bool		ok;
 
+	// NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result): PostgreSQL constant macro, not a palloc(n * size) site
 	cycleCtx = AllocSetContextCreate(TopMemoryContext,
 									 "vamana launcher reconcile",
 									 ALLOCSET_DEFAULT_SIZES);
@@ -537,6 +538,7 @@ MaterializeInitialConfig(void)
 	ListCell   *lc;
 	bool		ok;
 
+	// NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result): PostgreSQL constant macro, not a palloc(n * size) site
 	scanCtx = AllocSetContextCreate(TopMemoryContext,
 									"vamana launcher initial scan",
 									ALLOCSET_DEFAULT_SIZES);

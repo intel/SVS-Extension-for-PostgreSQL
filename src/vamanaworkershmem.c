@@ -717,9 +717,9 @@ ApplyIndexCountDeltaCb(VamanaWorkerShmem *entry, void *ctx)
 	int			delta = *((int *) ctx);
 
 	if (delta > 0)
-		pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) delta);
+		pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) delta);	// NOLINT(bugprone-narrowing-conversions): already-explicit cast; the flagged narrowing is inside PostgreSQL's own atomics implementation, not this call
 	else
-		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));
+		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));	// NOLINT(bugprone-narrowing-conversions): same as above
 }
 
 /*
