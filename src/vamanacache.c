@@ -415,10 +415,24 @@ VamanaCacheIsEmpty(void)
 }
 
 /*
- * Kick the launcher only on the transition to zero cached entries: every
- * cached index shares one per-database grant, so unloading one of several
- * frees no capacity.  Worker-only: backends share this cache code but hold
- * no grant, so a backend's local eviction must not wake the launcher.
+ * Kick the launcher only on the transition to zero cached entries.  This
+ * has no effect on CPU grants, which are computed from worker liveness and
+ * configured thread count and never from cache state.  Its real effect is
+ * on the memory side: the eviction path that empties the cache also lowers
+ * residencyBytesCommitted and raises SumReclaimableBytes, and the kick lets
+ * PublishMemoryOverrides's call to ReconcileResidencyAdmission see that
+ * drop immediately instead of waiting out the launcher's normal naptime.
+ * This matters when a SIGHUP has lowered a database's residency budget
+ * below what it had already committed, and the lowered budget is pending
+ * admission until committed bytes fall enough to accommodate it.
+ *
+ * Known gap: this only fires on the transition to zero, not on every
+ * partial unload, so a database whose cache shrinks to a smaller nonzero
+ * set also lowers committed bytes but does not get the same prompt
+ * re-admission; such a pending rejection still waits out the naptime.
+ *
+ * Worker-only: backends share this cache code but hold no grant, so a
+ * backend's local eviction must not wake the launcher.
  */
 static void
 VamanaCacheMaybeKickLauncher(void)
