@@ -37,24 +37,35 @@ VamanaSubxidPendingArrayCreate(MemoryContext memContext, size_t elemSize,
 	return array;
 }
 
+void
+VamanaSubxidPendingArrayEnsureSpace(VamanaSubxidPendingArray *array, int maxCount)
+{
+	MemoryContext oldCtx;
+	int			newCapacity;
+
+	if (array->count < array->capacity)
+		return;
+
+	if (array->capacity > INT_MAX / 2)
+		elog(ERROR, "VamanaSubxidPendingArray: capacity overflow at %d entries",
+			 array->capacity);
+	newCapacity = array->capacity * 2;
+	if (newCapacity > maxCount)
+		newCapacity = maxCount;
+
+	oldCtx = MemoryContextSwitchTo(array->memContext);
+	array->capacity = newCapacity;
+	array->entries = repalloc(array->entries, array->elemSize * array->capacity);
+	MemoryContextSwitchTo(oldCtx);
+}
+
 void *
 VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array)
 {
 	void	   *entry;
 	SubTransactionId *subxid;
 
-	if (array->count >= array->capacity)
-	{
-		MemoryContext oldCtx = MemoryContextSwitchTo(array->memContext);
-
-		if (array->capacity > INT_MAX / 2)
-			elog(ERROR, "VamanaSubxidPendingArray: capacity overflow at %d entries",
-				 array->capacity);
-		array->capacity *= 2;
-		array->entries = repalloc(array->entries, array->elemSize * array->capacity);
-
-		MemoryContextSwitchTo(oldCtx);
-	}
+	VamanaSubxidPendingArrayEnsureSpace(array, INT_MAX);
 
 	entry = VamanaSubxidPendingArrayEntryAt(array, array->count);
 	array->count++;

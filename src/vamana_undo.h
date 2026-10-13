@@ -12,6 +12,11 @@
 /*
  * Public API for the per-transaction undo log.
  *
+ * Before submitting an insert to the worker, call VamanaUndoReserve(index)
+ * so the undo log has guaranteed space and so a transaction already at
+ * svs.undo_log_max_entries is rejected before the worker ever touches the
+ * graph, not after.
+ *
  * On INSERT: call VamanaUndoAppend(relid, externalId, growthBytes,
  * generation) immediately after the BGW confirms the insert. growthBytes
  * and generation are SvsMemoryReanchorInsert's own outputs from that same
@@ -32,6 +37,7 @@
  * subtransaction's entries.
  */
 
+void	VamanaUndoReserve(Relation index);
 void	VamanaUndoAppend(Oid indexRelid, uint64 externalId,
 						 uint64 growthBytes, uint32 generation);
 

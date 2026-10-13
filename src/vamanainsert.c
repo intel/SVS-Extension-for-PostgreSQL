@@ -57,6 +57,8 @@ vamanainsert(Relation index, Datum *values, bool *isnull,
 	if (isnull[0])
 		return false;
 
+	VamanaUndoReserve(index);
+
 	VamanaWorkerWaitUntilAvailable(relid, "insert into");
 
 	floats = VamanaDatumToFloats(typeInfo, values[0], &dim, "insert");

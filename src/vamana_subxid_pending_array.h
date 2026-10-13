@@ -40,6 +40,14 @@ extern VamanaSubxidPendingArray *VamanaSubxidPendingArrayCreate(MemoryContext me
 extern void *VamanaSubxidPendingArrayAppend(VamanaSubxidPendingArray *array);
 
 /*
+ * Grow the array, if full, so that one more VamanaSubxidPendingArrayAppend
+ * is guaranteed not to repalloc. Doubles capacity like Append does, but
+ * never grows past maxCount; the caller must have already confirmed
+ * array->count < maxCount.
+ */
+extern void VamanaSubxidPendingArrayEnsureSpace(VamanaSubxidPendingArray *array, int maxCount);
+
+/*
  * True if any element is still live, i.e. was not discarded by a rolled-back
  * subtransaction.  Not the same as count > 0: the array is never compacted, so
  * a discarded element keeps its place.
