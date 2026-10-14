@@ -903,7 +903,17 @@ If `hot_standby_feedback = off`, the primary may remove WAL segments that the st
 
 #### `vamana_databases` Access
 
-INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker. Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly — this is not a privilege escalation: the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
+INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker.
+
+**Owning `vamana_databases` is superuser-equivalent in effect.** The extension can only be created by a superuser, so the table starts out superuser-owned, but nothing stops a superuser from later handing it to an ordinary role (`ALTER TABLE ... OWNER TO`, `REASSIGN OWNED`) or granting that role `INSERT`, `UPDATE`, or `DELETE` on it. The copy in `svs.launcher_database` controls the whole cluster, not just the writer's own database. A role that can write it can:
+
+- start a Vamana worker in any database, by name, including one the role cannot connect to; the worker runs as the bootstrap superuser;
+- pause, restart, or remove the worker of any enrolled database, making its Vamana indexes unavailable;
+- divide the cluster-wide search-thread, build-thread, residency-memory, and search-memory pools among databases, including reserving thread floors that take capacity from every other database.
+
+The owner can additionally disable the table's validation triggers and CHECK constraints, and can attach its own triggers, which then run with the privileges of whichever role next writes the table, including a superuser running `svs_restart_worker()`. Treat ownership of, and DML on, `vamana_databases` as you would superuser: do not transfer or grant either to a non-superuser role.
+
+Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly: this is not a privilege escalation, since the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
 
 The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `search_num_threads BETWEEN 1 AND 1024`, `residency_memory > 0`, `search_work_mem > 0`, `search_threads_reserved BETWEEN 0 AND 1024`, and `maintenance_num_threads BETWEEN 0 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
 

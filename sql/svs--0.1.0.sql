@@ -78,6 +78,18 @@ CREATE TABLE vamana_databases (
 	maintenance_num_threads int CHECK (maintenance_num_threads BETWEEN 0 AND 1024)
 );
 
+COMMENT ON TABLE vamana_databases IS
+'Per-database Vamana worker enablement and resource policy. The copy in the '
+'database named by svs.launcher_database is authoritative for the whole cluster: '
+'writing it chooses which databases get a Vamana worker (which runs as the '
+'bootstrap superuser), pauses, restarts, or removes any database''s worker, and '
+'divides the cluster-wide search-thread, build-thread, residency-memory, and '
+'search-memory pools among databases. The table owner can also disable its '
+'validation triggers and attach triggers that run with the privileges of any '
+'role that later writes to it. Treat ownership of this table, and INSERT, UPDATE, '
+'or DELETE on it, as superuser-equivalent: do not transfer or grant them to a '
+'non-superuser role.';
+
 SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');
 
 -- Durable fallback for the residency override's decrease-validation trigger
