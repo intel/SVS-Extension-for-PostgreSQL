@@ -276,7 +276,7 @@ VamanaInit(void)
 							"disables that credit the same way it disables VACUUM's own compacts.",
 							&vamana_compact_threshold_pct,
 							10, 0, 100,
-							PGC_USERSET,
+							PGC_SUSET,
 							0,
 							NULL, NULL, NULL);
 

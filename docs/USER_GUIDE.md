@@ -832,6 +832,8 @@ The percent-deleted threshold that triggers `SVSCompact` during VACUUM cleanup. 
 
 Lower for memory-constrained deployments with heavy delete churn. Raise for write-heavy workloads where VACUUM latency matters more than memory. Change takes effect on the next `VACUUM` — no restart required.
 
+This GUC also bounds how much of a database's residency budget a rolled-back `INSERT` can leave uncredited before a compact is forced to reclaim it, so it is superuser-only (`SET` requires superuser or a role granted the parameter's `SET` privilege). It is not settable by ordinary roles.
+
 ### When to REINDEX
 
 You do **not** need periodic `REINDEX` for correctness. You might still choose to `REINDEX` if:
@@ -877,7 +879,7 @@ The serialized SVS index directory (`$PGDATA/vamana_indexes/<dboid>/<relid>/`) c
 
 Temporary files are removed as soon as they are no longer needed. `tidmap.bin` is published by writing `tidmap.bin.tmp` and renaming it into place; the temp file is removed on every error path, and any leftover is removed before a new one is created. A temp file orphaned by a crash between the write and the rename is removed at the next load or save of that index.
 
-**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE` is a **silent no-op** for Vamana indexes in the current release (v0.1). This limitation is tracked for resolution in v0.2.
+**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE`, `CREATE INDEX ... TABLESPACE`, and `default_tablespace` are all a **silent no-op** for Vamana indexes in the current release (v0.1): `pg_class` reports the index as living in the chosen tablespace, but its vector data still lands under `$PGDATA` regardless of which tablespace was requested. This limitation is tracked for resolution in v0.2.
 
 Operators who require encryption-at-rest for embedding data should use full-disk or volume-level encryption on the filesystem backing `$PGDATA`.
 
@@ -1201,7 +1203,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
-| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
+| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact. Superuser-only: it also bounds database-wide residency accounting, not just the caller's own session |
 
 ### Superuser-Settable GUC Parameters (`SET …`, superuser only; also settable in `postgresql.conf` + reload)
 
@@ -1231,7 +1233,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |
 | `svs.worker_stop_timeout_ms` | `30000` | `0` | `600000` | Wait for a restarting worker to report stopped before giving up; does not force-kill |
 | `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
-| `svs.max_build_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory |
+| `svs.max_build_memory` | `4096MB` | `1MB` | — | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory |
 | `svs.max_residency_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved residency budget; checked at `vamana_databases` enrollment |
 | `svs.default_residency_memory` | `100MB` | `1MB` | — | Residency budget for a database whose `vamana_databases.residency_memory` is `NULL`; independent of `svs.max_residency_memory` |
 | `svs.max_search_work_mem` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved search-scratch budget; checked as a catalog aggregate at `vamana_databases` insert/update time |
@@ -1239,8 +1241,8 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |
 | `svs.checkpoint_min_ops` | `10000` | — | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
-| `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set |
-| `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set |
+| `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
 
 ### SQL Functions
 

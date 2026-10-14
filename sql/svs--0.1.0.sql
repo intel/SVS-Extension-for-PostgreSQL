@@ -234,18 +234,19 @@ GRANT SELECT ON pg_stat_vamana_worker, pg_stat_vamana_worker_slot TO PUBLIC;
 -- the worker. Only applies to enabled databases; raises an actionable error if the
 -- database is paused or does not exist.
 CREATE FUNCTION svs_restart_worker(dbname name) RETURNS void
-	LANGUAGE plpgsql AS
+	LANGUAGE plpgsql
+	SET search_path = pg_catalog AS
 $$
 DECLARE
 	rows int;
 BEGIN
-	UPDATE vamana_databases
+	UPDATE @extschema@.vamana_databases
 	   SET restart_generation = restart_generation + 1
 	 WHERE datname = dbname AND enabled;
 	GET DIAGNOSTICS rows = ROW_COUNT;
 
 	IF rows = 0 THEN
-		IF EXISTS (SELECT 1 FROM vamana_databases WHERE datname = dbname) THEN
+		IF EXISTS (SELECT 1 FROM @extschema@.vamana_databases WHERE datname = dbname) THEN
 			RAISE EXCEPTION 'database "%" is paused; re-enable it instead of restarting', dbname;
 		ELSE
 			RAISE EXCEPTION 'database "%" is not configured for vamana', dbname;
