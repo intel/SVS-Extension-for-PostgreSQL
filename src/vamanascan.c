@@ -148,7 +148,7 @@ LoadIndexFromPages(Relation index)
 	VamanaCacheIndex(relid, svsIndex,
 					 config.dimensions, config.graph_degree,
 					 VAMANA_ALPHA_TO_FLOAT(config.alpha),
-					 tidMapping, meta.numVectors,
+					 tidMapping, (int) meta.numVectors,
 					 (int) tidMappingCapacity,
 					 nextExternalId, (int) numDeleted,
 					 SVSComputeCapacityHeadroomVectors(&config));

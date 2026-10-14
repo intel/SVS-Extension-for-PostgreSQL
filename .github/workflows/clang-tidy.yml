@@ -1,0 +1,103 @@
+name: Clang-Tidy
+
+# Tool-assisted aid to the human PR review that already happens on every
+# change: a consistent, repeatable first pass over CERT C and common C bug
+# patterns so reviewers can spend their attention on logic, concurrency,
+# memory-context lifetime, and PostgreSQL error-handling semantics that this
+# tool does not understand (it has no model of palloc/pfree, and an
+# assert-disabled build makes Assert() invisible to it). It does not
+# approve, waive, or replace human review.
+#
+# Not required from day one: this job fails on any finding from the moment
+# it lands (the tree is clean when it merges), but is only added to the
+# required status checks after a short burn-in period to confirm there is
+# no flakiness from the cache path or the toolchain install. That is a
+# temporary, operational-confidence gap, unlike assert-build.yml's
+# permanently-non-required status, which exists because of a known,
+# accepted assertion trap. Do not treat the two the same way.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clang-tidy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CC: gcc
+      CXX: g++
+      # Same values as build-and-test.yml's ubuntu-24.04 leg, so the cache
+      # keys below are byte-identical and this job restores that leg's
+      # PostgreSQL/SVS installs instead of building its own.
+      PG_CONFIGURE_EXTRA_ARGS: "--enable-tap-tests --enable-injection-points"
+      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
+      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache PostgreSQL install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/pgsql_install
+          key: pg-ubuntu-24.04-gcc-REL_18_1-${{ env.PG_CONFIGURE_EXTRA_ARGS }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh') }}-v1
+
+      - name: Cache SVS install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/svs_install
+          key: svs-ubuntu-24.04-gcc-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
+
+      - name: deps
+        run: ci/build_and_test.sh deps
+
+      - name: build-postgres
+        run: ci/build_and_test.sh build-postgres
+
+      - name: build-svs
+        run: ci/build_and_test.sh build-svs
+
+      - name: build-pgvector
+        run: ci/build_and_test.sh build-pgvector
+
+      - name: Install Clang-Tidy tooling
+        run: |
+          python3 -m pip install --user "clang-tidy==22.1.8" "compiledb==0.10.7"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate compile_commands.json
+        run: |
+          source docs/build_guide/config
+          # No WERROR=1: gcc-only flags from pg_config make Clang-Tidy abort
+          # on every file if -Werror is in the recorded command.
+          compiledb -n make PG_CONFIG="$PG_CONFIG" SVS_INSTALL="$SVS_INSTALL_DIR"
+          count=$(python3 -c "import json; print(len(json.load(open('compile_commands.json'))))")
+          echo "compile_commands.json has $count entries"
+          if [ "$count" -ne 35 ]; then
+            echo "error: expected 35 compile_commands.json entries (one per OBJS member), got $count" >&2
+            echo "This usually means compiledb's dry-run parser misread the Makefile; see docs/build_guide for the bear -- make fallback." >&2
+            exit 1
+          fi
+
+      - name: Run Clang-Tidy
+        run: run-clang-tidy.py -p . -quiet -j "$(nproc)" -extra-arg=-Wno-unknown-warning-option 'src/.*\.c$'
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-output
+          path: |
+            compile_commands.json
+          if-no-files-found: ignore
+          retention-days: 7

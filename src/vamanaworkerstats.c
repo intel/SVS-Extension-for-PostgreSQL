@@ -418,7 +418,7 @@ VamanaWorkerReadSlotSnapshot(VamanaWorkerSlot *slot,
 static const char *
 VamanaSlotStatusName(uint32 status)
 {
-	switch (status)
+	switch (status)	/* NOLINT(bugprone-switch-missing-default-case): exhaustive over the enum so a new status value trips -Wswitch */
 	{
 		case VAMANA_SLOT_EMPTY:		 return "empty";
 		case VAMANA_SLOT_PENDING:	 return "pending";
@@ -436,7 +436,7 @@ VamanaSlotKindName(uint32 status, uint8 slotKind)
 	if (status == VAMANA_SLOT_EMPTY)
 		return NULL;
 
-	switch (slotKind)
+	switch (slotKind)	/* NOLINT(bugprone-switch-missing-default-case): exhaustive over the enum so a new slot kind trips -Wswitch */
 	{
 		case VAMANA_SLOTKIND_SEARCH:	  return "search";
 		case VAMANA_SLOTKIND_INSERT:	  return "insert";

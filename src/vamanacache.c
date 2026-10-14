@@ -159,6 +159,7 @@ VamanaAllocCacheSlot(Oid indexRelid)
 
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	entry = palloc0(sizeof(VamanaIndexCache));
+	// NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result): PostgreSQL constant macro, not a palloc(n * size) site
 	entry->memCtx = AllocSetContextCreate(TopMemoryContext,
 										  "Vamana index cache",
 										  ALLOCSET_DEFAULT_SIZES);

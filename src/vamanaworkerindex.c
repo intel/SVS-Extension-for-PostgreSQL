@@ -290,8 +290,8 @@ VamanaAssembleBuildConfig(Relation indexRel, int numVectors, bool *useSearchHist
 	config.graph_degree = meta.graph_degree;
 	config.alpha = meta.alpha;
 	config.compression_type = meta.compression_type;
-	config.compression_primary = meta.compression_primary;
-	config.compression_secondary = meta.compression_secondary;
+	config.compression_primary = meta.compression_primary;		/* NOLINT(bugprone-signed-char-misuse,cert-str34-c): meta's int8 (signed char) quantization code is intentionally sign-extended, not a raw byte value */
+	config.compression_secondary = meta.compression_secondary;	/* NOLINT(bugprone-signed-char-misuse,cert-str34-c): same as above */
 	config.leanvec_dims = meta.leanvec_dims;
 	config.build_window_size = (meta.build_window_size > 0)
 		? meta.build_window_size
@@ -448,6 +448,7 @@ GetOrLoadIndexBody(void *arg)
 }
 
 SVSIndexHandle
+// NOLINTNEXTLINE(misc-no-recursion): the one recursive call rebuilds instead of reloading from disk, which cannot recurse again
 VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateResidencyRefusal)
 {
 	bool		needsRebuild;

@@ -1,0 +1,23 @@
+# Clang-Tidy configuration for the SVS extension (C, PostgreSQL backend code).
+# Check groups chosen for bug-pattern and CERT C coverage; groups aimed at
+# C++ or at style (readability, modernize, cppcoreguidelines, hicpp) are not
+# enabled. Each disabled check below fights a PostgreSQL or C idiom.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  misc-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-casting-through-void,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -misc-include-cleaner,
+  -misc-unused-parameters
+# Report on this project's own headers only. PostgreSQL's server headers are
+# included with -I, not -isystem, so without this filter Clang-Tidy reports
+# on c.h and friends (it does: bugprone-macro-parentheses at c.h:742).
+HeaderFilterRegex: '(^|/)src/[^/]+\.h$'
+SystemHeaders: false
+WarningsAsErrors: '*'
