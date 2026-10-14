@@ -340,8 +340,9 @@ VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions)
 
 	if (graph_degree)
 		*graph_degree = metap->graph_degree;
+	/* vector dimension counts are far below INT_MAX; cast makes the narrowing explicit */
 	if (dimensions)
-		*dimensions = metap->dimensions;
+		*dimensions = (int) metap->dimensions;
 
 	UnlockReleaseBuffer(buf);
 }
