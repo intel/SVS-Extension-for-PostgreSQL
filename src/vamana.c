@@ -98,7 +98,8 @@ VamanaInit(void)
 					   VAMANA_DEFAULT_USE_SEARCH_HISTORY, AccessExclusiveLock);
 	add_int_reloption(vamana_relopt_kind, "compression_type",
 					  "Compression type (0=none, 1=leanvec, 2=lvq)",
-					  VAMANA_DEFAULT_COMPRESSION_TYPE, 0, 2,
+					  VAMANA_DEFAULT_COMPRESSION_TYPE,
+					  VAMANA_COMPRESSION_NONE, VAMANA_COMPRESSION_LVQ,
 					  AccessExclusiveLock);
 	add_int_reloption(vamana_relopt_kind, "compression_primary", "Primary quantization (4=UINT4, -4=INT4, 8=UINT8, -8=INT8)",
 					  VAMANA_DEFAULT_COMPRESSION_PRIMARY, -8, 8, AccessExclusiveLock);
