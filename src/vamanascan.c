@@ -230,6 +230,13 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 		queryFloats = VamanaDatumToFloats(so->typeInfo, so->queryValue,
 										  &queryDim, "search");
 
+		/* Defense-in-depth: PostgreSQL's type system normally prevents this. */
+		if (queryDim != TupleDescAttr(scan->indexRelation->rd_att, 0)->atttypmod)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("vector dimension %d does not match index dimension %d",
+							queryDim, TupleDescAttr(scan->indexRelation->rd_att, 0)->atttypmod)));
+
 		if (so->results)
 			pfree(so->results);
 		if (so->distances)
