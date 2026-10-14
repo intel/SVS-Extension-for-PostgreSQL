@@ -73,8 +73,17 @@ VamanaMakeDirectoryOrError(const char *path)
 }
 
 /*
+ * Subdirectories that svs_index_save creates under the save directory.
+ * SVS's create_directory is a no-op on an existing directory, so creating
+ * them here first gives them pg_dir_create_mode rather than a mode that
+ * depends on the process umask.
+ */
+static const char *const VamanaSvsPayloadSubdirs[] = {"config", "graph", "data"};
+
+/*
  * Create the directory hierarchy needed to save an index.
- * Creates $PGDATA/vamana_indexes/, .../<dboid>/, and .../<dboid>/<relid>/.
+ * Creates $PGDATA/vamana_indexes/, .../<dboid>/, .../<dboid>/<relid>/, and
+ * the config/, graph/, and data/ subdirectories that svs_index_save fills in.
  */
 void
 VamanaEnsureSaveDir(Oid dboid, Oid relid)
@@ -82,6 +91,7 @@ VamanaEnsureSaveDir(Oid dboid, Oid relid)
 	char		parentdir[MAXPGPATH];
 	char		dbdir[MAXPGPATH];
 	char		indexdir[MAXPGPATH];
+	char		subdir[MAXPGPATH];
 
 	snprintf(parentdir, sizeof(parentdir), "%s/vamana_indexes", DataDir);
 	VamanaMakeDirectoryOrError(parentdir);
@@ -91,6 +101,12 @@ VamanaEnsureSaveDir(Oid dboid, Oid relid)
 
 	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
 	VamanaMakeDirectoryOrError(indexdir);
+
+	for (int i = 0; i < lengthof(VamanaSvsPayloadSubdirs); i++)
+	{
+		snprintf(subdir, sizeof(subdir), "%s/%s", indexdir, VamanaSvsPayloadSubdirs[i]);
+		VamanaMakeDirectoryOrError(subdir);
+	}
 }
 
 /*
