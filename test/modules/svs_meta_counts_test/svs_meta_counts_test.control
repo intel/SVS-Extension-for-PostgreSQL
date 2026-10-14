@@ -1,0 +1,5 @@
+# svs_meta_counts_test extension
+comment = 'Standalone test harness for VamanaValidateMetaCounts'
+default_version = '1.0'
+module_pathname = '$libdir/svs_meta_counts_test'
+relocatable = true

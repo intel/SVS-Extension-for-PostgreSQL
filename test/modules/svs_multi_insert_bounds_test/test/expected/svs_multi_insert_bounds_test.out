@@ -1,0 +1,73 @@
+CREATE EXTENSION svs_multi_insert_bounds_test;
+-- Valid: a typical in-range, consistent record.
+SELECT svs_multi_insert_bounds_test_validate(10, false, 4 + 10 * 2) AS typical_valid;
+ typical_valid 
+---------------
+ t
+(1 row)
+
+-- Boundary: ntuples = 0 is invalid (nothing to insert).
+SELECT svs_multi_insert_bounds_test_validate(0, false, 8) AS ntuples_zero;
+ ntuples_zero 
+--------------
+ f
+(1 row)
+
+-- Boundary: ntuples = 1 is the smallest valid count.
+SELECT svs_multi_insert_bounds_test_validate(1, false, 4 + 1 * 2) AS ntuples_one;
+ ntuples_one 
+-------------
+ t
+(1 row)
+
+-- Boundary: ntuples = MaxHeapTuplesPerPage (291 at 8KB BLCKSZ) is valid.
+SELECT svs_multi_insert_bounds_test_validate(291, false, 4 + 291 * 2) AS ntuples_at_max;
+ ntuples_at_max 
+----------------
+ t
+(1 row)
+
+-- Boundary: ntuples = MaxHeapTuplesPerPage + 1 is invalid.
+SELECT svs_multi_insert_bounds_test_validate(292, false, 4 + 292 * 2) AS ntuples_above_max;
+ ntuples_above_max 
+-------------------
+ f
+(1 row)
+
+-- Boundary: ntuples = 65535 (uint16 max) is invalid, far above the page limit.
+SELECT svs_multi_insert_bounds_test_validate(65535, false, 4 + 1 * 2) AS ntuples_uint16_max;
+ ntuples_uint16_max 
+--------------------
+ f
+(1 row)
+
+-- Data length: exactly sufficient for the claimed ntuples is valid.
+SELECT svs_multi_insert_bounds_test_validate(5, false, 4 + 5 * 2) AS data_len_exact;
+ data_len_exact 
+----------------
+ t
+(1 row)
+
+-- Data length: one OffsetNumber short of the claimed ntuples is invalid.
+SELECT svs_multi_insert_bounds_test_validate(5, false, 4 + 5 * 2 - 1) AS data_len_one_short;
+ data_len_one_short 
+--------------------
+ f
+(1 row)
+
+-- isinit = true skips the data-length check entirely: a short length that
+-- would fail for isinit = false is accepted when the page is freshly
+-- initialised, since there are no offsets in the record to read.
+SELECT svs_multi_insert_bounds_test_validate(5, true, 0) AS isinit_skips_length_check;
+ isinit_skips_length_check 
+---------------------------
+ t
+(1 row)
+
+-- isinit = true still enforces the ntuples bound.
+SELECT svs_multi_insert_bounds_test_validate(292, true, 0) AS isinit_still_bounds_ntuples;
+ isinit_still_bounds_ntuples 
+-----------------------------
+ f
+(1 row)
+
