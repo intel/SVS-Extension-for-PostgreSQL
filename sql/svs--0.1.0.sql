@@ -54,10 +54,13 @@ CREATE TABLE vamana_databases (
 	enabled             bool    NOT NULL DEFAULT true,
 	restart_generation  bigint  NOT NULL DEFAULT 0,
 
-	-- Placeholders for a future resource-management phase; NULL means
-	-- "use the GUC default." Nullable with no default so activating them
-	-- later needs no ALTER TABLE.
+	-- Reserved for a future resource-management phase; not read anywhere
+	-- today. NULL means "use the GUC default." Nullable with no default
+	-- so activating it later needs no ALTER TABLE.
 	graph_memory_mb          int CHECK (graph_memory_mb > 0),
+
+	-- NULL means "use the cluster-wide default." Actively read and
+	-- enforced: fed into the launcher's CPU-grant calculator.
 	search_num_threads       int CHECK (search_num_threads BETWEEN 1 AND 1024),
 
 	-- NULL means "use svs.default_residency_memory" / "use
