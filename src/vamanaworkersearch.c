@@ -142,6 +142,21 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 	{
 		VamanaIndexCache *cache = VamanaGetCache(relid);
 		bool		isEmpty = (cache != NULL && cache->isValid && cache->numVectors == 0);
+		int			loadErrSqlerrcode;
+		const char *loadErrMessage;
+		const char *loadErrHint;
+		bool		hasLoadErr = !isEmpty &&
+			VamanaWorkerGetLastLoadError(&loadErrSqlerrcode, &loadErrMessage, &loadErrHint);
+		char		notLoadedMsg[512];
+
+		if (hasLoadErr)
+		{
+			if (loadErrHint != NULL)
+				snprintf(notLoadedMsg, sizeof(notLoadedMsg), "%s %s",
+						 loadErrMessage, loadErrHint);
+			else
+				snprintf(notLoadedMsg, sizeof(notLoadedMsg), "%s", loadErrMessage);
+		}
 
 		for (int i = 0; i < n; i++)
 		{
@@ -150,9 +165,18 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 			slot->numResults = 0;
 			if (!isEmpty)
 			{
-				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-						 "vamana worker: index %u not loaded", relid);
-				slot->errorCategory = VAMANA_ERR_INTERNAL;
+				if (hasLoadErr)
+				{
+					snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+							 "%s", notLoadedMsg);
+					slot->errorCategory = VAMANA_ERR_DATA;
+				}
+				else
+				{
+					snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+							 "vamana worker: index %u not loaded", relid);
+					slot->errorCategory = VAMANA_ERR_INTERNAL;
+				}
 			}
 			pg_write_barrier();
 			pg_atomic_write_u32(&slot->status,

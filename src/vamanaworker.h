@@ -715,6 +715,16 @@ SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk,
 SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateResidencyRefusal);
 void	VamanaWorkerResetStaleSlots(void);
 
+/*
+ * Returns the error from the most recent VamanaWorkerGetOrLoadIndex() call
+ * that failed with an ereport-able error, or false if that call returned
+ * NULL for some other reason (for example, a DDL lock skip). Valid only
+ * immediately after such a call returns NULL, before any other load is
+ * attempted.
+ */
+bool	VamanaWorkerGetLastLoadError(int *sqlerrcode, const char **message,
+									const char **hint);
+
 /* Converges a standby's cache onto targetRelids; returns true once every relid has a live slot. */
 bool	VamanaReconcileStandbyCache(List *targetRelids,
 									void (*activateSlot) (Oid relid));
