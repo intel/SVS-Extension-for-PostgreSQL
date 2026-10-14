@@ -913,7 +913,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			 * the already-correct timeout error that VamanaWorkerWaitUntilAvailable
 			 * throws.
 			 */
-			VamanaWorkerWaitUntilAvailable(relid, "build index");
+			VamanaWorkerWaitUntilAvailable(relid, "build");
 
 			VamanaReadMetaPage(index, &meta);
 			config = VamanaAssembleBuildConfig(index, (int) meta.numVectors, NULL);
