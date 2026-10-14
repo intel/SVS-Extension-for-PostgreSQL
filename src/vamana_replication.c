@@ -1285,10 +1285,42 @@ VamanaReplicationOpen(Oid dboid, Oid indexRelid)
 }
 
 /*
+ * Per-record callback for VamanaSlotAdvance's catch-up decode.  Drives the
+ * reorder buffer so it populates candidate_xmin_lsn/candidate_restart_valid,
+ * without applying anything: the context's output_plugin_private->cache stays
+ * NULL (VamanaOpenDecoder never sets it), so PluginChange no-ops on every
+ * change and VamanaPreScanWalRecord is unneeded (it also no-ops on a NULL
+ * cache).  Writes already landed via the primary's own write-IPC path.
+ */
+static bool
+DiscardRecordCallback(LogicalDecodingContext *ctx, void *arg)
+{
+	INJECTION_POINT("vamana-slot-advance-discard-decode", NULL);
+	LogicalDecodingProcessRecord(ctx, ctx->reader);
+	return false;
+}
+
+/*
  * Advance confirmed_flush_lsn by briefly acquiring the slot.  A persistent
  * non-active slot can be acquired and released in a tight window.  Returns
  * false, advancing nothing, if the slot is busy or gone; the caller decides
  * whether that makes its own checkpoint incomplete.
+ *
+ * On a primary, nothing else ever decodes this slot (VamanaReplicationDrainSlot
+ * is standby-only), so LogicalConfirmReceivedLocation below can never promote
+ * restart_lsn/confirmed_flush_lsn on its own: both are gated on reorder-buffer
+ * candidate positions, which the reorder buffer only sets once it has decoded
+ * a RUNNING_XACTS record and watched every transaction live at that point
+ * finish.  Nothing on a primary writes a fresh RUNNING_XACTS record either
+ * (that is otherwise left to a logical walsender or Postgres's own, far less
+ * frequent, checkpoint), so catching up to whatever already happens to be in
+ * WAL is not enough: this writes its own with LogStandbySnapshot before
+ * decoding, and decodes through that point even if it is past newLsn, so the
+ * pass always has fresh running-xact data to resolve against instead of
+ * freezing again as soon as it exhausts whatever happened to already be in
+ * WAL.  Skipped entirely when there is no lag to catch up (restart_lsn
+ * already at or past newLsn, or the slot has not reached its first
+ * consistent point yet).
  */
 bool
 VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
@@ -1301,6 +1333,32 @@ VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 
 	PG_TRY();
 	{
+		XLogRecPtr restartLsn = MyReplicationSlot->data.restart_lsn;
+
+		if (restartLsn != InvalidXLogRecPtr && restartLsn < newLsn)
+		{
+			LogicalDecodingContext *ctx;
+			XLogRecPtr	snapshotLsn = LogStandbySnapshot();
+			XLogRecPtr	decodeEnd = Max(newLsn, snapshotLsn);
+
+			/*
+			 * LogStandbySnapshot only inserts; it does not wait for the
+			 * record to be on disk.  XLogReadRecord blocks until a record
+			 * it is asked to read becomes flushed, normally resolved by the
+			 * walwriter -- which is already gone during this worker's own
+			 * shutdown-time drain, so without an explicit flush here the
+			 * decode loop below would wait on a flush nothing will ever do.
+			 */
+			XLogFlush(decodeEnd);
+
+			ctx = VamanaOpenDecoder();
+			VamanaRunDecodeLoop(ctx, decodeEnd, "vamana slot advance",
+								DiscardRecordCallback, NULL);
+			FreeDecodingContext(ctx);
+
+			newLsn = decodeEnd;
+		}
+
 		LogicalConfirmReceivedLocation(newLsn);
 		ReplicationSlotRelease();
 	}
