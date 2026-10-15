@@ -904,6 +904,38 @@ VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb)
 }
 
 /*
+ * VamanaReplicationSlotIsInvalidated
+ *
+ * True when the index's slot exists and core has already marked it
+ * invalidated (RS_INVAL_NONE means valid).  An invalidated slot can never
+ * resume decoding past the point core cut it off, so an attached slot found
+ * in this state cannot recover on its own; the only way back to a correct,
+ * bounded state is to drop it and rebuild from the heap, same as an
+ * over-budget slot.
+ *
+ * No-op-safe when the slot does not exist.
+ */
+bool
+VamanaReplicationSlotIsInvalidated(Oid indexRelid)
+{
+	char				slotName[NAMEDATALEN];
+	ReplicationSlot	   *slot;
+	ReplicationSlotInvalidationCause invalidated;
+
+	SlotName(VamanaWorkerShmemPtr->dbOid, indexRelid, slotName);
+
+	slot = SearchNamedReplicationSlot(slotName, true);
+	if (slot == NULL)
+		return false;
+
+	SpinLockAcquire(&slot->mutex);
+	invalidated = slot->data.invalidated;
+	SpinLockRelease(&slot->mutex);
+
+	return invalidated != RS_INVAL_NONE;
+}
+
+/*
  * True once the index's slot has reached snapshot consistency (confirmed_flush
  * is set).  A freshly created slot has confirmed_flush unset until snapshot
  * build reaches CONSISTENT, so a slot handle existing is not by itself proof
@@ -1260,6 +1292,11 @@ VamanaReplicationEnsureSlot(Oid dboid, Oid indexRelid)
  * Open a lightweight handle referencing the persistent slot.
  * The slot is not acquired; it remains inactive and droppable.
  * Returns NULL if the slot does not exist.
+ *
+ * An on-disk slot that core has already marked invalidated is dropped
+ * rather than handed back: every caller already treats NULL as "no slot
+ * yet" and responds by creating a fresh one, so this turns adopting a dead
+ * slot into the same rebuild-from-heap path a first boot takes.
  */
 VamanaReplicationSlot *
 VamanaReplicationOpen(Oid dboid, Oid indexRelid)
@@ -1267,11 +1304,27 @@ VamanaReplicationOpen(Oid dboid, Oid indexRelid)
 	char				   slotName[NAMEDATALEN];
 	VamanaReplicationSlot *vslot;
 	MemoryContext			oldCtx;
+	ReplicationSlot		   *slot;
+	ReplicationSlotInvalidationCause invalidated;
 
 	SlotName(dboid, indexRelid, slotName);
 
-	if (SearchNamedReplicationSlot(slotName, true) == NULL)
+	slot = SearchNamedReplicationSlot(slotName, true);
+	if (slot == NULL)
 		return NULL;
+
+	SpinLockAcquire(&slot->mutex);
+	invalidated = slot->data.invalidated;
+	SpinLockRelease(&slot->mutex);
+
+	if (invalidated != RS_INVAL_NONE)
+	{
+		ereport(LOG,
+				(errmsg("vamana: replication slot \"%s\" is invalidated; dropping it and rebuilding from heap",
+						slotName)));
+		(void) TryDropSlot(slotName);
+		return NULL;
+	}
 
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
 	vslot = palloc0(sizeof(VamanaReplicationSlot));

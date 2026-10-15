@@ -90,6 +90,13 @@ void	VamanaReplicationDrainSlot(Oid indexRelid);
  */
 bool	VamanaReplicationSlotWalLagExceeds(Oid indexRelid, int maxLagMb);
 
+/*
+ * BGW: true when the index's slot exists and core has already marked it
+ * invalidated (e.g. a recovery conflict against a primary catalog VACUUM).
+ * Safe when the slot does not exist.
+ */
+bool	VamanaReplicationSlotIsInvalidated(Oid indexRelid);
+
 /* BGW: true once the index's slot has reached snapshot consistency. */
 bool	VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid);
 

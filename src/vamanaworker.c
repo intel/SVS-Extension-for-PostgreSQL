@@ -529,9 +529,15 @@ VamanaRelcacheCallback(Datum arg, Oid relid)
 }
 
 /*
- * Trip the WAL-budget valve for every cached index's slot: past
- * max_slot_wal_size, a slot is cheaper to drop and rebuild from the heap
- * than to drain.  Applies to primary and standby alike.
+ * Trip the WAL-budget or invalidation valve for every cached index's slot.
+ * Past max_slot_wal_size, a slot is cheaper to drop and rebuild from the heap
+ * than to drain.  A slot core has already invalidated (most often a standby
+ * recovery conflict against a primary catalog VACUUM while
+ * hot_standby_feedback is off) can never resume decoding past that point, so
+ * continuing to drain it would keep serving reads that silently stop
+ * reflecting new writes with nothing surfacing the condition; rebuilding is
+ * the only path back to a correct, bounded state and is checked first since
+ * it is also the cheaper read.  Applies to primary and standby alike.
  */
 static void
 VamanaWorkerEnforceWalBudgetOnAllSlots(void)
@@ -540,6 +546,29 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 
 	foreach_oid(relid, relids)
 	{
+		if (VamanaReplicationSlotIsInvalidated(relid))
+		{
+			ereport(LOG,
+					(errmsg("vamana replay: slot for index %u is invalidated; "
+							"rebuilding from heap", relid)));
+			VamanaForceHeapRebuild(relid);
+
+			/*
+			 * The rebuild drops the slot along with the cache entry, with
+			 * nothing left to decode new primary writes until a fresh slot
+			 * exists.  The reconcile below only acts once the cache entry
+			 * exists again, which happens on the next read's lazy reload,
+			 * not here; create the replacement slot immediately so that
+			 * reload finds it on disk and attaches to it the same way it
+			 * would on an ordinary first boot, instead of leaving the index
+			 * slot-less until some unrelated relcache invalidation happens
+			 * to also set standbyRediscoverPending.
+			 */
+			VamanaReplicationCreate(VamanaWorkerShmemPtr->dbOid, relid);
+			standbyRediscoverPending = true;
+			continue;
+		}
+
 		if (VamanaReplicationSlotWalLagExceeds(relid, vamana_max_slot_wal_size_mb))
 		{
 			ereport(LOG,
@@ -1257,7 +1286,13 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 			VamanaWorkerActivatePendingSnapshots();
 		}
 		else
+		{
+			/* Test hook: lets a test pin the standby's heap at a known state
+			 * before the sweep below can act on an invalidated or over-budget
+			 * slot. */
+			INJECTION_POINT("vamana-worker-pre-drain", NULL);
 			VamanaWorkerDrainAllSlots();
+		}
 
 		VamanaWorkerHandlePromotion(&wasReplayingWal, role);
 
