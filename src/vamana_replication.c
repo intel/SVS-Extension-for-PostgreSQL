@@ -19,6 +19,7 @@
 #include "vamanaworker.h"
 
 #include "access/heapam_xlog.h"
+#include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -279,6 +280,25 @@ PluginStartup(LogicalDecodingContext *ctx, OutputPluginOptions *opt,
  * decoding deliberately invalidates t_self on every decoded tuple.  PluginChange
  * then retrieves the TID by looking up change->lsn.
  */
+/*
+ * heap_multi_insert never emits more than one page's worth per record, so
+ * MaxHeapTuplesPerPage is the producer's own limit, not a value chosen
+ * here. A record claiming more offsets than its own data actually holds
+ * would read past XLogRecGetData's buffer.
+ */
+bool
+VamanaMultiInsertCountsValid(uint16 ntuples, bool isinit, Size dataLen)
+{
+	if (ntuples == 0 || ntuples > MaxHeapTuplesPerPage)
+		return false;
+
+	if (!isinit &&
+		dataLen < SizeOfHeapMultiInsert + (Size) ntuples * sizeof(OffsetNumber))
+		return false;
+
+	return true;
+}
+
 static void
 VamanaPreScanWalRecord(LogicalDecodingContext *ctx, VamanaReplayContext *priv)
 {
@@ -356,6 +376,33 @@ VamanaPreScanWalRecord(LogicalDecodingContext *ctx, VamanaReplayContext *priv)
 			return;
 
 		isinit = (XLogRecGetInfo(ctx->reader) & XLOG_HEAP_INIT_PAGE) != 0;
+
+		/*
+		 * ntuples is trusted by the allocation and the offsets loop below.
+		 * A record claiming an offset outside what a heap page can hold
+		 * could never have come from heap_multi_insert either. Both raise
+		 * ERROR, which VamanaRecoverFromReplayError turns into dropping
+		 * this index's replication slot and rebuilding it from the heap.
+		 */
+		if (!VamanaMultiInsertCountsValid(xlrec->ntuples, isinit,
+										  XLogRecGetDataLen(ctx->reader)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("vamana replay: multi-insert record has an invalid or inconsistent tuple count"),
+					 errdetail("ntuples = %u, maximum = %u.",
+							   xlrec->ntuples, (unsigned) MaxHeapTuplesPerPage)));
+
+		if (!isinit)
+		{
+			for (i = 0; i < xlrec->ntuples; i++)
+			{
+				if (xlrec->offsets[i] < FirstOffsetNumber ||
+					xlrec->offsets[i] > MaxHeapTuplesPerPage)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("vamana replay: multi-insert record has an out-of-range tuple offset")));
+			}
+		}
 
 		entry = hash_search(priv->lsnToTidList, &lsn, HASH_ENTER, &found);
 		if (!found)

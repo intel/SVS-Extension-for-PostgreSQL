@@ -43,6 +43,14 @@ typedef struct VamanaReplayRole
 const VamanaReplayRole *VamanaGetReplayRole(void);
 
 /* True when this node is the primary (not in recovery). */
+/*
+ * Pure predicate: is a multi-insert WAL record's own ntuples count plausible
+ * for the producer that could have emitted it, and (when the page was not
+ * freshly initialised) does the record actually carry that many offsets?
+ * dataLen is XLogRecGetDataLen(ctx->reader).
+ */
+bool	VamanaMultiInsertCountsValid(uint16 ntuples, bool isinit, Size dataLen);
+
 bool	VamanaNodeIsPrimary(void);
 
 /* BGW: create and persist a slot anchored at the current WAL position. */

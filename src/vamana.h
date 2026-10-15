@@ -14,6 +14,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
+#include "utils/memutils.h"
 #include "utils/sampling.h"
 #include "utils/timestamp.h"
 #include "halfvec.h"
@@ -52,6 +53,15 @@
 #define VAMANA_DEFAULT_UNDO_LOG_MAX_ENTRIES	1048576
 #define VAMANA_MIN_UNDO_LOG_MAX_ENTRIES		16
 #define VAMANA_MAX_UNDO_LOG_MAX_ENTRIES		16777216
+
+/*
+ * Ceiling on tidMappingCapacity (and the other metapage counters) accepted
+ * from an on-disk metapage or a load-slot IPC payload. Every downstream
+ * consumer casts these counters to int, so INT_MAX is the point past which
+ * they are already mishandled; the StaticAssertDecl next to this struct's
+ * definition proves the resulting allocation still fits MaxAllocHugeSize.
+ */
+#define VAMANA_MAX_TID_MAPPING_CAPACITY		INT_MAX
 
 /* Compression types (internal representation) */
 #define VAMANA_COMPRESSION_NONE			0
@@ -238,6 +248,9 @@ StaticAssertDecl(offsetof(VamanaMetaPageData, tidMappingCapacity) == 60,
 StaticAssertDecl(sizeof(VamanaMetaPageData) == 64,
 				 "VamanaMetaPageData size changed — update readers/writers");
 
+StaticAssertDecl((uint64) VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) <= MaxAllocHugeSize,
+				 "VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) exceeds MaxAllocHugeSize");
+
 typedef struct VamanaPageOpaqueData
 {
 	BlockNumber nextblkno;
@@ -348,6 +361,10 @@ const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
 const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
+void		VamanaValidateMetaCounts(Oid relid, uint32 tidMappingCapacity,
+									  uint32 numVectors, uint32 numDeleted,
+									  uint64 nextExternalId,
+									  bool checkResidencyBudget);
 void		VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno, Size indexDataSize, uint32 numVectors, ForkNumber forkNum);
 void		VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum);
 bytea	   *vamanaoptions(Datum reloptions, bool validate);
