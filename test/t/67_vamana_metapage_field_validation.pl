@@ -7,6 +7,13 @@
 # an index's on-disk metapage and confirms the backend path raises
 # ERRCODE_DATA_CORRUPTED naming the field, the worker survives a load
 # attempt through the same corrupted field, and REINDEX recovers the index.
+#
+# The compression-related cases poke compression_type/primary/secondary
+# onto an otherwise plain, uncompressed index rather than building a real
+# LVQ/LeanVec index first. ValidateMetaPageConfig reads only the metapage
+# bytes and runs before any SVS load, so this exercises the same validation
+# branch without depending on LVQ/LeanVec hardware support, which not every
+# CI runner's CPU has (see HW_TAP_TESTS in the Makefile).
 
 use strict;
 use warnings FATAL => 'all';
@@ -131,20 +138,20 @@ my @cases = (
     },
     {
         name    => 'lvq_bad_primary',
-        with    => 'WITH (compression_type = 2, compression_primary = 4, compression_secondary = 0)',
-        pokes   => [ [ 'compression_primary', 5 ] ],
+        with    => '',
+        pokes   => [ [ 'compression_type', 2 ], [ 'compression_primary', 5 ], [ 'compression_secondary', 0 ] ],
         pattern => qr/invalid compression configuration/,
     },
     {
         name    => 'lvq_bad_pair',
-        with    => 'WITH (compression_type = 2, compression_primary = 4, compression_secondary = 0)',
-        pokes   => [ [ 'compression_primary', 8 ], [ 'compression_secondary', 8 ] ],
+        with    => '',
+        pokes   => [ [ 'compression_type', 2 ], [ 'compression_primary', 8 ], [ 'compression_secondary', 8 ] ],
         pattern => qr/invalid compression configuration/,
     },
     {
         name    => 'leanvec_bad_pair',
-        with    => 'WITH (compression_type = 1, compression_primary = 4, compression_secondary = 8)',
-        pokes   => [ [ 'compression_primary', 8 ], [ 'compression_secondary', 4 ] ],
+        with    => '',
+        pokes   => [ [ 'compression_type', 1 ], [ 'compression_primary', 8 ], [ 'compression_secondary', 4 ] ],
         pattern => qr/invalid compression configuration/,
     },
 );
@@ -171,16 +178,28 @@ sub create_case_objects
             SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200);
         CREATE INDEX mp_control_idx ON mp_control_tbl USING vamana (val vector_l2_ops);
     });
+
+    for my $case (@cases)
+    {
+        my $relpath = $node->safe_psql('postgres',
+            "SELECT pg_relation_filepath('$case->{index}');");
+        chomp $relpath;
+        $case->{path} = $node->data_dir . "/" . $relpath;
+    }
 }
 
-create_case_objects();
-
-for my $case (@cases)
+# A setup failure here (e.g. an unexpected CREATE INDEX error) must not take
+# down the whole TAP file with no plan declared: report it as a normal test
+# failure with the server log attached instead.
+if (!eval { create_case_objects(); 1 })
 {
-    my $relpath = $node->safe_psql('postgres',
-        "SELECT pg_relation_filepath('$case->{index}');");
-    chomp $relpath;
-    $case->{path} = $node->data_dir . "/" . $relpath;
+    my $err = $@;
+    fail('build every case table/index before corruption');
+    diag("setup failed: $err");
+    diag("server log tail:\n" . substr($node->log_content(), -4000));
+    $node->stop('immediate');
+    done_testing();
+    exit;
 }
 
 $node->stop;
