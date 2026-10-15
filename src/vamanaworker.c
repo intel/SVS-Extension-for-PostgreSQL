@@ -215,6 +215,10 @@ VamanaWorkerProcessRequests(void)
 	int		   *allPending;
 	bool		acceptsWrites = VamanaGetReplayRole()->processes_write_ipc;
 
+	/* Test hook: TAP parks the worker here so concurrently submitted searches
+	 * accumulate as PENDING and are collected in one pass. */
+	INJECTION_POINT("vamana-worker-before-collect-requests", NULL);
+
 	maxBatch = (vamana_max_batch_size > 0) ? vamana_max_batch_size : MaxBackends;
 
 	searchPending = palloc(MaxBackends * sizeof(int));
