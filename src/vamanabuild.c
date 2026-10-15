@@ -907,6 +907,18 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			VamanaMetaPageData meta;
 			SVSBuildConfig config;
 
+			/*
+			 * Bound the wait on a startup race the same way the DML paths do
+			 * (vamanascan.c, vamanainsert.c, vamana_warmup.c): a slot can be
+			 * reserved with no live worker yet (workerPid == 0) while the
+			 * worker is still starting. Without this, the build fell through
+			 * to the WARNING-and-commit branch below for a condition that is
+			 * ordinarily transient, instead of waiting it out or surfacing
+			 * the already-correct timeout error that VamanaWorkerWaitUntilAvailable
+			 * throws.
+			 */
+			VamanaWorkerWaitUntilAvailable(relid, "build");
+
 			VamanaReadMetaPage(index, &meta);
 			config = VamanaAssembleBuildConfig(index, (int) meta.numVectors, NULL);
 
@@ -946,7 +958,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					 */
 					ereport(WARNING,
 							(errmsg("vamana index \"%s\": background worker load failed; "
-									"index will be adopted by the worker on startup",
+									"index will be loaded on its next access",
 									RelationGetRelationName(index))));
 				}
 
@@ -960,10 +972,16 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			}
 			else
 			{
-				/* Same HANDOFF reasoning as the load-failure branch above. */
+				/*
+				 * Same HANDOFF reasoning as the load-failure branch above.
+				 * VamanaWorkerWaitUntilAvailable above already blocked until
+				 * the worker was live or threw; reaching here means the
+				 * worker died again in that narrow window, not that it was
+				 * never waited for.
+				 */
 				ereport(WARNING,
-						(errmsg("vamana index \"%s\": background worker not yet available; "
-								"index will be adopted by the worker on startup",
+						(errmsg("vamana index \"%s\": background worker not available; "
+								"index will be loaded on its next access",
 								RelationGetRelationName(index))));
 			}
 		}

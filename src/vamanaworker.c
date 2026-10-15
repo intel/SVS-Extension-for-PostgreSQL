@@ -30,7 +30,6 @@
 #include "svs_wrapper.h"
 
 #include "access/xact.h"
-#include "access/xlog.h"
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -1297,10 +1296,12 @@ VamanaWorkerMain(Datum main_arg)
 	pqsignal(SIGHUP, VamanaWorkerSighup);
 	BackgroundWorkerUnblockSignals();
 
-	if (wal_level < WAL_LEVEL_LOGICAL)
-		ereport(FATAL,
-				(errmsg("vamana background worker requires wal_level = logical"),
-				 errhint("Set wal_level = logical in postgresql.conf and restart.")));
+	/*
+	 * wal_level is checked once, at launcher startup (VamanaLauncherMain):
+	 * it is PGC_POSTMASTER and cannot change while the server runs, and the
+	 * launcher never spawns a per-database worker unless that check already
+	 * passed.
+	 */
 
 	BackgroundWorkerInitializeConnectionByOid(DatumGetObjectId(main_arg), InvalidOid, 0);
 
