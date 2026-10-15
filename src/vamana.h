@@ -223,6 +223,18 @@ typedef struct VamanaMetaPageData
 
 typedef VamanaMetaPageData * VamanaMetaPage;
 
+StaticAssertDecl(offsetof(VamanaMetaPageData, dimensions) == 4,
+				 "VamanaMetaPageData.dimensions offset changed, on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, graph_degree) == 8,
+				 "VamanaMetaPageData.graph_degree offset changed, on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, alpha) == 10,
+				 "VamanaMetaPageData.alpha offset changed, on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, compression_type) == 12,
+				 "VamanaMetaPageData.compression_type offset changed, on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, compression_primary) == 13,
+				 "VamanaMetaPageData.compression_primary offset changed, on-disk compatibility broken");
+StaticAssertDecl(offsetof(VamanaMetaPageData, compression_secondary) == 14,
+				 "VamanaMetaPageData.compression_secondary offset changed, on-disk compatibility broken");
 StaticAssertDecl(offsetof(VamanaMetaPageData, leanvec_dims) == 16,
 				 "VamanaMetaPageData.leanvec_dims offset changed — on-disk compatibility broken");
 StaticAssertDecl(offsetof(VamanaMetaPageData, build_window_size) == 20,
@@ -346,8 +358,9 @@ void		VamanaInitPage(Buffer buf, Page page);
 void		VamanaInit(void);
 const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
 const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
-void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
+bool		VamanaCompressionConfigIsValid(int compression_type, int compression_primary,
+										   int compression_secondary);
 void		VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno, Size indexDataSize, uint32 numVectors, ForkNumber forkNum);
 void		VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum);
 bytea	   *vamanaoptions(Datum reloptions, bool validate);
