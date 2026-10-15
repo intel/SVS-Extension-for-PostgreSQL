@@ -71,22 +71,23 @@ LookupEntryOrError(Oid dbOid)
  * responses. One is genuinely transient: admission runs as a backend-local
  * pre-commit callback keyed off the enrolling INSERT into vamana_databases,
  * so a slot can exist for a handful of statements, in the enrolling
- * backend's own transaction, before that callback lands. The other is a
- * standing misconfiguration: enrolling (an INSERT into vamana_databases, or
- * svs_restart_worker()) while connected to a database other than
- * svs.launcher_database still runs that same pre-commit callback and still
- * sets residencyBudget, from the enrolling backend's own connection, so it
- * does not actually leave this check at 0 -- the enrolled database's worker
- * simply never spawns, because the launcher only ever reads vamana_databases
- * from svs.launcher_database's copy of that table, and the enrolling row
- * lands in a different database's copy instead. dbOid carries no record of
- * which database its own enrolment ran from, so this function cannot detect
- * that failure; it can only warn about it. The warning is keyed on dbOid
- * itself not being svs.launcher_database, which is also the ordinary,
- * healthy shape of most enrolled databases, so it fires on both the rare
- * misconfiguration and the common transient window whenever dbOid is not
- * the launcher database. It is phrased as a follow-up to try if retrying
- * does not resolve the wait, not as a diagnosis.
+ * backend's own transaction, before that callback lands. The other used to
+ * be a standing misconfiguration: enrolling (an INSERT into
+ * vamana_databases, or svs_restart_worker()) while connected to a database
+ * other than svs.launcher_database still ran that same pre-commit callback
+ * and still set residencyBudget, so this check did not actually catch it --
+ * the enrolled database's worker simply never spawned, because the launcher
+ * only ever reads vamana_databases from svs.launcher_database's copy of that
+ * table, and the enrolling row landed in a different database's copy
+ * instead. That path is now closed at the source: vamana_databases_queue_reservation
+ * (vamana_databases.c) rejects an INSERT/UPDATE made from any database other
+ * than svs.launcher_database before it ever reaches the reservation queue,
+ * so no new slot can be stranded this way. The "else" branch below remains
+ * only as defense-in-depth for a slot stranded by shmem state that predates
+ * the guard (e.g. an unclean restart mid-upgrade); it is phrased as a
+ * follow-up to try if retrying does not resolve the wait, not as a
+ * diagnosis, since dbOid still carries no record of which database its own
+ * enrolment ran from.
  */
 static void
 RequireAdmitted(VamanaWorkerShmem *entry, Oid dbOid)
