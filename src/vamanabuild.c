@@ -319,6 +319,14 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 
 	buildstate->distance_type = VamanaGetDistanceMetric(index);
 
+	if (!VamanaOrderOperatorMatchesMetric(index->rd_opfamily[0], index->rd_opcintype[0],
+										  buildstate->distance_type))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator class for vamana index does not match its own distance metric"),
+				 errdetail("The ordering operator and support function 1 compute different distance metrics, so the index would return nearest neighbours in the wrong order."),
+				 errhint("Fix the operator class definition so its ordering operator and support function 1 agree on the same distance metric.")));
+
 	// NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result): PostgreSQL constant macro, not a palloc(n * size) site
 	buildstate->buildCtx = AllocSetContextCreate(CurrentMemoryContext,
 												 "Vamana build context",
