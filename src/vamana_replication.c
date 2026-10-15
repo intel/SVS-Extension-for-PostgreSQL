@@ -1488,7 +1488,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 		ereport(DEBUG1,
 				(errmsg("vamana catch-up: slot \"%s\" start_restart=%X/%X "
 						"exit_recptr=%X/%X end_restart=%X/%X confirmed_flush=%X/%X "
-						"records=" UINT64_FORMAT " elapsed_us=%.0f budget_exhausted=%d "
+						"records=" UINT64_FORMAT " elapsed_us=" INT64_FORMAT " budget_exhausted=%d "
 						"skipped_no_lag=%d",
 						slotName,
 						LSN_FORMAT_ARGS(result->startRestartLsn),
@@ -1496,7 +1496,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 						LSN_FORMAT_ARGS(result->endRestartLsn),
 						LSN_FORMAT_ARGS(confirmedFlush),
 						result->recordsDecoded,
-						INSTR_TIME_GET_MICROSEC(elapsed) * 1.0,
+						INSTR_TIME_GET_MICROSEC(elapsed),
 						(int) result->budgetExhausted,
 						(int) result->skippedNoLag)));
 
@@ -1514,7 +1514,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 }
 
 /* Minimum WAL growth, and minimum spacing, between D7 stride emissions. */
-#define VAMANA_RUNNING_XACTS_STRIDE			(64 * 1024 * 1024)
+#define VAMANA_RUNNING_XACTS_STRIDE			((uint64) 64 * 1024 * 1024)
 #define VAMANA_RUNNING_XACTS_STRIDE_MIN_MS	250
 
 /*
