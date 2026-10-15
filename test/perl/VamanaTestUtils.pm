@@ -19,7 +19,7 @@ use Time::HiRes qw(usleep);
 our @EXPORT_OK = qw(
     $dim $array_sql $query_sql $lv_query_sql
     $N @query_vecs $SYNC_SLEEP
-    run_concurrent run_synchronized dir_size vamana_save_dir
+    run_concurrent run_synchronized run_parked_batch dir_size vamana_save_dir
     wait_for_worker wait_for_worker_db wait_for_slot_release
     orphan_slot_count wait_for_no_orphan_slots
     search_scratch_in_flight_bytes wait_for_search_scratch_in_flight
@@ -128,8 +128,9 @@ sub run_concurrent
 # ---------------------------------------------------------------------------
 sub run_synchronized
 {
-    my ($node, $db, $n, $pre_sql_of, $search_sql_of, $barrier_key) = @_;
+    my ($node, $db, $n, $pre_sql_of, $search_sql_of, $barrier_key, $hooks) = @_;
     $barrier_key //= 4747;
+    $hooks //= {};
 
     my $tmpdir = tempdir(CLEANUP => 1);
 
@@ -190,10 +191,14 @@ sub run_synchronized
       if int($waiting) < $n;
     usleep(50_000);         # 50 ms margin
 
+    $hooks->{before_release}->() if $hooks->{before_release};
+
     # Release exclusive lock: all N children get the shared lock simultaneously
     # and immediately run their SELECT queries.
     $coord->query_safe("SELECT pg_advisory_unlock($barrier_key);");
     $coord->quit;
+
+    $hooks->{after_release}->() if $hooks->{after_release};
 
     waitpid($_, 0) for @pids;
 
@@ -207,6 +212,53 @@ sub run_synchronized
         push @results, $r;
     }
     return @results;
+}
+
+# ---------------------------------------------------------------------------
+# run_parked_batch: like run_synchronized, but parks the vamana worker at
+# vamana-worker-before-collect-requests before releasing the barrier, so all
+# $n backends publish their PENDING search slots while the worker is frozen,
+# and are guaranteed to be collected together in the worker's next pass.
+# Requires injection_points already created in $db.
+#
+# Returns ($results_ref, $pending_seen), where $pending_seen is the highest
+# observed count of pending search slots for $index_name (>= $n on success).
+# ---------------------------------------------------------------------------
+sub run_parked_batch
+{
+    my ($node, $db, $n, $pre_sql_of, $search_sql_of, $index_name) = @_;
+    my $point = 'vamana-worker-before-collect-requests';
+    my $pending_seen = 0;
+
+    my @results = run_synchronized(
+        $node, $db, $n, $pre_sql_of, $search_sql_of, undef,
+        {
+            before_release => sub {
+                $node->safe_psql($db,
+                    "SELECT injection_points_attach('$point', 'wait');");
+                $node->wait_for_event('vamana worker', $point);
+            },
+            after_release => sub {
+                for (1 .. 100)
+                {
+                    my $count = $node->safe_psql($db,
+                        "SELECT count(*) FROM pg_stat_vamana_worker_slot "
+                      . "WHERE slot_status = 'pending' AND slot_kind = 'search' "
+                      . "AND index_relid = '$index_name'::regclass;");
+                    chomp $count;
+                    $pending_seen = int($count) if int($count) > $pending_seen;
+                    last if $pending_seen >= $n;
+                    usleep(20_000);
+                }
+                $node->safe_psql($db,
+                    "SELECT injection_points_detach('$point');");
+                $node->safe_psql($db,
+                    "SELECT injection_points_wakeup('$point');");
+            },
+        }
+    );
+
+    return (\@results, $pending_seen);
 }
 
 # ---------------------------------------------------------------------------
