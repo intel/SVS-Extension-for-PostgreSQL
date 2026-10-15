@@ -129,6 +129,10 @@ TRUNCATE vamana_databases;
 RESET ROLE;
 DROP ROLE vamana_databases_test_nonowner;
 
+-- Owning this table is superuser-equivalent; the comment must say so
+SELECT obj_description('vamana_databases'::regclass, 'pg_class')
+	LIKE '%superuser-equivalent%' AS owner_warning_present;
+
 -- Unlike residency_memory, search_work_mem has no decrease-validation
 -- trigger at all: nothing about this axis is durable or crash-sensitive, so
 -- a lower value has nothing to make unsafe.
