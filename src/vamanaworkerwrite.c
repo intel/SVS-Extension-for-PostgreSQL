@@ -647,12 +647,26 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 					 errmsg("vamana worker: failed to load index %u", relid),
 					 errdetail_log("Path: \"%s\".", savepath)));
 
+		/*
+		 * Guard against a torn save the same way LoadIndexFromPages does:
+		 * the just-loaded graph/data/config must come from the same save as
+		 * the metapage fields packed into params.  Unreachable in the
+		 * current single caller (immediately after this process's own
+		 * build-time save), but this function's contract -- load whatever
+		 * generation params names -- should not depend on that.
+		 */
+		if (!VamanaCheckSaveGeneration(VamanaWorkerShmemPtr->dbOid, relid, params->saveGeneration))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("vamana worker: torn save detected for index %u", relid)));
+
 		if (params->tidMappingCapacity > 0)
 		{
 			tidMapping = (ItemPointerData *)
 				MemoryContextAlloc(TopMemoryContext,
 								   (Size) params->tidMappingCapacity * sizeof(ItemPointerData));
-			if (!VamanaLoadTidMap(VamanaWorkerShmemPtr->dbOid, relid, tidMapping, params->tidMappingCapacity))
+			if (!VamanaLoadTidMap(VamanaWorkerShmemPtr->dbOid, relid, tidMapping, params->tidMappingCapacity,
+								  params->saveGeneration))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATA_EXCEPTION),
 						 errmsg("vamana worker: TID map missing or corrupt for index %u",
