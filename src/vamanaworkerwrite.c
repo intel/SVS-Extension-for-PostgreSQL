@@ -693,8 +693,21 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		/* Ownership passed to the cache entry; a later error must not free these. */
+		/*
+		 * svsIndex: ownership passed to the cache entry; a later error must
+		 * not free it.
+		 *
+		 * tidMapping: VamanaCacheIndex copies this buffer into its own,
+		 * separately allocated one rather than taking ownership of it, so
+		 * the local copy must be freed here. It is still set to NULL
+		 * afterward so the PG_CATCH block below, which legitimately owns
+		 * freeing it on the failure path (an error before this point),
+		 * never attempts a second free of the same pointer; the two paths
+		 * are mutually exclusive within one PG_TRY/PG_CATCH.
+		 */
 		svsIndex = NULL;
+		if (tidMapping != NULL)
+			pfree(tidMapping);
 		tidMapping = NULL;
 
 		{
