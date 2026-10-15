@@ -96,6 +96,38 @@ bool	VamanaReplicationSlotIsConsistent(Oid dboid, Oid indexRelid);
 /* BGW: advance confirmed_flush_lsn. Safe to call with slot == NULL. */
 bool	VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn);
 
+/* One VamanaReplicationCatchUpSlot slice's outcome, for scheduling and logging. */
+typedef struct VamanaCatchUpResult
+{
+	XLogRecPtr	startRestartLsn;
+	XLogRecPtr	endRestartLsn;
+	XLogRecPtr	endRecPtr;
+	uint64		recordsDecoded;
+	bool		budgetExhausted;
+	bool		skippedNoLag;
+} VamanaCatchUpResult;
+
+/*
+ * BGW, primary only: fast-forward-decode one index's slot from restart_lsn
+ * up to its own confirmed_flush (never past it), for up to budgetMs.  Issues
+ * no confirm of its own; restart_lsn follows the reader live because every
+ * running-xacts record it crosses is already covered by confirmed_flush.
+ * No-op (result->skippedNoLag) if there is less than one WAL segment of lag,
+ * or the slot has not reached its first consistent point.  Returns false,
+ * with *result unset, only if the slot could not be acquired right now.
+ */
+bool	VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs,
+									VamanaCatchUpResult *result);
+
+/*
+ * BGW, primary only, call once per main-loop iteration: emit a fresh
+ * RUNNING_XACTS record at most once per VAMANA_RUNNING_XACTS_STRIDE bytes of
+ * WAL and VAMANA_RUNNING_XACTS_STRIDE_MIN_MS, cluster-wide across every
+ * database worker, so a catch-up slice is never handed a running-xacts gap
+ * large enough to make it make zero progress.
+ */
+void	VamanaReplicationMaybeEmitRunningXactsStride(void);
+
 /* BGW: free the handle (does not drop the underlying slot). Safe with NULL. */
 void	VamanaReplicationClose(VamanaReplicationSlot *slot);
 

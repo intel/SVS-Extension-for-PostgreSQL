@@ -80,7 +80,30 @@ ShouldCheckpoint(VamanaIndexCache *cache)
 	enough_ops = (cache->opsSinceCheckpoint >= vamana_checkpoint_min_ops);
 
 	if (!enough_ops)
+	{
+		/*
+		 * An index with some writes that never reaches checkpoint_min_ops
+		 * would otherwise never checkpoint at all under debounce mode, so
+		 * confirmed_flush would never move and the catch-up step
+		 * (VamanaReplicationCatchUpSlot) would have nothing past it to
+		 * drain toward (I2 forbids decoding past confirmed_flush), leaving
+		 * the slot's lag to grow without bound regardless of the catch-up
+		 * fix.  Force a checkpoint once lag crosses half the WAL budget
+		 * regardless of ops, so every index with any activity still gets
+		 * bounded; the heap-rebuild valve was always going to fire at the
+		 * full budget anyway, this just lets a cheap checkpoint pre-empt
+		 * it.  An index with literally zero writes ever (ops == 0, so
+		 * nothing to force a checkpoint over) is left to that valve: a
+		 * wasteful rebuild of an index that is already fully current, but
+		 * not an incorrect one.
+		 */
+		if (cache->opsSinceCheckpoint > 0 &&
+			VamanaReplicationSlotWalLagExceeds(cache->indexRelid,
+												vamana_max_slot_wal_size_mb / 2))
+			return true;
+
 		return false;
+	}
 
 	if (cache->lastWriteTime > 0 && vamana_checkpoint_debounce_window > 0)
 	{

@@ -12,10 +12,19 @@
 # both LSNs froze at their first-consistent-point value and retained WAL grew
 # without bound as steady-state behavior, not an edge case.
 #
+# The fix splits recording the durable point (the checkpoint path, cheap and
+# constant-time, confirms only) from catching the slot up (a separate,
+# budgeted fast-forward decode run from the worker's main loop, bounded to
+# never decode past the slot's own confirmed_flush).  A lag under one WAL
+# segment retains nothing extra on disk, so the catch-up step is a no-op
+# below that; this file's cheap cases generate enough WAL to cross that
+# floor instead of asserting restart_lsn moves every single write cycle.
+#
 # Tests:
-#   restart_lsn and confirmed_flush_lsn advance across repeated write and
-#       checkpoint cycles on a lone primary (the primary pass/fail signal).
-#   pg_wal usage stays bounded rather than growing with every cycle.
+#   The catch-up step drains restart_lsn toward confirmed_flush once lag
+#       exceeds one WAL segment, on its own cadence, without the checkpoint
+#       path ever decoding (the primary pass/fail signal).
+#   pg_wal usage stays bounded rather than tracking total WAL written.
 
 use strict;
 use warnings FATAL => 'all';
@@ -38,10 +47,12 @@ $node->append_conf('postgresql.conf', "wal_level = logical");
 $node->append_conf('postgresql.conf', "max_replication_slots = 10");
 $node->append_conf('postgresql.conf', "max_wal_senders = 10");
 $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+$node->append_conf('postgresql.conf', "log_min_messages = debug1");
 
-# Debounce the per-index checkpoint on a small, deterministic op count instead
-# of the default (10000 ops / 300s quiet window), so each write batch below
-# reliably triggers its own VamanaSlotAdvance call.
+# Debounce the per-index checkpoint on a small, deterministic op count
+# instead of the default (10000 ops / 300s quiet window), so the one write
+# batch below reliably triggers a checkpoint instead of waiting on either
+# default threshold.
 $node->append_conf('postgresql.conf', "svs.checkpoint_operations = 50");
 $node->start;
 
@@ -96,38 +107,90 @@ for (1 .. 60)
 }
 ok($consistent, 'primary slot advance: slot reaches its first consistent point');
 
-# Drive several write + per-index-checkpoint cycles and confirm both LSNs
-# keep pace with WAL growth instead of freezing at their first value.
-my $prev_restart = $restart0;
-my $advanced_count = 0;
-for my $cycle (1 .. 6)
+my $wal_segment_size_str = $node->safe_psql('postgres', "SHOW wal_segment_size;");
+chomp $wal_segment_size_str;
+my ($seg_num, $seg_unit) = $wal_segment_size_str =~ /^(\d+)\s*([A-Za-z]*)$/;
+my %unit_bytes = ('' => 1, 'kB' => 1024, 'MB' => 1024 * 1024, 'GB' => 1024 * 1024 * 1024);
+my $seg_bytes = $seg_num * ($unit_bytes{$seg_unit} // 1);
+
+$node->safe_psql('postgres', "CREATE TABLE advance_filler (id bigserial, pad text);");
+
+# Generate well past one WAL segment of filler on an unrelated table, call
+# pg_log_standby_snapshot() explicitly (what D7's stride emission would
+# eventually do on its own, but deterministically, before confirmed_flush
+# is captured rather than racing with it: GetXLogInsertRecPtr, which D7
+# reads, leads the flush pointer checkpoint_lsn is captured from, so a
+# record D7 emits around a checkpoint typically lands at or just past that
+# same checkpoint's own confirmed_flush -- too late to help it, only a
+# later one), then one small checkpoint-worthy write to advance_tbl so
+# confirmed_flush is captured only slightly past the explicit snapshot and
+# covers it.  Without a fresh running-xacts record inside [restart_lsn,
+# confirmed_flush], this would be exactly the "point 3" livelock the
+# addendum describes: nothing else writes one on a timescale this short, so
+# the only candidate restart_lsn can accept is whatever running-xacts
+# record already existed before the filler, and it stays stuck there.
+$node->safe_psql('postgres', qq{
+	INSERT INTO advance_filler (pad)
+		SELECT repeat('x', 1024) FROM generate_series(1, 30000);
+});
+$node->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+$node->safe_psql('postgres', qq{
+	INSERT INTO advance_tbl (val)
+		SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 60) i;
+});
+
+my ($restart1, $confirmed1) = slot_lsns();
+my $lag_after_filler = $node->safe_psql('postgres',
+	"SELECT pg_wal_lsn_diff('$confirmed1', '$restart1');");
+chomp $lag_after_filler;
+cmp_ok($lag_after_filler, '>=', $seg_bytes,
+	"primary slot advance: filler plus checkpoints produced at least one WAL segment of lag ($lag_after_filler bytes)");
+
+# confirmed_flush only moves at a checkpoint, so a one-shot snapshot call
+# before a single checkpoint is a race against exactly where that one call
+# lands relative to the confirmed_flush that same checkpoint captures (this
+# flaked in practice).  Instead, keep both moving together: a small write
+# to advance_tbl each iteration both raises confirmed_flush a bit further
+# (so there is always fresh ground for a running-xacts record to land on)
+# and calls pg_log_standby_snapshot() right after, standing in for D7's own
+# ongoing stride emission in a real deployment.  Frequent checkpoints like
+# this are exactly what D6's save-defer counter exists to tolerate without
+# starving the catch-up step outright; this is also a live check that the
+# defer counter actually bounds the starvation rather than being unbounded.
+my $drained = 0;
+my $restart_final = $restart1;
+for (1 .. 60)
 {
 	$node->safe_psql('postgres', qq{
 		INSERT INTO advance_tbl (val)
 			SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 60) i;
 	});
-	usleep(1_500_000);
+	$node->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
 
 	my ($restart, $confirmed) = slot_lsns();
-	$advanced_count++
-	  if $node->safe_psql('postgres',
-		"SELECT pg_lsn('$restart') > pg_lsn('$prev_restart');") eq 't';
-	$prev_restart = $restart;
+	my $lag = $node->safe_psql('postgres',
+		"SELECT pg_wal_lsn_diff('$confirmed', '$restart');");
+	chomp $lag;
+	$restart_final = $restart;
+	if ($lag < $seg_bytes)
+	{
+		$drained = 1;
+		last;
+	}
+	usleep(500_000);
 }
+ok($drained,
+	'primary slot advance: catch-up step drains restart_lsn toward confirmed_flush below one WAL segment');
 
-cmp_ok($advanced_count, '>=', 4,
-	"primary slot advance: restart_lsn advanced in at least 4 of 6 cycles ($advanced_count observed)");
-
-my ($restart_final, $confirmed_final) = slot_lsns();
 my $wal_now = $node->safe_psql('postgres', "SELECT pg_current_wal_lsn();");
 chomp $wal_now;
 
-my $lag = $node->safe_psql('postgres',
+my $lag_final = $node->safe_psql('postgres',
 	"SELECT pg_wal_lsn_diff('$wal_now', '$restart_final');");
-chomp $lag;
+chomp $lag_final;
 
-cmp_ok($lag, '<', 8 * 1024 * 1024,
-	"primary slot advance: restart_lsn lag ($lag bytes) stays small instead of tracking total WAL written");
+cmp_ok($lag_final, '<', 2 * $seg_bytes,
+	"primary slot advance: restart_lsn lag ($lag_final bytes) stays bounded instead of tracking total WAL written");
 
 $node->stop;
 

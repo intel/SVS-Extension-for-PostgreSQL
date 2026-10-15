@@ -1080,11 +1080,17 @@ VamanaWorkerHandlePromotion(bool *wasReplayingWal, const VamanaReplayRole *role)
  * a mid-loop eviction does not invalidate the iterator; VamanaGetCache
  * returns NULL for any OID that was evicted by then.  One index's checkpoint
  * failure only skips that index; ShouldCheckpoint tries it again next cycle.
+ *
+ * Returns true if any index was actually saved this call, so
+ * VamanaWorkerCatchUpSlots can skip its own slice whenever a save already
+ * ran: PerformCheckpoint's save and a catch-up slice must never stack in
+ * the same uninterrupted window (D6).
  */
-static void
+static bool
 VamanaWorkerCheckpointDueIndexes(void)
 {
 	List	   *relids = VamanaGetAllCachedRelids();
+	bool		savedAny = false;
 
 	foreach_oid(relid, relids)
 	{
@@ -1097,7 +1103,153 @@ VamanaWorkerCheckpointDueIndexes(void)
 			ereport(LOG,
 					(errmsg("vamana checkpoint: index %u not checkpointed this cycle, will retry",
 							relid)));
+		else
+			savedAny = true;
 	}
+
+	return savedAny;
+}
+
+/* Minimum spacing between catch-up slices, worker-wide (D6). */
+#define VAMANA_SLOT_CATCHUP_INTERVAL_MS 1000
+
+/*
+ * Consecutive attempt opportunities this worker may defer in a row because
+ * each one happened to coincide with a save, before it runs a slice anyway.
+ * Deferring once avoids stacking a slice's budget on top of a save that
+ * just ran in the same uninterrupted window; deferring forever does not
+ * avoid that, it just moves the slot's lag bound from "bounded" to
+ * "unbounded whenever checkpoints keep landing on every attempt," which an
+ * operator who configures aggressive simple-mode checkpointing
+ * (svs.checkpoint_operations or svs.checkpoint_interval set low) can
+ * trigger on an otherwise healthy, continuously-writing primary.  Capping
+ * the defer streak guarantees catch-up a turn at least once every
+ * (VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS + 1) attempt opportunities,
+ * independent of checkpoint cadence.
+ */
+#define VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS 5
+
+/*
+ * Process-local: which cached index's catch-up this worker served last, when
+ * it may next attempt one at all, and how many attempt opportunities in a
+ * row it has deferred because each coincided with a save.  All reset to
+ * "eligible now" / zero by their zero value; none need to survive a worker
+ * restart.
+ */
+static Oid			vamanaCatchUpRoundRobinRelid = InvalidOid;
+static TimestampTz	vamanaNextCatchUpAttempt = 0;
+static int			vamanaConsecutiveSaveDefers = 0;
+
+/*
+ * VamanaWorkerCatchUpSlots
+ *
+ * Primary only.  Spends up to Min(1000, svs.worker_timeout_ms / 5) ms of
+ * wall clock catching up one cached index's replication slot
+ * (VamanaReplicationCatchUpSlot), round-robinning across cached indexes one
+ * per call so a single large backlog cannot starve the others.  Called at
+ * most once per VAMANA_SLOT_CATCHUP_INTERVAL_MS, so the worker stays at
+ * least half free for IPC while a backlog drains.  Each attempt that
+ * coincides with a save in the same iteration (VamanaWorkerCheckpointDueIndexes
+ * returned true) defers rather than stacking a slice's budget on top of the
+ * save, up to VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS times in a row,
+ * after which it runs anyway so sustained checkpoint pressure cannot starve
+ * it indefinitely.
+ *
+ * A slice that exhausts its budget without moving restart_lsn backs that
+ * index off exponentially (cache->catchUpBackoffMs, 1 s doubling to a 60 s
+ * cap) rather than spending the same share of the worker on it forever;
+ * this is the only defense against the two cases where decoding cannot move
+ * the slot no matter how many slices it gets: a long-open transaction
+ * pinning the slot's restart point, or a running-xacts gap wider than one
+ * slice.  Any progress resets the backoff.
+ */
+static void
+VamanaWorkerCatchUpSlots(bool savedThisIteration)
+{
+	TimestampTz	now;
+	List	   *relids;
+	int			n;
+	int			startIdx;
+	int			budgetMs;
+
+	now = GetCurrentTimestamp();
+	if (vamanaNextCatchUpAttempt != 0 && vamanaNextCatchUpAttempt > now)
+		return;
+
+	if (savedThisIteration &&
+		vamanaConsecutiveSaveDefers < VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS)
+	{
+		vamanaConsecutiveSaveDefers++;
+		vamanaNextCatchUpAttempt = TimestampTzPlusMilliseconds(now, VAMANA_SLOT_CATCHUP_INTERVAL_MS);
+		return;
+	}
+
+	vamanaConsecutiveSaveDefers = 0;
+
+	relids = VamanaGetAllCachedRelids();
+	n = list_length(relids);
+	if (n == 0)
+	{
+		list_free(relids);
+		return;
+	}
+
+	budgetMs = Min(1000, vamana_worker_timeout_ms / 5);
+
+	startIdx = 0;
+	if (OidIsValid(vamanaCatchUpRoundRobinRelid))
+	{
+		int			i = 0;
+
+		foreach_oid(relid, relids)
+		{
+			if (relid == vamanaCatchUpRoundRobinRelid)
+			{
+				startIdx = (i + 1) % n;
+				break;
+			}
+			i++;
+		}
+	}
+
+	for (int tries = 0; tries < n; tries++)
+	{
+		int					idx = (startIdx + tries) % n;
+		Oid					relid = list_nth_oid(relids, idx);
+		VamanaIndexCache   *cache = VamanaGetCache(relid);
+		VamanaCatchUpResult	result;
+
+		if (cache == NULL || cache->replicationSlot == NULL)
+			continue;
+
+		if (cache->nextCatchUpAttempt != 0 && cache->nextCatchUpAttempt > now)
+			continue;
+
+		if (!VamanaReplicationCatchUpSlot(relid, budgetMs, &result))
+			continue;
+
+		vamanaCatchUpRoundRobinRelid = relid;
+
+		if (result.skippedNoLag || result.endRestartLsn > result.startRestartLsn)
+		{
+			cache->catchUpBackoffMs = 0;
+			cache->nextCatchUpAttempt = 0;
+		}
+		else
+		{
+			int			backoff = (cache->catchUpBackoffMs == 0)
+				? 1000
+				: Min(cache->catchUpBackoffMs * 2, 60000);
+
+			cache->catchUpBackoffMs = backoff;
+			cache->nextCatchUpAttempt = TimestampTzPlusMilliseconds(now, backoff);
+		}
+
+		break;
+	}
+
+	list_free(relids);
+	vamanaNextCatchUpAttempt = TimestampTzPlusMilliseconds(now, VAMANA_SLOT_CATCHUP_INTERVAL_MS);
 }
 
 /*
@@ -1256,13 +1408,19 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		{
 			VamanaWorkerEnforceWalBudgetOnAllSlots();
 			VamanaWorkerActivatePendingSnapshots();
+			VamanaReplicationMaybeEmitRunningXactsStride();
 		}
 		else
 			VamanaWorkerDrainAllSlots();
 
 		VamanaWorkerHandlePromotion(&wasReplayingWal, role);
 
-		VamanaWorkerCheckpointDueIndexes();
+		{
+			bool savedThisIteration = VamanaWorkerCheckpointDueIndexes();
+
+			if (role->processes_write_ipc)
+				VamanaWorkerCatchUpSlots(savedThisIteration);
+		}
 	}
 }
 

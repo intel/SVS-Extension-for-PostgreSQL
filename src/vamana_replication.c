@@ -26,6 +26,7 @@
 #include "access/xlogutils.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/snapbuild.h"
@@ -1285,42 +1286,18 @@ VamanaReplicationOpen(Oid dboid, Oid indexRelid)
 }
 
 /*
- * Per-record callback for VamanaSlotAdvance's catch-up decode.  Drives the
- * reorder buffer so it populates candidate_xmin_lsn/candidate_restart_valid,
- * without applying anything: the context's output_plugin_private->cache stays
- * NULL (VamanaOpenDecoder never sets it), so PluginChange no-ops on every
- * change and VamanaPreScanWalRecord is unneeded (it also no-ops on a NULL
- * cache).  Writes already landed via the primary's own write-IPC path.
- */
-static bool
-DiscardRecordCallback(LogicalDecodingContext *ctx, void *arg)
-{
-	INJECTION_POINT("vamana-slot-advance-discard-decode", NULL);
-	LogicalDecodingProcessRecord(ctx, ctx->reader);
-	return false;
-}
-
-/*
  * Advance confirmed_flush_lsn by briefly acquiring the slot.  A persistent
  * non-active slot can be acquired and released in a tight window.  Returns
  * false, advancing nothing, if the slot is busy or gone; the caller decides
  * whether that makes its own checkpoint incomplete.
  *
- * On a primary, nothing else ever decodes this slot (VamanaReplicationDrainSlot
- * is standby-only), so LogicalConfirmReceivedLocation below can never promote
- * restart_lsn/confirmed_flush_lsn on its own: both are gated on reorder-buffer
- * candidate positions, which the reorder buffer only sets once it has decoded
- * a RUNNING_XACTS record and watched every transaction live at that point
- * finish.  Nothing on a primary writes a fresh RUNNING_XACTS record either
- * (that is otherwise left to a logical walsender or Postgres's own, far less
- * frequent, checkpoint), so catching up to whatever already happens to be in
- * WAL is not enough: this writes its own with LogStandbySnapshot before
- * decoding, and decodes through that point even if it is past newLsn, so the
- * pass always has fresh running-xact data to resolve against instead of
- * freezing again as soon as it exhausts whatever happened to already be in
- * WAL.  Skipped entirely when there is no lag to catch up (restart_lsn
- * already at or past newLsn, or the slot has not reached its first
- * consistent point yet).
+ * Confirms only, never decodes: confirmed_flush can legitimately run ahead
+ * of anything this process has decoded (core stores it unconditionally when
+ * no reorder-buffer candidate is pending), and newLsn is always the LSN
+ * through which the on-disk save is already durable, captured by the caller
+ * before the save started.  Catching restart_lsn up to that point is a
+ * separate, budgeted step (VamanaReplicationCatchUpSlot) run from the
+ * worker's main loop, not from here.
  */
 bool
 VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
@@ -1333,32 +1310,6 @@ VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 
 	PG_TRY();
 	{
-		XLogRecPtr restartLsn = MyReplicationSlot->data.restart_lsn;
-
-		if (restartLsn != InvalidXLogRecPtr && restartLsn < newLsn)
-		{
-			LogicalDecodingContext *ctx;
-			XLogRecPtr	snapshotLsn = LogStandbySnapshot();
-			XLogRecPtr	decodeEnd = Max(newLsn, snapshotLsn);
-
-			/*
-			 * LogStandbySnapshot only inserts; it does not wait for the
-			 * record to be on disk.  XLogReadRecord blocks until a record
-			 * it is asked to read becomes flushed, normally resolved by the
-			 * walwriter -- which is already gone during this worker's own
-			 * shutdown-time drain, so without an explicit flush here the
-			 * decode loop below would wait on a flush nothing will ever do.
-			 */
-			XLogFlush(decodeEnd);
-
-			ctx = VamanaOpenDecoder();
-			VamanaRunDecodeLoop(ctx, decodeEnd, "vamana slot advance",
-								DiscardRecordCallback, NULL);
-			FreeDecodingContext(ctx);
-
-			newLsn = decodeEnd;
-		}
-
 		LogicalConfirmReceivedLocation(newLsn);
 		ReplicationSlotRelease();
 	}
@@ -1371,6 +1322,243 @@ VamanaSlotAdvance(VamanaReplicationSlot *slot, XLogRecPtr newLsn)
 	PG_END_TRY();
 
 	return true;
+}
+
+/*
+ * VamanaOpenDecoderFastForward
+ *
+ * Like VamanaOpenDecoder, but with fast_forward = true: no output plugin
+ * load, no heap-change queuing, no commit replay (PG core: logical.c around
+ * the fast_forward checks in CreateDecodingContext, decode.c's early-return
+ * in DecodeInsert/DecodeUpdate/DecodeDelete-style handlers, and
+ * DecodeCommit's DecodeTXNNeedSkip), while snapbuild and the running-xacts
+ * bookkeeping that sets restart_lsn's candidates still run.  Per-record cost
+ * is then roughly uniform (WAL read plus header decode, plus snapbuild work
+ * at running-xacts and commit records), which is what makes a
+ * record-granular budget check (VamanaCatchUpBudget below) a real time
+ * bound instead of one a single large commit's replay can blow past.
+ */
+static LogicalDecodingContext *
+VamanaOpenDecoderFastForward(void)
+{
+	LogicalDecodingContext *ctx;
+
+	ctx = CreateDecodingContext(InvalidXLogRecPtr,
+								NIL,
+								/*fast_forward=*/ true,
+								VAMANA_XLOG_ROUTINE,
+								NULL, NULL, NULL);
+	XLogBeginRead(ctx->reader, MyReplicationSlot->data.restart_lsn);
+	return ctx;
+}
+
+/* Records between budget checks; see VamanaCatchUpBudget's callback. */
+#define VAMANA_CATCHUP_CHECK_STRIDE 32
+
+/*
+ * Per-slice wall-clock budget for VamanaReplicationCatchUpSlot's decode
+ * loop.  deadline is computed once per call from the caller's budgetMs;
+ * sinceCheck/exhausted are callback-private bookkeeping.  recordsDecoded is
+ * for the slice's own progress log, not the budget decision.
+ */
+typedef struct VamanaCatchUpBudget
+{
+	TimestampTz deadline;
+	uint32		sinceCheck;
+	bool		exhausted;
+	uint64		recordsDecoded;
+} VamanaCatchUpBudget;
+
+/*
+ * Process first, check second, so ctx->reader->EndRecPtr at loop exit is
+ * always the end of a record that was actually passed to
+ * LogicalDecodingProcessRecord: returning true before processing (as
+ * ActivateSlotRecordCallback does, where that is fine for its own purpose)
+ * would make EndRecPtr overstate progress by one record here, where the
+ * exit EndRecPtr is logged as how far the slice actually got.
+ *
+ * GetCurrentTimestamp is a vDSO clock_gettime on Linux, not a syscall, but
+ * calling it every record still costs a measurable fraction at millions of
+ * small records per second; checking every VAMANA_CATCHUP_CHECK_STRIDE
+ * records keeps that overhead low and bounds the overshoot past the
+ * deadline to a few cheap records.
+ */
+static bool
+DiscardRecordCallback(LogicalDecodingContext *ctx, void *arg)
+{
+	VamanaCatchUpBudget *budget = (VamanaCatchUpBudget *) arg;
+
+	INJECTION_POINT("vamana-slot-advance-discard-decode", NULL);
+	LogicalDecodingProcessRecord(ctx, ctx->reader);
+	budget->recordsDecoded++;
+
+	if (++budget->sinceCheck < VAMANA_CATCHUP_CHECK_STRIDE)
+		return false;
+	budget->sinceCheck = 0;
+	if (GetCurrentTimestamp() < budget->deadline)
+		return false;
+	budget->exhausted = true;
+	return true;
+}
+
+/*
+ * VamanaReplicationCatchUpSlot
+ *
+ * Primary only.  Fast-forward-decode this index's slot from restart_lsn up
+ * to its own confirmed_flush, never past it, for up to budgetMs of wall
+ * clock.  Issues no confirm of its own: every running-xacts record decoded
+ * here is at or below confirmed_flush, so core's reorder buffer accepts
+ * each candidate immediately (LogicalIncreaseRestartDecodingForSlot's
+ * direct-accept branch, taken once confirmed_flush already covers the
+ * reader), and restart_lsn follows the reader live through the slice with
+ * no action from this function.  confirmed_flush itself never moves here:
+ * only VamanaSlotAdvance raises it, and only to the LSN through which the
+ * on-disk save is already durable (I2 -- see the addendum's D5).
+ *
+ * No-op (result->skippedNoLag = true, nothing decoded) when there is less
+ * than one WAL segment of lag -- not enough to reclaim anything on disk --
+ * or the slot has not yet reached its first consistent point (restart_lsn
+ * invalid).  Returns false, with *result unset, only if the slot could not
+ * be acquired right now; the caller treats that the same as "no progress
+ * this call" and retries on a later iteration.
+ */
+bool
+VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *result)
+{
+	char				slotName[NAMEDATALEN];
+	XLogRecPtr volatile	startRestartLsn = InvalidXLogRecPtr;
+	XLogRecPtr volatile	confirmedFlush = InvalidXLogRecPtr;
+	bool volatile		skippedNoLag = false;
+	uint64 volatile		recordsDecoded = 0;
+	XLogRecPtr volatile	endRecPtr = InvalidXLogRecPtr;
+	bool volatile		budgetExhausted = false;
+
+	SlotName(VamanaWorkerShmemPtr->dbOid, indexRelid, slotName);
+
+	if (!VamanaTryAcquireSlotNoWait(slotName))
+		return false;
+
+	PG_TRY();
+	{
+		instr_time	startTime;
+		instr_time	elapsed;
+
+		INSTR_TIME_SET_CURRENT(startTime);
+
+		startRestartLsn = MyReplicationSlot->data.restart_lsn;
+		confirmedFlush = MyReplicationSlot->data.confirmed_flush;
+
+		if (startRestartLsn == InvalidXLogRecPtr ||
+			confirmedFlush == InvalidXLogRecPtr ||
+			confirmedFlush - startRestartLsn < (XLogRecPtr) wal_segment_size)
+		{
+			skippedNoLag = true;
+			endRecPtr = startRestartLsn;
+		}
+		else
+		{
+			LogicalDecodingContext *ctx = VamanaOpenDecoderFastForward();
+			VamanaCatchUpBudget budget;
+
+			budget.deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), budgetMs);
+			budget.sinceCheck = 0;
+			budget.exhausted = false;
+			budget.recordsDecoded = 0;
+
+			VamanaRunDecodeLoop(ctx, confirmedFlush, "vamana catch-up",
+								DiscardRecordCallback, &budget);
+
+			endRecPtr = ctx->reader->EndRecPtr;
+			recordsDecoded = budget.recordsDecoded;
+			budgetExhausted = budget.exhausted;
+
+			FreeDecodingContext(ctx);
+		}
+
+		result->startRestartLsn = startRestartLsn;
+		result->endRestartLsn = MyReplicationSlot->data.restart_lsn;
+		result->endRecPtr = endRecPtr;
+		result->recordsDecoded = recordsDecoded;
+		result->budgetExhausted = budgetExhausted;
+		result->skippedNoLag = skippedNoLag;
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, startTime);
+
+		ereport(DEBUG1,
+				(errmsg("vamana catch-up: slot \"%s\" start_restart=%X/%X "
+						"exit_recptr=%X/%X end_restart=%X/%X confirmed_flush=%X/%X "
+						"records=" UINT64_FORMAT " elapsed_us=%.0f budget_exhausted=%d "
+						"skipped_no_lag=%d",
+						slotName,
+						LSN_FORMAT_ARGS(result->startRestartLsn),
+						LSN_FORMAT_ARGS(result->endRecPtr),
+						LSN_FORMAT_ARGS(result->endRestartLsn),
+						LSN_FORMAT_ARGS(confirmedFlush),
+						result->recordsDecoded,
+						INSTR_TIME_GET_MICROSEC(elapsed) * 1.0,
+						(int) result->budgetExhausted,
+						(int) result->skippedNoLag)));
+
+		ReplicationSlotRelease();
+	}
+	PG_CATCH();
+	{
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return true;
+}
+
+/* Minimum WAL growth, and minimum spacing, between D7 stride emissions. */
+#define VAMANA_RUNNING_XACTS_STRIDE			(64 * 1024 * 1024)
+#define VAMANA_RUNNING_XACTS_STRIDE_MIN_MS	250
+
+/*
+ * VamanaReplicationMaybeEmitRunningXactsStride
+ *
+ * Primary only, called once per main-loop iteration.  A fast-forward catch-up
+ * slice can only move restart_lsn as far as a running-xacts record it
+ * actually decoded; a gap between two such records bigger than one slice
+ * means every slice in between makes zero progress.  bgwriter and the
+ * checkpointer already write one periodically, but the gap between those can
+ * run to several GB under a large max_wal_size and sustained WAL volume.
+ * This keeps future gaps bounded to roughly VAMANA_RUNNING_XACTS_STRIDE bytes
+ * plus VAMANA_RUNNING_XACTS_STRIDE_MIN_MS, independent of core's own cadence.
+ *
+ * Coordinated cluster-wide through one CAS on the shared header's
+ * lastRunningXactsLsn, so N database workers crossing the stride at the same
+ * time cost one LogStandbySnapshot call (which holds ProcArrayLock), not N:
+ * the byte and time gates are read unlocked and can race, but only the
+ * worker that wins the CAS actually emits.
+ */
+void
+VamanaReplicationMaybeEmitRunningXactsStride(void)
+{
+	VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
+	uint64		current = (uint64) GetXLogInsertRecPtr();
+	uint64		lastEmitted;
+	TimestampTz	now = GetCurrentTimestamp();
+	TimestampTz	lastTs;
+
+	lastEmitted = pg_atomic_read_u64(&header->lastRunningXactsLsn);
+	if (current < lastEmitted + VAMANA_RUNNING_XACTS_STRIDE)
+		return;
+
+	lastTs = (TimestampTz) pg_atomic_read_u64(&header->lastRunningXactsEmitTs);
+	if (lastTs != 0 &&
+		!TimestampDifferenceExceeds(lastTs, now, VAMANA_RUNNING_XACTS_STRIDE_MIN_MS))
+		return;
+
+	if (!pg_atomic_compare_exchange_u64(&header->lastRunningXactsLsn,
+										&lastEmitted, current))
+		return;
+
+	pg_atomic_write_u64(&header->lastRunningXactsEmitTs, (uint64) now);
+	LogStandbySnapshot();
 }
 
 /*
