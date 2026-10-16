@@ -67,7 +67,7 @@ chomp $index_count;
 is($index_count, '1', 'the shmem live-index counter the guard reads says 1');
 
 # ---------------------------------------------------------------------------
-# TRUNCATE is now rejected, exactly like DELETE.
+# TRUNCATE is rejected, exactly like DELETE.
 # ---------------------------------------------------------------------------
 {
     my ($del_rc, undef, $del_err) = $node->psql('postgres',
@@ -80,7 +80,7 @@ is($index_count, '1', 'the shmem live-index counter the guard reads says 1');
 
     my ($rc, undef, $err) = $node->psql('postgres', "TRUNCATE vamana_databases;");
 
-    isnt($rc, 0, 'FIXED: TRUNCATE is now rejected while a vamana index still exists');
+    isnt($rc, 0, 'TRUNCATE is rejected while a vamana index still exists');
     like($err, qr/cannot truncate vamana_databases: 1 vamana index\(es\) still exist in database "postgres"/,
         'the rejection names the database and its live index count');
     like($err, qr/run svs_teardown_database\(\) in "postgres" first/,
@@ -88,14 +88,14 @@ is($index_count, '1', 'the shmem live-index counter the guard reads says 1');
 
     my $rows = $node->safe_psql('postgres', "SELECT count(*) FROM vamana_databases;");
     chomp $rows;
-    isnt($rows, '0', 'FIXED: the row survives -- nothing was wiped');
+    isnt($rows, '0', 'the row survives -- nothing was wiped');
 
-    ok(-d $save_dir, 'FIXED: the index save directory is still intact');
+    ok(-d $save_dir, 'the index save directory is still intact');
 
     my $orphan_slots = $node->safe_psql('postgres',
         "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'vamana_%';");
     chomp $orphan_slots;
-    cmp_ok($orphan_slots, '>=', 1, 'FIXED: the replication slot is still intact');
+    cmp_ok($orphan_slots, '>=', 1, 'the replication slot is still intact');
 
     # Nothing should have been disrupted: the worker is still alive and no
     # shutdown was logged.

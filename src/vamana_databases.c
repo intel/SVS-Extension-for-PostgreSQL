@@ -164,19 +164,32 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 		elog(ERROR, "vamana_databases_queue_reservation: datname is null");
 	datname = DatumGetName(datnameDatum);
 
+	dbOid = get_database_oid(NameStr(*datname), false);
+
 	/*
 	 * Only the launcher's own connected database's copy of this table is
 	 * ever read (ReadDatabaseRows, via SvsDatabasesQualifiedName). A row
 	 * written from any other database's copy would otherwise still reach
 	 * ReserveSlotsForEnabledEntries below and reserve a real shmem slot,
 	 * making VamanaWorkerAssertDatabase believe the database is configured
-	 * while no worker is ever spawned for it. Reject it here, before it
-	 * reaches the reservation queue at all.
+	 * while no worker is ever spawned for it.
+	 *
+	 * Reject only when that would be a new problem: a slot already reserved
+	 * for dbOid means it was already properly enrolled from the launcher
+	 * database at some point (this trigger is the only path that ever
+	 * reserves one, and it has rejected every out-of-band attempt since this
+	 * guard existed), so a second, local-only write from elsewhere targeting
+	 * the same dbOid -- svs_restart_worker()'s UPDATE, a per-database config
+	 * write like maintenance_num_threads from the database's own connection,
+	 * or a pg_dump/restore replay into a differently-named database -- is a
+	 * harmless, idempotent no-op for enrollment purposes: it does not change
+	 * what the launcher's own copy says, so it cannot strand anything.
 	 */
 	{
 		Oid			launcherDbOid = get_database_oid(vamana_launcher_database, true);
 
-		if (OidIsValid(launcherDbOid) && MyDatabaseId != launcherDbOid)
+		if (OidIsValid(launcherDbOid) && MyDatabaseId != launcherDbOid &&
+			VamanaWorkerLookupSlot(dbOid) == NULL)
 		{
 			char		safeLauncherDatname[NAMEDATALEN * 4];
 
@@ -209,8 +222,6 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 										 &residencyMemoryIsNull);
 	searchWorkMemDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM, tupdesc,
 									   &searchWorkMemIsNull);
-
-	dbOid = get_database_oid(NameStr(*datname), false);
 
 	/* Resolved here, not in the PRE_COMMIT callback that drains this queue: only this trigger has an active snapshot. */
 	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation,

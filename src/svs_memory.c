@@ -71,23 +71,20 @@ LookupEntryOrError(Oid dbOid)
  * responses. One is genuinely transient: admission runs as a backend-local
  * pre-commit callback keyed off the enrolling INSERT into vamana_databases,
  * so a slot can exist for a handful of statements, in the enrolling
- * backend's own transaction, before that callback lands. The other used to
- * be a standing misconfiguration: enrolling (an INSERT into
- * vamana_databases, or svs_restart_worker()) while connected to a database
- * other than svs.launcher_database still ran that same pre-commit callback
- * and still set residencyBudget, so this check did not actually catch it --
- * the enrolled database's worker simply never spawned, because the launcher
- * only ever reads vamana_databases from svs.launcher_database's copy of that
- * table, and the enrolling row landed in a different database's copy
- * instead. That path is now closed at the source: vamana_databases_queue_reservation
- * (vamana_databases.c) rejects an INSERT/UPDATE made from any database other
- * than svs.launcher_database before it ever reaches the reservation queue,
- * so no new slot can be stranded this way. The "else" branch below remains
- * only as defense-in-depth for a slot stranded by shmem state that predates
- * the guard (e.g. an unclean restart mid-upgrade); it is phrased as a
+ * backend's own transaction, before that callback lands.
+ *
+ * The other is a database that will never spawn a worker because the
+ * launcher never saw its enrolling row: the launcher only ever reads
+ * vamana_databases from svs.launcher_database's copy of that table, and
+ * vamana_databases_queue_reservation (vamana_databases.c) rejects an
+ * enrolling INSERT/UPDATE made from any other database unless dbOid
+ * already has a reserved slot -- so a *first* enrollment from the wrong
+ * database cannot strand one. The "else" branch below is defense-in-depth
+ * for the cases that guard cannot see: shmem state that predates it (an
+ * unclean restart mid-upgrade), or dbOid carrying no record of which
+ * database its own enrolment ran from in general. It is phrased as a
  * follow-up to try if retrying does not resolve the wait, not as a
- * diagnosis, since dbOid still carries no record of which database its own
- * enrolment ran from.
+ * diagnosis.
  */
 static void
 RequireAdmitted(VamanaWorkerShmem *entry, Oid dbOid)

@@ -59,13 +59,13 @@ my $appdb_oid = $node->safe_psql('postgres',
 chomp $appdb_oid;
 
 # ---------------------------------------------------------------------------
-# FIXED: enrolling from appdb's own copy of the table is now rejected
+# Enrolling from appdb's own copy of the table is rejected
 # immediately, instead of silently reserving a stray slot.
 # ---------------------------------------------------------------------------
 {
     my ($ins_rc, undef, $ins_err) = $node->psql('appdb',
         "INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true);");
-    isnt($ins_rc, 0, 'FIXED: the INSERT into appdb\'s own vamana_databases is now rejected')
+    isnt($ins_rc, 0, 'the INSERT into appdb\'s own vamana_databases is rejected')
       or diag('the INSERT unexpectedly succeeded');
     like($ins_err, qr/cannot enroll "appdb" into vamana_databases from this database/,
         'the rejection names the database and the enrollment problem');
@@ -77,12 +77,12 @@ chomp $appdb_oid;
     my $in_appdb = $node->safe_psql('appdb',
         "SELECT count(*) FROM vamana_databases WHERE datname = 'appdb';");
     chomp $in_appdb;
-    is($in_appdb, '0', 'FIXED: no row was left behind in appdb\'s own copy');
+    is($in_appdb, '0', 'no row was left behind in appdb\'s own copy');
 
     my $slot = $node->safe_psql('postgres',
         "SELECT count(*) FROM pg_stat_vamana_worker WHERE db_oid = $appdb_oid;");
     chomp $slot;
-    is($slot, '0', 'FIXED: no stray shmem slot was reserved for appdb');
+    is($slot, '0', 'no stray shmem slot was reserved for appdb');
 
     my $pid = wait_for_worker_db($node, 'appdb', 8);
     is($pid, '', 'no worker is spawned for appdb (nothing was ever enrolled)');
@@ -101,7 +101,7 @@ chomp $appdb_oid;
     is($in_launcher, '1', 'the row lands in the launcher\'s own copy of the table');
 
     my $pid = wait_for_worker_db($node, 'appdb', 40);
-    ok($pid =~ /^\d+$/, "a worker is now spawned for appdb (pid=$pid)");
+    ok($pid =~ /^\d+$/, "a worker is spawned for appdb (pid=$pid)");
 
     $node->safe_psql('appdb', qq{
         CREATE TABLE t34 (id serial PRIMARY KEY, val vector($dim));
@@ -112,6 +112,34 @@ chomp $appdb_oid;
         "CREATE INDEX i34 ON t34 USING vamana (val vector_l2_ops);");
     is($rc, 0, 'CREATE INDEX succeeds in appdb once it is correctly enrolled')
       or diag($err);
+}
+
+# ---------------------------------------------------------------------------
+# Once a database is correctly enrolled (above), a second, local-only write
+# from that same database's own connection -- not the launcher's -- succeeds,
+# because a slot is already reserved for it: this is the pattern
+# svs_restart_worker() uses from the launcher side, and the pattern
+# maintenance_num_threads overrides use from the enrolled database's own
+# side (see SvsDatabasesGetMyMaintenanceNumThreads, test 19). It must not be
+# confused with a first enrollment attempt from the wrong database, which
+# the earlier block in this file still rejects.
+# ---------------------------------------------------------------------------
+{
+    # appdb's own local copy of the table has no row yet: the enrolling
+    # INSERT above landed in the launcher's ('postgres') copy, which is a
+    # separate relation instance from appdb's own. This INSERT is the
+    # local-only write SvsDatabasesGetMyMaintenanceNumThreads() later reads
+    # back, same pattern test 19 uses.
+    my ($rc, undef, $err) = $node->psql('appdb',
+        "INSERT INTO vamana_databases (datname, enabled, maintenance_num_threads) "
+      . "VALUES ('appdb', true, 2);");
+    is($rc, 0, 'a local-only write from an already-enrolled database\'s own connection succeeds')
+      or diag($err);
+
+    my $value = $node->safe_psql('appdb',
+        "SELECT maintenance_num_threads FROM vamana_databases WHERE datname = 'appdb';");
+    chomp $value;
+    is($value, '2', 'the local write actually took effect in appdb\'s own copy');
 }
 
 # ---------------------------------------------------------------------------
@@ -136,7 +164,7 @@ chomp $appdb_oid;
 
     my ($rc, undef, $err) = $node->psql('staledb',
         "SELECT svs_restart_worker('staledb');");
-    isnt($rc, 0, 'FIXED: svs_restart_worker() from the wrong database is rejected too')
+    isnt($rc, 0, 'svs_restart_worker() from the wrong database is rejected too')
       or diag('svs_restart_worker() unexpectedly succeeded');
     like($err, qr/cannot enroll "staledb" into vamana_databases from this database/,
         'the rejection is the same enrollment-guard error, not a different message');
