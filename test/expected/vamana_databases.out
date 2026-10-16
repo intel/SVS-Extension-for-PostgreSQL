@@ -29,6 +29,7 @@ Triggers:
     vamana_databases_check_search_work_mem_ceiling_upd AFTER UPDATE ON vamana_databases REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling()
     vamana_databases_queue_reservation AFTER INSERT OR UPDATE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_queue_reservation()
     vamana_databases_reject_delete_with_live_indexes BEFORE DELETE ON vamana_databases FOR EACH ROW EXECUTE FUNCTION vamana_databases_reject_delete_with_live_indexes()
+    vamana_databases_reject_truncate_with_live_indexes BEFORE TRUNCATE ON vamana_databases FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_reject_truncate_with_live_indexes()
 
 \d svs_index_residency
             Table "public.svs_index_residency"
@@ -607,6 +608,18 @@ SELECT count(*) FROM vamana_databases WHERE datname = current_database();
      1
 (1 row)
 
+-- TRUNCATE must be rejected for the identical reason: a row-level BEFORE
+-- DELETE trigger alone cannot stop it (TRUNCATE never fires row triggers),
+-- so this needs its own BEFORE TRUNCATE guard.
+TRUNCATE vamana_databases;
+ERROR:  cannot truncate vamana_databases: 1 vamana index(es) still exist in database "contrib_regression"
+HINT:  run svs_teardown_database() in "contrib_regression" first
+SELECT count(*) FROM vamana_databases WHERE datname = current_database();
+ count 
+-------
+     1
+(1 row)
+
 -- After teardown the count is zero, so the same DELETE is allowed.  Rolled
 -- back to keep this database enabled for the remaining regression files.
 SELECT dropped FROM svs_teardown_database();
@@ -624,6 +637,12 @@ SELECT DISTINCT index_count FROM pg_stat_vamana_worker
 
 BEGIN;
 DELETE FROM vamana_databases WHERE datname = current_database();
+ROLLBACK;
+-- TRUNCATE is allowed once no indexes remain, same as DELETE above.  Rolled
+-- back for the same reason: keep this database enabled for the rest of the
+-- suite.
+BEGIN;
+TRUNCATE vamana_databases;
 ROLLBACK;
 DROP TABLE vamana_gate_t;
 -- A row whose database was dropped without cleanup is deletable: the guard
