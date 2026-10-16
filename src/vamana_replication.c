@@ -1413,7 +1413,7 @@ DiscardRecordCallback(LogicalDecodingContext *ctx, void *arg)
  * reader), and restart_lsn follows the reader live through the slice with
  * no action from this function.  confirmed_flush itself never moves here:
  * only VamanaSlotAdvance raises it, and only to the LSN through which the
- * on-disk save is already durable (I2 -- see the addendum's D5).
+ * on-disk save is already durable.
  *
  * No-op (result->skippedNoLag = true, nothing decoded) when there is less
  * than one WAL segment of lag -- not enough to reclaim anything on disk --
@@ -1513,7 +1513,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 	return true;
 }
 
-/* Minimum WAL growth, and minimum spacing, between D7 stride emissions. */
+/* Minimum WAL growth, and minimum spacing, between running-xacts stride emissions. */
 #define VAMANA_RUNNING_XACTS_STRIDE			((uint64) 64 * 1024 * 1024)
 #define VAMANA_RUNNING_XACTS_STRIDE_MIN_MS	250
 

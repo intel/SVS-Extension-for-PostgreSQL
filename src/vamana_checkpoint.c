@@ -86,9 +86,9 @@ ShouldCheckpoint(VamanaIndexCache *cache)
 		 * would otherwise never checkpoint at all under debounce mode, so
 		 * confirmed_flush would never move and the catch-up step
 		 * (VamanaReplicationCatchUpSlot) would have nothing past it to
-		 * drain toward (I2 forbids decoding past confirmed_flush), leaving
-		 * the slot's lag to grow without bound regardless of the catch-up
-		 * fix.  Force a checkpoint once lag crosses half the WAL budget
+		 * drain toward, since it never decodes past confirmed_flush,
+		 * leaving the slot's lag to grow without bound regardless of the
+		 * catch-up fix.  Force a checkpoint once lag crosses half the WAL budget
 		 * regardless of ops, so every index with any activity still gets
 		 * bounded; the heap-rebuild valve was always going to fire at the
 		 * full budget anyway, this just lets a cheap checkpoint pre-empt

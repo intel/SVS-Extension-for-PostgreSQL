@@ -1,21 +1,13 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 69_primary_slot_advance.pl -- a primary's own replication slot must advance
-# without a standby or any other logical consumer ever decoding it.
+# 69_primary_slot_advance.pl -- a primary's own replication slot advances on
+# its own, without a standby or any other logical consumer ever decoding it.
 #
-# Nothing on a primary used to run a logical decode against a vamana index's
-# own slot: the checkpoint-triggered advance called LogicalConfirmReceivedLocation
-# directly, which can only promote restart_lsn/confirmed_flush_lsn once a decode
-# has already populated the reorder buffer's candidate positions.  On a lone
-# primary with no standby and no logical consumer, nothing ever did that, so
-# both LSNs froze at their first-consistent-point value and retained WAL grew
-# without bound as steady-state behavior, not an edge case.
-#
-# The fix splits recording the durable point (the checkpoint path, cheap and
-# constant-time, confirms only) from catching the slot up (a separate,
-# budgeted fast-forward decode run from the worker's main loop, bounded to
-# never decode past the slot's own confirmed_flush).  A lag under one WAL
+# The checkpoint path records the slot's durable point directly, with no
+# decoding of its own; a separate, budgeted fast-forward decode step run
+# from the worker's main loop is what actually advances restart_lsn, bounded
+# to never decode past the slot's own confirmed_flush.  A lag under one WAL
 # segment retains nothing extra on disk, so the catch-up step is a no-op
 # below that; this file's cheap cases generate enough WAL to cross that
 # floor instead of asserting restart_lsn moves every single write cycle.
@@ -116,19 +108,19 @@ my $seg_bytes = $seg_num * ($unit_bytes{$seg_unit} // 1);
 $node->safe_psql('postgres', "CREATE TABLE advance_filler (id bigserial, pad text);");
 
 # Generate well past one WAL segment of filler on an unrelated table, call
-# pg_log_standby_snapshot() explicitly (what D7's stride emission would
-# eventually do on its own, but deterministically, before confirmed_flush
-# is captured rather than racing with it: GetXLogInsertRecPtr, which D7
-# reads, leads the flush pointer checkpoint_lsn is captured from, so a
-# record D7 emits around a checkpoint typically lands at or just past that
-# same checkpoint's own confirmed_flush -- too late to help it, only a
-# later one), then one small checkpoint-worthy write to advance_tbl so
-# confirmed_flush is captured only slightly past the explicit snapshot and
-# covers it.  Without a fresh running-xacts record inside [restart_lsn,
-# confirmed_flush], this would be exactly the "point 3" livelock the
-# addendum describes: nothing else writes one on a timescale this short, so
-# the only candidate restart_lsn can accept is whatever running-xacts
-# record already existed before the filler, and it stays stuck there.
+# pg_log_standby_snapshot() explicitly (what the worker's own periodic
+# running-xacts emission would eventually do on its own, but deterministically,
+# before confirmed_flush is captured rather than racing with it:
+# GetXLogInsertRecPtr, which that emission reads, leads the flush pointer
+# checkpoint_lsn is captured from, so a record emitted around a checkpoint
+# typically lands at or just past that same checkpoint's own confirmed_flush --
+# too late to help it, only a later one), then one small checkpoint-worthy
+# write to advance_tbl so confirmed_flush is captured only slightly past the
+# explicit snapshot and covers it.  Without a fresh running-xacts record
+# inside [restart_lsn, confirmed_flush], the catch-up step would be stuck:
+# nothing else writes one on a timescale this short, so the only candidate
+# restart_lsn can accept is whatever running-xacts record already existed
+# before the filler, and it stays stuck there.
 $node->safe_psql('postgres', qq{
 	INSERT INTO advance_filler (pad)
 		SELECT repeat('x', 1024) FROM generate_series(1, 30000);
@@ -152,11 +144,12 @@ cmp_ok($lag_after_filler, '>=', $seg_bytes,
 # flaked in practice).  Instead, keep both moving together: a small write
 # to advance_tbl each iteration both raises confirmed_flush a bit further
 # (so there is always fresh ground for a running-xacts record to land on)
-# and calls pg_log_standby_snapshot() right after, standing in for D7's own
-# ongoing stride emission in a real deployment.  Frequent checkpoints like
-# this are exactly what D6's save-defer counter exists to tolerate without
-# starving the catch-up step outright; this is also a live check that the
-# defer counter actually bounds the starvation rather than being unbounded.
+# and calls pg_log_standby_snapshot() right after, standing in for the
+# worker's own ongoing running-xacts emission in a real deployment.
+# Frequent checkpoints like this are exactly what the catch-up step's
+# save-defer counter exists to tolerate without starving the step outright;
+# this is also a live check that the defer counter actually bounds the
+# starvation rather than being unbounded.
 my $drained = 0;
 my $restart_final = $restart1;
 for (1 .. 60)

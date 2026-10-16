@@ -1084,7 +1084,7 @@ VamanaWorkerHandlePromotion(bool *wasReplayingWal, const VamanaReplayRole *role)
  * Returns true if any index was actually saved this call, so
  * VamanaWorkerCatchUpSlots can skip its own slice whenever a save already
  * ran: PerformCheckpoint's save and a catch-up slice must never stack in
- * the same uninterrupted window (D6).
+ * the same uninterrupted window.
  */
 static bool
 VamanaWorkerCheckpointDueIndexes(void)
@@ -1110,7 +1110,7 @@ VamanaWorkerCheckpointDueIndexes(void)
 	return savedAny;
 }
 
-/* Minimum spacing between catch-up slices, worker-wide (D6). */
+/* Minimum spacing between catch-up slices, worker-wide. */
 #define VAMANA_SLOT_CATCHUP_INTERVAL_MS 1000
 
 /*

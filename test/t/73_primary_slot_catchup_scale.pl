@@ -15,11 +15,13 @@
 #   The backlog is real (verified against pg_wal, not just the slot view).
 #   Concurrent single-row inserts to the indexed table never time out
 #       while the backlog drains.
-#   The gap closes to within one D7 stride inside a stated slice budget.
-#   Per-slice invariants (I1-I3) hold throughout, checked against
-#       pg_replication_slots.
-#   I2 holds end-to-end: a hard kill mid-drain, followed by restart, loses
-#       nothing durable (search results match the heap).
+#   The gap closes to within one running-xacts stride inside a stated
+#       slice budget.
+#   Per-slice invariants hold throughout, checked against
+#       pg_replication_slots: restart_lsn never outruns what a slice
+#       actually decoded, and stays monotonic and bounded by confirmed_flush.
+#   The durability invariant holds end-to-end: a hard kill, followed by
+#       restart, loses nothing durable (search results match the heap).
 
 use strict;
 use warnings FATAL => 'all';
@@ -98,10 +100,10 @@ for (1 .. 60)
 ok($consistent, "catchup scale: slot reaches its first consistent point");
 
 # ---------------------------------------------------------------------------
-# Build the backlog (test plan item 2): hold an open transaction so its own
-# xid pins the slot's restart point under core semantics, generate real WAL
-# on an unindexed table, checkpoint the vamana index so confirmed_flush
-# covers the backlog, then commit.  No injection points required.
+# Build the backlog: hold an open transaction so its own xid pins the
+# slot's restart point under core semantics, generate real WAL on an
+# unindexed table, checkpoint the vamana index so confirmed_flush covers
+# the backlog, then commit.  No injection points required.
 # ---------------------------------------------------------------------------
 my $held_h = $node->background_psql('postgres');
 $held_h->query_safe("BEGIN;");
@@ -113,15 +115,15 @@ my $wal_before = $node->safe_psql('postgres', "SELECT pg_current_wal_lsn();");
 chomp $wal_before;
 
 # ~1 GB of filler total, well past svs.max_slot_wal_size / 2 so the lag is
-# unmistakably real, and well past one D7 stride (64 MB).  Generated in
-# chunks with an explicit pg_log_standby_snapshot() after each one, not as
-# a single bulk statement: a fresh fast-forward decoder is re-opened from
-# the same frozen restart_lsn every slice (re-open-per-slice, D1/D6) and
-# can only reach as far into the backlog as its own budget allows before
-# timing out, a small fraction of a gap this size.  A single marker placed
-# only at the very end, near confirmed_flush, would sit far past where any
-# one slice can reach -- this is the "point 3" livelock from the addendum,
-# on a backlog large enough that D7's own stride emission (which also only
+# unmistakably real, and well past one running-xacts stride (64 MB).
+# Generated in chunks with an explicit pg_log_standby_snapshot() after each
+# one, not as a single bulk statement: a fresh fast-forward decoder is
+# re-opened from the same frozen restart_lsn every slice and can only reach
+# as far into the backlog as its own budget allows before timing out, a
+# small fraction of a gap this size.  A single marker placed only at the
+# very end, near confirmed_flush, would sit far past where any one slice
+# can reach, so the catch-up step would be stuck on a backlog large enough
+# that the worker's own periodic running-xacts emission (which also only
 # ever lands near the current end of WAL) cannot help either.  Markers
 # spread through the backlog let each slice close one step of the gap and
 # start the next slice that much closer to the next marker, the same
@@ -160,24 +162,24 @@ $held_h->quit;
 
 # The transaction's own commit does not by itself write a fresh
 # RUNNING_XACTS record; without one, every slice re-opens from the same
-# restart_lsn (re-open-per-slice, D1/D6) and can only make progress as far
-# into the backlog as its budget reaches before timing out, which for a
-# backlog this size is a small fraction of the whole gap -- nowhere near
-# any marker written later, near the current end of WAL.  One explicit
-# snapshot right here, at the point restart_lsn is actually stuck, is what
-# a slice can reach quickly; this is the "point 3" livelock the addendum
-# describes, applied to a backlog large enough that D7's own stride
-# emission (which only ever lands near the current end of WAL, just like
-# this one would without the explicit call below) cannot help either.
+# restart_lsn and can only make progress as far into the backlog as its
+# budget reaches before timing out, which for a backlog this size is a
+# small fraction of the whole gap -- nowhere near any marker written
+# later, near the current end of WAL.  One explicit snapshot right here,
+# at the point restart_lsn is actually stuck, is what a slice can reach
+# quickly; without it the catch-up step would be stuck on a backlog large
+# enough that the worker's own periodic running-xacts emission (which
+# only ever lands near the current end of WAL, just like this one would
+# without the explicit call below) cannot help either.
 $node->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
 
 # ---------------------------------------------------------------------------
-# Concurrent writes never time out (test plan item 3), while the drain runs
-# and invariants are checked (test plan item 5).  One sequential loop of
-# single-row inserts overlaps whatever slice is in progress at any given
-# moment, since the worker is single-threaded: a write issued mid-slice
-# either returns promptly (the request queue is serviced between slices,
-# per D6's spacing) or, if the fix regresses, blocks for the slice's
+# Concurrent writes never time out while the drain runs, and invariants
+# are checked throughout.  One sequential loop of single-row inserts
+# overlaps whatever slice is in progress at any given moment, since the
+# worker is single-threaded: a write issued mid-slice either returns
+# promptly (the request queue is serviced between slices, per the catch-up
+# step's own spacing) or, if the fix regresses, blocks for the slice's
 # duration or longer.
 # ---------------------------------------------------------------------------
 my $max_write_latency = 0;
@@ -216,7 +218,7 @@ for my $iter (1 .. 90)
 
 	my ($restart, $confirmed) = slot_row();
 
-	# I3: restart_lsn monotonic and <= confirmed_flush.
+	# restart_lsn must stay monotonic and never pass confirmed_flush.
 	my $monotonic = $node->safe_psql('postgres',
 		"SELECT pg_lsn('$restart') >= pg_lsn('$prev_restart') AND pg_lsn('$restart') <= pg_lsn('$confirmed');");
 	chomp $monotonic;
@@ -238,13 +240,13 @@ for my $iter (1 .. 90)
 is($write_errors, 0, "catchup scale: zero write errors while the backlog drains");
 cmp_ok($max_write_latency, '<', 1000,
 	"catchup scale: max write latency ($max_write_latency ms) stays under svs.worker_timeout_ms");
-is($i3_violations, 0, "catchup scale: I3 (restart_lsn monotonic, <= confirmed_flush) held every sample");
+is($i3_violations, 0, "catchup scale: restart_lsn stayed monotonic and <= confirmed_flush every sample");
 ok($drained,
-	"catchup scale: gap closed to within one D7 stride (restart_lsn=$restart_final)");
+	"catchup scale: gap closed to within one running-xacts stride (restart_lsn=$restart_final)");
 
-# I1 (restart_lsn only ever advances to a decoded position) is checked from
-# the DEBUG1 slice log: every slice's end_restart must be <= that slice's
-# own exit_recptr.
+# restart_lsn must never advance past a position a slice actually decoded;
+# checked from the DEBUG1 slice log: every slice's end_restart must be
+# <= that slice's own exit_recptr.
 my $log_content = $node->log_content();
 my @slices = ($log_content =~
 	/vamana catch-up:.*?exit_recptr=([0-9A-Fa-f]+\/[0-9A-Fa-f]+).*?end_restart=([0-9A-Fa-f]+\/[0-9A-Fa-f]+)/g);
@@ -258,12 +260,12 @@ for (my $s = 0; $s < @slices; $s += 2)
 	chomp $ok;
 	$i1_violations++ if $ok ne 't';
 }
-is($i1_violations, 0, "catchup scale: I1 (restart_lsn never past a decoded position) held every slice");
+is($i1_violations, 0, "catchup scale: restart_lsn never advanced past a decoded position, every slice");
 
-# D3's bound: B = Min(1000, svs.worker_timeout_ms / 5) = 200 ms here.  Each
-# slice's own elapsed_us (measured inside C around the decode loop, not
-# inferred from log timestamps) must stay within B plus the itemised
-# overshoot margin D3 derives (150 ms covers it).
+# The slice time budget: B = Min(1000, svs.worker_timeout_ms / 5) = 200 ms
+# here.  Each slice's own elapsed_us (measured inside C around the decode
+# loop, not inferred from log timestamps) must stay within B plus the
+# itemised overshoot margin the budget design allows for (150 ms covers it).
 my $budget_ms = 200;
 my @elapsed_values = ($log_content =~ /vamana catch-up:.*?elapsed_us=(\d+(?:\.\d+)?)/g);
 my $slow_slices = 0;
@@ -272,7 +274,7 @@ is($slow_slices, 0,
 	"catchup scale: every slice's elapsed time stayed within B + 150 ms (" . scalar(@elapsed_values) . " slices checked)");
 
 # ---------------------------------------------------------------------------
-# I2 end to end (test plan item 5): a hard kill mid-write, then restart,
+# The durability invariant end to end: a hard kill mid-write, then restart,
 # must lose nothing durable.  Capture the expected row count first.
 # ---------------------------------------------------------------------------
 my $expected_count = $node->safe_psql('postgres', "SELECT count(*) FROM scale_tbl;");
@@ -292,7 +294,7 @@ my $after_count = $node->safe_psql('postgres', qq{
 });
 chomp $after_count;
 is($after_count, $expected_count,
-	"catchup scale: I2 end to end -- index search matches the heap after a hard kill ($after_count rows)");
+	"catchup scale: index search matches the heap after a hard kill ($after_count rows)");
 
 $node->stop;
 
