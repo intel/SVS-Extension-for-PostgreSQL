@@ -623,28 +623,45 @@ VamanaCheckSaveGeneration(Oid dboid, Oid relid, TimestampTz expectedSaveGenerati
 	char		indexdir[MAXPGPATH];
 	char		genpath[MAXPGPATH];
 	char		gentmp[MAXPGPATH];
-	struct stat tmpst;
+	int			tmpfd;
 	FILE	   *f;
 	VamanaSaveGenHeader header;
 
 	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
 	VamanaGetSaveGenPath(indexdir, genpath, sizeof(genpath));
 
-	/* Same orphan-temp-file hygiene as VamanaLoadTidMap; see its comment. */
+	/*
+	 * Same orphan-temp-file hygiene as VamanaLoadTidMap; see its comment.
+	 * Checked via an open file descriptor rather than lstat-by-path so the
+	 * mtime/mode this decides on belongs to the exact file the unlink below
+	 * removes, not to whatever a later rename or recreation leaves at that
+	 * path in between: a plain stat-then-unlink-by-name would let a
+	 * concurrent writer's own temp-file replace land in that window and be
+	 * removed instead of the orphan actually checked.
+	 */
 	VamanaGetSaveGenTmpPath(indexdir, gentmp, sizeof(gentmp));
-	if (lstat(gentmp, &tmpst) == 0 &&
-		S_ISREG(tmpst.st_mode) &&
-		tmpst.st_mtime < timestamptz_to_time_t(PgStartTime))
+	tmpfd = OpenTransientFile(gentmp, O_RDONLY | PG_BINARY);
+	if (tmpfd >= 0)
 	{
-		if (unlink(gentmp) == 0)
-			ereport(DEBUG1,
-					(errmsg("vamana index %u: removed orphaned save-generation temp file", relid),
-					 errdetail_log("Path: \"%s\".", gentmp)));
-		else
-			ereport(DEBUG1,
-					(errcode_for_file_access(),
-					 errmsg("vamana index %u: could not remove orphaned save-generation temp file: %m", relid),
-					 errdetail_log("Path: \"%s\".", gentmp)));
+		struct stat tmpst;
+		bool		is_orphan = fstat(tmpfd, &tmpst) == 0 &&
+			S_ISREG(tmpst.st_mode) &&
+			tmpst.st_mtime < timestamptz_to_time_t(PgStartTime);
+
+		CloseTransientFile(tmpfd);
+
+		if (is_orphan)
+		{
+			if (unlink(gentmp) == 0)
+				ereport(DEBUG1,
+						(errmsg("vamana index %u: removed orphaned save-generation temp file", relid),
+						 errdetail_log("Path: \"%s\".", gentmp)));
+			else
+				ereport(DEBUG1,
+						(errcode_for_file_access(),
+						 errmsg("vamana index %u: could not remove orphaned save-generation temp file: %m", relid),
+						 errdetail_log("Path: \"%s\".", gentmp)));
+		}
 	}
 
 	f = AllocateFile(genpath, PG_BINARY_R);
