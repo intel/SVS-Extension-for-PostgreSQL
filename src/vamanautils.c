@@ -626,6 +626,54 @@ VamanaGetDistanceMetric(Relation index)
 }
 
 /*
+ * Check that the opfamily's strategy-1 (ordering) operator implements the
+ * same distance metric as the one derived from support function 1. An
+ * opclass that pairs, for example, <=> with an L2 support function builds
+ * successfully with no error, but the index then serves ORDER BY <=> from
+ * an L2 graph with no recheck, returning neighbours in the wrong order.
+ * Name-based, like the rest of the metric mapping in VamanaGetDistanceMetric;
+ * that is a known property of this code, not something this check
+ * introduces.
+ */
+bool
+VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric)
+{
+	Oid			orderOpOid;
+	Oid			orderFuncOid;
+	char	   *orderFuncName;
+	bool		matches = false;
+
+	orderOpOid = get_opfamily_member(opfamilyoid, inputTypeOid, inputTypeOid, 1);
+	if (!OidIsValid(orderOpOid))
+		return false;
+
+	orderFuncOid = get_opcode(orderOpOid);
+	if (!OidIsValid(orderFuncOid))
+		return false;
+
+	orderFuncName = get_func_name(orderFuncOid);
+	if (orderFuncName == NULL)
+		return false;
+
+	switch (metric)
+	{
+		case SVS_DISTANCE_L2:
+			matches = (strcmp(orderFuncName, "l2_distance") == 0);
+			break;
+		case SVS_DISTANCE_IP:
+			matches = (strcmp(orderFuncName, "vector_negative_inner_product") == 0 ||
+					   strcmp(orderFuncName, "halfvec_negative_inner_product") == 0);
+			break;
+		case SVS_DISTANCE_COSINE:
+			matches = (strcmp(orderFuncName, "cosine_distance") == 0);
+			break;
+	}
+
+	pfree(orderFuncName);
+	return matches;
+}
+
+/*
  * Reject vectors containing NaN or Inf before passing them to the SVS
  * library. SVS performs no input validation; non-finite values propagate
  * silently through distance computations (IEEE 754), corrupting k-NN

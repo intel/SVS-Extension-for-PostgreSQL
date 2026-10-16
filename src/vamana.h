@@ -377,6 +377,7 @@ bool		vamanavalidate(Oid opclassoid);
 
 /* Distance metric helper */
 SVSDistanceType VamanaGetDistanceMetric(Relation index);
+bool		VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric);
 
 /* On-disk serialization helpers */
 void		VamanaGetIndexSavePath(Oid dboid, Oid relid, char *buf, size_t bufsz);
