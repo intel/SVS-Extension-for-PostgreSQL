@@ -66,12 +66,18 @@ CheckSVSError(svs_error_h error, const char *operation)
 }
 
 /*
- * Client-visible report for SVS_ERROR_UNSUPPORTED_HW: this build has
- * compiled in LVQ/LeanVec support for CPU instructions (e.g. AVX512) that
- * this machine's processor does not have. Takes plain strings, not an
- * svs_error_h, so it can be exercised directly from a unit test module
- * without needing a real SVS error handle (svs_wrapper.h never exposes SVS
- * types to the rest of the codebase; keep it that way).
+ * Report for SVS_ERROR_UNSUPPORTED_HW: this build has compiled in
+ * LVQ/LeanVec support for CPU instructions (e.g. AVX512) that this
+ * machine's processor does not have. errmsg/errhint are controlled,
+ * client-visible sentences; the raw SVS message goes to errdetail_log
+ * (server log only), matching this file's existing convention (see
+ * CheckSVSError) of never putting a third-party library's raw text in
+ * front of the client.
+ *
+ * Takes plain strings, not an svs_error_h, so it can be exercised directly
+ * from a unit test module without needing a real SVS error handle
+ * (svs_wrapper.h never exposes SVS types to the rest of the codebase; keep
+ * it that way).
  */
 void
 SVSReportUnsupportedHardware(const char *message, const char *compressionName)
@@ -79,9 +85,9 @@ SVSReportUnsupportedHardware(const char *message, const char *compressionName)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("%s compression is not supported on this CPU", compressionName),
-			 errdetail("%s", message),
 			 errhint("Rebuild the index with compression_type = 0 (no compression), "
-					 "or run it on hardware with the required CPU instructions.")));
+					 "or run it on hardware with the required CPU instructions."),
+			 errdetail_log("SVS error: %s", message)));
 }
 
 /*

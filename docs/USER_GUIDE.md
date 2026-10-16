@@ -1070,6 +1070,8 @@ RESET enable_seqscan;
 **Cause:** LVQ and LeanVec need CPU instructions (e.g. AVX512) that this build of SVS supports but this machine's processor does not have — common when an index built on one host is loaded on another with an older or different CPU. SVS detects this at build/load time and refuses rather than running on an unsupported code path.  
 **Fix:** `REINDEX` with `compression_type = 0` (no compression), or run this database on hardware with the required CPU instructions.
 
+A `CREATE INDEX`/`REINDEX` that hits this directly on the backend shows the full error, including the hint above. The same failure reached through the background worker (an on-disk load, a first insert into an empty-table index, or a heap rebuild) shows only the message naming the compression type; the worker's error channel to the backend does not carry the hint. This is an existing limitation of that channel, not specific to this error.
+
 ### Error: `value X out of bounds for option "compression_type"`
 
 **Cause:** `compression_type` is outside `[0, 2]`.  
