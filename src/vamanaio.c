@@ -34,9 +34,14 @@
  * so the loader can reject a file written at a different capacity or format
  * instead of silently zero-filling a short read.  Bump the version on any
  * format change.
+ *
+ * generation carries the same save-generation stamp as the metapage's
+ * saveGeneration and the save directory's generation marker (see
+ * VamanaSaveGenHeader below); the loader rejects any disagreement among the
+ * three as a torn save instead of serving it.
  */
 #define VAMANA_TIDMAP_MAGIC		0x53565354	/* "SVST" */
-#define VAMANA_TIDMAP_VERSION	1
+#define VAMANA_TIDMAP_VERSION	2
 
 typedef struct VamanaTidMapHeader
 {
@@ -44,10 +49,33 @@ typedef struct VamanaTidMapHeader
 	uint32		version;
 	uint32		capacity;		/* ItemPointerData slots following the header */
 	uint32		reserved;		/* zero; pads to 8-byte alignment */
+	TimestampTz generation;	/* save-generation stamp; see comment above */
 } VamanaTidMapHeader;
 
-StaticAssertDecl(sizeof(VamanaTidMapHeader) == 16,
+StaticAssertDecl(sizeof(VamanaTidMapHeader) == 24,
 				 "VamanaTidMapHeader size changed — update readers/writers");
+
+/*
+ * On-disk header for the save directory's generation marker file
+ * (generation.bin).  Written durably before SVSSaveIndex begins overwriting
+ * graph/data/config in place, so its presence and value answer "has a new
+ * generation's graph write started" independently of whether that write
+ * ever finished.  See VamanaSaveIndexToDisk for how the three stamps
+ * (this marker, the TID map header above, and the metapage) are used
+ * together to detect a torn save.
+ */
+#define VAMANA_SAVEGEN_MAGIC	0x53565347	/* "SVSG" */
+#define VAMANA_SAVEGEN_VERSION	1
+
+typedef struct VamanaSaveGenHeader
+{
+	uint32		magic;
+	uint32		version;
+	TimestampTz generation;
+} VamanaSaveGenHeader;
+
+StaticAssertDecl(sizeof(VamanaSaveGenHeader) == 16,
+				 "VamanaSaveGenHeader size changed, update readers/writers");
 
 /*
  * Construct the save-directory path for a vamana index.
@@ -145,6 +173,25 @@ VamanaGetTidMapTmpPath(const char *indexdir, char *buf, size_t bufsz)
 }
 
 /*
+ * Construct the path of the save directory's generation marker file and its
+ * temp-file counterpart, given an index save directory from
+ * VamanaGetIndexSavePath.  Same deterministic-name rationale as
+ * VamanaGetTidMapTmpPath: a temp file orphaned by a crash must be
+ * recognizable and removable later.
+ */
+static void
+VamanaGetSaveGenPath(const char *indexdir, char *buf, size_t bufsz)
+{
+	snprintf(buf, bufsz, "%s/generation.bin", indexdir);
+}
+
+static void
+VamanaGetSaveGenTmpPath(const char *indexdir, char *buf, size_t bufsz)
+{
+	snprintf(buf, bufsz, "%s/generation.bin.tmp", indexdir);
+}
+
+/*
  * write() the whole buffer, looping over short writes.  Returns false with
  * errno set on failure.
  *
@@ -191,6 +238,97 @@ VamanaWriteFully(int fd, const void *data, size_t len)
 }
 
 /*
+ * Durably stamp the save directory's generation marker with <generation>,
+ * via the same write-to-tmp-then-rename pattern as VamanaSaveTidMapAtomically.
+ *
+ * Called at the start of VamanaSaveIndexToDisk, before SVSSaveIndex begins
+ * overwriting graph/data/config in place.  This ordering is what closes the
+ * torn-save window: a crash at any point from here through the end of the
+ * save leaves this marker already at the new generation while the TID map
+ * and/or metapage are still at the old one, so VamanaCheckSaveGeneration and
+ * VamanaLoadTidMap's own check both see a mismatch and reject the save
+ * instead of serving it.  A crash before this call leaves everything
+ * (marker, graph, TID map, metapage) at the prior, fully consistent
+ * generation.
+ *
+ * Ereports ERROR on I/O failure; caller's PG_TRY handles cleanup of the
+ * entire save directory.
+ */
+static void
+VamanaWriteSaveGeneration(Oid dboid, Oid relid, TimestampTz generation)
+{
+	char		indexdir[MAXPGPATH];
+	char		genpath[MAXPGPATH];
+	char		gentmp[MAXPGPATH];
+	int			fd;
+	VamanaSaveGenHeader header;
+
+	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
+	VamanaGetSaveGenPath(indexdir, genpath, sizeof(genpath));
+	VamanaGetSaveGenTmpPath(indexdir, gentmp, sizeof(gentmp));
+
+	/* ENOENT is the expected case: usually there is nothing to clean up. */
+	if (unlink(gentmp) != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not remove stale save-generation temp file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", gentmp)));
+
+	fd = OpenTransientFilePerm(gentmp,
+							   O_WRONLY | O_CREAT | O_EXCL | PG_BINARY,
+							   pg_file_create_mode);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create save-generation file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", gentmp)));
+
+	if (fchmod(fd, (mode_t) pg_file_create_mode) != 0)
+	{
+		int			save_errno = errno;
+
+		CloseTransientFile(fd);
+		unlink(gentmp);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not set permissions on save-generation file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", gentmp)));
+	}
+
+	header.magic = VAMANA_SAVEGEN_MAGIC;
+	header.version = VAMANA_SAVEGEN_VERSION;
+	header.generation = generation;
+
+	if (!VamanaWriteFully(fd, &header, sizeof(header)))
+	{
+		int			save_errno = errno;
+
+		CloseTransientFile(fd);
+		unlink(gentmp);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write save-generation file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", gentmp)));
+	}
+
+	if (CloseTransientFile(fd) != 0)
+	{
+		int			save_errno = errno;
+
+		unlink(gentmp);
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not close save-generation file for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", gentmp)));
+	}
+
+	durable_rename(gentmp, genpath, ERROR);
+}
+
+/*
  * Write the TID mapping for a vamana index to a sidecar file inside its
  * save directory.  The file is a VamanaTidMapHeader followed by <count>
  * ItemPointerData slots.  Uses a write-to-tmp-then-rename pattern so a crash
@@ -219,7 +357,8 @@ VamanaWriteFully(int fd, const void *data, size_t len)
  * entire save directory.
  */
 void
-VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count)
+VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count,
+							TimestampTz generation)
 {
 	char		indexdir[MAXPGPATH];
 	char		tidmappath[MAXPGPATH];
@@ -269,6 +408,7 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
 	header.version = VAMANA_TIDMAP_VERSION;
 	header.capacity = (uint32) count;
 	header.reserved = 0;
+	header.generation = generation;
 
 	/*
 	 * Unreachable on 64-bit systems: int count (max ~2.1e9) * 6 bytes fits
@@ -337,12 +477,17 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
  *
  * Returns true and fills all of tidMapping[0..tidMappingCapacity-1] on success.
  * Returns false (triggering caller to rebuild from the heap) if the file is
- * absent, unreadable, malformed, truncated, or larger than the metapage claims.
+ * absent, unreadable, malformed, truncated, larger than the metapage claims,
+ * or stamped with a save generation that disagrees with
+ * expectedSaveGeneration (the metapage's own saveGeneration) -- the latter
+ * is a torn save: a self-consistent, well-formed TID map left over from a
+ * generation older or newer than the graph/data/config on disk.
  *
  * tidMapping must be pre-allocated with at least tidMappingCapacity elements.
  */
 bool
-VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity)
+VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity,
+				 TimestampTz expectedSaveGeneration)
 {
 	char		indexdir[MAXPGPATH];
 	char		tidmappath[MAXPGPATH];
@@ -421,6 +566,23 @@ VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappi
 		return false;
 	}
 
+	/*
+	 * A well-formed TID map left over from a different save generation than
+	 * the metapage's: the mismatch itself is the only evidence, since the
+	 * file is otherwise complete and internally consistent.  See
+	 * VamanaWriteSaveGeneration for which crash windows this catches.
+	 */
+	if (header.generation != expectedSaveGeneration)
+	{
+		FreeFile(f);
+		ereport(WARNING,
+				(errmsg("vamana index %u: TID map generation does not match "
+						"the index's current generation, torn save detected, will rebuild",
+						relid),
+				 errdetail_log("Path: \"%s\".", tidmappath)));
+		return false;
+	}
+
 	if (fread(tidMapping, sizeof(ItemPointerData), header.capacity, f)
 		!= header.capacity)
 	{
@@ -438,6 +600,111 @@ VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappi
 	/* Slots past the persisted set are WAL-replayed inserts: mark them empty. */
 	for (int i = (int) header.capacity; i < tidMappingCapacity; i++)
 		ItemPointerSetInvalid(&tidMapping[i]);
+
+	return true;
+}
+
+/*
+ * Confirm the save directory's generation marker agrees with
+ * expectedSaveGeneration (the metapage's own saveGeneration), independent of
+ * whether a TID map load is also being attempted (an index with
+ * tidMappingCapacity == 0 never calls VamanaLoadTidMap, but a torn graph is
+ * still possible, so this is the generation check all load paths need).
+ *
+ * Returns false (triggering caller to rebuild from the heap) if the marker
+ * is absent, unreadable, malformed, or stamped with a different generation
+ * than expected.  Returns true only when the marker and the metapage agree,
+ * meaning the on-disk graph/data/config and the metapage come from the same
+ * completed save.
+ */
+bool
+VamanaCheckSaveGeneration(Oid dboid, Oid relid, TimestampTz expectedSaveGeneration)
+{
+	char		indexdir[MAXPGPATH];
+	char		genpath[MAXPGPATH];
+	char		gentmp[MAXPGPATH];
+	int			tmpfd;
+	FILE	   *f;
+	VamanaSaveGenHeader header;
+
+	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
+	VamanaGetSaveGenPath(indexdir, genpath, sizeof(genpath));
+
+	/*
+	 * Same orphan-temp-file hygiene as VamanaLoadTidMap; see its comment.
+	 * Checked via an open file descriptor rather than lstat-by-path so the
+	 * mtime/mode this decides on belongs to the exact file the unlink below
+	 * removes, not to whatever a later rename or recreation leaves at that
+	 * path in between: a plain stat-then-unlink-by-name would let a
+	 * concurrent writer's own temp-file replace land in that window and be
+	 * removed instead of the orphan actually checked.
+	 */
+	VamanaGetSaveGenTmpPath(indexdir, gentmp, sizeof(gentmp));
+	tmpfd = OpenTransientFile(gentmp, O_RDONLY | PG_BINARY);
+	if (tmpfd >= 0)
+	{
+		struct stat tmpst;
+		bool		is_orphan = fstat(tmpfd, &tmpst) == 0 &&
+			S_ISREG(tmpst.st_mode) &&
+			tmpst.st_mtime < timestamptz_to_time_t(PgStartTime);
+
+		CloseTransientFile(tmpfd);
+
+		if (is_orphan)
+		{
+			if (unlink(gentmp) == 0)
+				ereport(DEBUG1,
+						(errmsg("vamana index %u: removed orphaned save-generation temp file", relid),
+						 errdetail_log("Path: \"%s\".", gentmp)));
+			else
+				ereport(DEBUG1,
+						(errcode_for_file_access(),
+						 errmsg("vamana index %u: could not remove orphaned save-generation temp file: %m", relid),
+						 errdetail_log("Path: \"%s\".", gentmp)));
+		}
+	}
+
+	f = AllocateFile(genpath, PG_BINARY_R);
+	if (f == NULL)
+	{
+		if (errno == ENOENT)
+		{
+			ereport(WARNING,
+					(errmsg("vamana index %u: save-generation marker missing, torn save detected, will rebuild",
+							relid),
+					 errdetail_log("Path: \"%s\".", genpath)));
+			return false;
+		}
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not open save-generation marker for vamana index %u: %m", relid),
+				 errdetail_log("Path: \"%s\".", genpath)));
+		return false;
+	}
+
+	if (fread(&header, sizeof(header), 1, f) != 1 ||
+		header.magic != VAMANA_SAVEGEN_MAGIC ||
+		header.version != VAMANA_SAVEGEN_VERSION)
+	{
+		FreeFile(f);
+		ereport(WARNING,
+				(errmsg("vamana index %u: save-generation marker is malformed, will rebuild",
+						relid),
+				 errdetail_log("Path: \"%s\".", genpath)));
+		return false;
+	}
+
+	FreeFile(f);
+
+	if (header.generation != expectedSaveGeneration)
+	{
+		ereport(WARNING,
+				(errmsg("vamana index %u: save-generation marker does not match "
+						"the index's current generation, torn save detected, will rebuild",
+						relid),
+				 errdetail_log("Path: \"%s\".", genpath)));
+		return false;
+	}
 
 	return true;
 }
@@ -493,7 +760,8 @@ VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum)
  * Atomically write hasSavedIndex and all metapage state from <meta>.
  */
 static void
-VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache *meta)
+VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache *meta,
+					  TimestampTz generation)
 {
 	Buffer		buf;
 	Page		page;
@@ -514,6 +782,7 @@ VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache 
 	metap->nextExternalId = meta->nextExternalId;
 	metap->numDeleted = (uint32) meta->numDeleted;
 	metap->tidMappingCapacity = (uint32) meta->tidMappingCapacity;
+	metap->saveGeneration = generation;
 
 	/* Test hook: TAP forces a failure while buf's exclusive content lock is held. */
 	INJECTION_POINT("vamana-mark-index-saved-error", NULL);
@@ -542,6 +811,17 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 	char		savepath[MAXPGPATH];
 	Oid			relid = RelationGetRelid(index);
 
+	/*
+	 * One stamp for this save, written to the generation marker before
+	 * anything else changes, then carried through to the TID map and the
+	 * metapage.  A fresh, strictly-increasing-in-practice value is all that
+	 * is needed: the load path only ever checks equality across the three
+	 * places it is stamped, never ordering, and this function's own callers
+	 * already guarantee at most one saver per index at a time (see
+	 * VamanaSaveTidMapAtomically's comment).
+	 */
+	TimestampTz generation = GetCurrentTimestamp();
+
 	/* Temporary indexes are session-private; never serialize them. */
 	if (index->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 		return;
@@ -550,6 +830,18 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 	{
 		VamanaEnsureSaveDir(MyDatabaseId, relid);
 		VamanaGetIndexSavePath(MyDatabaseId, relid, savepath, sizeof(savepath));
+
+		/*
+		 * Stamp the new generation before SVSSaveIndex starts overwriting
+		 * graph/data/config in place.  See VamanaWriteSaveGeneration for why
+		 * this ordering, not writing the marker after SVSSaveIndex returns,
+		 * is what closes the torn-save window: any crash from here through
+		 * VamanaMarkIndexSaved below leaves this marker at the new
+		 * generation while something else (the graph itself, mid-overwrite;
+		 * or the TID map or metapage, not yet updated) is still at the old
+		 * one, which the load path's generation check rejects.
+		 */
+		VamanaWriteSaveGeneration(MyDatabaseId, relid, generation);
 
 		ereport(DEBUG1,
 				(errmsg("saving vamana index for relation %u", relid),
@@ -566,7 +858,8 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 		 * to wrong TIDs.
 		 */
 		if (meta->tidMapping != NULL && meta->tidMappingCapacity > 0)
-			VamanaSaveTidMapAtomically(MyDatabaseId, relid, meta->tidMapping, meta->tidMappingCapacity);
+			VamanaSaveTidMapAtomically(MyDatabaseId, relid, meta->tidMapping, meta->tidMappingCapacity,
+										generation);
 	}
 	PG_CATCH();
 	{
@@ -587,10 +880,12 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 	 * point, the flag remains set and the files are valid: no harm done. If
 	 * the server crashes after SVSSaveIndex but before VamanaMarkIndexSaved,
 	 * the partial directory persists until the index is dropped
-	 * (VamanaObjectAccessHook cleans it up) or until the next save attempt,
-	 * which will overwrite the stale files.
+	 * (VamanaObjectAccessHook cleans it up) or until the next save attempt
+	 * overwrites it; in the meantime, the generation marker written above
+	 * already disagrees with the metapage's still-old saveGeneration, so a
+	 * load in between is rejected and rebuilt rather than served torn.
 	 */
-	VamanaMarkIndexSaved(index, forkNum, meta);
+	VamanaMarkIndexSaved(index, forkNum, meta, generation);
 
 	VamanaCacheSetNeedsSave(relid, false);
 

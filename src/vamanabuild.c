@@ -113,6 +113,7 @@ CreateMetaPage(VamanaBuildState * buildstate)
 	metap->nextExternalId = 0;
 	metap->numDeleted = 0;
 	metap->tidMappingCapacity = 0;
+	metap->saveGeneration = 0;
 
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(VamanaMetaPageData)) - (char *) page;
@@ -943,7 +944,8 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 						meta.nextExternalId,
 						(int) meta.numDeleted,
 						RelationGetRelid(heap),
-						index->rd_index->indkey.values[0] - 1))
+						index->rd_index->indkey.values[0] - 1,
+						meta.saveGeneration))
 				{
 					/*
 					 * The reservation stays in HANDOFF: the index is

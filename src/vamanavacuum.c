@@ -91,7 +91,7 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	tidMapping = palloc0((Size) tidMappingCapacity * sizeof(ItemPointerData));
 
-	if (!VamanaLoadTidMap(MyDatabaseId, relid, tidMapping, tidMappingCapacity))
+	if (!VamanaLoadTidMap(MyDatabaseId, relid, tidMapping, tidMappingCapacity, meta.saveGeneration))
 	{
 		pfree(tidMapping);
 		ereport(LOG,

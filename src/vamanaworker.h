@@ -755,7 +755,8 @@ bool	VamanaWorkerSubmitLoad(Oid indexRelid,
 							   int distance_type, int data_type,
 							   int numVectors, int tidMappingCapacity,
 							   uint64 nextExternalId, int numDeleted,
-							   Oid heapRelid, int vectorAttNum);
+							   Oid heapRelid, int vectorAttNum,
+							   TimestampTz saveGeneration);
 bool	VamanaWorkerSubmitWarmup(Oid indexRelid);
 
 void	VamanaReleaseIndexLock(VamanaWorkerShmem *entry, Oid relid);
@@ -806,6 +807,7 @@ typedef struct VamanaLoadParams
 	int			numDeleted;
 	Oid			heapRelid;			/* heap relation OID (for replay decoder) */
 	int			vectorAttNum;		/* 0-based heap attribute number of the vector column */
+	TimestampTz saveGeneration;	/* metapage's stamp; checked against the save directory's own marker */
 } VamanaLoadParams;
 
 #endif							/* VAMANA_WORKER_H */
