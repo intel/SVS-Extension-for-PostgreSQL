@@ -42,6 +42,7 @@ typedef void *SVSIndexHandle;
 #define VAMANA_ERR_DATA         2	/* ERRCODE_DATA_EXCEPTION (dim mismatch etc.) */
 #define VAMANA_ERR_IO           3	/* ERRCODE_IO_ERROR */
 #define VAMANA_ERR_INTERNAL     4	/* ERRCODE_INTERNAL_ERROR */
+#define VAMANA_ERR_UNSUPPORTED  5	/* ERRCODE_FEATURE_NOT_SUPPORTED */
 
 /* -----------------------------------------------------------------------
  * Slot kind: what operation this slot carries
