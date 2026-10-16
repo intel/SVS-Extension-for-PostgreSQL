@@ -66,6 +66,44 @@ CheckSVSError(svs_error_h error, const char *operation)
 }
 
 /*
+ * Client-visible report for SVS_ERROR_UNSUPPORTED_HW: this build has
+ * compiled in LVQ/LeanVec support for CPU instructions (e.g. AVX512) that
+ * this machine's processor does not have. Takes plain strings, not an
+ * svs_error_h, so it can be exercised directly from a unit test module
+ * without needing a real SVS error handle (svs_wrapper.h never exposes SVS
+ * types to the rest of the codebase; keep it that way).
+ */
+void
+SVSReportUnsupportedHardware(const char *message, const char *compressionName)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("%s compression is not supported on this CPU", compressionName),
+			 errdetail("%s", message),
+			 errhint("Rebuild the index with compression_type = 0 (no compression), "
+					 "or run it on hardware with the required CPU instructions.")));
+}
+
+/*
+ * Same contract as CheckSVSError, except SVS_ERROR_UNSUPPORTED_HW gets a
+ * clear, specific client-visible report instead of the generic internal-
+ * error text: every other SVS error code falls through to CheckSVSError
+ * unchanged.
+ */
+static void
+CheckSVSCompressionError(svs_error_h error, const char *compressionName, const char *operation)
+{
+	if (error && !svs_error_ok(error) && svs_error_get_code(error) == SVS_ERROR_UNSUPPORTED_HW)
+	{
+		char	   *msg = SVSConsumeErrorMessage(error);	/* frees error */
+
+		SVSReportUnsupportedHardware(msg, compressionName);	/* never returns */
+	}
+
+	CheckSVSError(error, operation);
+}
+
+/*
  * param encoding: 4=UINT4, -4=INT4, 8=UINT8, -8=INT8.  allow_none additionally
  * accepts 0, mapping it to SVS_DATA_TYPE_VOID; pass it only for LVQ's residual,
  * the one parameter for which "absent" is a legal value.
@@ -202,7 +240,7 @@ SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int primary_param, int
 
 	storage = svs_storage_create_leanvec(actual_leanvec_dims, svs_primary, svs_secondary, error);
 
-	CheckSVSError(error, "LeanVec storage creation");
+	CheckSVSCompressionError(error, "LeanVec", "LeanVec storage creation");
 	svs_error_free(error);
 
 	return (SVSStorageHandle) storage;
@@ -226,7 +264,7 @@ SVSCreateLVQStorage(int primary_param, int residual_param)
 
 	storage = svs_storage_create_lvq(svs_primary, svs_residual, error);
 
-	CheckSVSError(error, "LVQ storage creation");
+	CheckSVSCompressionError(error, "LVQ", "LVQ storage creation");
 	svs_error_free(error);
 
 	return (SVSStorageHandle) storage;
