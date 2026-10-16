@@ -311,6 +311,19 @@ typedef struct VamanaIndexCache
 	 */
 	TimestampTz nextSnapshotActivateAttempt;
 
+	/*
+	 * Zero-progress backoff for this index's own fast-forward catch-up slice
+	 * (VamanaReplicationCatchUpSlot, scheduled by VamanaWorkerCatchUpSlots).
+	 * 0 = eligible now / no active backoff.  A slice that exhausts its
+	 * budget without moving restart_lsn doubles catchUpBackoffMs (capped at
+	 * 60000) and sets nextCatchUpAttempt accordingly; any progress resets
+	 * both to 0.  Without this, a long-open transaction or a running-xacts
+	 * gap bigger than one slice would spend the worker's whole catch-up
+	 * share on this one index forever.
+	 */
+	TimestampTz nextCatchUpAttempt;
+	int			catchUpBackoffMs;
+
 	/* Checkpoint debounce state */
 	int64		opsSinceCheckpoint;
 	TimestampTz lastWriteTime;		/* updated on every write slot; 0 = no writes yet */

@@ -346,6 +346,8 @@ VamanaWorkerShmemStartup(void)
 			&(GetNamedLWLockTranche(VamanaWorkerHeaderLockName))->lock;
 		VamanaWorkerShmemHeaderPtr->numSlots = max_vamana_databases;
 		VamanaWorkerShmemHeaderPtr->numActive = 0;
+		pg_atomic_init_u64(&VamanaWorkerShmemHeaderPtr->lastRunningXactsLsn, 0);
+		pg_atomic_init_u64(&VamanaWorkerShmemHeaderPtr->lastRunningXactsEmitTs, 0);
 
 		for (int db = 0; db < max_vamana_databases; db++)
 			VamanaWorkerInitSlot(&VamanaWorkerShmemHeaderPtr->slots[db],
