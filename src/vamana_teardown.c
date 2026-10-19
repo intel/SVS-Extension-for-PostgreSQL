@@ -58,6 +58,7 @@ EnumerateVamanaIndexes(MemoryContext resultCtx, int *nout)
 {
 	TeardownTarget *targets;
 	uint64		nrows;
+	int			n;
 	MemoryContext oldCtx;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -71,24 +72,40 @@ EnumerateVamanaIndexes(MemoryContext resultCtx, int *nout)
 	oldCtx = MemoryContextSwitchTo(resultCtx);
 	targets = (nrows > 0) ? palloc(nrows * sizeof(TeardownTarget)) : NULL;
 
+	n = 0;
 	for (uint64 i = 0; i < nrows; i++)
 	{
 		bool		isnull;
 		Oid			relid = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i],
 														   SPI_tuptable->tupdesc,
 														   1, &isnull));
+		char	   *relname;
+		char	   *nspname;
 
 		Assert(!isnull);
-		targets[i].indexRelid = relid;
-		targets[i].qualifiedName =
-			quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
-									   get_rel_name(relid));
+
+		relname = get_rel_name(relid);
+		nspname = get_namespace_name(get_rel_namespace(relid));
+
+		/*
+		 * Either name failing to resolve means the index's relation or its
+		 * schema no longer exists: the drop this entry would have performed
+		 * already happened, so there is nothing to tear down and no name to
+		 * report. Skip it rather than pass a NULL into
+		 * quote_qualified_identifier().
+		 */
+		if (relname == NULL || nspname == NULL)
+			continue;
+
+		targets[n].indexRelid = relid;
+		targets[n].qualifiedName = quote_qualified_identifier(nspname, relname);
+		n++;
 	}
 	MemoryContextSwitchTo(oldCtx);
 
 	SPI_finish();				/* releases the enumeration's tuptable */
 
-	*nout = (int) nrows;
+	*nout = n;
 	return targets;
 }
 

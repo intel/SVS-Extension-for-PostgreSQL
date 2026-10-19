@@ -20,11 +20,11 @@ If your system ships an older version, you can upgrade via pip:
 pip install cmake --upgrade
 ```
 
-Or via Kitware's APT repository:
+Or via Kitware's APT repository (adjust `jammy` to match your Ubuntu release):
 
 ```bash
-wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo apt-key add -
-sudo apt-add-repository 'deb https://apt.kitware.com/ubuntu/ jammy main'
+wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg
+echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' | sudo tee /etc/apt/sources.list.d/kitware.list
 sudo apt-get update && sudo apt-get install cmake
 ```
 

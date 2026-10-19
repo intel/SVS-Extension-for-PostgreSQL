@@ -1,0 +1,67 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+
+-- Enable this database and wait for its worker before any index work, so this
+-- file runs standalone.  Enrollment reserves the slot synchronously (the gate
+-- then passes), but the worker spawns asynchronously; the first INSERT would
+-- otherwise race its cold start and time out.  Idempotent and a no-op in the
+-- full suite, where vamana_databases.sql (ordered first) has already warmed it.
+INSERT INTO vamana_databases (datname, enabled) VALUES (current_database(), true)
+	ON CONFLICT (datname) DO NOTHING;
+DO $$
+BEGIN
+	FOR i IN 1 .. 300 LOOP
+		PERFORM 1 FROM pg_stat_vamana_worker
+			WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())
+			  AND worker_state = 'running';
+		EXIT WHEN FOUND;
+		PERFORM pg_sleep(0.1);
+	END LOOP;
+END $$;
+
+SET enable_seqscan = off;
+
+-- A query vector whose dimension does not match the index's indexed column
+-- dimension must be rejected before any search runs, the same way the insert
+-- path already rejects a mismatched row.
+
+CREATE TABLE t (id int PRIMARY KEY, val vector(16));
+INSERT INTO t SELECT g, ('[' || array_to_string(array_agg(0.1 * x), ',') || ']')::vector
+	FROM generate_series(1, 2000) g, generate_series(1, 16) x
+	GROUP BY g;
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+
+-- Direct literal, wrong dimension: must ERROR, not return rows silently.
+SELECT id FROM t ORDER BY val <-> '[1,2,3]' LIMIT 5;
+
+-- A WHERE clause that rejects every row defeats the executor's own, later
+-- re-check of the ORDER BY expression (PostgreSQL only re-evaluates <-> on
+-- rows it actually projects).  The new check must still fire, proving it
+-- runs before the search itself, not as a side effect of the executor
+-- re-evaluating the expression on a surviving row.
+SELECT id FROM t WHERE (id % 9999) = 123456 ORDER BY val <-> '[1,2,3]' LIMIT 5;
+
+-- Correctly-dimensioned query is unaffected by the new check.
+SELECT id FROM t ORDER BY val <-> (SELECT val FROM t WHERE id = 1) LIMIT 1;
+
+DROP TABLE t;
+
+-- Regression guard for the insert path: a wrong-dimension literal assigned to
+-- a typed column is rejected by the column's own typmod before the row ever
+-- reaches the access method's insert routine. No prior coverage existed for
+-- this either.
+CREATE TABLE t (id int PRIMARY KEY, val vector(16));
+CREATE INDEX ON t USING vamana (val vector_l2_ops);
+INSERT INTO t VALUES (1, '[1,2,3]');
+DROP TABLE t;
+
+-- halfvec opclass goes through the same vamanarescan check.
+CREATE TABLE t (id int PRIMARY KEY, val halfvec(16));
+INSERT INTO t SELECT g, ('[' || array_to_string(array_agg(0.1 * x), ',') || ']')::halfvec
+	FROM generate_series(1, 50) g, generate_series(1, 16) x
+	GROUP BY g;
+CREATE INDEX ON t USING vamana (val halfvec_l2_ops);
+
+SELECT id FROM t ORDER BY val <-> '[1,2,3]' LIMIT 5;
+
+DROP TABLE t;

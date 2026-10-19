@@ -346,6 +346,8 @@ VamanaWorkerShmemStartup(void)
 			&(GetNamedLWLockTranche(VamanaWorkerHeaderLockName))->lock;
 		VamanaWorkerShmemHeaderPtr->numSlots = max_vamana_databases;
 		VamanaWorkerShmemHeaderPtr->numActive = 0;
+		pg_atomic_init_u64(&VamanaWorkerShmemHeaderPtr->lastRunningXactsLsn, 0);
+		pg_atomic_init_u64(&VamanaWorkerShmemHeaderPtr->lastRunningXactsEmitTs, 0);
 
 		for (int db = 0; db < max_vamana_databases; db++)
 			VamanaWorkerInitSlot(&VamanaWorkerShmemHeaderPtr->slots[db],
@@ -1368,6 +1370,8 @@ VamanaCategorizeSQLState(int sqlerrcode)
 {
 	if (sqlerrcode == ERRCODE_OUT_OF_MEMORY)
 		return VAMANA_ERR_OOM;
+	if (sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED)
+		return VAMANA_ERR_UNSUPPORTED;
 	if (ERRCODE_TO_CATEGORY(sqlerrcode) == ERRCODE_TO_CATEGORY(ERRCODE_DATA_EXCEPTION))
 		return VAMANA_ERR_DATA;
 	if (ERRCODE_TO_CATEGORY(sqlerrcode) == ERRCODE_TO_CATEGORY(ERRCODE_IO_ERROR))
@@ -1380,10 +1384,11 @@ VamanaSlotErrcode(uint8 category)
 {
 	switch (category)
 	{
-		case VAMANA_ERR_OOM:	return ERRCODE_OUT_OF_MEMORY;
-		case VAMANA_ERR_DATA:	return ERRCODE_DATA_EXCEPTION;
-		case VAMANA_ERR_IO:		return ERRCODE_IO_ERROR;
-		default:				return ERRCODE_INTERNAL_ERROR;
+		case VAMANA_ERR_OOM:			return ERRCODE_OUT_OF_MEMORY;
+		case VAMANA_ERR_DATA:			return ERRCODE_DATA_EXCEPTION;
+		case VAMANA_ERR_IO:				return ERRCODE_IO_ERROR;
+		case VAMANA_ERR_UNSUPPORTED:	return ERRCODE_FEATURE_NOT_SUPPORTED;
+		default:						return ERRCODE_INTERNAL_ERROR;
 	}
 }
 

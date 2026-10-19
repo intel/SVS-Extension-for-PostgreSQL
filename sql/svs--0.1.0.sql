@@ -78,6 +78,18 @@ CREATE TABLE vamana_databases (
 	maintenance_num_threads int CHECK (maintenance_num_threads BETWEEN 0 AND 1024)
 );
 
+COMMENT ON TABLE vamana_databases IS
+'Per-database Vamana worker enablement and resource policy. The copy in the '
+'database named by svs.launcher_database is authoritative for the whole cluster: '
+'writing it chooses which databases get a Vamana worker (which runs as the '
+'bootstrap superuser), pauses, restarts, or removes any database''s worker, and '
+'divides the cluster-wide search-thread, build-thread, residency-memory, and '
+'search-memory pools among databases. The table owner can also disable its '
+'validation triggers and attach triggers that run with the privileges of any '
+'role that later writes to it. Treat ownership of this table, and INSERT, UPDATE, '
+'or DELETE on it, as superuser-equivalent: do not transfer or grant them to a '
+'non-superuser role.';
+
 SELECT pg_catalog.pg_extension_config_dump('vamana_databases', '');
 
 -- Durable fallback for the residency override's decrease-validation trigger
@@ -234,18 +246,19 @@ GRANT SELECT ON pg_stat_vamana_worker, pg_stat_vamana_worker_slot TO PUBLIC;
 -- the worker. Only applies to enabled databases; raises an actionable error if the
 -- database is paused or does not exist.
 CREATE FUNCTION svs_restart_worker(dbname name) RETURNS void
-	LANGUAGE plpgsql AS
+	LANGUAGE plpgsql
+	SET search_path = pg_catalog AS
 $$
 DECLARE
 	rows int;
 BEGIN
-	UPDATE vamana_databases
+	UPDATE @extschema@.vamana_databases
 	   SET restart_generation = restart_generation + 1
 	 WHERE datname = dbname AND enabled;
 	GET DIAGNOSTICS rows = ROW_COUNT;
 
 	IF rows = 0 THEN
-		IF EXISTS (SELECT 1 FROM vamana_databases WHERE datname = dbname) THEN
+		IF EXISTS (SELECT 1 FROM @extschema@.vamana_databases WHERE datname = dbname) THEN
 			RAISE EXCEPTION 'database "%" is paused; re-enable it instead of restarting', dbname;
 		ELSE
 			RAISE EXCEPTION 'database "%" is not configured for vamana', dbname;
