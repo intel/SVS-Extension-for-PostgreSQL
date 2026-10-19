@@ -474,6 +474,16 @@ typedef struct VamanaWorkerShmemHeader
 	uint64			totalResidencyCommittedGlobal;
 	uint64			totalBuildCommittedGlobal;
 
+	/*
+	 * Cluster-wide last LSN and timestamp at which any vamana worker called
+	 * LogStandbySnapshot to keep future running-xacts gaps small for every
+	 * primary's catch-up slices (VamanaReplicationMaybeEmitRunningXactsStride).
+	 * CAS-claimed on lastRunningXactsLsn so N database workers crossing the
+	 * stride at once cost one LogStandbySnapshot call, not N.
+	 */
+	pg_atomic_uint64 lastRunningXactsLsn;
+	pg_atomic_uint64 lastRunningXactsEmitTs;	/* TimestampTz stored as uint64 */
+
 	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
 } VamanaWorkerShmemHeader;
 
