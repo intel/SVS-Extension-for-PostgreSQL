@@ -174,38 +174,67 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	 * making VamanaWorkerAssertDatabase believe the database is configured
 	 * while no worker is ever spawned for it.
 	 *
-	 * Reject only when that would be a new problem: a slot already reserved
-	 * for dbOid means it was already properly enrolled from the launcher
-	 * database at some point (this trigger is the only path that ever
-	 * reserves one, and it has rejected every out-of-band attempt since this
-	 * guard existed), so a second, local-only write from elsewhere targeting
-	 * the same dbOid -- svs_restart_worker()'s UPDATE, a per-database config
-	 * write like maintenance_num_threads from the database's own connection,
-	 * or a pg_dump/restore replay into a differently-named database -- is a
-	 * harmless, idempotent no-op for enrollment purposes: it does not change
-	 * what the launcher's own copy says, so it cannot strand anything.
+	 * Two cases below are not enrollment attempts at all and must not be
+	 * confused with one: dbOid naming the writer's own database (this
+	 * connection's own local-only config, e.g. svs_restart_worker()'s
+	 * UPDATE or a maintenance_num_threads override) and dbOid naming some
+	 * other database entirely (e.g. a pg_dump/restore replay of a row
+	 * enrolled elsewhere, landing in a differently-named database here).
 	 */
 	{
 		Oid			launcherDbOid = get_database_oid(vamana_launcher_database, true);
 
-		if (OidIsValid(launcherDbOid) && MyDatabaseId != launcherDbOid &&
-			VamanaWorkerLookupSlot(dbOid) == NULL)
+		if (OidIsValid(launcherDbOid) && MyDatabaseId != launcherDbOid)
 		{
-			char		safeLauncherDatname[NAMEDATALEN * 4];
+			if (dbOid != MyDatabaseId)
+			{
+				/*
+				 * A row naming a database other than the one writing it --
+				 * most commonly a pg_dump/restore replay, since the dumped
+				 * datname is whatever the source database was, not the
+				 * target this INSERT/COPY is running against. Let the row
+				 * sit in this database's own copy (dump/restore needs the
+				 * write itself to succeed), but never queue it: that would
+				 * apply this row's overrides to dbOid's live shared-memory
+				 * state via ReserveSlotsForEnabledEntries even though dbOid
+				 * never saw this write and nothing here was ever meant to
+				 * reach it. A row naming dbOid's own database handles that
+				 * correctly below; this is the only path that must not.
+				 */
+				return PointerGetDatum(NULL);
+			}
 
-			CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(*datname));
-			CopySanitizedDatname(safeLauncherDatname, sizeof(safeLauncherDatname),
-								 vamana_launcher_database);
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("cannot enroll \"%s\" into vamana_databases from this database",
-							safeDatname),
-					 errdetail("vamana_databases is only read by the launcher from \"%s\" "
-							   "(svs.launcher_database); a row inserted or updated from any "
-							   "other database's copy of this table is never seen by it.",
-							   safeLauncherDatname),
-					 errhint("Run this INSERT/UPDATE while connected to \"%s\" instead.",
-							 safeLauncherDatname)));
+			/*
+			 * dbOid is the writer's own database. Reject only when that
+			 * would be a new problem: a slot already reserved for dbOid
+			 * means it was already properly enrolled from the launcher
+			 * database at some point (this trigger is the only path that
+			 * ever reserves one, and it has rejected every out-of-band
+			 * attempt since this guard existed), so a second, local-only
+			 * write from the same database -- svs_restart_worker()'s
+			 * UPDATE or a maintenance_num_threads override -- is a
+			 * harmless, idempotent no-op for enrollment purposes: it does
+			 * not change what the launcher's own copy says, so it cannot
+			 * strand anything.
+			 */
+			if (VamanaWorkerLookupSlot(dbOid) == NULL)
+			{
+				char		safeLauncherDatname[NAMEDATALEN * 4];
+
+				CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(*datname));
+				CopySanitizedDatname(safeLauncherDatname, sizeof(safeLauncherDatname),
+									 vamana_launcher_database);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot enroll \"%s\" into vamana_databases from this database",
+								safeDatname),
+						 errdetail("vamana_databases is only read by the launcher from \"%s\" "
+								   "(svs.launcher_database); a row inserted or updated from any "
+								   "other database's copy of this table is never seen by it.",
+								   safeLauncherDatname),
+						 errhint("Run this INSERT/UPDATE while connected to \"%s\" instead.",
+								 safeLauncherDatname)));
+			}
 		}
 	}
 

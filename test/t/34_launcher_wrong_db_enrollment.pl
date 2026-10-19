@@ -143,6 +143,48 @@ chomp $appdb_oid;
 }
 
 # ---------------------------------------------------------------------------
+# The slot-existence exemption above must not be confused with letting any
+# database reach into a *different*, already-enrolled database's live
+# config just by naming it. A write from a third, unrelated database that
+# names appdb (rather than itself) must succeed -- the same write shape a
+# pg_dump/restore replay produces, which must not start erroring -- but
+# must never actually reach appdb's real shared-memory state.
+# ---------------------------------------------------------------------------
+{
+    $node->safe_psql('postgres', "CREATE DATABASE unrelateddb;");
+    $node->safe_psql('unrelateddb', "CREATE EXTENSION vector;");
+    $node->safe_psql('unrelateddb', "CREATE EXTENSION svs;");
+
+    my $appdb_oid = $node->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'appdb';");
+    chomp $appdb_oid;
+
+    my $before = $node->safe_psql('postgres',
+        "SELECT search_work_mem_limit FROM pg_stat_vamana_worker WHERE db_oid = $appdb_oid;");
+    chomp $before;
+
+    my ($rc, undef, $err) = $node->psql('unrelateddb',
+        "INSERT INTO vamana_databases (datname, enabled, search_work_mem) "
+      . "VALUES ('appdb', true, 9);");
+    is($rc, 0, 'a write from an unrelated database naming a different, already-enrolled '
+             . 'database succeeds (does not start erroring, e.g. for pg_dump/restore)')
+      or diag($err);
+
+    my $after = $node->safe_psql('postgres',
+        "SELECT search_work_mem_limit FROM pg_stat_vamana_worker WHERE db_oid = $appdb_oid;");
+    chomp $after;
+    is($after, $before,
+        'but the write never reaches appdb\'s real shared-memory state: '
+      . "search_work_mem_limit is unchanged ($before)");
+
+    my $stray_slot = $node->safe_psql('postgres',
+        "SELECT count(*) FROM pg_stat_vamana_worker WHERE db_oid = "
+      . "(SELECT oid FROM pg_database WHERE datname = 'unrelateddb');");
+    chomp $stray_slot;
+    is($stray_slot, '0', 'no stray shmem slot was reserved for unrelateddb either');
+}
+
+# ---------------------------------------------------------------------------
 # Defense-in-depth: svs_restart_worker() run from the wrong database is
 # rejected the same way, covering a row that predates this fix (the only way
 # such a row can still exist, since a fresh INSERT from the wrong database
