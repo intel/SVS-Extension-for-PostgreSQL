@@ -566,6 +566,19 @@ VamanaWorkerEnforceWalBudgetOnAllSlots(void)
 			 */
 			VamanaReplicationCreate(VamanaWorkerShmemPtr->dbOid, relid);
 			standbyRediscoverPending = true;
+
+			/*
+			 * The log line above says "rebuilding", not "caught up": this
+			 * replacement slot still needs a running-xacts WAL record to
+			 * resume active decoding, and core only emits one automatically
+			 * from CreateCheckPoint() (LogStandbySnapshot's only caller,
+			 * gated on !shutdown && XLogStandbyInfoActive()).  Absent other
+			 * activity forcing an earlier checkpoint, this index can sit at
+			 * the heap snapshot above for up to checkpoint_timeout (5
+			 * minutes by default) before it decodes anything new.  This is
+			 * the same bound an ordinary first-boot standby slot is already
+			 * subject to, not something this rebuild path introduces.
+			 */
 			continue;
 		}
 
