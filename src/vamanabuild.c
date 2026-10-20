@@ -179,6 +179,22 @@ static const VamanaLVQPair VAMANA_VALID_LVQ_PAIRS[] = {
 	(sizeof(VAMANA_VALID_LVQ_PAIRS) / sizeof(VAMANA_VALID_LVQ_PAIRS[0]))
 
 /*
+ * Whether value is one of the quantization encodings in
+ * VAMANA_VALID_COMPRESSION_VALUES, independent of allow_none handling.
+ */
+static bool
+CompressionValueInSet(int value)
+{
+	for (size_t i = 0; i < VAMANA_NUM_COMPRESSION_VALUES; i++)
+	{
+		if (value == VAMANA_VALID_COMPRESSION_VALUES[i])
+			return true;
+	}
+
+	return false;
+}
+
+/*
  * Validate compression parameter (must be one of the valid values).  allow_none
  * additionally accepts 0; pass it only for LVQ's residual, the one parameter
  * for which "absent" is a legal value.
@@ -186,19 +202,12 @@ static const VamanaLVQPair VAMANA_VALID_LVQ_PAIRS[] = {
 static void
 ValidateCompressionParam(int value, const char *param_name, bool allow_none)
 {
-	bool		is_valid = false;
+	bool		is_valid;
 
 	if (allow_none && value == VAMANA_COMPRESSION_NO_RESIDUAL)
 		return;
 
-	for (size_t i = 0; i < VAMANA_NUM_COMPRESSION_VALUES; i++)
-	{
-		if (value == VAMANA_VALID_COMPRESSION_VALUES[i])
-		{
-			is_valid = true;
-			break;
-		}
-	}
+	is_valid = CompressionValueInSet(value);
 
 	if (!is_valid)
 	{
@@ -265,6 +274,54 @@ ValidateCompressionOptions(int compression_type, int compression_primary,
 					 errhint("Supported LVQ configurations are 4- or 8-bit primary with no residual (compression_secondary = 0), or 4-bit primary with a 4- or 8-bit residual.")));
 		}
 	}
+}
+
+/*
+ * Non-throwing form of ValidateCompressionOptions, over the same tables.
+ * Used to range-check a metapage's stored compression configuration.
+ */
+bool
+VamanaCompressionConfigIsValid(int compression_type, int compression_primary,
+							   int compression_secondary)
+{
+	int			primary_bits = abs(compression_primary);
+	int			secondary_bits = abs(compression_secondary);
+
+	if (compression_type == VAMANA_COMPRESSION_NONE)
+		return true;
+
+	if (compression_type == VAMANA_COMPRESSION_LEANVEC)
+	{
+		if (!CompressionValueInSet(compression_primary) ||
+			!CompressionValueInSet(compression_secondary))
+			return false;
+
+		return primary_bits <= secondary_bits;
+	}
+
+	if (compression_type == VAMANA_COMPRESSION_LVQ)
+	{
+		bool		secondary_ok;
+
+		if (!CompressionValueInSet(compression_primary))
+			return false;
+
+		secondary_ok = (compression_secondary == VAMANA_COMPRESSION_NO_RESIDUAL) ||
+			CompressionValueInSet(compression_secondary);
+		if (!secondary_ok)
+			return false;
+
+		for (size_t i = 0; i < VAMANA_NUM_LVQ_PAIRS; i++)
+		{
+			if (primary_bits == VAMANA_VALID_LVQ_PAIRS[i].primary_bits &&
+				secondary_bits == VAMANA_VALID_LVQ_PAIRS[i].residual_bits)
+				return true;
+		}
+
+		return false;
+	}
+
+	return false;
 }
 
 /*

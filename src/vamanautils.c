@@ -325,27 +325,69 @@ VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno,
 }
 
 /*
- * Get metapage information
+ * Raise ERRCODE_DATA_CORRUPTED for a metapage field outside [lo, hi].  Uses
+ * int64 so an unsigned field read back out of range (e.g. a uint32
+ * underflowed to 0xFFFFFFFF) is reported as the large positive value it
+ * actually holds, not as a negative number.
  */
-void
-VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions)
+static void
+CheckMetaField(Relation index, const char *field, int64 value, int64 lo, int64 hi)
 {
-	Buffer		buf;
-	Page		page;
-	VamanaMetaPage metap;
+	if (value >= lo && value <= hi)
+		return;
 
-	buf = ReadBuffer(index, VAMANA_METAPAGE_BLKNO);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	metap = VamanaPageGetMeta(page);
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("vamana index \"%s\" has an invalid %s value %lld in its metapage",
+					RelationGetRelationName(index), field, (long long) value),
+			 errdetail("Valid range is %lld to %lld.", (long long) lo, (long long) hi),
+			 errhint("REINDEX this index.")));
+}
 
-	if (graph_degree)
-		*graph_degree = metap->graph_degree;
-	/* vector dimension counts are far below INT_MAX; cast makes the narrowing explicit */
-	if (dimensions)
-		*dimensions = (int) metap->dimensions;
+/*
+ * Validate every build-config field stored in the metapage against the same
+ * bounds CREATE INDEX enforces on the corresponding reloptions, so a
+ * metapage corrupted after a successful build is rejected rather than
+ * trusted. Called only after the magic-number check has already passed.
+ */
+static void
+ValidateMetaPageConfig(Relation index, const VamanaMetaPageData * meta)
+{
+	int32		column_dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
 
-	UnlockReleaseBuffer(buf);
+	CheckMetaField(index, "graph_degree", meta->graph_degree,
+				  VAMANA_MIN_GRAPH_DEGREE, VAMANA_MAX_GRAPH_DEGREE);
+	CheckMetaField(index, "alpha", meta->alpha,
+				  VAMANA_MIN_ALPHA, VAMANA_MAX_ALPHA);
+	CheckMetaField(index, "build_window_size", meta->build_window_size,
+				  VAMANA_MIN_BUILD_WINDOW, VAMANA_MAX_BUILD_WINDOW);
+	CheckMetaField(index, "leanvec_dims", meta->leanvec_dims,
+				  VAMANA_MIN_LEANVEC_DIMS, VAMANA_MAX_LEANVEC_DIMS);
+	CheckMetaField(index, "compression_type", meta->compression_type,
+				  VAMANA_COMPRESSION_NONE, VAMANA_COMPRESSION_LVQ);
+
+	if (!VamanaCompressionConfigIsValid(meta->compression_type,
+									   meta->compression_primary,
+									   meta->compression_secondary))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index \"%s\" has an invalid compression configuration in its metapage",
+						RelationGetRelationName(index)),
+				 errdetail("compression_type %u, compression_primary %d, compression_secondary %d is not a supported combination.",
+						   meta->compression_type, meta->compression_primary,
+						   meta->compression_secondary),
+				 errhint("REINDEX this index.")));
+
+	CheckMetaField(index, "dimensions", meta->dimensions, 1, VAMANA_MAX_DIM);
+
+	if (meta->dimensions != column_dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index \"%s\" has a metapage dimensions value that does not match its column",
+						RelationGetRelationName(index)),
+				 errdetail("Metapage dimensions %u do not match column dimensions %d.",
+						   meta->dimensions, column_dim),
+				 errhint("REINDEX this index.")));
 }
 
 /*
@@ -372,6 +414,8 @@ VamanaReadMetaPage(Relation index, VamanaMetaPageData * meta)
 				 errmsg("vamana index \"%s\" was built with an incompatible on-disk format",
 						RelationGetRelationName(index)),
 				 errhint("REINDEX this index.")));
+
+	ValidateMetaPageConfig(index, meta);
 }
 
 /*
