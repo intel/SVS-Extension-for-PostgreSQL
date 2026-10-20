@@ -11,7 +11,7 @@
 #      save-directory generation marker already stamped with it), but the
 #      TID-map rename has not run: tidmap.bin and the metapage are still at
 #      the old generation.
-# K2: break at the call to VamanaMarkIndexSaved(), i.e. after the TID-map
+# K2: break at VamanaMarkIndexSaved() entry, i.e. after the TID-map
 #      rename has completed: graph/data/config, the generation marker, and
 #      tidmap.bin are all at the new generation, but the metapage update has
 #      not run: the metapage alone still reflects the old generation.
@@ -227,7 +227,7 @@ sub run_kill_trial
     my $hit = 0;
     for (1 .. 60)
     {
-        if (slurp_gdb_log($gdb_log) =~ /Breakpoint \d+,/)
+        if (slurp_gdb_log($gdb_log) =~ /Breakpoint \d+, \Q$break_target\E\b/)
         {
             $hit = 1;
             last;
@@ -276,7 +276,7 @@ sub run_kill_trial
 # ===========================================================================
 {
     my $log_pos = length($node->log_content());
-    run_kill_trial('k2', 'k2_tbl', 'k2_idx', 'vamanaio.c:871');
+    run_kill_trial('k2', 'k2_tbl', 'k2_idx', 'VamanaMarkIndexSaved');
 
     assert_full_recall($node, 'k2_tbl', 'K2: after rejecting the crash-torn save');
 

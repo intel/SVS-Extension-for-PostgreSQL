@@ -758,8 +758,10 @@ VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum)
 
 /*
  * Atomically write hasSavedIndex and all metapage state from <meta>.
+ *
+ * Kept out of line so a debugger can stop on entry by name.
  */
-static void
+static pg_noinline void
 VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache *meta,
 					  TimestampTz generation)
 {
