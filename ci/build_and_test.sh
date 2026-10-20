@@ -157,8 +157,8 @@ step_build_modules() {
 		local name
 		name="$(basename "${moddir}")"
 		echo "  building test module: ${name}"
-		make -C "${moddir}" PG_CONFIG="${PG_CONFIG}"
-		make -C "${moddir}" install PG_CONFIG="${PG_CONFIG}"
+		make -C "${moddir}" PG_CONFIG="${PG_CONFIG}" SVS_INSTALL="${SVS_INSTALL_DIR}"
+		make -C "${moddir}" install PG_CONFIG="${PG_CONFIG}" SVS_INSTALL="${SVS_INSTALL_DIR}"
 	done
 }
 

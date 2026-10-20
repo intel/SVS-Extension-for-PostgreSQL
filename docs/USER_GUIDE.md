@@ -832,6 +832,8 @@ The percent-deleted threshold that triggers `SVSCompact` during VACUUM cleanup. 
 
 Lower for memory-constrained deployments with heavy delete churn. Raise for write-heavy workloads where VACUUM latency matters more than memory. Change takes effect on the next `VACUUM` — no restart required.
 
+This GUC also bounds how much of a database's residency budget a rolled-back `INSERT` can leave uncredited before a compact is forced to reclaim it, so it is superuser-only (`SET` requires superuser or a role granted the parameter's `SET` privilege). It is not settable by ordinary roles.
+
 ### Upgrading the Extension
 
 The on-disk format of a Vamana index is not guaranteed to be stable between builds of this extension while it is at version 0.x. When the format changes, indexes built by an older build are not converted: they fail closed, and must be rebuilt with `REINDEX`. No `ALTER EXTENSION svs UPDATE` script is provided for on-disk format changes; a SQL upgrade script cannot rewrite index pages.
@@ -900,7 +902,7 @@ The serialized SVS index directory (`$PGDATA/vamana_indexes/<dboid>/<relid>/`) c
 
 Temporary files are removed as soon as they are no longer needed. `tidmap.bin` is published by writing `tidmap.bin.tmp` and renaming it into place; the temp file is removed on every error path, and any leftover is removed before a new one is created. A temp file orphaned by a crash between the write and the rename is removed at the next load or save of that index.
 
-**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE` is a **silent no-op** for Vamana indexes in the current release (v0.1). This limitation is tracked for resolution in v0.2.
+**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE`, `CREATE INDEX ... TABLESPACE`, and `default_tablespace` are all a **silent no-op** for Vamana indexes in the current release (v0.1): `pg_class` reports the index as living in the chosen tablespace, but its vector data still lands under `$PGDATA` regardless of which tablespace was requested. This limitation is tracked for resolution in v0.2.
 
 Operators who require encryption-at-rest for embedding data should use full-disk or volume-level encryption on the filesystem backing `$PGDATA`.
 
@@ -926,9 +928,21 @@ If `hot_standby_feedback = off`, the primary may remove WAL segments that the st
 
 #### `vamana_databases` Access
 
-INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker. Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly — this is not a privilege escalation: the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
+INSERT, UPDATE, DELETE, and TRUNCATE on `vamana_databases` are all revoked from `PUBLIC`; only the table owner (or a superuser) can change which databases run a Vamana worker.
 
-The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `residency_memory > 0`, `search_work_mem > 0`, and `search_num_threads BETWEEN 1 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
+**Owning `vamana_databases` is superuser-equivalent in effect.** The extension can only be created by a superuser, so the table starts out superuser-owned, but nothing stops a superuser from later handing it to an ordinary role (`ALTER TABLE ... OWNER TO`, `REASSIGN OWNED`) or granting that role `INSERT`, `UPDATE`, or `DELETE` on it. The copy in `svs.launcher_database` controls the whole cluster, not just the writer's own database. A role that can write it can:
+
+- start a Vamana worker in any database, by name, including one the role cannot connect to; the worker runs as the bootstrap superuser;
+- pause, restart, or remove the worker of any enrolled database, making its Vamana indexes unavailable;
+- divide the cluster-wide search-thread, build-thread, residency-memory, and search-memory pools among databases, including reserving thread floors that take capacity from every other database.
+
+The owner can additionally disable the table's validation triggers and CHECK constraints, and can attach its own triggers, which then run with the privileges of whichever role next writes the table, including a superuser running `svs_restart_worker()`. Treat ownership of, and DML on, `vamana_databases` as you would superuser: do not transfer or grant either to a non-superuser role.
+
+Because writes to this table carry that much weight, they are worth auditing. `vamana_databases` is written rarely (install time, enabling or disabling a database, policy changes), which makes it a good fit for `pgaudit`'s object-level auditing: grant a dedicated audit role privileges on `vamana_databases` and set `pgaudit.role` to it, so every write is logged regardless of who makes it. Prefer that over a blanket `log_statement = 'mod'`, which is cluster- or session-wide rather than table-scoped and would also log every other table's writes, which is noisy on any database with real traffic elsewhere.
+
+Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', '')` directly: this is not a privilege escalation, since the payload is empty, and the launcher only wakes up and re-reads `vamana_databases` under its own privileges, so an unprivileged NOTIFY cannot change which databases are enabled.
+
+The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `search_num_threads BETWEEN 1 AND 1024`, `residency_memory > 0`, `search_work_mem > 0`, `search_threads_reserved BETWEEN 0 AND 1024`, and `maintenance_num_threads BETWEEN 0 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
 
 Beyond those CHECK constraints, two triggers reject writes based on live state rather than the value alone. Lowering `residency_memory` on an `UPDATE` is rejected if the new value is below the database's currently committed resident bytes — read from shared memory if its worker is live, or from `svs_index_residency` if it isn't, so a worker that's down doesn't let a shrink through that would fail the next reload. Raising or setting `search_work_mem` on an `INSERT` or `UPDATE` is rejected if the resulting cluster-wide sum across all enabled databases would exceed `svs.max_search_work_mem`.
 
@@ -1086,6 +1100,13 @@ RESET enable_seqscan;
 **Cause:** The `(compression_primary, compression_secondary)` pair is not one SVS compiles an LVQ specialization for. The supported pairs, by bit width, are (4, 0), (8, 0), (4, 4) and (4, 8) — so an 8-bit primary must be paired with `compression_secondary = 0`.  
 **Fix:** Either drop the residual (`compression_secondary = 0`) or drop the primary to 4 bits.
 
+### Error: `LeanVec compression is not supported on this CPU` / `LVQ compression is not supported on this CPU`
+
+**Cause:** LVQ and LeanVec need CPU instructions (e.g. AVX512) that this build of SVS supports but this machine's processor does not have — common when an index built on one host is loaded on another with an older or different CPU. SVS detects this at build/load time and refuses rather than running on an unsupported code path.  
+**Fix:** `REINDEX` with `compression_type = 0` (no compression), or run this database on hardware with the required CPU instructions.
+
+A `CREATE INDEX`/`REINDEX` that hits this directly on the backend shows the full error, including the hint above. The same failure reached through the background worker (an on-disk load, a first insert into an empty-table index, or a heap rebuild) shows only the message naming the compression type; the worker's error channel to the backend does not carry the hint. This is an existing limitation of that channel, not specific to this error.
+
 ### Error: `value X out of bounds for option "compression_type"`
 
 **Cause:** `compression_type` is outside `[0, 2]`.  
@@ -1229,7 +1250,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
-| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact |
+| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact. Superuser-only: it also bounds database-wide residency accounting, not just the caller's own session |
 
 ### Superuser-Settable GUC Parameters (`SET …`, superuser only; also settable in `postgresql.conf` + reload)
 
@@ -1259,7 +1280,7 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |
 | `svs.worker_stop_timeout_ms` | `30000` | `0` | `600000` | Wait for a restarting worker to report stopped before giving up; does not force-kill |
 | `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
-| `svs.max_build_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory |
+| `svs.max_build_memory` | `4096MB` | `1MB` | — | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory |
 | `svs.max_residency_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved residency budget; checked at `vamana_databases` enrollment |
 | `svs.default_residency_memory` | `100MB` | `1MB` | — | Residency budget for a database whose `vamana_databases.residency_memory` is `NULL`; independent of `svs.max_residency_memory` |
 | `svs.max_search_work_mem` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved search-scratch budget; checked as a catalog aggregate at `vamana_databases` insert/update time |
@@ -1267,8 +1288,8 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |
 | `svs.checkpoint_min_ops` | `10000` | — | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
-| `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set |
-| `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set |
+| `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
 
 ### SQL Functions
 

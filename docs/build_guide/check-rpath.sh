@@ -309,7 +309,7 @@ check_a2_svs_so_rpath() {
 
     bad_rel=$(nonrelative_rpath_violations "$rpath")
     if [[ -n "$bad_rel" ]]; then
-        result_fail A2b "run path of $(basename "$so") must be \$ORIGIN-relative or empty; found absolute entries"
+        result_fail A2b "run path of $(basename "$so") must be \$ORIGIN-relative or empty; found an absolute or non-\$ORIGIN-relative entry"
         printf '%s\n' "$bad_rel" | sed 's/^/FAIL   offending entry: /'
     else
         result_pass A2b "run path of $(basename "$so") is \$ORIGIN-relative or empty"
@@ -333,7 +333,7 @@ check_a3_capi_rpath() {
 
     bad_rel=$(nonrelative_rpath_violations "$rpath")
     if [[ -n "$bad_rel" ]]; then
-        result_fail A3b "run path of $(basename "$so") must be \$ORIGIN-relative or empty; found absolute entries"
+        result_fail A3b "run path of $(basename "$so") must be \$ORIGIN-relative or empty; found an absolute or non-\$ORIGIN-relative entry"
         printf '%s\n' "$bad_rel" | sed 's/^/FAIL   offending entry: /'
     else
         result_pass A3b "run path of $(basename "$so") is \$ORIGIN-relative or empty"

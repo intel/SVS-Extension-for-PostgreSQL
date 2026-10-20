@@ -76,6 +76,7 @@ int			vamana_checkpoint_interval = -1;		/* -1 = off (simple time-based trigger) 
 int			vamana_shutdown_drain_budget_ms = 30000;
 int			vamana_worker_stop_timeout_ms = 30000;
 
+// NOLINTNEXTLINE(misc-use-internal-linkage): externed in vamanautils.c, not a header
 relopt_kind vamana_relopt_kind;
 
 void
@@ -275,7 +276,7 @@ VamanaInit(void)
 							"disables that credit the same way it disables VACUUM's own compacts.",
 							&vamana_compact_threshold_pct,
 							10, 0, 100,
-							PGC_USERSET,
+							PGC_SUSET,
 							0,
 							NULL, NULL, NULL);
 

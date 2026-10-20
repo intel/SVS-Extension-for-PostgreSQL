@@ -14,6 +14,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
+#include "utils/memutils.h"
 #include "utils/sampling.h"
 #include "utils/timestamp.h"
 #include "halfvec.h"
@@ -39,11 +40,11 @@
 #define VAMANA_DEFAULT_GRAPH_DEGREE		64
 #define VAMANA_MIN_GRAPH_DEGREE			16
 #define VAMANA_MAX_GRAPH_DEGREE			256
-#define VAMANA_DEFAULT_ALPHA			-1  /* -1 = use SVS library default */
-#define VAMANA_MIN_ALPHA				-1
+#define VAMANA_DEFAULT_ALPHA			(-1)  /* -1 = use SVS library default */
+#define VAMANA_MIN_ALPHA				(-1)
 #define VAMANA_MAX_ALPHA				200 /* 2.0 * 100 */
-#define VAMANA_DEFAULT_BUILD_WINDOW		-1  /* -1 = 2 * graph_degree */
-#define VAMANA_MIN_BUILD_WINDOW			-1
+#define VAMANA_DEFAULT_BUILD_WINDOW		(-1)  /* -1 = 2 * graph_degree */
+#define VAMANA_MIN_BUILD_WINDOW			(-1)
 #define VAMANA_MAX_BUILD_WINDOW			1000
 #define VAMANA_DEFAULT_SEARCH_WINDOW	100
 #define VAMANA_MIN_SEARCH_WINDOW		10
@@ -52,6 +53,15 @@
 #define VAMANA_DEFAULT_UNDO_LOG_MAX_ENTRIES	1048576
 #define VAMANA_MIN_UNDO_LOG_MAX_ENTRIES		16
 #define VAMANA_MAX_UNDO_LOG_MAX_ENTRIES		16777216
+
+/*
+ * Ceiling on tidMappingCapacity (and the other metapage counters) accepted
+ * from an on-disk metapage or a load-slot IPC payload. Every downstream
+ * consumer casts these counters to int, so INT_MAX is the point past which
+ * they are already mishandled; the StaticAssertDecl next to this struct's
+ * definition proves the resulting allocation still fits MaxAllocHugeSize.
+ */
+#define VAMANA_MAX_TID_MAPPING_CAPACITY		INT_MAX
 
 /* Compression types (internal representation) */
 #define VAMANA_COMPRESSION_NONE			0
@@ -67,9 +77,9 @@
 
 /* Quantization data types shared by LeanVec and LVQ (map to SVS data types) */
 #define VAMANA_LEANVEC_UINT4			4
-#define VAMANA_LEANVEC_INT4				-4
+#define VAMANA_LEANVEC_INT4				(-4)
 #define VAMANA_LEANVEC_UINT8			8
-#define VAMANA_LEANVEC_INT8				-8
+#define VAMANA_LEANVEC_INT8				(-8)
 
 /*
  * LVQ-only compression_secondary value: no residual.  Maps to
@@ -94,8 +104,8 @@
  */
 #define VAMANA_DEFAULT_COMPRESSION_PRIMARY		VAMANA_LEANVEC_UINT4
 #define VAMANA_DEFAULT_COMPRESSION_SECONDARY	VAMANA_LEANVEC_UINT8
-#define VAMANA_DEFAULT_LEANVEC_DIMS			-1	/* -1 = dimensions / 2 */
-#define VAMANA_MIN_LEANVEC_DIMS				-1
+#define VAMANA_DEFAULT_LEANVEC_DIMS			(-1)	/* -1 = dimensions / 2 */
+#define VAMANA_MIN_LEANVEC_DIMS				(-1)
 #define VAMANA_MAX_LEANVEC_DIMS				2000
 
 /* Build phases */
@@ -238,6 +248,9 @@ StaticAssertDecl(offsetof(VamanaMetaPageData, tidMappingCapacity) == 60,
 StaticAssertDecl(sizeof(VamanaMetaPageData) == 64,
 				 "VamanaMetaPageData size changed — update readers/writers");
 
+StaticAssertDecl((uint64) VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) <= MaxAllocHugeSize,
+				 "VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) exceeds MaxAllocHugeSize");
+
 typedef struct VamanaPageOpaqueData
 {
 	BlockNumber nextblkno;
@@ -298,6 +311,19 @@ typedef struct VamanaIndexCache
 	 */
 	TimestampTz nextSnapshotActivateAttempt;
 
+	/*
+	 * Zero-progress backoff for this index's own fast-forward catch-up slice
+	 * (VamanaReplicationCatchUpSlot, scheduled by VamanaWorkerCatchUpSlots).
+	 * 0 = eligible now / no active backoff.  A slice that exhausts its
+	 * budget without moving restart_lsn doubles catchUpBackoffMs (capped at
+	 * 60000) and sets nextCatchUpAttempt accordingly; any progress resets
+	 * both to 0.  Without this, a long-open transaction or a running-xacts
+	 * gap bigger than one slice would spend the worker's whole catch-up
+	 * share on this one index forever.
+	 */
+	TimestampTz nextCatchUpAttempt;
+	int			catchUpBackoffMs;
+
 	/* Checkpoint debounce state */
 	int64		opsSinceCheckpoint;
 	TimestampTz lastWriteTime;		/* updated on every write slot; 0 = no writes yet */
@@ -348,6 +374,10 @@ const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
 const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
+void		VamanaValidateMetaCounts(Oid relid, uint32 tidMappingCapacity,
+									  uint32 numVectors, uint32 numDeleted,
+									  uint64 nextExternalId,
+									  bool checkResidencyBudget);
 void		VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno, Size indexDataSize, uint32 numVectors, ForkNumber forkNum);
 void		VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum);
 bytea	   *vamanaoptions(Datum reloptions, bool validate);
@@ -360,6 +390,7 @@ bool		vamanavalidate(Oid opclassoid);
 
 /* Distance metric helper */
 SVSDistanceType VamanaGetDistanceMetric(Relation index);
+bool		VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric);
 
 /* On-disk serialization helpers */
 void		VamanaGetIndexSavePath(Oid dboid, Oid relid, char *buf, size_t bufsz);

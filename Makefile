@@ -113,6 +113,10 @@ endif
 
 # SVS library paths
 SVS_INSTALL ?= svs_install_public
+# Resolve to an absolute path: a relative RUNPATH is resolved by the dynamic
+# loader against the process's current working directory, and the postmaster
+# changes into $PGDATA before loading shared_preload_libraries.
+override SVS_INSTALL := $(abspath $(SVS_INSTALL))
 
 # Validate SVS library exists
 ifeq (,$(wildcard $(SVS_INSTALL)/lib/libsvs_c_api.so))
