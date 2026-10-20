@@ -139,9 +139,10 @@ CREATE TRIGGER vamana_databases_check_search_work_mem_ceiling_upd
 	REFERENCING NEW TABLE AS new_rows
 	FOR EACH STATEMENT EXECUTE FUNCTION vamana_databases_check_search_work_mem_ceiling();
 
--- TRUNCATE bypasses DELETE triggers; block it since no role has a
--- legitimate reason to bulk-wipe this table. The owner retains TRUNCATE
--- regardless of this revoke.
+-- TRUNCATE bypasses DELETE triggers; this REVOKE blocks ordinary roles from
+-- bulk-wiping this table, but the owner retains TRUNCATE regardless of it.
+-- vamana_databases_reject_truncate_with_live_indexes (below) is what blocks
+-- the owner too, whenever a listed database still has live vamana indexes.
 REVOKE TRUNCATE ON vamana_databases FROM PUBLIC;
 
 -- Not granted to PUBLIC by default, but explicit so the invariant survives a
@@ -290,7 +291,8 @@ CREATE FUNCTION svs_warmup_database() RETURNS integer
 
 -- Reject deleting a row while vamana indexes still exist in that database, so
 -- their save directories and replication slots are never orphaned.  TRUNCATE
--- would bypass a DELETE trigger; it is already revoked from PUBLIC above.
+-- bypasses this DELETE trigger; vamana_databases_reject_truncate_with_live_indexes
+-- below gives TRUNCATE the same guarantee.
 CREATE FUNCTION vamana_databases_reject_delete_with_live_indexes()
 	RETURNS trigger
 	AS 'MODULE_PATHNAME', 'vamana_databases_reject_delete_with_live_indexes'
@@ -300,3 +302,19 @@ CREATE TRIGGER vamana_databases_reject_delete_with_live_indexes
 	BEFORE DELETE ON vamana_databases
 	FOR EACH ROW
 	EXECUTE FUNCTION vamana_databases_reject_delete_with_live_indexes();
+
+-- TRUNCATE bypasses DELETE triggers entirely (row-level or not), so it needs
+-- its own guard with the identical guarantee as the DELETE trigger above:
+-- reject it while any row's database still has live vamana indexes. A
+-- TRUNCATE trigger can only be declared FOR EACH STATEMENT (Postgres rejects
+-- a row-level one), so the function reads every current row itself via SPI
+-- rather than being handed a single tuple.
+CREATE FUNCTION vamana_databases_reject_truncate_with_live_indexes()
+	RETURNS trigger
+	AS 'MODULE_PATHNAME', 'vamana_databases_reject_truncate_with_live_indexes'
+	LANGUAGE C;
+
+CREATE TRIGGER vamana_databases_reject_truncate_with_live_indexes
+	BEFORE TRUNCATE ON vamana_databases
+	FOR EACH STATEMENT
+	EXECUTE FUNCTION vamana_databases_reject_truncate_with_live_indexes();
