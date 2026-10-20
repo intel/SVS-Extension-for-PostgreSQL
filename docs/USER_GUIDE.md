@@ -163,7 +163,7 @@ LIMIT 5;
 
 > **Storage format:** An uncompressed `halfvec` index is stored as float16, so it occupies roughly half the resident bytes of the same data in a `vector` column. Under `compression_type` 1 or 2 the compressed format governs the stored size for both column types.
 
-> **Upgrading:** A `halfvec` index built before this release was stored as float32. It will not load under the float16 format and will be rebuilt from the table on first use — correctly, but with a warning in the log and the cost of a full rebuild. `REINDEX` such indexes to avoid that, and re-run any query whose results were recorded from one, as the answers may have changed.
+> **Upgrading:** A `halfvec` index built before this release was stored as float32. It will not load under the float16 format and will be rebuilt from the table on first use, correctly, but with a warning in the log and the cost of a full rebuild. `REINDEX` such indexes to avoid that, and re-run any query whose results were recorded from one, as the answers may have changed. See [Upgrading the Extension](#upgrading-the-extension) for on-disk format changes in general.
 
 > **NULL vectors:** Rows with a `NULL` value in the indexed column are silently skipped at index build and insert time — they are not added to the graph. A `NULL` query vector returns zero results immediately without scanning the index.
 
@@ -834,6 +834,28 @@ Lower for memory-constrained deployments with heavy delete churn. Raise for writ
 
 This GUC also bounds how much of a database's residency budget a rolled-back `INSERT` can leave uncredited before a compact is forced to reclaim it, so it is superuser-only (`SET` requires superuser or a role granted the parameter's `SET` privilege). It is not settable by ordinary roles.
 
+### Upgrading the Extension
+
+The on-disk format of a Vamana index is not guaranteed to be stable between builds of this extension while it is at version 0.x. When the format changes, indexes built by an older build are not converted: they fail closed, and must be rebuilt with `REINDEX`. No `ALTER EXTENSION svs UPDATE` script is provided for on-disk format changes; a SQL upgrade script cannot rewrite index pages.
+
+The format changed in commit `9395a7c` (September 2026). Every Vamana index built with an earlier build must be rebuilt after upgrading. Until it is, `INSERT` and `VACUUM` against it fail with:
+
+    ERROR:  vamana index "documents_vamana_idx" was built with an incompatible on-disk format
+    HINT:  REINDEX this index.
+
+A `SELECT` against the same index fails with the same underlying error, routed through the worker:
+
+    ERROR:  vamana worker error: vamana index "documents_vamana_idx" was built with an incompatible on-disk format REINDEX this index.
+
+The index is never read with the wrong layout, so no wrong results are returned; it is simply unusable until rebuilt. To rebuild every Vamana index in a database, run this in each database that has them and execute the statements it returns:
+
+    SELECT format('REINDEX INDEX %s;', c.oid::regclass)
+    FROM pg_class c
+    JOIN pg_am a ON a.oid = c.relam
+    WHERE a.amname = 'vamana';
+
+A rebuild reads the whole table, so schedule it like any other `CREATE INDEX`. `REINDEX INDEX CONCURRENTLY` also works and avoids blocking writes during the rebuild. `DROP INDEX` also works on an index in this state.
+
 ### When to REINDEX
 
 You do **not** need periodic `REINDEX` for correctness. You might still choose to `REINDEX` if:
@@ -841,6 +863,7 @@ You do **not** need periodic `REINDEX` for correctness. You might still choose t
 - Autovacuum has not run for an extended period and the deleted fraction is unusually high.
 - You have observed measurable recall drop in production after a long write horizon. Vamana graphs accumulate a small amount of topological debt over many incremental inserts; a fresh build produces the optimal graph for the current data.
 - You need to change a build-time parameter (`graph_degree`, `compression_type`, etc.).
+- You upgraded from a build whose on-disk index format differs from the current one. This one *is* required for correctness; see [Upgrading the Extension](#upgrading-the-extension).
 
 ### VACUUM
 
@@ -1093,6 +1116,11 @@ A `CREATE INDEX`/`REINDEX` that hits this directly on the backend shows the full
 
 **Cause:** The current transaction has recorded `svs.undo_log_max_entries` undo entries (one per Vamana index insert, counted even for rows later undone by `ROLLBACK TO SAVEPOINT`) and the next insert would exceed it. This is a dedicated, budget-independent cap on per-transaction undo memory, separate from `svs.max_residency_memory`.  
 **Fix:** Commit in smaller batches, or have a superuser raise `svs.undo_log_max_entries` for the session (`SET svs.undo_log_max_entries = ...`) or cluster-wide (`postgresql.conf` + reload).
+
+### Error: `vamana index "X" was built with an incompatible on-disk format`
+
+**Cause:** The index was built by an older build of the extension that used a different on-disk format. It is refused rather than read with the wrong layout.  
+**Fix:** `REINDEX INDEX X;`. See [Upgrading the Extension](#upgrading-the-extension) to rebuild every Vamana index in a database at once.
 
 ### Unexpected recall with large `leanvec_dims`
 
