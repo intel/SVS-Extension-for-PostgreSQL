@@ -6,23 +6,22 @@
 # approach with an actual crash at the two points one can land on inside
 # VamanaSaveIndexToDisk's save sequence.
 #
-# K1: break at VamanaSaveTidMapAtomically() entry: SVSSaveIndex has
-#      returned (graph/data/config at the new generation, and the
-#      save-directory generation marker already stamped with it), but the
-#      TID-map rename has not run: tidmap.bin and the metapage are still at
+# K1: the worker is parked at the vamana-save-before-tidmap-write injection
+#      point: SVSSaveIndex has returned (graph/data/config at the new
+#      generation, and the save-directory generation marker already stamped
+#      with it), but the TID-map rename has not run: tidmap.bin and the
+#      metapage are still at the old generation.
+# K2: the worker is parked at the vamana-save-before-mark-saved injection
+#      point, i.e. after the TID-map rename has completed: graph/data/config,
+#      the generation marker, and tidmap.bin are all at the new generation,
+#      but the metapage update has not run: the metapage alone still reflects
 #      the old generation.
-# K2: break at VamanaMarkIndexSaved() entry, i.e. after the TID-map
-#      rename has completed: graph/data/config, the generation marker, and
-#      tidmap.bin are all at the new generation, but the metapage update has
-#      not run: the metapage alone still reflects the old generation.
 #
-# Attaches gdb to the live vamana worker and kills it with SIGKILL while gdb
-# holds it stopped at each point -- not a clean PG_TRY unwind, no simulated
-# file edits.  `sudo` is required because the worker is not a descendant of
-# this script's own shell, and the host's Yama ptrace_scope=1 policy forbids
-# non-descendant ptrace otherwise.
+# The injection point holds the live vamana worker still, and this script
+# then kills it with SIGKILL -- not a clean PG_TRY unwind, no simulated file
+# edits.
 #
-# Both breakpoints are armed only after two independently-confirmed clean
+# Both injection points are attached only after two independently-confirmed clean
 # saves have already completed (so the interrupted save is never the index's
 # first -- see the "not the same bug as the replication-slot startup window"
 # note below) and with the replication slot already consistent
@@ -47,23 +46,14 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
-use File::Temp qw(tempdir);
 
 use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
 
-if ($^O ne 'linux')
+if (($ENV{enable_injection_points} // 'no') ne 'yes')
 {
-    plan skip_all => 'gdb ptrace attach to a live worker is only exercised on Linux';
-}
-if (system('sudo -n true >/dev/null 2>&1') != 0)
-{
-    plan skip_all => 'passwordless sudo is required to ptrace-attach to the vamana worker';
-}
-if (system('which gdb >/dev/null 2>&1') != 0)
-{
-    plan skip_all => 'gdb is not available';
+    plan skip_all => 'server not built with --enable-injection-points';
 }
 
 my $node = PostgreSQL::Test::Cluster->new('vamana_torn_crash');
@@ -85,21 +75,9 @@ $node->start;
 
 $node->safe_psql('postgres', "CREATE EXTENSION vector;");
 $node->safe_psql('postgres', "CREATE EXTENSION svs;");
+$node->safe_psql('postgres', "CREATE EXTENSION injection_points;");
 $node->safe_psql('postgres',
     "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
-
-my $tmpdir = tempdir(CLEANUP => 1);
-
-sub slurp_gdb_log
-{
-    my ($path) = @_;
-    return '' unless -f $path;
-    open(my $fh, '<', $path) or return '';
-    local $/;
-    my $data = <$fh>;
-    close($fh);
-    return $data // '';
-}
 
 # ---------------------------------------------------------------------------
 # wait_for_reconnect: poll until the server accepts a trivial query again.
@@ -171,14 +149,14 @@ sub assert_full_recall
 }
 
 # ---------------------------------------------------------------------------
-# run_kill_trial: build a fresh table/index, complete two clean saves, arm a
-# gdb breakpoint on the live worker at $break_target, insert a third batch to
-# trigger a re-save, and kill -9 the worker once gdb reports the breakpoint
-# hit.  Returns once the cluster has recovered.
+# run_kill_trial: build a fresh table/index, complete two clean saves, attach
+# the wait injection point $point, insert a third batch to trigger a re-save,
+# and kill -9 the worker once it is parked there.  Returns once the cluster
+# has recovered.
 # ---------------------------------------------------------------------------
 sub run_kill_trial
 {
-    my ($label, $table, $index, $break_target) = @_;
+    my ($label, $table, $index, $point) = @_;
 
     $node->safe_psql('postgres', qq{
         CREATE TABLE $table (id serial PRIMARY KEY, val vector($dim));
@@ -197,48 +175,26 @@ sub run_kill_trial
     usleep(2_000_000);    # let the debounced checkpoint land
 
     ok(confirmed_flush_non_null($node),
-        "$label: replication slot is consistent before arming the breakpoint");
+        "$label: replication slot is consistent before the injection point is attached");
 
     my $pid = wait_for_worker($node, 30);
     ok($pid =~ /^\d+$/, "$label: found a live worker pid ($pid)");
 
-    my $gdb_log = "$tmpdir/$label.gdb.log";
-    unlink($gdb_log) if -f $gdb_log;
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('$point', 'wait');");
 
-    my $gdb_cmd = "sudo gdb -p $pid -batch "
-      . "-ex 'break $break_target' "
-      . "-ex 'continue' "
-      . "-ex 'shell kill -9 $pid' "
-      . "-ex 'detach' "
-      . "-ex 'quit' "
-      . ">$gdb_log 2>&1 &";
-    system($gdb_cmd);
-
-    # Give gdb a moment to attach and set the breakpoint before the
-    # triggering insert below can race it.
-    usleep(1_000_000);
-
-    # Third batch: triggers the re-save that the armed breakpoint parks.
+    # Third batch: triggers the re-save that parks at the injection point.
     $node->safe_psql('postgres', qq{
         INSERT INTO $table (val)
             SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 15);
     });
 
-    my $hit = 0;
-    for (1 .. 60)
-    {
-        if (slurp_gdb_log($gdb_log) =~ /Breakpoint \d+, \Q$break_target\E\b/)
-        {
-            $hit = 1;
-            last;
-        }
-        usleep(500_000);
-    }
-    ok($hit, "$label: gdb reported the breakpoint hit");
+    # Dies (and fails the file) if the worker never reaches the point.
+    $node->wait_for_event('vamana worker', $point);
+    pass("$label: worker is parked at $point");
 
-    # Independently confirm the kill landed; do not rely on gdb's own
-    # "detached" message (observed in the original investigation to print
-    # even after the kill had already been issued).
+    kill('KILL', $pid);
+
     my $dead = 0;
     for (1 .. 60)
     {
@@ -260,7 +216,7 @@ sub run_kill_trial
 # ===========================================================================
 {
     my $log_pos = length($node->log_content());
-    run_kill_trial('k1', 'k1_tbl', 'k1_idx', 'VamanaSaveTidMapAtomically');
+    run_kill_trial('k1', 'k1_tbl', 'k1_idx', 'vamana-save-before-tidmap-write');
 
     # The load (and this check's own log message) is lazy: it happens on the
     # first query that touches the index, not eagerly at worker startup.
@@ -276,7 +232,7 @@ sub run_kill_trial
 # ===========================================================================
 {
     my $log_pos = length($node->log_content());
-    run_kill_trial('k2', 'k2_tbl', 'k2_idx', 'VamanaMarkIndexSaved');
+    run_kill_trial('k2', 'k2_tbl', 'k2_idx', 'vamana-save-before-mark-saved');
 
     assert_full_recall($node, 'k2_tbl', 'K2: after rejecting the crash-torn save');
 

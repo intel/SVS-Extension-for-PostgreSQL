@@ -758,10 +758,8 @@ VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum)
 
 /*
  * Atomically write hasSavedIndex and all metapage state from <meta>.
- *
- * Kept out of line so a debugger can stop on entry by name.
  */
-static pg_noinline void
+static void
 VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache *meta,
 					  TimestampTz generation)
 {
@@ -859,6 +857,8 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 		 * may visit tuples in different physical order and would map SVS IDs
 		 * to wrong TIDs.
 		 */
+		INJECTION_POINT("vamana-save-before-tidmap-write", NULL);
+
 		if (meta->tidMapping != NULL && meta->tidMappingCapacity > 0)
 			VamanaSaveTidMapAtomically(MyDatabaseId, relid, meta->tidMapping, meta->tidMappingCapacity,
 										generation);
@@ -887,6 +887,8 @@ VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNu
 	 * already disagrees with the metapage's still-old saveGeneration, so a
 	 * load in between is rejected and rebuilt rather than served torn.
 	 */
+	INJECTION_POINT("vamana-save-before-mark-saved", NULL);
+
 	VamanaMarkIndexSaved(index, forkNum, meta, generation);
 
 	VamanaCacheSetNeedsSave(relid, false);
