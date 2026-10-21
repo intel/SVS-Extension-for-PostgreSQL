@@ -1,0 +1,102 @@
+name: Build and test (arm64, informational)
+
+# Informational only: shows whether the extension builds and passes on
+# aarch64. It must never be a required status check, and a failure here must
+# not turn CI red.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# docs/build_guide/config is the single source of truth for PG_CONFIG,
+# SVS_INSTALL_DIR and every other dependency install path; nothing here
+# overrides them.
+
+jobs:
+  build-and-test-arm:
+    # Keeps the workflow run green when a step fails.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # stock: the same SVS build as the x86 workflow (expected to fail
+          # on aarch64, recorded as evidence). open-core: LVQ/LeanVec off.
+          - svs_variant: stock
+            svs_lvq_leanvec: "ON"
+          - svs_variant: open-core
+            svs_lvq_leanvec: "OFF"
+    runs-on: ubuntu-24.04-arm
+    env:
+      CC: gcc
+      CXX: g++
+      PG_CONFIGURE_EXTRA_ARGS: "--enable-tap-tests --enable-injection-points"
+      SVS_ENABLE_LVQ_LEANVEC: ${{ matrix.svs_lvq_leanvec }}
+      # Keep in sync with build-and-test.yml.
+      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
+      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: CPU info
+        run: |
+          uname -m
+          lscpu | grep -E 'Architecture|Model name|Vendor|Flags|Features'
+
+      - name: Cache PostgreSQL install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/pgsql_install
+          key: pg-arm64-${{ env.PG_CONFIGURE_EXTRA_ARGS }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh') }}-arm-v1
+
+      - name: Cache SVS install
+        uses: actions/cache@v4
+        with:
+          path: docs/build_guide/svs_install
+          key: svs-arm64-${{ matrix.svs_variant }}-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-arm-v1
+
+      - name: deps
+        run: ci/build_and_test.sh deps
+
+      - name: build-postgres
+        run: ci/build_and_test.sh build-postgres
+
+      - name: build-svs
+        run: ci/build_and_test.sh build-svs
+
+      - name: build-pgvector
+        run: ci/build_and_test.sh build-pgvector
+
+      - name: build-extension
+        run: ci/build_and_test.sh build-extension
+
+      - name: build-modules
+        run: ci/build_and_test.sh build-modules
+
+      - name: test-sql
+        run: ci/build_and_test.sh test-sql
+
+      - name: test-tap
+        run: ci/build_and_test.sh test-tap
+        env:
+          PROVE_FLAGS: -j2
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-arm64-${{ matrix.svs_variant }}
+          path: |
+            regression.diffs
+            regression.out
+            results/
+            tmp_check/log/
+            ci/.workdir/postgres.log
+          if-no-files-found: ignore
+          retention-days: 7
