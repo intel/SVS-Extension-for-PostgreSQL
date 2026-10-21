@@ -10,6 +10,16 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      svs_variant:
+        description: "SVS variant to run"
+        type: choice
+        options: [both, stock, open-core]
+        default: both
+      prove_tests:
+        description: "Space-separated TAP files to run instead of the full suite (skips test-sql)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -22,6 +32,7 @@ jobs:
   build-and-test-arm:
     # Keeps the workflow run green when a step fails.
     continue-on-error: true
+    if: github.event_name != 'workflow_dispatch' || inputs.svs_variant == 'both' || inputs.svs_variant == matrix.svs_variant
     strategy:
       fail-fast: false
       matrix:
@@ -80,12 +91,14 @@ jobs:
         run: ci/build_and_test.sh build-modules
 
       - name: test-sql
+        if: ${{ !inputs.prove_tests }}
         run: ci/build_and_test.sh test-sql
 
       - name: test-tap
         run: ci/build_and_test.sh test-tap
         env:
           PROVE_FLAGS: -j2
+          PROVE_TESTS: ${{ inputs.prove_tests }}
 
       - name: Upload failure artifacts
         if: failure()
@@ -96,7 +109,7 @@ jobs:
             regression.diffs
             regression.out
             results/
-            tmp_check/log/
+            log/
             ci/.workdir/postgres.log
           if-no-files-found: ignore
           retention-days: 7
