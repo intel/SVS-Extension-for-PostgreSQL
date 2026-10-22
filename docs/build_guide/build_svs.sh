@@ -22,14 +22,18 @@ fi
 # had no effect.
 rm -rf "$SVS_BUILD_DIR"
 
+# The LVQ/LeanVec core is a prebuilt x86-64 library; set this to OFF on
+# targets it does not support (e.g. aarch64) to build only the open SVS core.
+SVS_ENABLE_LVQ_LEANVEC=${SVS_ENABLE_LVQ_LEANVEC:-ON}
+
 SVS_URL_ARGS=()
-[[ -n "$SVS_URL" ]] && SVS_URL_ARGS=(-DSVS_URL="$SVS_URL")
+[[ -n "$SVS_URL" && "$SVS_ENABLE_LVQ_LEANVEC" == ON ]] && SVS_URL_ARGS=(-DSVS_URL="$SVS_URL")
 
 cmake -S "${SVS_SRC_DIR}/bindings/c" \
       -B "$SVS_BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-      -DSVS_RUNTIME_ENABLE_LVQ_LEANVEC=ON \
+      -DSVS_RUNTIME_ENABLE_LVQ_LEANVEC="$SVS_ENABLE_LVQ_LEANVEC" \
       "${SVS_URL_ARGS[@]}" \
       -DCMAKE_INSTALL_PREFIX="$SVS_INSTALL_DIR"
 

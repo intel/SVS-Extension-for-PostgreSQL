@@ -50,6 +50,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: CPU info
+        run: lscpu | grep -E 'Architecture|Model name|Vendor|Flags'
+
       - name: Install compiler package (non-default only)
         if: matrix.cc != 'gcc'
         run: |
