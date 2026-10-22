@@ -32,17 +32,14 @@ jobs:
   build-and-test-arm:
     # Keeps the workflow run green when a step fails.
     continue-on-error: true
-    if: github.event_name != 'workflow_dispatch' || inputs.svs_variant == 'both' || inputs.svs_variant == matrix.svs_variant
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # stock: the same SVS build as the x86 workflow (expected to fail
-          # on aarch64, recorded as evidence). open-core: LVQ/LeanVec off.
-          - svs_variant: stock
-            svs_lvq_leanvec: "ON"
-          - svs_variant: open-core
-            svs_lvq_leanvec: "OFF"
+        # stock: the same SVS build as the x86 workflow (expected to fail on
+        # aarch64, recorded as evidence). open-core: LVQ/LeanVec off. The
+        # svs_variant dispatch input narrows this to one leg; every other
+        # event (inputs.svs_variant is null) runs both.
+        include: ${{ fromJSON(inputs.svs_variant == 'stock' && '[{"svs_variant":"stock","svs_lvq_leanvec":"ON"}]' || inputs.svs_variant == 'open-core' && '[{"svs_variant":"open-core","svs_lvq_leanvec":"OFF"}]' || '[{"svs_variant":"stock","svs_lvq_leanvec":"ON"},{"svs_variant":"open-core","svs_lvq_leanvec":"OFF"}]') }}
     runs-on: ubuntu-24.04-arm
     env:
       CC: gcc
