@@ -1305,7 +1305,8 @@ VamanaWorkerCatchUpSlots(bool savedThisIteration)
 static void
 VamanaWorkerConvergeSearchSlots(void)
 {
-	int held = SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
+	int			grant = (int) pg_atomic_read_u32(&VamanaWorkerShmemPtr->grantedSearchThreads);
+	int			held = SvsSlotSetResize(VamanaWorkerSearchSlots, grant);
 
 	pg_atomic_write_u32(&VamanaWorkerShmemPtr->registeredSearchSlots, (uint32) held);
 }
@@ -1344,8 +1345,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 	 * spawn loop ran, and the postmaster's SIGUSR1 on worker start fires
 	 * before workerPid above is set, so neither event wakes the launcher on
 	 * this worker's 0-to-nonzero liveness transition. Nothing else shortens
-	 * naptime, so without this kick a freshly enabled database would serve
-	 * at its zero-clamped-to-one grant for up to VAMANA_LAUNCHER_NAPTIME_MS.
+	 * naptime, so without this kick a freshly enabled database would wait up
+	 * to VAMANA_LAUNCHER_NAPTIME_MS for its grant. The reconcile it triggers
+	 * also completes the database's memory admission, which the startup
+	 * transaction's residency seed needs, so this kick must precede that
+	 * transaction.
+	 *
 	 * Safe here: VamanaWorkerEntryIsLive only needs a non-zero workerPid and
 	 * a non-stale heartbeat, and VamanaHeartbeatIsStale treats a never-beaten
 	 * worker as live.
@@ -1353,6 +1358,14 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 	SvsKickLauncher();
 
 	VamanaWorkerRunStartupTransaction(zeroIndexState, datname);
+
+	/*
+	 * The kick above can be served before the startup transaction has seeded
+	 * indexCount, in which case the launcher sees 0 after a restart and
+	 * withholds the search claim from a database that has indexes. Kick again
+	 * so a reconcile reads the seeded count.
+	 */
+	SvsKickLauncher();
 
 	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
 
@@ -1422,10 +1435,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		 * then hold zero slots indefinitely after such a restart. Do not
 		 * remove this poll in favor of relying on the kick alone.
 		 *
-		 * Resize to exactly what SvsCurrentSearchGrant() returns, with no
-		 * clamp of our own. The launcher owns the ceiling; a grant can never
-		 * exceed MAX_PARALLEL_WORKER_LIMIT (1024) in the first place, so
-		 * there is nothing here for a second clamp to guard against.
+		 * Resize to exactly the published grant, which may be 0 for a
+		 * database with no index yet; SvsCurrentSearchGrant()'s floor of 1
+		 * is for search threads, not for parked slots.  No clamp of our own.
+		 * The launcher owns the ceiling; a grant can never exceed
+		 * MAX_PARALLEL_WORKER_LIMIT (1024) in the first place, so there is
+		 * nothing here for a second clamp to guard against.
 		 */
 		VamanaWorkerConvergeSearchSlots();
 

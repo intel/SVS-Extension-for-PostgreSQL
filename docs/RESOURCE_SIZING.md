@@ -65,6 +65,10 @@ enrolled and live, not only while a search query is executing.** Once the launch
 database N search threads, those N slots are parked and unavailable to anything else, whether or
 not that database is currently being queried.
 
+Slots are held only once a database has at least one vamana index. A newly enrolled database,
+or one whose indexes have all been dropped, is granted no search threads and parks no slots, so
+its first `CREATE INDEX` is not competing with slots that have nothing to search.
+
 Size the pool for **how many databases you enroll, not how many queries run concurrently**:
 
 ```
@@ -83,11 +87,11 @@ only draw against elastic demand headroom, never against a database's floor. In 
 means a build in progress can shrink under pressure from search demand, but not the reverse: a
 build never reduces a database's protected floor.
 
-An unconfigured enrolled database (no `search_num_threads` override in `vamana_databases`)
-resolves to a **1-thread grant**. Concretely: `svs.max_databases` defaults to 8,
-`max_parallel_workers` defaults to 8, and **eight enrolled databases at stock settings hold the
-entire default parallel pool permanently, with zero SVS queries running**, leaving nothing for
-core parallel query or a parallel `CREATE INDEX`.
+An unconfigured enrolled database (no `search_num_threads` override in `vamana_databases`) that
+has a vamana index resolves to a **1-thread grant**. Concretely: `svs.max_databases` defaults to
+8, `max_parallel_workers` defaults to 8, and **eight enrolled databases with indexes at stock
+settings hold the entire default parallel pool permanently, with zero SVS queries running**,
+leaving nothing for core parallel query or a parallel `CREATE INDEX`.
 
 This is expected behavior, not a leak. If you see it, raise `max_parallel_workers` (and
 `max_worker_processes` with it, per the formula above) to the sum of what your enrolled databases
@@ -144,6 +148,15 @@ Two distinct problems produce a shortfall, and they call for different fixes:
   it could not register, which points at the `max_worker_processes` slot array being exhausted.
   Raise `max_worker_processes` (see §1); note this is restart-only, unlike
   `max_parallel_workers`.
+
+A `CREATE INDEX` that reports **`WARNING: vamana index build started N of M granted parallel
+workers`** was granted M threads but PostgreSQL started only N parallel workers, and the build proceeds
+with the smaller count. Parked search slots and other parallel workers count against
+`max_parallel_workers`, so check it first. Remember that it can be overridden per session
+(`SET max_parallel_workers`) and per role (`ALTER ROLE ... SET max_parallel_workers`), either
+of which takes precedence over the server setting; `SHOW max_parallel_workers` in the building
+session shows the value in effect. If the value is adequate, `max_worker_processes` may be
+exhausted instead.
 
 Two server log lines are usually the first signal an operator sees, before ever querying the
 view:
