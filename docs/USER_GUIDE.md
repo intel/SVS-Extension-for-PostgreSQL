@@ -968,7 +968,7 @@ FROM pg_stat_vamana_worker;
 | `search_threads_desired` | The thread count this database's search would use with no contention, before any cluster-wide sharing is applied |
 | `search_threads_granted` | The thread count the launcher has actually granted this database's search, after floors and elastic-remainder sharing across all enabled databases; what search uses right now |
 | `search_threads_reserved` | This database's reserved search-thread floor (`vamana_databases.search_threads_reserved`, or `0`/no floor if unset) |
-| `search_slots_registered` | Number of parked search-thread slots currently registered for this database, used to realize `search_threads_granted` as real, PostgreSQL-visible parallel workers |
+| `search_slots_registered` | Number of parked search-thread slots currently registered for this database, used to realize `search_threads_granted` as real, PostgreSQL-visible parallel workers; `0` until the database has at least one vamana index |
 | `max_search_threads_per_db` | The resolved per-database ceiling in effect (`svs.max_search_threads_per_db`, or the per-database override) |
 
 `pg_stat_vamana_worker_slot` reports one row per worker request slot per visible database — including idle (`empty`) slots, not just in-flight ones — for finer-grained diagnosis of what a worker is currently processing (`slot_status`, `slot_kind`, `index_relid`, `error_message`, `search_scratch_bytes_per_query`).
