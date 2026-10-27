@@ -13,35 +13,30 @@ A PostgreSQL extension that adds the **Vamana** approximate nearest neighbor (AN
 - Dynamic index: incremental `INSERT` and `DELETE` without full rebuilds
 - On-disk persistence — index survives server restarts
 - Background worker for a shared index cache across backends
-- AVX-512 optimizations on Intel Xeon processors
 
 ## Requirements
 
 | Dependency | Version |
 |---|---|
 | PostgreSQL | 18.1+ |
-| pgvector extension | latest |
+| pgvector extension | 0.8.2+ |
 | Intel SVS C API (`libsvs_c_api.so`) | see [build guide](docs/build_guide/README.md) |
 | GCC | 11+ |
-| CMake | 3.24+ (for building SVS) |
 | `gcovr` | 5.0+ — optional, only for `make coverage` ([coverage guide](docs/dev/CODE_COVERAGE.md)) |
 
-An Intel Xeon processor with AVX-512 is recommended for best performance. The extension works on any x86_64 platform but falls back to scalar code.
+An Intel Xeon processor with AVX-512 is recommended for best performance. The Vamana index runs on x86-64 CPUs from any vendor. LeanVec and LVQ compression are supported only on Intel CPUs; on other CPUs, creating a compressed index fails with an error.
 
-**Linux only.** The extension and its SVS dependency are only supported on Linux; there is no macOS or Windows support.
+**Linux x86-64 only.** The extension and its SVS dependency are only supported on Linux x86-64; there is no ARM, macOS or Windows support.
 
 ## Building
 
-Building SVS and the extension involves compiling Intel's SVS C API, then building the extension against it. See the [build guide](docs/build_guide/README.md) for the full sequence, prerequisites, and an all-in-one build script.
-
-```bash
-make          # build the extension (SVS_INSTALL must point at your SVS install prefix)
-make install
-```
+See the [build guide](docs/build_guide/README.md) for the full sequence, prerequisites, and an all-in-one build script.
 
 Coverage instrumentation is opt-in and off by default; build with `make COVERAGE=1` to enable it. See the [coverage guide](docs/dev/CODE_COVERAGE.md).
 
 ## Quick Start
+
+Before you start, set the required server settings (for example `wal_level = logical`) and enroll your database. See [Required PostgreSQL settings](docs/build_guide/README.md#required-postgresql-settings).
 
 ```sql
 CREATE EXTENSION vector;
@@ -66,35 +61,42 @@ The extension implements a PostgreSQL index access method backed by a per-databa
 
 ## Running Tests
 
-Build, install, and run both suites in one chain, so the tests always exercise
-what was just built rather than whatever `svs.so` happens to already be
-installed:
+Set `SVS_INSTALL` (SVS install prefix) and `PG_CONFIG` (path to `pg_config`) if they are not in the default locations. The `all-in-one` build in the [build guide](docs/build_guide/README.md) sets both.
 
-### SQL regression tests
+Build and install the extension:
+
 ```bash
-make && make install && make installcheck && make prove_installcheck
+make SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config
+make install SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config
 ```
 
-`installcheck` and `prove_installcheck` refuse to run if the installed
-`svs.so` differs from the one just built; run `make install` first if you see
-that error.
+Then start the server with the settings in [Required PostgreSQL settings](docs/build_guide/README.md#required-postgresql-settings). The tests need a running server.
 
-`installcheck` excludes tests that build real LeanVec or LVQ compressed
-indexes, since those require hardware most CI runners lack. Run them
-separately, on hardware that supports it:
+<sub>**Note:** `installcheck` and `prove_installcheck` refuse to run if the installed `svs.so` differs from the one just built. Run `make install` first if you see that error.</sub>
+
+### SQL regression tests
 
 ```bash
-make installcheck-hw
+make installcheck SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config
 ```
 
 ### Perl TAP tests (background worker, persistence)
-`prove_installcheck` has the same exclusion on the TAP side, for the same
-reason: `39_persistence_compression.pl` and
-`44_build_memory_calibration_compression.pl` build real LeanVec/LVQ indexes.
-Run them separately, on hardware that supports it:
 
 ```bash
-make prove_installcheck-hw
+make prove_installcheck SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config
+```
+
+### Hardware dependent tests
+
+`installcheck` and `prove_installcheck` exclude tests that build real LeanVec or LVQ compressed indexes (`halfvec_compression`, `vector_compression`, `39_persistence_compression.pl`, `44_build_memory_calibration_compression.pl`). These need AVX-512 hardware, which most CI runners lack. Run them separately, on hardware that supports it:
+
+```bash
+make installcheck-hw SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config
+make prove_installcheck-hw SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config
 ```
 
 Test files are in `test/sql/` and `test/t/`.
+
+## Known Limitations and Performance
+
+See [Known Limitations](docs/dev/ARCHITECTURE.md#84-known-limitations) for performance considerations and current limits, such as searches waiting during writes.
