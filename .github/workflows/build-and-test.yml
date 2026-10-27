@@ -106,6 +106,7 @@ jobs:
             regression.out
             results/
             tmp_check/log/
+            log/
             ci/.workdir/postgres.log
           if-no-files-found: ignore
           retention-days: 7
