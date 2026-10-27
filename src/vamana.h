@@ -145,7 +145,7 @@ typedef struct VamanaOptions
 	int			leanvec_dims;		/* LeanVec dimensions (-1 = dimensions/2; unused by LVQ) */
 }			VamanaOptions;
 
-/* Search window size: svs.search_window_size GUC, else opts' reloption, else the default. */
+/* Search window size: the svs.search_window_size GUC. The reloption is not currently used (the GUC minimum of 10 means it always applies). */
 extern int VamanaResolveSearchWindowSize(const VamanaOptions *opts);
 
 /*

@@ -1275,8 +1275,8 @@ These GUCs are `PGC_POSTMASTER` only when `svs` is in `shared_preload_libraries`
 | `svs.checkpoint_debounce_window` | `300s` | `0` | `86400s` | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | `1s` | `86400s` | Maximum time between checkpoints; safety net for constant-write workloads |
 | `svs.checkpoint_min_ops` | `10000` | `0` | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
-| `svs.checkpoint_operations` | `-1` (off) | `-1` | — | Legacy op-count checkpoint trigger; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
-| `svs.checkpoint_interval` | `-1` (off) | `-1` | `86400` | Legacy time-based checkpoint trigger in seconds; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_operations` | `-1` (off) | `-1` | — | Simple op-count checkpoint trigger; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_interval` | `-1` (off) | `-1` | `86400` | Simple time-based checkpoint trigger in seconds; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
 
 ### SQL Functions
 
