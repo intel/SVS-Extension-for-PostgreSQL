@@ -8,6 +8,7 @@
 # Stable observables only:
 #   - backend_type = 'vamana search slot'  (SvsSlotKindBgwType; not under review)
 #   - pg_stat_vamana_worker.search_threads_desired / _granted / _reserved
+#   - pg_stat_vamana_worker.search_slots_registered
 #   - pg_stat_vamana_worker.worker_pid / heartbeat_ts
 #   - absence of "exited with exit code" / "Segmentation fault" in the log
 #   - whether a plain core parallel query gets workers from the shared pool
@@ -380,31 +381,11 @@ is($pid_after_12, $pg_worker_pid,
         CREATE EXTENSION svs;
     ));
 
-    # Resolved before the enabling INSERT below, not after: the not-yet-live
-    # window this case samples for is a one-shot transient (0 published once,
-    # then never again), so any query latency spent between the INSERT and
-    # the first sample eats directly into the only chance to observe it.
     my $fresh_oid = db_oid($node, 'fresh_db');
 
-    # Case 3: sample repeatedly while the published grant is still 0 (the
-    # not-yet-live window). STATIC-HOLD ASSUMPTION: expects 0 held slots
-    # throughout this window, not the eventual configured grant of 5.
-    #
-    # Measured by hand against a scratch cluster: with the launcher kicked
-    # promptly once the worker publishes its own workerPid, the whole span
-    # from the enabling INSERT to the worker's startup log
-    # line is single-digit milliseconds. A one-shot transient that short
-    # cannot be sampled by spawning a new psql client process per poll --
-    # each spawn alone costs more than the entire window. Both the INSERT
-    # and every poll below therefore run over background_psql sessions
-    # already connected before the INSERT fires, so the only latency left
-    # between "grant published as 0" and "this poll observes it" is one
-    # protocol round trip, not a process fork/exec/connect/authenticate
-    # cycle.
-    #
     # fresh_db needs a vamana index to hold slots at all, and an index can
     # only be created in an enabled database. So enroll it, index it, and
-    # disable it again before the timed re-enable below.
+    # disable it again before the re-enable below.
     $node->safe_psql('postgres',
         "INSERT INTO vamana_databases (datname, enabled, search_num_threads) "
       . "VALUES ('fresh_db', true, 5);");
@@ -426,70 +407,50 @@ is($pid_after_12, $pg_worker_pid,
         last if $alive eq '0';
     }
 
-    my $ctl = $node->background_psql('postgres');
-    my $poll = $node->background_psql('postgres');
+    # Case 3: the not-yet-live window. It lasts only from the reconcile that
+    # spawns the worker until the worker's own kick, a few milliseconds, so
+    # it cannot be observed by polling; the spawned worker is held just
+    # before it publishes its pid instead, which keeps the window open.
+    my $hold_worker = ($ENV{enable_injection_points} // 'no') eq 'yes';
+    if ($hold_worker)
+    {
+        $node->safe_psql('postgres', "CREATE EXTENSION IF NOT EXISTS injection_points;");
+        $node->safe_psql('postgres',
+            "SELECT injection_points_attach('vamana-worker-before-publish-pid', 'wait');");
+    }
 
     my $t0 = [gettimeofday];
-    $ctl->query_safe(
+    $node->safe_psql('postgres',
         "UPDATE vamana_databases SET enabled = true WHERE datname = 'fresh_db';");
 
-    my $saw_zero_grant_window = 0;
-    my $slots_threads_ever_disagreed = 0;
-    for (1 .. 4000)    # tight for ~2s, then the coarser waits below take over
-    {
-        # Both columns are read from the same $poll session, back to back,
-        # in one round trip each over an already-open connection. Reading
-        # the held count via a freshly spawned safe_psql process here (as
-        # search_slot_count does everywhere else in this file) would add
-        # tens of milliseconds of fork/exec/connect latency between the two
-        # reads -- long enough, confirmed by hand, for the real system to
-        # have already converged past the instant the grant was sampled at,
-        # making the two columns describe two different moments in time
-        # rather than one.
-        my $g = $poll->query_safe(
-            "SELECT search_threads_granted FROM pg_stat_vamana_worker "
+    SKIP: {
+        skip 'server not built with --enable-injection-points', 2
+          if !$hold_worker;
+
+        $node->wait_for_event('vamana worker', 'vamana-worker-before-publish-pid');
+
+        # A disabled database's row keeps its last grant of 5, so a 0 here
+        # was published by the re-enable's own reconcile.
+        is(granted_for_db($node, $fresh_oid), '0',
+            "case 3: the published grant is 0 while the spawned worker is not yet live");
+
+        # The held worker has already converged its slots on that 0 grant.
+        # Read the worker's own count, not pg_stat_activity: a slot parked
+        # before workerPid is published fails its first owner check and
+        # exits at once, so an activity count of 0 cannot tell "parked none"
+        # from "parked one that already exited".
+        my $registered = $node->safe_psql('postgres',
+            "SELECT search_slots_registered FROM pg_stat_vamana_worker "
           . "WHERE db_oid = $fresh_oid;");
-        chomp $g;
-        next unless $g ne '';
-        if ($g == 0)
-        {
-            $saw_zero_grant_window = 1;
+        is($registered, '0',
+            "case 3: the not-yet-live worker parks no slot, "
+          . "never the eventual grant of 5");
 
-            # The worker parks exactly the published grant, so 0 slots are
-            # held while the grant reads 0. Only a nonzero count with the
-            # grant still reading 0 afterward is a disagreement; if the
-            # grant moved off 0 between the two reads, this window is over
-            # and the count says nothing about it.
-            my $held = $poll->query_safe(
-                "SELECT count(*) FROM pg_stat_activity "
-              . "WHERE backend_type = 'vamana search slot' "
-              . "AND application_name LIKE '%db=fresh_db';");
-            chomp $held;
-
-            my $g2 = $poll->query_safe(
-                "SELECT search_threads_granted FROM pg_stat_vamana_worker "
-              . "WHERE db_oid = $fresh_oid;");
-            chomp $g2;
-
-            $slots_threads_ever_disagreed = 1
-              if $held ne '0' && $g2 eq '0';
-        }
-        else
-        {
-            # A disabled database's row keeps its last-known grant until the
-            # re-enable's first reconcile publishes 0, so a nonzero read
-            # before the window has opened is stale, not the window's end.
-            last if $saw_zero_grant_window;    # grant has moved off 0
-        }
+        $node->safe_psql('postgres',
+            "SELECT injection_points_detach('vamana-worker-before-publish-pid');");
+        $node->safe_psql('postgres',
+            "SELECT injection_points_wakeup('vamana-worker-before-publish-pid');");
     }
-    $ctl->quit;
-    $poll->quit;
-
-    ok($saw_zero_grant_window,
-        "case 3: observed the not-yet-live window where the published grant is 0");
-    ok(!$slots_threads_ever_disagreed,
-        "case 3: during the zero-grant window, no slot is held, "
-      . "never the eventual grant of 5");
 
     # Now wait, bounded well under the 180s naptime, for convergence to the
     # configured grant of 5.
@@ -858,6 +819,10 @@ if (($ENV{enable_injection_points} // 'no') eq 'yes')
     # crash, then self-terminate once SvsSlotOwnerIsAlive notices workerPid
     # no longer matches.  Placed last for the same reason as case 12.
     #
+    # The launcher is held across the crash.  Its dead-entry cleanup is what
+    # clears workerPid, so without the hold an orphan can reach its next
+    # owner poll and exit before the survivors are sampled.
+    #
     # fresh_db is disabled again for the same reason as in case 12: its
     # worker, now holding slots of its own, would otherwise be the one to
     # trip the injection points instead of 'postgres'.
@@ -889,6 +854,13 @@ if (($ENV{enable_injection_points} // 'no') eq 'yes')
 
     my $log_pos13 = length($node->log_content());
 
+    # Any write to vamana_databases wakes the launcher onto the hook.
+    $node->safe_psql('postgres',
+        "SELECT injection_points_attach('vamana-launcher-before-reconcile', 'wait');");
+    $node->safe_psql('postgres',
+        "UPDATE vamana_databases SET search_num_threads = 3 WHERE datname = 'postgres';");
+    $node->wait_for_event('vamana launcher', 'vamana-launcher-before-reconcile');
+
     $node->safe_psql('postgres',
         "SELECT injection_points_attach('vamana-search-slot-release-crash', 'error');");
     $node->safe_psql('postgres',
@@ -907,6 +879,11 @@ if (($ENV{enable_injection_points} // 'no') eq 'yes')
     ok(scalar(@survivors_right_after_crash) > 0,
         "case 13: the crashed worker's search slots outlive it when its own "
       . "release-on-exit callback fails");
+
+    $node->safe_psql('postgres',
+        "SELECT injection_points_detach('vamana-launcher-before-reconcile');");
+    $node->safe_psql('postgres',
+        "SELECT injection_points_wakeup('vamana-launcher-before-reconcile');");
 
     my $all_pre13_gone = '';
     for (1 .. 60)    # up to 30s: bounded by SVS_PARKED_SLOT_OWNER_POLL_MS
