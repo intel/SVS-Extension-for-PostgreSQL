@@ -1,15 +1,15 @@
 # SVS Vamana Index Integration Architecture for pgvector
 
 ## Table of Contents
-1. [Executive Summary](#executive-summary)
-2. [Background](#background)
-3. [Architecture Overview](#architecture-overview)
-4. [Detailed Design](#detailed-design)
-5. [ACID Compliance](#acid-compliance)
-6. [GUC Parameters](#guc-parameters)
-7. [Integration Points](#integration-points)
-8. [Performance Considerations](#performance-considerations)
-9. [Security Objectives](#security-objectives)
+1. [Executive Summary](#1-executive-summary)
+2. [Background](#2-background)
+3. [Architecture Overview](#3-architecture-overview)
+4. [Detailed Design](#4-detailed-design)
+5. [ACID Compliance](#5-acid-compliance)
+6. [GUC Parameters](#6-guc-parameters)
+7. [Integration Points](#7-integration-points)
+8. [Performance Considerations](#8-performance-considerations)
+9. [Security Objectives](#9-security-objectives)
 
 ---
 
@@ -100,7 +100,7 @@ LVQ and LeanVec are **not open-source**. They are distributed in binary form onl
 
 The extension entry point initializes the access method and registers GUCs, the object-access hook, and a background worker *launcher* at server start. The launcher supervises one background worker per enabled database; see [BGW_LAUNCHER.md](BGW_LAUNCHER.md) for the full launcher and per-database worker model. Throughout this document, "the BGW" or "the worker" refers to the per-database worker serving the database an operation runs in. The index access method handler implements the PostgreSQL AM interface and dispatches to the appropriate subsystem for each operation.
 
-The build subsystem performs a full heap scan, buffers all vectors in memory, calls the SVS dynamic build API to construct the mutable graph, serializes it to disk, creates the replication slot, and submits a synchronous LOAD request to the BGW before returning. The insert subsystem routes each incoming vector through the BGW via IPC, where it is added incrementally to the live graph and recorded in the per-transaction undo log. The scan subsystem executes ANN queries by submitting search requests to the BGW and mapping returned SVS indices back to heap TIDs via the TID mapping. The vacuum subsystem collects dead TIDs from the heap callback and submits batched delete, consolidate, and compact requests to the BGW.
+The build subsystem performs a full heap scan, buffers all vectors in memory, calls the SVS dynamic build API to construct the mutable graph, serializes it to disk, and submits a synchronous LOAD request to the BGW before returning; the BGW creates the replication slot while handling that request. The insert subsystem routes each incoming vector through the BGW via IPC, where it is added incrementally to the live graph and recorded in the per-transaction undo log. The scan subsystem executes ANN queries by submitting search requests to the BGW and mapping returned SVS indices back to heap TIDs via the TID mapping. The vacuum subsystem collects dead TIDs from the heap callback and submits batched delete, consolidate, and compact requests to the BGW.
 
 The BGW subsystem owns the in-memory SVS index state for all indexes in its database, processes IPC slots from backends (search, insert, delete, maintenance), manages the replication slot, and performs periodic checkpoints. Indexes are loaded on demand (on first access), not eagerly at worker startup. The undo log subsystem records external IDs inserted within each transaction and submits compensating BGW deletes on transaction abort. The SVS wrapper layer provides a thin, PostgreSQL-friendly interface over the Intel SVS C API for all graph operations.
 
@@ -120,24 +120,24 @@ SVS provides a high-level batch build API with internal parallelism management.
 - **SVS manages parallelism internally** via threads
 - **No manual shared memory management** required for build
 - **Build and search thread counts are both launcher-governed, through the same grant calculator:** a build backend requests a thread count (`maintenance_num_threads` from `vamana_databases`, falling back to `max_parallel_maintenance_workers` when unset) and blocks until the launcher grants it from the database's CPU budget; search reads its last-published grant (derived from `svs.search_num_threads` and its per-database/cluster ceilings) non-blockingly instead of waiting on one
-- **Dynamic index:** Uses `svs_index_build_dynamic` to produce a mutable index; INSERT calls `SVSAddPoints` for incremental updates, DELETE + VACUUM calls `SVSDeletePoints` with consolidation and compaction
+- **Dynamic index:** Uses `svs_index_build_dynamic` to produce a mutable index; INSERT calls `SVSAddPoints` for incremental updates, DELETE + VACUUM calls `SVSDeletePoints` with consolidation, and with compaction when the deleted fraction exceeds `svs.compact_threshold_pct`
 - **Must buffer vectors:** All vectors loaded into memory before build
 
 ### 4.2 On-Disk Serialization
 
-After the SVS batch build completes, the index is serialized to a directory on the filesystem using `VamanaGetIndexSavePath()`. The path is keyed by the index's relation OID. The metapage stores `hasSavedIndex`, `indexDataBlkno`, and `indexDataSize` to track serialization state. Immediately after serialization, `vamanabuild` creates a logical replication slot (`vamana_<db>_<idx>`) with `confirmed_flush_lsn` set to the current WAL flush position. This anchors the slot LSN to the exact point where the on-disk state is complete, ensuring crash recovery replays only changes committed after that point.
+After the SVS batch build completes, the index is serialized to a directory on the filesystem using `VamanaGetIndexSavePath()`. The path is keyed by the database OID and the index's relation OID. The metapage stores `hasSavedIndex`, `indexDataBlkno`, and `indexDataSize` to track serialization state. When the BGW handles the LOAD request that follows serialization, it creates a logical replication slot (`vamana_<dboid>_<indexoid>`) with `confirmed_flush_lsn` set to the current WAL flush position. The BGW creates the slot because slot creation cannot run inside the backend's write transaction. This anchors the slot LSN to the exact point where the on-disk state is complete, ensuring crash recovery replays only changes committed after that point.
 
-Indexes are loaded on demand: on the first access to an index, `LoadIndexFromPages()` reads the saved index from disk. If no saved copy exists, `VamanaRebuildFromTable()` performs an in-memory rebuild from the heap. (The worker no longer eagerly loads every index at startup; see [BGW_LAUNCHER.md](BGW_LAUNCHER.md).) Loading also restores the TID map sidecar file (`tidmap.bin`, one `ItemPointerData` per allocated slot, written atomically via temp-file + rename) and the metapage's dynamic-index fields (`tidMappingCapacity`, `nextExternalId`, `numDeleted`) into the in-memory cache. `hasSavedIndex` and the dynamic fields are flipped to their final values together, in a single WAL-logged transaction, only after the on-disk files are durable.
+Indexes are loaded on demand: on the first access to an index, `LoadIndexFromPages()` reads the saved index from disk. If no saved copy exists, `VamanaRebuildFromTable()` performs an in-memory rebuild from the heap. (The worker does not eagerly load every index at startup; see [BGW_LAUNCHER.md](BGW_LAUNCHER.md).) Loading also restores the TID map sidecar file (`tidmap.bin`, one `ItemPointerData` per allocated slot, written atomically via temp-file + rename) and the metapage's dynamic-index fields (`tidMappingCapacity`, `nextExternalId`, `numDeleted`) into the in-memory cache. `hasSavedIndex` and the dynamic fields are flipped to their final values together, in a single WAL-logged transaction, only after the on-disk files are durable.
 
 An object-access hook (`VamanaInstallObjectAccessHook`) cleans up the on-disk save directory when an index or its parent table is dropped.
 
 ### 4.3 Insert and Vacuum Behavior
 
-**Inserts:** `vamanainsert` calls `VamanaWorkerWaitUntilAvailable` before submitting, then routes the insert through the background worker (slot kind `VAMANA_SLOTKIND_INSERT`). The worker calls `SVSAddPoints` to add the new vector incrementally to the live in-memory index. External IDs are allocated from a counter held in the BGW's in-memory cache (`cache->nextExternalId`); the latest value is written back to the metapage by `VamanaWriteMetaPageDynamic` so the counter survives restart. The inserting backend records the new external ID in the per-transaction undo log (`VamanaUndoAppend`); on transaction ABORT, the registered XactCallback submits a BGW DELETE for each logged ID to roll back the in-memory graph state. All indexes are born dynamic; there is no static-only fallback path for inserts.
+**Inserts:** `vamanainsert` calls `VamanaWorkerWaitUntilAvailable` before submitting, then routes the insert through the background worker (slot kind `VAMANA_SLOTKIND_INSERT`). The worker calls `SVSAddPoints` to add the new vector incrementally to the live in-memory index. External IDs are allocated from a counter held in the BGW's in-memory cache (`cache->nextExternalId`); the latest value is written back to the metapage by `VamanaWriteMetaPageDynamic` so the counter survives restart. The inserting backend records the new external ID in the per-transaction undo log (`VamanaUndoAppend`); on transaction ABORT, the registered XactCallback submits a BGW DELETE for each logged ID to roll back the in-memory graph state.
 
 The worker loads indexes on demand, not eagerly at startup, so the first insert against an index it hasn't cached yet (e.g. immediately after a server restart) triggers a synchronous load via `VamanaWorkerGetOrLoadIndex`: try `LoadIndexFromPages`, falling back to `VamanaRebuildFromTable` if no saved copy exists. Subsequent inserts find the index already cached and take the fast path.
 
-**Vacuum:** `vamanabulkdelete` iterates the TID mapping, calls PostgreSQL's dead-tuple callback for each live entry, and batches dead IDs to the BGW via `VamanaWorkerSubmitDelete`. `vamanavacuumcleanup` submits `CONSOLIDATE` and `COMPACT` requests to the BGW via `VamanaWorkerSubmitMaintenance`. The BGW calls `SVSDeletePoints`, `SVSConsolidate`, and `SVSCompact` respectively, and updates the metapage counters atomically after each operation.
+**Vacuum:** `vamanabulkdelete` iterates the TID mapping, calls PostgreSQL's dead-tuple callback for each live entry, and batches dead IDs to the BGW via `VamanaWorkerSubmitDelete`. `vamanavacuumcleanup` submits a `CONSOLIDATE` request to the BGW via `VamanaWorkerSubmitMaintenance` when there are deleted entries, and a `COMPACT` request only when the deleted fraction exceeds `svs.compact_threshold_pct`. The BGW calls `SVSDeletePoints`, `SVSConsolidate`, and `SVSCompact` respectively, and updates the metapage counters atomically after each operation.
 
 **Known Limitation:** `PREPARE TRANSACTION` (two-phase commit / 2PC) is not supported on any transaction that has inserted into a Vamana index. The undo log implementation raises `ERRCODE_FEATURE_NOT_SUPPORTED` at prepare time. This is a fundamental constraint of the in-memory undo log design: prepared state cannot be persisted to disk and resumed by a later `COMMIT PREPARED`. Users with `max_prepared_transactions > 0` or distributed 2PC coordinators (e.g., Citus, XA drivers) must avoid issuing `PREPARE TRANSACTION` on transactions that touch Vamana indexes.
 
@@ -147,14 +147,14 @@ Vamana index state lives in background worker processes, one per enabled databas
 
 **Request serving:**
 - The per-database shared-memory region contains a per-backend slot array plus variable-length areas for query vectors, result TIDs, and distances
-- Each slot has a kind (`VAMANA_SLOTKIND_SEARCH`, `_INSERT`, `_DELETE`, `_MAINTENANCE`, `_LOAD`); backends set the kind and data, set status `PENDING`, and wait on a shared latch
+- Each slot has a kind (`VAMANA_SLOTKIND_SEARCH`, `_INSERT`, `_DELETE`, `_MAINTENANCE`, `_LOAD`, `_WARMUP`); backends set the kind and data, set status `PENDING`, and wait on a shared latch
 - The worker drains all pending slots each cycle: SEARCH slots are batched and dispatched to `SVSSearch`; write slots (`INSERT`, `DELETE`, `MAINTENANCE`) are dispatched one at a time via `VamanaWorkerProcessWriteSlot`
 - If the worker is unavailable or startup times out (controlled by `svs.worker_startup_timeout_ms`), the backend throws an error rather than silently falling back
-- Per-index LWLocks (`VamanaIndexLockSlot`, up to `VAMANA_MAX_INDEXES = 64` live indexes) serialize concurrent write operations within the worker. Writers acquire the lock `LW_EXCLUSIVE`; searches acquire it `LW_SHARED`, so concurrent searches proceed together and only block against an in-progress writer on the same index
-- On restart, the worker loads each index's last checkpoint from disk on first access, opens the persisted replication slot, and replays all committed changes from the slot's `restart_lsn` forward before serving the first request against that index
+- Per-index LWLocks (`VamanaIndexLockSlot`, up to `VAMANA_MAX_INDEXES = 64` live indexes) guard each live index's state. Writers acquire the lock `LW_EXCLUSIVE`; searches acquire it `LW_SHARED`. The worker main loop handles requests one at a time, so a write in progress delays every search in the database (see [8.4](#84-known-limitations))
+- On restart, the worker loads each index's last checkpoint from disk on first access, opens the persisted replication slot, and replays all committed changes made after the last checkpoint before serving the first request against that index
 - Reload signaling: for edge cases such as TRUNCATE or REINDEX, backends write to `reloadRequests[]` to signal index invalidation; the worker reloads the affected index on its next cycle. Normal write-path state synchronization uses replication slot replay, not reload signals
 
-**Checkpoint and durability:** The BGW periodically checkpoints the in-memory SVS graph to disk using an atomic 5-phase sequence: write to temp files, fsync, rename, fsync directory, advance the replication slot. The slot advance is the final step — it marks the on-disk state as durable and bounds the WAL that PostgreSQL must retain. Between checkpoints, the BGW continuously applies committed changes from the slot to the in-memory graph. Checkpoint frequency is governed by the debounce GUCs (`svs.checkpoint_min_ops`, `svs.checkpoint_debounce_window`, `svs.checkpoint_max_interval`). A deliberate stop (database pause or explicit restart) drains and checkpoints every cached index before exiting — see [BGW_LAUNCHER.md](BGW_LAUNCHER.md). See Section 5 for the full recovery and idempotency design.
+**Checkpoint and durability:** The BGW periodically checkpoints the in-memory SVS graph to disk using an atomic 5-phase sequence: write to temp files, fsync, rename, fsync directory, advance the replication slot. The slot advance is the final step — it marks the on-disk state as durable and bounds the WAL that PostgreSQL must retain. Between checkpoints, the BGW continuously applies committed changes from the slot to the in-memory graph. Checkpoint frequency is governed by the debounce GUCs (`svs.checkpoint_min_ops`, `svs.checkpoint_debounce_window`, `svs.checkpoint_max_interval`) or, when set, the simple triggers `svs.checkpoint_operations` and `svs.checkpoint_interval`. A deliberate stop (database pause or explicit restart) drains and checkpoints every cached index before exiting — see [BGW_LAUNCHER.md](BGW_LAUNCHER.md). See Section 5 for the full recovery and idempotency design.
 
 **Transaction safety:** Inserts are logged to a per-transaction undo log. On ABORT, an XactCallback/SubXactCallback submits BGW DELETE operations for each logged insert, rolling back the in-memory graph state. On COMMIT, the undo log is discarded.
 
@@ -165,8 +165,6 @@ Workers require the extension to be loaded via `shared_preload_libraries = 'svs'
 Vamana indexes support `vector` (float32) and `halfvec` (float16) types. `sparsevec` and `bit` are not supported.
 
 The indexed column's type is resolved from the relation (`VamanaGetTypeInfo`, `src/vamanautils.c`), which yields both the element width to read a heap datum at and the SVS storage element type to build and load with — float32 for `vector`, float16 for `halfvec`. The SVS C API only accepts `float` arrays, so a `halfvec` datum is widened on the way in and stored back down to float16 by SVS; the storage type is therefore a separate choice from the datum width. Build and load must name the same storage type or the saved index will not reload, so every storage site takes it from this one source. Under `compression_type` 1 or 2 the compressed spec owns the stored format and the storage element type is not consulted.
-
-Because the type is derived from the relation rather than recorded on the metapage, a `halfvec` index built before float16 storage was introduced fails to load and is rebuilt from the table; `REINDEX` resolves it.
 
 | Operator Class | Type | Distance Operator | Metric |
 |---|---|---|---|
@@ -187,19 +185,19 @@ Two progress phases are reported via `pg_stat_progress_create_index`:
 
 Dynamic behavior is split across the same files listed in §3.1: `vamanabuild.c` builds via `SVSBuildDynamicIndex`; `vamanainsert.c`'s `vamanainsert` routes through `VamanaWorkerSubmitInsert`; `vamanavacuum.c`'s `vamanabulkdelete` and `vamanavacuumcleanup` route through `VamanaWorkerSubmitDelete` and `VamanaWorkerSubmitMaintenance`; `vamanautils.c` holds `VamanaRebuildFromTable` and `VamanaWriteMetaPageDynamic`; and `vamanascan.c`'s `LoadIndexFromPages` calls `SVSLoadDynamicIndex`, with `SVSSearch` skipping any slot marked `InvalidItemPointer` (soft-delete).
 
-**Metapage fields.** Beyond the static-index fields, the metapage (`VamanaMetaPageData`) carries three fields specific to dynamic indexes: `nextExternalId`, `numDeleted`, and `tidMappingCapacity`.
+**Metapage fields.** In addition to the base fields, the metapage (`VamanaMetaPageData`) carries three fields that track the mutable index: `nextExternalId`, `numDeleted`, and `tidMappingCapacity`.
 
-- `nextExternalId` — SVS external IDs must be unique for the life of the index. The metapage is the single source of truth across backends; the BGW reads it while holding the exclusive per-index LWLock, passes the value to `SVSAddPoints`, and writes `value+1` back.
+- `nextExternalId` — SVS external IDs must be unique for the life of the index. While an index is loaded, the BGW's cached counter is authoritative: the BGW passes it to `SVSAddPoints` under the exclusive per-index LWLock and increments it. The BGW writes it to the metapage after writes, and reloads it from the metapage when the index is loaded.
 - `numDeleted` — drives the `SVSCompact` decision threshold (`svs.compact_threshold_pct`) and reports deletion pressure.
 - `tidMappingCapacity` — after deletes, the TID mapping array has holes. `numVectors` tracks live entries; `tidMappingCapacity` tracks the allocated length, which is what the sidecar `tidmap.bin` file serializes. Search bounds-checks against the capacity, then filters out `InvalidItemPointer` slots.
 
-**In-memory cache.** The BGW's per-process cache (`VamanaIndexCache`) mirrors the metapage and adds runtime-only fields (`svsIndex`, `isValid`, `memCtx`, `tidMapping`, `needsSave`). Its `nextExternalId` is a mirror of the metapage, not authoritative — the BGW re-reads the metapage while holding the exclusive per-index LWLock before assigning an ID, so assignment stays monotonic even if the cached value is stale.
+**In-memory cache.** The BGW's per-process cache (`VamanaIndexCache`) mirrors the metapage and adds runtime-only fields (`svsIndex`, `isValid`, `memCtx`, `tidMapping`, `needsSave`). While the index is loaded, the cached `nextExternalId` is the counter the BGW uses to assign IDs, under the exclusive per-index LWLock; the BGW persists it to the metapage after each write and reloads it from the metapage when the index is loaded.
 
 ### 4.8 Read Path and Soft-Delete Semantics
 
-`SVSSearch` is the query-time hot path; two changes affect reads under dynamic indexes:
+`SVSSearch` is the query-time hot path; two mechanisms apply to reads:
 
-- **Bounds check widened to `tidMappingCapacity`.** Static indexes always had `numVectors == tidMappingCapacity`. Dynamic indexes can have `tidMappingCapacity > numVectors` because deleted slots stay allocated (as holes) until compaction, so SVS may return indices up to the full capacity. The search loop in `svs_wrapper.c` bounds-checks against `cachedIndex->tidMappingCapacity` rather than `numVectors`.
+- **Bounds check widened to `tidMappingCapacity`.** `tidMappingCapacity` can exceed `numVectors` because deleted slots stay allocated (as holes) until compaction, so SVS may return indices up to the full capacity. The search loop in `svs_wrapper.c` bounds-checks against `cachedIndex->tidMappingCapacity` rather than `numVectors`.
 - **Soft-delete filtering.** The search loop skips any slot whose TID is `InvalidItemPointer`. This is the read-side half of the bulk-delete protocol (§5.2): between VACUUM's write-lock release and the next `SVSConsolidate`, SVS may still surface deleted vectors as candidates, and this filter ensures they never reach the client. Because the filter can drop results, the loop tracks a separate "surviving results" counter rather than reusing the raw SVS result index — the returned result count may be less than the requested `k`, matching the existing pgvector contract for sparse result sets.
 
 ---
@@ -210,9 +208,9 @@ The Vamana index stores its graph structure in a background worker (BGW) process
 
 | Property | Mechanism |
 |---|---|
-| **Atomicity** | BGW undo log for in-flight transactions; WAL slot filtering as safety net |
+| **Atomicity** | Per-transaction backend undo log for in-flight transactions; WAL slot filtering as safety net |
 | **Consistency** | VACUUM as authoritative dead-entry scanner; idempotent replay prevents divergence |
-| **Isolation** | Delegated to PostgreSQL's MVCC layer — dead or aborted heap TIDs are filtered by `HeapTupleSatisfiesVisibility` before results are returned, so stale graph entries never surface to queries |
+| **Isolation** | Delegated to PostgreSQL's MVCC layer — dead or aborted heap TIDs are filtered by the heap fetch's MVCC visibility check before results are returned, so stale graph entries never surface to queries |
 | **Durability** | Logical replication slot + atomic checkpoint sequence; crash recovery replays committed changes from the slot |
 
 ### 5.1 Hybrid Design — Synchronous Writes + WAL Recovery
@@ -223,7 +221,7 @@ The Vamana index stores its graph structure in a background worker (BGW) process
 |---|---|
 | INSERT visibility | Backend submits to BGW via IPC; BGW calls `SVSAddPoints`; backend blocks until ACK |
 | DELETE visibility | VACUUM submits dead TIDs to BGW via IPC; BGW calls `SVSDeletePoints` |
-| Atomicity (abort) | BGW undo log: on abort, `SVSDeletePoints` for all externalIds added in that transaction |
+| Atomicity (abort) | Backend undo log: on abort, the backend asks the BGW to run `SVSDeletePoints` for all externalIds added in that transaction |
 | Durability (crash) | Replication slot: on restart, replay committed ops from last checkpoint LSN |
 | Consistency (standby) | Replication slot: standby BGW replays from slot incrementally (no IPC available) |
 
@@ -260,12 +258,12 @@ INSERT INTO t (val) ...
       submit (vector, heapTID) to BGW via IPC
       block until ACK                    ──► SVSAddPoints(externalId, vector)
                                               tidMapping[externalId] = heapTID
-                                              record (xid, externalId) in undo log
       ◄── ACK ──────────────────────────
+      record (indexRelid, externalId) in the backend undo log
   → return to executor
 COMMIT
   → VamanaXactCallback(COMMIT):
-      clear undo entries for this xid
+      discard the backend undo log
 ```
 
 #### INSERT + ABORT
@@ -278,13 +276,16 @@ INSERT INTO t (val) ...
   → vamanainsert():
       submit to BGW via IPC
       block until ACK                    ──► SVSAddPoints(externalId, vector)
-                                              record (xid, externalId) in undo log
       ◄── ACK ──────────────────────────
+      record (indexRelid, externalId) in the backend undo log
 ROLLBACK
   → VamanaXactCallback(ABORT):
       submit undo entries to BGW         ──► SVSDeletePoints(externalId)
                                               invalidate tidMapping[externalId]
+      submit CONSOLIDATE (and COMPACT if needed) for each affected index
 ```
+
+On `ROLLBACK TO SAVEPOINT`, only the entries recorded by the aborting subtransaction are undone. `PREPARE TRANSACTION` is rejected for a transaction that has inserted into a Vamana index. The undo log is bounded by `svs.undo_log_max_entries`.
 
 #### DELETE (via VACUUM)
 
@@ -292,16 +293,17 @@ ROLLBACK
 VACUUM                          BGW
 ──────                          ───
 vamanabulkdelete():
-  walk index, find dead TIDs
+  load the TID map from tidmap.bin; call the dead-tuple callback for each valid entry
   submit dead TIDs to BGW via IPC
   block until ACK                        ──► SVSDeletePoints(externalIds...)
                                               invalidate tidMapping entries
   ◄── ACK ──────────────────────────
 vamanavacuumcleanup():
-  submit CONSOLIDATE/COMPACT             ──► SVSConsolidate() / SVSCompact()
+  submit CONSOLIDATE; COMPACT only past
+  svs.compact_threshold_pct              ──► SVSConsolidate() / SVSCompact()
 ```
 
-`vamanabulkdelete` marks each dead TID's slot `InvalidItemPointer` itself, before submitting the batched delete to the BGW — not after the BGW's `SVSDeletePoints` call succeeds. If the BGW delete then fails, the heap already reflects the deletion, so the next rebuild from the heap is still correct; leaving the TID valid in the interim would risk a concurrent SELECT returning a dead row that raced the delete path.
+If the BGW is unavailable, or a delete batch fails, VACUUM logs a WARNING and skips removal. The dead vectors stay in the graph, hidden by MVCC, until a later VACUUM removes them.
 
 ### 5.3 Recovery Path (Crash Restart)
 
@@ -309,12 +311,14 @@ vamanavacuumcleanup():
 BGW starts after crash:
   1. Load last checkpoint from disk (SVS graph + tidMapping)
   2. Open replication slot (persisted by PostgreSQL across crashes)
-  3. Slot's restart_lsn = position of last checkpoint
+  3. Slot's confirmed_flush_lsn = LSN of last checkpoint (restart_lsn is at or before it)
   4. Replay all committed changes from restart_lsn to current WAL position:
        - INSERT records → SVSAddPoints (idempotency check: skip if TID exists)
        - DELETE records → SVSDeletePoints (idempotency check: skip if TID absent)
   5. Resume normal IPC operation
 ```
+
+This runs per index, when the index is loaded from disk. If the slot is invalidated, over `svs.max_slot_wal_size`, or cannot be decoded, the BGW rebuilds the index from the heap instead.
 
 The reorder buffer guarantees only committed transactions are delivered. Aborted transactions are automatically filtered — even if the BGW was down when the abort happened, the aborted insert never appears in the slot replay.
 
@@ -325,13 +329,13 @@ On a standby, there is no DML and no IPC. The BGW runs in replay-only mode:
 ```
 Standby BGW:
   1. Create/open replication slot at replay LSN
-  2. Every poll interval (~200ms):
+  2. Every worker loop iteration (latch wake or 1 s heartbeat):
        replay committed changes from slot
        SVSAddPoints / SVSDeletePoints
-  3. Staleness bounded by poll interval
+  3. Staleness bounded by the loop interval (about 1 s)
 ```
 
-This is identical to the primary's crash-recovery catch-up path, gated by `RecoveryInProgress()`.
+This is identical to the primary's crash-recovery catch-up path, selected by the replay role (`VamanaGetReplayRole()`). The standby needs `hot_standby_feedback = on`, which pins the primary's `catalog_xmin` so the catalog rows the standby's logical slot reads are not vacuumed. WAL retention comes from `primary_slot_name`.
 
 ### 5.5 Undo Mechanism
 
@@ -341,7 +345,7 @@ On abort, `VamanaXactCallback(ABORT)` submits undo entries to BGW. BGW calls `SV
 
 #### Safety net: WAL slot filtering
 
-If BGW is down at abort time, the undo is deferred. On BGW restart, the slot replay only delivers committed transactions (reorder buffer filtering). The aborted INSERT never appears in the replay stream. The stale externalId in the SVS graph points to a heap TID whose xmin is aborted — MVCC visibility filtering prevents it from appearing in query results. The next VACUUM cycle detects the dead TID and submits the delete via IPC.
+If BGW is down at abort time, the undo is skipped. On BGW restart, the slot replay only delivers committed transactions (reorder buffer filtering). The aborted INSERT never appears in the replay stream. The stale externalId in the SVS graph points to a heap TID whose xmin is aborted — MVCC visibility filtering prevents it from appearing in query results. The next VACUUM cycle detects the dead TID and submits the delete via IPC.
 
 This two-layer approach provides immediate undo when possible and guaranteed eventual correctness always.
 
@@ -376,29 +380,31 @@ Recovery:
   - Reorder buffer never delivers the uncommitted transaction
   - No replay command arrives to add or remove v1, v2, v3
   - v1, v2, v3 remain in the graph BUT their heap TIDs have aborted xmin
-  - MVCC filtering in vamanascan hides them from all query results
+  - MVCC visibility checks on the heap fetch hide them from all query results
   - Next VACUUM discovers the dead TIDs and submits SVSDeletePoints via IPC
   - Result: invisible to users immediately, cleaned from graph at next VACUUM
 ```
 
 ### 5.6 VACUUM's Role
 
-VACUUM is the authoritative delete-discovery mechanism, scanning the index for dead TIDs and submitting them to the BGW:
+VACUUM is the authoritative delete-discovery mechanism, scanning the TID map for dead TIDs and submitting them to the BGW:
 
 ```c
 vamanabulkdelete():
-    for each TID in index:
+    for each valid TID in the TID map:
         if callback(TID) says "dead":
-            submit SVSDeletePoints to BGW via IPC
+            collect its externalId
+    submit the collected externalIds to the BGW in batches (SVSDeletePoints)
     return stats
 
 vamanavacuumcleanup():
-    if numDeleted > threshold:
+    if numDeleted > 0:
         submit CONSOLIDATE to BGW
-        submit COMPACT to BGW (if threshold exceeded)
+        if numDeleted exceeds svs.compact_threshold_pct of numVectors:
+            submit COMPACT to BGW
 ```
 
-The replication slot provides crash-recovery protection so deletes applied by the BGW are not lost on crash — they'll be re-discovered by the next VACUUM anyway, but the slot makes recovery faster.
+The replication slot replays committed deletes on crash recovery. Any delete it does not cover is rediscovered by the next VACUUM.
 
 ### 5.7 CREATE INDEX Workflow
 
@@ -416,7 +422,7 @@ The BGW keeps the SVS graph in its private process memory. After CREATE INDEX se
 
 The backend absorbs the load latency at build time by submitting a LOAD request to the BGW before returning from `vamanabuild`. The BGW loads from the save directory (no `index_open`, no lock conflict) and confirms via the IPC slot. The backend blocks until DONE.
 
-The replication slot is created by the backend (not the BGW) immediately after serialization. This eliminates the lazy-creation gap and anchors the slot LSN to the exact point where the on-disk state is complete.
+The BGW creates the replication slot while handling the LOAD request, because slot creation cannot run inside the backend's write transaction. This eliminates the lazy-creation gap and anchors the slot LSN to the point where the on-disk state is complete.
 
 #### Full Sequence
 
@@ -433,46 +439,47 @@ Backend (vamanabuild)                          BGW main loop
 3. SVSBuildDynamicIndex
    - build graph in backend process memory
 
-4. VamanaSaveIndexToDisk(relid)
-   - SVSSaveIndex → $PGDATA/vamana_indexes/<relid>/
+4. SerializeIndexToPages
+   - SVSSaveIndex → $PGDATA/vamana_indexes/<dboid>/<relid>/
    - VamanaSaveTidMapAtomically
    - VamanaMarkIndexSaved (metapage flag)
 
-5. ReplicationSlotCreate("vamana_<db>_<idx>")
-   - confirmed_flush = GetFlushRecPtr()
-   - PG core persists slot to pg_replslot/
+5. SvsMemoryHandoffBuild
+   (hand the build's memory accounting
+   over to residency)
 
-6. log_newpage_range (WAL-log index pages)
-
-7. SVSFreeIndex (free backend-local graph copy)
-
-8. VamanaWorkerSubmitLoad(relid, heapRelid,     ─── slot PENDING, latch set ───►
-     dims, graph_degree, alpha, distType,
+6. VamanaWorkerSubmitLoad(relid, heapRelid,     ─── slot PENDING, latch set ───►
+     build config, metapage counters,
      vectorAttNum)
    - packs metadata into IPC slot
    - slotKind = VAMANA_SLOTKIND_LOAD
    - blocks on slot latch
-     (heartbeat-aware, no fixed timeout)
-                                                9.  Wakes from WaitLatch
+     (heartbeat-aware, waits up to
+      svs.worker_startup_timeout_ms)
+                                                 7.  Wakes from WaitLatch
 
-                                                10. ProcessRequests():
-                                                    finds LOAD slot, transitions
-                                                    to PROCESSING
+                                                 8.  VamanaWorkerProcessRequests:
+                                                     finds LOAD slot, transitions
+                                                     to PROCESSING
 
-                                                11. VamanaWorkerProcessLoadSlot:
-                                                    - Reads SVS index from
-                                                      $PGDATA/vamana_indexes/<relid>/
-                                                    - VamanaCacheIndex(relid, heapRelid,
-                                                        dims, ..., tidMapping)
-                                                    - VamanaReplicationOpen(dboid, relid)
-                                                      (slot already exists from step 5)
-                                                    - cache->last_replay_lsn =
-                                                      GetFlushRecPtr()
+                                                 9.  VamanaWorkerProcessLoadSlot:
+                                                     - Reads SVS index from
+                                                       $PGDATA/vamana_indexes/<dboid>/<relid>/
+                                                     - VamanaCacheIndex(relid, heapRelid,
+                                                         dims, ..., tidMapping)
+                                                     - VamanaReplicationCreate(dboid, relid)
+                                                       (confirmed_flush = GetFlushRecPtr())
+                                                     - VamanaReplicationOpen(dboid, relid)
+                                                     - cache->lastReplayLsn =
+                                                       GetFlushRecPtr()
 
-                                                12. slot status = DONE
-                                                ◄── latch set on backend ────────────
+                                                 10. slot status = DONE
+                                                 ◄── latch set on backend ────────────
 
-13. Backend wakes, sees DONE
+11. Backend wakes, sees DONE
+    - SvsIndexResidencyRecordLoad
+    - SVSFreeIndex (free backend-local graph copy)
+    - log_newpage_range (WAL-log index pages)
     - returns IndexBuildResult
 
 ═══ PG core commits CREATE INDEX transaction ═══
@@ -482,20 +489,19 @@ Backend (vamanabuild)                          BGW main loop
     First INSERT/SEARCH served immediately.
 ```
 
-The BGW loads from the filesystem save directory (`$PGDATA/vamana_indexes/<relid>/`), not from relation pages. The relid and build parameters are passed through the IPC slot. No catalog access or relation lock required. The backend's AccessExclusiveLock protects the BGW's load: no other process can interfere with the save directory while the backend holds the lock.
+The BGW loads from the filesystem save directory (`$PGDATA/vamana_indexes/<dboid>/<relid>/`), not from relation pages. The relid and build parameters are passed through the IPC slot. No catalog access or relation lock required. The backend's AccessExclusiveLock protects the BGW's load: no other process can interfere with the save directory while the backend holds the lock.
 
 #### Crash Scenarios
 
 | Crash point | State on recovery |
 |---|---|
-| During steps 1–4 (before slot creation) | Transaction uncommitted. PG rolls back catalog entry. Orphaned save directory cleaned by object-access hook or next startup. |
-| During steps 5–7 (after slot, before IPC) | Slot exists, save directory complete, WAL-logged pages present. The worker loads the index on first access (demand-driven). No data loss. |
-| During steps 8–12 (IPC in flight) | Same as above: slot + save directory complete. Backend's transaction is uncommitted. PG rolls back. The worker loads cleanly from disk on first access. |
-| After step 13, before PG COMMIT | PG rolls back catalog entry. Orphaned save directory + replication slot persist. A later `CREATE INDEX` that is assigned the same relid drops both (`VamanaReplicationCreate` try-drops a slot of the same name before creating one). Failing that, the primary has no reconciliation pass: the slot keeps pinning WAL and `catalog_xmin` cluster-wide until dropped with `pg_drop_replication_slot()`. |
+| During steps 1–5 (before the LOAD request) | Transaction uncommitted. PG rolls back catalog entry. An orphaned save directory is removed on DROP by the object-access hook, or overwritten by the next save. |
+| During steps 6–10 (IPC in flight) | Save directory complete. The slot may or may not exist yet, depending on whether the worker reached step 9. Backend's transaction is uncommitted. PG rolls back. If the build aborts without a crash, the slot is retired at transaction abort (`VamanaReplicationQueueRetireOnAbort`). |
+| After step 11, before PG COMMIT | PG rolls back catalog entry. Orphaned save directory + replication slot persist. A later `CREATE INDEX` that is assigned the same relid drops both (`VamanaReplicationCreate` try-drops a slot of the same name before creating one). Failing that, the primary has no reconciliation pass: the slot keeps pinning WAL and `catalog_xmin` cluster-wide until dropped with `pg_drop_replication_slot()`. |
 
 #### Worker-Unavailable Handling
 
-`CREATE INDEX` gates on the state of the calling database's worker slot: a missing slot (database not enrolled) is a hard error, a reserved slot with no live worker is a bounded wait, and a live worker proceeds. Once the index is built and its save directory is durable, the worker loads it on first access. See the reservation handshake and three-state gate in [BGW_LAUNCHER.md](BGW_LAUNCHER.md). The first INSERT blocks on `VamanaWorkerWaitUntilAvailable` until the worker has loaded the index and marked it available, guaranteeing the cache is warm before any write is applied.
+`CREATE INDEX` gates on the state of the calling database's worker slot: a missing slot (database not enrolled) is a hard error, a reserved slot with no live worker is a wait bounded by `svs.worker_startup_timeout_ms`, and a live worker proceeds. Once the index is built and its save directory is durable, the worker loads it on first access. See the reservation handshake and three-state gate in [BGW_LAUNCHER.md](BGW_LAUNCHER.md). The first INSERT blocks on `VamanaWorkerWaitUntilAvailable` until the worker has loaded the index and marked it available, guaranteeing the cache is warm before any write is applied.
 
 #### Build Thread Grant
 
@@ -503,7 +509,7 @@ Before the build itself runs, the backend negotiates its build thread count with
 
 The launcher's CPU grant pass (see [BGW_LAUNCHER.md §6](BGW_LAUNCHER.md#6-launcher-behavior)) folds this request into the same calculation it uses for search-thread grants, clamped against that database's CPU budget and `max_parallel_workers`, and writes a grant back into the backend's request slot. The backend reads the grant, caps its `ParallelContext`'s `nworkers` to it, and proceeds. On completion (success, error, or abort) the backend clears its own request slot and wakes the launcher so the capacity is reclaimed immediately rather than on the launcher's next unrelated wake.
 
-If no grant arrives before a timeout, the backend fails the `CREATE INDEX` with an error naming the launcher, rather than falling back to an uncoordinated thread count. If the backend itself dies before clearing its request slot, the launcher's reconcile pass detects the stale request by PID liveness and reclaims the slot.
+If no grant arrives within `svs.worker_timeout_ms`, the backend fails the `CREATE INDEX` with an error naming the launcher, rather than falling back to an uncoordinated thread count. If the backend itself dies before clearing its request slot, the launcher's reconcile pass detects the stale request by PID liveness and reclaims the slot.
 
 ### 5.8 Checkpoint and Atomicity
 
@@ -518,7 +524,7 @@ A checkpoint makes the in-memory SVS graph durable to disk and marks that point 
 
 #### Checkpoint Triggers (Debounce Design)
 
-The design follows the Redis AND-logic pattern:
+The default (debounce) policy is:
 
 ```
 Rule 1 (burst completion): ops >= min_ops AND quiet_for >= debounce_window
@@ -527,37 +533,31 @@ Rule 2 (safety timeout):   ops >= min_ops AND time >= max_interval
 should_checkpoint = Rule 1 OR Rule 2
 ```
 
+Below `min_ops`, an index that has had any writes is still checkpointed once its slot's WAL lag exceeds half of `svs.max_slot_wal_size`. Setting `svs.checkpoint_operations` or `svs.checkpoint_interval` selects a simple mode instead: a checkpoint runs when either threshold is reached.
+
 `min_ops` acts as a **filter** that prevents expensive checkpoints for trivial changes. `max_interval` is a safety net for constant-write workloads (never-quiet) that would otherwise cause unbounded WAL accumulation.
 
-**Clean shutdown checkpoint:** When BGW receives SIGTERM, it performs a final checkpoint before exiting, advancing the slot to current WAL position. Next startup has zero replay cost.
+**Clean shutdown checkpoint:** When BGW receives SIGTERM, it performs a final checkpoint of each cached index before exiting, within `svs.shutdown_drain_budget_ms`, advancing the slot to the checkpoint LSN. For an index checkpointed within the budget, the next startup has zero replay cost.
 
 #### Atomic Checkpoint Sequence (5 Phases)
 
 ```c
-void PerformCheckpoint(VamanaCacheEntry *cache)
+bool PerformCheckpoint(VamanaIndexCache *cache)
 {
-    // Phase 1: Write to temporary files
-    VamanaSaveIndexToDisk(indexRel, cache->index, MAIN_FORKNUM, cache, graphTmp);
-    VamanaSaveTidMap(cache->tidMapping, tidmapTmp);
+    // Snapshot the flush LSN first, so WAL that arrives during the save is not skipped
+    checkpoint_lsn = GetFlushRecPtr();
 
-    // Phase 2: Fsync temporary files (durability)
-    fsync_fname(graphTmp, false);
-    fsync_fname(tidmapTmp, false);
+    // Phases 1-4, inside VamanaSaveIndexToDisk:
+    //   write the SVS graph and TID map to temporary files, fsync them,
+    //   atomically rename them into place, fsync the directory
+    VamanaSaveIndexToDisk(indexRel, cache->svsIndex, MAIN_FORKNUM, cache, &compactedOnDisk);
 
-    // Phase 3: Atomic rename (crash-safe)
-    durable_rename(graphTmp, cache->graphPath, LOG);
-    durable_rename(tidmapTmp, cache->tidmapPath, LOG);
-
-    // Phase 4: Fsync directory (make renames durable)
-    fsync_parent_path(cache->graphPath);
-
-    // Phase 5: Advance slot (ONLY after checkpoint fully durable)
-    current_lsn = GetFlushRecPtr();
-    VamanaSlotAdvance(cache->slot, current_lsn);
+    // Phase 5: advance the slot (ONLY after the checkpoint is fully durable)
+    VamanaSlotAdvance(cache->replicationSlot, checkpoint_lsn);
 }
 ```
 
-**Critical invariant:** Slot LSN only advances **after** `SVSSaveIndex()` succeeds.
+**Critical invariant:** Slot LSN only advances **after** `VamanaSaveIndexToDisk` succeeds, and only to an LSN taken before the save began.
 
 | Phase | Purpose | Crash result |
 |---|---|---|
@@ -591,7 +591,7 @@ Result: ✅ Correct — idempotency handles the duplicate
 **Scenario 3: Successful checkpoint, then crash**
 ```
 t1: SVSSaveIndex()                    → 101 vectors on disk, slot LSN 100
-t2: pg_logical_slot_advance(200)      → slot LSN 200
+t2: VamanaSlotAdvance(200)            → slot LSN 200
 t3: CRASH
 t4: Restart: Load on-disk graph       → 101 vectors
 t5: Replay from slot LSN 200 forward  → no changes to replay
@@ -609,7 +609,7 @@ Result: ✅ Correct — zero replay cost
 | **Ordering** | Save first, advance slot second (never reverse) |
 | **Search Latency** | Paused during checkpoint |
 | **Insert/Delete Latency** | Paused during checkpoint (same window) |
-| **Clean Shutdown** | Zero replay cost (slot advanced to current LSN) |
+| **Clean Shutdown** | Zero replay cost for indexes checkpointed within `svs.shutdown_drain_budget_ms` |
 
 ### 5.9 WAL and Replication Slot Internals
 
@@ -642,8 +642,8 @@ SVSAddPoints applied to in-memory graph
 Logical decoding encounters transactions that span multiple WAL records. The reorder buffer buffers changes until COMMIT is seen, then delivers all changes atomically. On restart, the slot must start reading from the BEGIN of the oldest buffered transaction — not from the last delivered position — to reconstruct transaction state. This is why `restart_lsn` is earlier than `confirmed_flush_lsn`.
 
 **What we control:**
-- When to call `pg_logical_slot_advance()` (checkpoint timing)
-- What LSN to pass (current WAL flush position)
+- When to advance `confirmed_flush_lsn` (`VamanaSlotAdvance`, at checkpoint)
+- What LSN to advance it to (the LSN through which the on-disk save is durable)
 - Ensuring idempotency for duplicate replay
 
 **What PostgreSQL controls:**
@@ -651,7 +651,7 @@ Logical decoding encounters transactions that span multiple WAL records. The reo
 - Delivering only committed, complete transactions
 - Filtering aborted transactions
 
-We never directly read or set `restart_lsn` — it's managed entirely by PostgreSQL's logical decoding infrastructure.
+We never set `restart_lsn` directly: it is advanced only by PostgreSQL's logical decoding. The worker reads it to measure WAL lag, and `VamanaReplicationCatchUpSlot` decodes the slot forward so that `restart_lsn` can move.
 
 #### WAL Retention Implications
 
@@ -661,12 +661,12 @@ PostgreSQL retains WAL from `restart_lsn` forward (not `confirmed_flush_lsn`). C
 2. **BGW down** — `confirmed_flush_lsn` not advancing, WAL accumulates
 3. **Infrequent checkpoints** — `confirmed_flush_lsn` advances only at checkpoint
 
-The `svs.max_slot_wal_size` GUC is the safety valve: if lag exceeds the threshold, drop slot and rebuild from heap.
+The `svs.max_slot_wal_size` GUC is the safety valve: if lag exceeds the threshold, drop slot and rebuild from heap. A checkpoint is forced earlier, at half the threshold, for any index with writes.
 
 | LSN Type | Managed by | When it advances | Affects WAL retention |
 |---|---|---|---|
 | `restart_lsn` | PostgreSQL | All buffered transactions delivered | Yes |
-| `confirmed_flush_lsn` | SVS extension (at checkpoint) | `pg_logical_slot_advance()` call | No |
+| `confirmed_flush_lsn` | SVS extension (at checkpoint) | `VamanaSlotAdvance` call | No |
 
 #### Slot Removal on DROP INDEX
 
@@ -700,14 +700,14 @@ The search-thread GUCs in §6.1 and the per-database `maintenance_num_threads` o
 |---|---|---|---|---|---|
 | `svs.search_window_size` | int | 100 | 10–10000 | `PGC_USERSET` | Search window (L) for index scans. Higher values improve recall at the cost of latency. |
 | `svs.search_num_threads` | int | 0 | 0–1024 | `PGC_SIGHUP` | Cluster-wide default search thread count, subject to the launcher's grant path (see note below the table). `0` = auto, resolves to `1`. Superuser-only; no session `SET`. |
-| `svs.max_search_threads_per_db` | int | 0 | 0–1024 | `PGC_SIGHUP` | Per-database ceiling on search threads. `0` = no cap (bounded only by `svs.max_total_search_threads` and `max_parallel_workers`). |
-| `svs.max_total_search_threads` | int | 0 | 0–1024 | `PGC_SIGHUP` | Cluster-wide ceiling on search threads across all databases. `0` = follow `max_parallel_workers`. |
+| `svs.max_search_threads_per_db` | int | 0 | 0–1024 | `PGC_SIGHUP` | Per-database ceiling on search threads. `0` = follow `max_parallel_workers`. Superuser-only; no session `SET`. |
+| `svs.max_total_search_threads` | int | 0 | 0–1024 | `PGC_SIGHUP` | Cluster-wide ceiling on search threads across all databases. `0` = follow `max_parallel_workers`. Superuser-only; no session `SET`. |
 
-These three GUCs are inputs to the launcher's grant calculator, not values a worker uses directly: search reads its last-published grant non-blockingly at query time, while a build blocks on `SvsWaitForBuildGrant` until the launcher grants it. Both paths resolve through the same calculator and the same floor/ceiling logic; search does not bypass it.
+The three thread GUCs (`svs.search_num_threads`, `svs.max_search_threads_per_db`, `svs.max_total_search_threads`) are inputs to the launcher's grant calculator, not values a worker uses directly: search reads its last-published grant non-blockingly at query time, while a build blocks on `SvsWaitForBuildGrant` until the launcher grants it. Both paths resolve through the same calculator and the same floor/ceiling logic; search does not bypass it.
 
 ### 6.2 Background Worker Parameters
 
-The launcher runs one background worker per enabled database. Which databases are enabled is controlled by the `vamana_databases` catalog, not a GUC; see [BGW_LAUNCHER.md](BGW_LAUNCHER.md) for the launcher, enrollment, and restart/backoff model. `svs.launcher_database` and `svs.max_databases` require a server restart. The timeout GUCs can be updated at runtime via `SIGHUP`.
+The launcher runs one background worker per enabled database. Which databases are enabled is controlled by the `vamana_databases` catalog, not a GUC; see [BGW_LAUNCHER.md](BGW_LAUNCHER.md) for the launcher, enrollment, and restart/backoff model. `svs.launcher_database`, `svs.max_databases` and `svs.worker_restart_time` require a server restart: they are `PGC_POSTMASTER` when the library is loaded through `shared_preload_libraries`, which the extension requires. The timeout GUCs can be updated at runtime via `SIGHUP`.
 
 | GUC | Type | Default | Range | Scope | Description |
 |---|---|---|---|---|---|
@@ -720,21 +720,22 @@ The launcher runs one background worker per enabled database. Which databases ar
 | `svs.max_batch_size` | int | 0 | 0–1000 | `PGC_SIGHUP` | Maximum queries per SVS batch search call. `0` = `MaxBackends`. |
 | `svs.compact_threshold_pct` | int | 10 | 0–100 | `PGC_SUSET` | Percent-deleted threshold that triggers SVS compact during VACUUM cleanup. `0` = compact on every VACUUM with pending deletes; `100` = disable compact (consolidate still runs). Also bounds the database-wide residency credit on aborted inserts, so it is superuser-only, not per-session. |
 | `svs.max_slot_wal_size` | int (MB) | 10240 | 64–2147483647 | `PGC_SIGHUP` | Maximum WAL retained by the replication slot. If exceeded, the slot is dropped and the index is rebuilt from the heap. |
-| `svs.checkpoint_debounce_window` | int | 300 | — | `PGC_SIGHUP` | Seconds of write inactivity required after a burst before a checkpoint is triggered (AND-logic with `checkpoint_min_ops`). |
-| `svs.checkpoint_max_interval` | int | 3600 | — | `PGC_SIGHUP` | Maximum seconds between checkpoints; safety net for constant-write workloads that never go quiet. |
-| `svs.checkpoint_min_ops` | int | 10000 | — | `PGC_SIGHUP` | Minimum write operations required before any checkpoint rule fires. Prevents expensive checkpoints for trivial changes. |
-| `svs.checkpoint_operations` | int | -1 | — | `PGC_SIGHUP` | Legacy op-count checkpoint trigger. `-1` = off. Setting a positive value activates simple mode (overrides debounce logic). |
-| `svs.checkpoint_interval` | int | -1 | — | `PGC_SIGHUP` | Legacy time-based checkpoint trigger in seconds. `-1` = off. Setting a positive value activates simple mode. |
+| `svs.checkpoint_debounce_window` | int (s) | 300 | 0–86400 | `PGC_SIGHUP` | Seconds of write inactivity required after a burst before a checkpoint is triggered (AND-logic with `checkpoint_min_ops`). |
+| `svs.checkpoint_max_interval` | int (s) | 3600 | 1–86400 | `PGC_SIGHUP` | Maximum seconds between checkpoints; safety net for constant-write workloads that never go quiet. |
+| `svs.checkpoint_min_ops` | int | 10000 | 0–INT_MAX | `PGC_SIGHUP` | Minimum write operations required before any checkpoint rule fires. Prevents expensive checkpoints for trivial changes. |
+| `svs.checkpoint_operations` | int | -1 | -1–INT_MAX | `PGC_SIGHUP` | Simple op-count checkpoint trigger. `-1` = off. Setting a positive value activates simple mode (overrides debounce logic). |
+| `svs.checkpoint_interval` | int (s) | -1 | -1–86400 | `PGC_SIGHUP` | Simple time-based checkpoint trigger in seconds. `-1` = off. Setting a positive value activates simple mode. |
 | `svs.shutdown_drain_budget_ms` | int | 30000 | 0–600000 | `PGC_SIGHUP` | Time budget for the worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
+| `svs.undo_log_max_entries` | int | 1048576 | 16–16777216 | `PGC_SUSET` | Per-transaction cap on undo-log entries (one per Vamana index insert). An insert that would exceed it fails. |
 | `svs.worker_stop_timeout_ms` | int | 30000 | 0–600000 | `PGC_SIGHUP` | Milliseconds the launcher waits for a restarting worker to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
 
 ### 6.2a Memory Management Parameters
 
-Residency and build memory are two independent axes, each with its own cluster-wide ceiling and per-database default; a per-database override lives in `vamana_databases.residency_memory`/`search_work_mem` (see [Section 6](../USER_GUIDE.md) of the User Guide). The `max_*` and `default_*` GUCs in each pair are deliberately independent, not one derived from the other: collapsing them would let a single unconfigured database's default consume the whole cluster ceiling.
+Residency and build memory are two independent axes, each with its own cluster-wide ceiling and per-database default; a per-database override lives in `vamana_databases.residency_memory`/`search_work_mem` (see [Section 6.1](../USER_GUIDE.md#61-background-workers-and-per-database-enablement-advanced) of the User Guide). The `max_*` and `default_*` GUCs in each pair are deliberately independent, not one derived from the other: collapsing them would let a single unconfigured database's default consume the whole cluster ceiling.
 
 | GUC | Type | Default | Range | Scope | Description |
 |---|---|---|---|---|---|
-| `svs.max_build_memory` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory. Always finite; there is no "0 means unlimited" path. |
+| `svs.max_build_memory` | int (MB) | 4096 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory. Always finite; there is no "0 means unlimited" path. |
 | `svs.max_residency_memory` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every database's resolved residency budget. Checked at config-time admission (`vamana_databases` enrollment), not at query time. |
 | `svs.default_residency_memory` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Residency budget for a database whose `vamana_databases.residency_memory` is `NULL`. |
 | `svs.max_search_work_mem` | int (MB) | 100 | 1–INT_MAX | `PGC_SIGHUP` | Cluster-wide ceiling on the sum of every database's resolved search-scratch (per-query candidate buffer) budget. Checked as a plain catalog aggregate at `vamana_databases` insert/update time, not against live worker state. |
@@ -749,7 +750,7 @@ Specified in the `WITH (...)` clause of `CREATE INDEX`.
 | `graph_degree` | int | 64 | 16–256 | Maximum graph connections per node (R parameter). |
 | `alpha` | int | -1 | -1–200 | Pruning parameter scaled by 100 (`120` = α 1.20). `-1` uses SVS library default. |
 | `build_window_size` | int | -1 | -1–1000 | Build window size (L parameter). `-1` = `2 × graph_degree`. |
-| `search_window_size` | int | 100 | 10–10000 | Search window during build and initial queries. |
+| `search_window_size` | int | 100 | 10–10000 | Stored with the index. The `svs.search_window_size` GUC governs queries. |
 | `use_search_history` | bool | `true` | — | Maintain the visited-node set during search. |
 | `compression_type` | int | 0 | 0–2 | `0` = none, `1` = LeanVec, `2` = LVQ. |
 | `compression_primary` | int | 4 | -8–8 | Primary quantization under either scheme: `4`=UINT4, `-4`=INT4, `8`=UINT8, `-8`=INT8. |
@@ -774,7 +775,7 @@ Compiler flags for SIMD optimization:
 -march=native -ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math
 ```
 
-> **Note:** `-march=native` is conditionally disabled on ARM Mac, PowerPC, and RISC-V64 (see `Makefile:17–33`). On those platforms `OPTFLAGS` is empty and only the remaining flags are applied.
+> **Note:** `-march=native` is conditionally disabled on ARM Mac, PowerPC, and RISC-V64 (see the `OPTFLAGS` block in the Makefile). On those platforms `OPTFLAGS` is empty and only the remaining flags are applied.
 
 ### 7.2 Extension Control File (`svs.control`)
 
@@ -782,6 +783,7 @@ Compiler flags for SIMD optimization:
 comment = 'SVS Vamana index access method for pgvector'
 default_version = '0.1.0'
 requires = 'vector'
+relocatable = false
 module_pathname = '$libdir/svs'
 ```
 
@@ -797,7 +799,8 @@ Operator classes for `vector` and `halfvec` are registered as shown in Section 4
 Users install the extension with:
 
 ```sql
-CREATE EXTENSION svs;  -- also installs the 'vector' dependency automatically
+CREATE EXTENSION vector;  -- required first: svs depends on it
+CREATE EXTENSION svs;
 ```
 
 ### 7.4 Loading via shared_preload_libraries
@@ -827,8 +830,8 @@ svs.max_databases = 8                 # default: 8; concurrent workers
 ### 8.2 Write Considerations
 
 Inserts are applied incrementally via `SVSAddPoints` and are immediately searchable. Deletes are applied during VACUUM via `SVSDeletePoints` with graph consolidation. For write-heavy workloads:
-- Writes are serialized per-index inside the BGW via a per-index LWLock (`VamanaIndexLockSlot`); high-throughput inserts may experience contention
-- The write lock is scoped by relation OID — concurrent writes to different indexes never serialize against each other
+- The BGW main loop handles requests one at a time, and writers hold a per-index LWLock (`VamanaIndexLockSlot`); high-throughput inserts may experience contention
+- One worker serves all Vamana indexes in a database, so a write to one index also delays searches and writes on the other indexes in that database; workloads in separate databases do not affect each other
 - Checkpoints run on the BGW main thread and block both searches and writes for their duration. This is required because `MutableVamanaIndex::save()` is not `const`: it calls `consolidate()` then `compact()` before writing, mutating shared graph state. Concurrent save + search is an unconditional data race. INSERT, DELETE, and SEARCH requests queue on their IPC slot latches and are processed once the checkpoint completes
 - Periodic `REINDEX CONCURRENTLY` produces a fresh, optimally-constructed graph after many incremental mutations
 - All writes (INSERT, DELETE, VACUUM) go through the background worker; the worker is the single owner of the live in-memory index, so all backends see a consistent view after the worker processes each slot
@@ -837,9 +840,41 @@ Inserts are applied incrementally via `SVSAddPoints` and are immediately searcha
 
 The TID mapping array is sized by `tidMappingCapacity`, not by the live vector count `numVectors`. After deletions, the capacity grows monotonically until `SVSCompact` reclaims the deleted slots. In workloads with high delete churn and infrequent compaction, the TID mapping and its on-disk sidecar can be significantly larger than the live vector count alone would suggest. Lowering `svs.compact_threshold_pct` reduces this overhead at the cost of more frequent compaction during VACUUM.
 
+Each index lives in the private memory of its database's background worker, so every index needs memory at build time and at search time. Build memory is bounded cluster-wide by `svs.max_build_memory`; the resident size of all loaded indexes in a database is bounded by that database's residency budget (see below).
+
 In addition to the graph edges and stored vectors, the SVS dynamic index maintains a small amount of per-vector bookkeeping (delete flags, insertion metadata). This overhead is small relative to the graph itself but grows linearly with `tidMappingCapacity`.
 
 **Cache eviction.** `VamanaIndexCache` is a byte-bounded, relid-keyed table governed by each database's residency budget (`vamana_databases.residency_memory`, or `svs.default_residency_memory`/`svs.max_residency_memory`; see [Section 6.2a](#62a-memory-management-parameters)), not a fixed slot count. A load that would push a database's committed resident bytes over its budget is refused before the cache is touched, with an error naming `svs.max_residency_memory`. Each index's exact resident bytes, as last measured by the worker, are also durably recorded in `svs_index_residency` so a `residency_memory` decrease can be validated even while that database's worker is not running.
+
+### 8.4 Known Limitations
+
+#### Searches wait during writes
+
+Each enrolled database has a single SVS worker that handles all of its Vamana requests in turn. While the worker is applying a write, searches on every Vamana index in that database wait until it finishes. Writes include INSERT, UPDATE, DELETE, and VACUUM.
+
+What to expect:
+
+- Under a mixed workload, search latency rises and search throughput drops as the proportion of write traffic increases.
+- Workloads in separate databases don't affect each other, because each database has its own worker.
+- VACUUM on a Vamana index can pause searches in that database for as long as each clean-up or compaction step takes. This grows with index size. The same applies to autovacuum.
+
+To limit the effect:
+
+- Schedule bulk loads and manual VACUUM outside peak search periods.
+- For a large initial load, insert the data first and run CREATE INDEX afterwards, rather than inserting row by row into an indexed table.
+- Put workloads that need fast searches during heavy writes in separate databases.
+
+#### Other limitations
+
+- Checkpoints block both searches and writes for their duration (see [8.2](#82-write-considerations)).
+- `PREPARE TRANSACTION` (two-phase commit) is not supported on a transaction that has inserted into a Vamana index (see [4.3](#43-insert-and-vacuum-behavior)).
+- Only `vector` (float32) and `halfvec` (float16) columns are supported; `sparsevec` and `bit` are not. The maximum dimension is 2000.
+- The index serves only `ORDER BY ... LIMIT` nearest-neighbor scans.
+- At most 64 Vamana indexes can be live in one database (`VAMANA_MAX_INDEXES`).
+- After a worker crash, reload time grows with the total serialized index size.
+- `ALTER INDEX ... SET TABLESPACE`, `CREATE INDEX ... TABLESPACE` and `default_tablespace` move only the index relation's own pages, including the metapage. The serialized graph and vectors are always stored under `$PGDATA/vamana_indexes/`.
+- `maintenance_work_mem` does not affect index builds; build memory is bounded by `svs.max_build_memory`.
+- Rows with a `NULL` indexed value are not added to the index. Cosine distance on a zero vector returns `NaN`.
 
 ---
 
@@ -878,7 +913,7 @@ The following risks are accepted with documented rationale:
 | Risk | Severity | Disposition |
 |---|---|---|
 | BGW saturation via `search_window_size = 10000` + connection flood | High | Accepted as bounded: `worker_timeout_ms` converts hangs to ERRORs; `search_window_size` GUC bounded 10-10000. |
-| CREATE INDEX OOM on oversized table | Medium | Backend-local failure; postmaster not impacted. A pre-flight `maintenance_work_mem` gate is planned for a future release. |
+| CREATE INDEX OOM on oversized table | Medium | Backend-local failure; postmaster not impacted. Build memory is bounded cluster-wide by `svs.max_build_memory`. |
 | BGW crash amplification (reload time proportional to index size) | Medium | Accepted as known. Reload time is linear in total serialized index size; documented in deployment guidance. |
 | MKL CPU-feature environment variable forcing SIGILL on incompatible hardware | Medium | Accepted: operator environment is trusted configuration. See the User Guide for AVX-512 requirements. |
 

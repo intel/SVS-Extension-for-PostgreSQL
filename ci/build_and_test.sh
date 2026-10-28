@@ -16,8 +16,8 @@
 #                   TAP and injection points enabled, plus the
 #                   injection_points test module (needed by TAP, not
 #                   installed by docs/build_guide's own install)
-#   build-svs       build the SVS C API bindings via docs/build_guide,
-#                   pinned to a known-good nightly release tarball
+#   build-svs       download the prebuilt SVS C API release via
+#                   docs/build_guide (SVS_TAG in docs/build_guide/config)
 #   build-pgvector  build and install vanilla pgvector via docs/build_guide
 #   build-extension build and install this extension via docs/build_guide
 #                   (WERROR=1)

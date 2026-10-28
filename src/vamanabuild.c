@@ -845,7 +845,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("failed to build SVS index"),
 					 errdetail_log("SVS error code: %d.", error_code),
-					 errhint("Try increasing maintenance_work_mem or reducing vector dimensions.")));
+					 errhint("Check the server log for the SVS error code. If memory is limited, reduce the vector dimensions or see svs.max_build_memory.")));
 		}
 
 		ereport(NOTICE,
