@@ -64,7 +64,6 @@ This guide covers the **Vamana** index access method and the two vector compress
 The Vamana index is a graph-based approximate nearest neighbor (ANN) index, similar in concept to HNSW but using a different graph construction strategy (originating from Microsoft Research's DiskANN). Key properties:
 
 - **High recall** at competitive query latencies
-- **AVX-512 optimized** — delivers best throughput on Intel Xeon processors. LeanVec and LVQ compression are supported only on Intel CPUs; see [Prerequisites](#2-prerequisites)
 - **Dynamic index** — the index is built from the initial table data and supports incremental updates: INSERT adds vectors to the live graph immediately via `SVSAddPoints`, and DELETE + VACUUM removes vectors via `SVSDeletePoints` with automatic graph consolidation (see [Section 7](#7-operational-considerations))
 - **On-disk persistence** — the SVS graph and TID mappings are serialized directly to files on the filesystem (via the SVS `save`/`load` API and atomic checkpoint sequence). Both are reloaded automatically on restart
 
@@ -166,7 +165,7 @@ LIMIT 5;
 **Edge cases to know about:**
 
 - Indexes are loaded on demand, not eagerly at worker startup. The first `SELECT`, `INSERT`, or `VACUUM` touching a given index after a server restart pays that index's load cost; subsequent operations serve from the warm cache. To pre-warm deliberately, call `svs_warmup_index()` or `svs_warmup_database()` (see [Section 6.1](#61-background-workers-and-per-database-enablement-advanced)).
-- Writes are serialized per index inside the worker. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
+- Writes are serialized per database inside the worker. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
 - Deletes are soft: `VACUUM` marks entries deleted, patches graph edges, and compacts when deletion pressure exceeds `svs.compact_threshold_pct` (default 10%).
 - External IDs are never reused for the life of the index. `REINDEX` resets the counter.
 
@@ -1275,8 +1274,8 @@ These GUCs are `PGC_POSTMASTER` only when `svs` is in `shared_preload_libraries`
 | `svs.checkpoint_debounce_window` | `300s` | `0` | `86400s` | Quiet-period wait after a write burst before triggering a checkpoint |
 | `svs.checkpoint_max_interval` | `3600s` | `1s` | `86400s` | Maximum time between checkpoints; safety net for constant-write workloads |
 | `svs.checkpoint_min_ops` | `10000` | `0` | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
-| `svs.checkpoint_operations` | `-1` (off) | `-1` | — | Simple op-count checkpoint trigger; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
-| `svs.checkpoint_interval` | `-1` (off) | `-1` | `86400` | Simple time-based checkpoint trigger in seconds; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_operations` | `-1` (off) | `-1` | — | Simple op-count checkpoint trigger; activates simple mode for a positive value, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_interval` | `-1` (off) | `-1` | `86400` | Simple time-based checkpoint trigger in seconds; activates simple mode for a positive value, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
 
 ### SQL Functions
 

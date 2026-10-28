@@ -43,6 +43,7 @@ In the launcher database (`svs.launcher_database`, default `postgres`), create t
 ```sql
 CREATE EXTENSION vector;
 CREATE EXTENSION svs;
+CREATE DATABASE mydb;
 INSERT INTO vamana_databases (datname) VALUES ('mydb');
 ```
 
@@ -98,7 +99,7 @@ make prove_installcheck SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_c
 
 ### Hardware dependent tests
 
-`installcheck` and `prove_installcheck` exclude tests that build real LeanVec or LVQ compressed indexes (`halfvec_compression`, `vector_compression`, `39_persistence_compression.pl`, `44_build_memory_calibration_compression.pl`). These need AVX-512 hardware, which most CI runners lack. Run them separately, on hardware that supports it:
+`installcheck` and `prove_installcheck` exclude tests that build real LeanVec or LVQ compressed indexes (`halfvec_compression`, `vector_compression`, `39_persistence_compression.pl`, `44_build_memory_calibration_compression.pl`). These need an Intel CPU with AVX-512, which most CI runners lack. Run them separately, on hardware that supports it:
 
 ```bash
 make installcheck-hw SVS_INSTALL=/path/to/svs_install PG_CONFIG=/path/to/pg_config

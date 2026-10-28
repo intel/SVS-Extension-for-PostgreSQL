@@ -93,6 +93,7 @@ CREATE EXTENSION svs;
 Then run this in the launcher database:
 
 ```sql
+CREATE DATABASE mydb;
 INSERT INTO vamana_databases (datname) VALUES ('mydb');
 ```
 
