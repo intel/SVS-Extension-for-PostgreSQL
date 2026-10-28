@@ -43,7 +43,7 @@ postmaster
 
 The launcher is a supervisor, not a data-plane process. It never serves index queries, never holds graph state, and never allocates shared memory. Its single responsibility is to keep the set of running per-database workers in agreement with the set of enabled databases in the configuration catalog, and to bring workers back when they die.
 
-Each per-database worker is bound to its database for its whole lifetime. It owns the in-memory SVS graph state for every Vamana index in that database, processes IPC requests from backends (search, insert, delete, maintenance), owns that database's replication slot, and performs the periodic checkpoints that persist graph state to disk. There is one worker per database, spawned on demand by the launcher.
+Each per-database worker is bound to its database for its whole lifetime. It owns the in-memory SVS graph state for every Vamana index in that database, processes IPC requests from backends (search, insert, delete, maintenance), owns the replication slot of each index in that database, and performs the periodic checkpoints that persist graph state to disk. There is one worker per database, spawned on demand by the launcher.
 
 ---
 

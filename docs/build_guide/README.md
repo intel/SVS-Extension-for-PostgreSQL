@@ -75,17 +75,22 @@ Add these to `postgresql.conf` and restart the server:
 ```
 shared_preload_libraries = 'svs'
 wal_level = logical
-max_wal_senders = 10
 max_replication_slots = 10
 ```
 
-`wal_level = logical` is required. Without it the launcher stops at startup and no worker starts. Keep `max_wal_senders` at or above the PostgreSQL default of 10.
-
+`wal_level = logical` is required. Without it the launcher stops at startup and no worker starts.
 The extension creates one logical replication slot for each Vamana index. Set `max_replication_slots` to the number of Vamana indexes plus the slots other features use (for example physical replicas), and keep some spare. The default of 10 allows about 10 indexes in the whole cluster.
 
 pgvector must be installed. In each database that hosts Vamana indexes, run `CREATE EXTENSION vector;` before `CREATE EXTENSION svs;`.
 
-Then enroll each database that hosts Vamana indexes. Run this in the launcher database (`svs.launcher_database`, default `postgres`):
+Then enroll each database that hosts Vamana indexes. The `vamana_databases` table exists only in a database where `CREATE EXTENSION svs` has run. First create the extensions in the launcher database (`svs.launcher_database`, default `postgres`):
+
+```sql
+CREATE EXTENSION vector;
+CREATE EXTENSION svs;
+```
+
+Then run this in the launcher database:
 
 ```sql
 INSERT INTO vamana_databases (datname) VALUES ('mydb');

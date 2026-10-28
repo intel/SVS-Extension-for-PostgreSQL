@@ -23,7 +23,7 @@ shared_preload_libraries = 'svs'
 This is sufficient on its own. `svs.so` does not call into `vector.so` at runtime; the two
 extensions' preload order does not matter. `svs.control` declares `requires = 'vector'`, but that
 is a SQL-level dependency on the `vector` type, satisfied when you run `CREATE EXTENSION vector`
-(or let `CREATE EXTENSION svs` pull it in automatically), and has no bearing on preload order.
+(`CREATE EXTENSION svs` does not install it automatically), and has no bearing on preload order.
 
 ### `max_worker_processes`
 

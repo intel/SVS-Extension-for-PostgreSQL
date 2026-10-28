@@ -659,7 +659,7 @@ Enrollment reserves the database's worker slot **synchronously** at commit, so a
 
 To bounce one database's worker without taking the database offline — for example, to force a clean checkpoint and replication-slot advance right now rather than waiting for the debounced checkpoint policy:
 
-Run it in the launcher's database (`svs.launcher_database`). Enrollment must also run there; enrolling from another database is rejected.
+Run it in the launcher's database (`svs.launcher_database`). Enrollment must run in the launcher database. Rows written to `vamana_databases` in any other database have no effect.
 
 ```sql
 SELECT svs_restart_worker('mydb');
@@ -1167,11 +1167,11 @@ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 ### 9.15 Symptom: INSERT throughput drops at high concurrency
 
-**Cause:** Writes are serialized per index inside the BGW. Throughput is bounded by single-threaded SVS add.
+**Cause:** One worker serves every Vamana index in a database, so writes are serialized per database inside the BGW. Throughput is bounded by single-threaded SVS add.
 
 **Fix:**
 - Batch rows in multi-row `INSERT` statements from a single backend.
-- Consider splitting logically independent datasets across multiple table partitions — each partition has its own index and its own serialization domain.
+- Splitting into partitions in the same database does not spread write load, because they share one worker. To scale writes, place independent datasets in separate databases (one worker each).
 
 ### 9.16 Warning: `SVSAddPoints` failure in server log
 
@@ -1223,7 +1223,7 @@ For benchmark results, see the [project wiki](https://github.com/intel/SVS-Exten
 | `graph_degree` | `64` | `16` | `256` | Max neighbors per node |
 | `alpha` | `-1` | `-1` | `200` | Pruning factor × 100; -1 = SVS default (1.2 for L2, 0.95 for inner product and cosine). L2 needs 100 or more; inner product and cosine need 100 or less |
 | `build_window_size` | `-1` | `-1` | `1000` | Build search window; -1 = 2×graph_degree |
-| `search_window_size` | `100` | `10` | `10000` | Default query window (always governed by `svs.search_window_size` GUC at runtime) |
+| `search_window_size` | `100` | `10` | `10000` | Stored with the index but not currently used; the `svs.search_window_size` GUC always sets the search window (see section 4.2) |
 | `use_search_history` | `true` | — | — | Maintain visited-node set during search; improves recall |
 | `compression_type` | `0` | `0` | `2` | 0=none, 1=leanvec, 2=lvq |
 | `compression_primary` | `4` | `-8` | `8` | One of: 4, -4, 8, -8 (the server checks the allowed set at build time) |

@@ -335,7 +335,7 @@ Standby BGW:
   3. Staleness bounded by the loop interval (about 1 s)
 ```
 
-This is identical to the primary's crash-recovery catch-up path, selected by the replay role (`VamanaGetReplayRole()`). The standby needs `hot_standby_feedback = on`, so that the primary keeps the WAL the standby's slot still needs.
+This is identical to the primary's crash-recovery catch-up path, selected by the replay role (`VamanaGetReplayRole()`). The standby needs `hot_standby_feedback = on`, which pins the primary's `catalog_xmin` so the catalog rows the standby's logical slot reads are not vacuumed. WAL retention comes from `primary_slot_name`.
 
 ### 5.5 Undo Mechanism
 
@@ -454,7 +454,8 @@ Backend (vamanabuild)                          BGW main loop
    - packs metadata into IPC slot
    - slotKind = VAMANA_SLOTKIND_LOAD
    - blocks on slot latch
-     (heartbeat-aware, no fixed timeout)
+     (heartbeat-aware, waits up to
+      svs.worker_startup_timeout_ms)
                                                  7.  Wakes from WaitLatch
 
                                                  8.  VamanaWorkerProcessRequests:

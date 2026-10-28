@@ -36,7 +36,17 @@ Coverage instrumentation is opt-in and off by default; build with `make COVERAGE
 
 ## Quick Start
 
-Before you start, set the required server settings (for example `wal_level = logical`) and enroll your database. See [Required PostgreSQL settings](docs/build_guide/README.md#required-postgresql-settings).
+Before you start, set the required server settings (for example `wal_level = logical`) and restart the server. See [Required PostgreSQL settings](docs/build_guide/README.md#required-postgresql-settings).
+
+In the launcher database (`svs.launcher_database`, default `postgres`), create the extensions and enroll your database:
+
+```sql
+CREATE EXTENSION vector;
+CREATE EXTENSION svs;
+INSERT INTO vamana_databases (datname) VALUES ('mydb');
+```
+
+Then, in each database that hosts indexes (`mydb` here):
 
 ```sql
 CREATE EXTENSION vector;
@@ -61,7 +71,7 @@ The extension implements a PostgreSQL index access method backed by a per-databa
 
 ## Running Tests
 
-Set `SVS_INSTALL` (SVS install prefix) and `PG_CONFIG` (path to `pg_config`) if they are not in the default locations. The `all-in-one` build in the [build guide](docs/build_guide/README.md) sets both.
+Set `SVS_INSTALL` (SVS install prefix) and `PG_CONFIG` (path to `pg_config`) if they are not in the default locations. The `all-in-one` build in the [build guide](docs/build_guide/README.md) does not set them in your shell (its config variable is `SVS_INSTALL_DIR`). The PostgreSQL it builds has no `--enable-tap-tests`, so `make prove_installcheck` needs a PostgreSQL built with TAP tests enabled.
 
 Build and install the extension:
 
