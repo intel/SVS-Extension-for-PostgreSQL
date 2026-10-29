@@ -16,6 +16,7 @@ typedef struct SvsDbCpuRequest
 {
 	Oid			dbOid;
 	bool		live;					/* false: dead or backing off; contributes nothing */
+	bool		hasIndexes;				/* false: no vamana index yet; holds no search claim */
 	int32		searchNumThreads;		/* catalog value; -1 = follow the GUC default */
 	int32		searchThreadsReserved;	/* guaranteed floor; 0 = no floor */
 } SvsDbCpuRequest;

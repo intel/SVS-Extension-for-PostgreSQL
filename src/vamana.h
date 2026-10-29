@@ -14,6 +14,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "optimizer/optimizer.h"
+#include "utils/memutils.h"
 #include "utils/sampling.h"
 #include "utils/timestamp.h"
 #include "halfvec.h"
@@ -52,6 +53,15 @@
 #define VAMANA_DEFAULT_UNDO_LOG_MAX_ENTRIES	1048576
 #define VAMANA_MIN_UNDO_LOG_MAX_ENTRIES		16
 #define VAMANA_MAX_UNDO_LOG_MAX_ENTRIES		16777216
+
+/*
+ * Ceiling on tidMappingCapacity (and the other metapage counters) accepted
+ * from an on-disk metapage or a load-slot IPC payload. Every downstream
+ * consumer casts these counters to int, so INT_MAX is the point past which
+ * they are already mishandled; the StaticAssertDecl next to this struct's
+ * definition proves the resulting allocation still fits MaxAllocHugeSize.
+ */
+#define VAMANA_MAX_TID_MAPPING_CAPACITY		INT_MAX
 
 /* Compression types (internal representation) */
 #define VAMANA_COMPRESSION_NONE			0
@@ -135,7 +145,7 @@ typedef struct VamanaOptions
 	int			leanvec_dims;		/* LeanVec dimensions (-1 = dimensions/2; unused by LVQ) */
 }			VamanaOptions;
 
-/* Search window size: svs.search_window_size GUC, else opts' reloption, else the default. */
+/* Search window size: the svs.search_window_size GUC. The reloption is not currently used (the GUC minimum of 10 means it always applies). */
 extern int VamanaResolveSearchWindowSize(const VamanaOptions *opts);
 
 /*
@@ -250,6 +260,9 @@ StaticAssertDecl(offsetof(VamanaMetaPageData, saveGeneration) == 64,
 StaticAssertDecl(sizeof(VamanaMetaPageData) == 72,
 				 "VamanaMetaPageData size changed — update readers/writers");
 
+StaticAssertDecl((uint64) VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) <= MaxAllocHugeSize,
+				 "VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) exceeds MaxAllocHugeSize");
+
 typedef struct VamanaPageOpaqueData
 {
 	BlockNumber nextblkno;
@@ -310,6 +323,19 @@ typedef struct VamanaIndexCache
 	 */
 	TimestampTz nextSnapshotActivateAttempt;
 
+	/*
+	 * Zero-progress backoff for this index's own fast-forward catch-up slice
+	 * (VamanaReplicationCatchUpSlot, scheduled by VamanaWorkerCatchUpSlots).
+	 * 0 = eligible now / no active backoff.  A slice that exhausts its
+	 * budget without moving restart_lsn doubles catchUpBackoffMs (capped at
+	 * 60000) and sets nextCatchUpAttempt accordingly; any progress resets
+	 * both to 0.  Without this, a long-open transaction or a running-xacts
+	 * gap bigger than one slice would spend the worker's whole catch-up
+	 * share on this one index forever.
+	 */
+	TimestampTz nextCatchUpAttempt;
+	int			catchUpBackoffMs;
+
 	/* Checkpoint debounce state */
 	int64		opsSinceCheckpoint;
 	TimestampTz lastWriteTime;		/* updated on every write slot; 0 = no writes yet */
@@ -360,6 +386,10 @@ const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
 const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
+void		VamanaValidateMetaCounts(Oid relid, uint32 tidMappingCapacity,
+									  uint32 numVectors, uint32 numDeleted,
+									  uint64 nextExternalId,
+									  bool checkResidencyBudget);
 void		VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno, Size indexDataSize, uint32 numVectors, ForkNumber forkNum);
 void		VamanaSetHasSavedIndex(Relation index, bool hasSavedIndex, ForkNumber forkNum);
 bytea	   *vamanaoptions(Datum reloptions, bool validate);
@@ -372,6 +402,7 @@ bool		vamanavalidate(Oid opclassoid);
 
 /* Distance metric helper */
 SVSDistanceType VamanaGetDistanceMetric(Relation index);
+bool		VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric);
 
 /* On-disk serialization helpers */
 void		VamanaGetIndexSavePath(Oid dboid, Oid relid, char *buf, size_t bufsz);
