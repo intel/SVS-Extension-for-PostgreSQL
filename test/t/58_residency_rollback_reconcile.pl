@@ -563,6 +563,21 @@ diag("=== T3: INSERT-only attacker cannot exhaust a tightly pinned budget ===");
         1;
     };
     ok($owner_ok, "T3: the owner's own committed INSERT still succeeds afterward");
+
+    # T3b: svs.compact_threshold_pct is PGC_SUSET, so the same INSERT-only
+    # attacker cannot widen or disable the database-wide credit cap itself.
+    my ($rc_set, $out_set, $err_set) = $node->psql('attack_db',
+        "SET svs.compact_threshold_pct = 0;",
+        extra_params => [ '-U', 'attacker' ], on_error_stop => 1);
+    isnt($rc_set, 0, "T3b: an unprivileged role cannot SET svs.compact_threshold_pct");
+    like($err_set, qr/permission denied to set parameter/,
+        "T3b: the attempt fails with permission denied to set parameter");
+
+    my $superuser_set_ok = eval {
+        $node->safe_psql('attack_db', "SET svs.compact_threshold_pct = 0;");
+        1;
+    };
+    ok($superuser_set_ok, "T3b: the superuser can still SET svs.compact_threshold_pct");
 }
 
 # ---------------------------------------------------------------------------

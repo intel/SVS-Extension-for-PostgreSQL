@@ -319,6 +319,14 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 
 	buildstate->distance_type = VamanaGetDistanceMetric(index);
 
+	if (!VamanaOrderOperatorMatchesMetric(index->rd_opfamily[0], index->rd_opcintype[0],
+										  buildstate->distance_type))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator class for vamana index does not match its own distance metric"),
+				 errdetail("The ordering operator and support function 1 compute different distance metrics, so the index would return nearest neighbours in the wrong order."),
+				 errhint("Fix the operator class definition so its ordering operator and support function 1 agree on the same distance metric.")));
+
 	// NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result): PostgreSQL constant macro, not a palloc(n * size) site
 	buildstate->buildCtx = AllocSetContextCreate(CurrentMemoryContext,
 												 "Vamana build context",
@@ -837,7 +845,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("failed to build SVS index"),
 					 errdetail_log("SVS error code: %d.", error_code),
-					 errhint("Try increasing maintenance_work_mem or reducing vector dimensions.")));
+					 errhint("Check the server log for the SVS error code. If memory is limited, reduce the vector dimensions or see svs.max_build_memory.")));
 		}
 
 		ereport(NOTICE,
@@ -907,6 +915,18 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			VamanaMetaPageData meta;
 			SVSBuildConfig config;
 
+			/*
+			 * Bound the wait on a startup race the same way the DML paths do
+			 * (vamanascan.c, vamanainsert.c, vamana_warmup.c): a slot can be
+			 * reserved with no live worker yet (workerPid == 0) while the
+			 * worker is still starting. Without this, the build fell through
+			 * to the WARNING-and-commit branch below for a condition that is
+			 * ordinarily transient, instead of waiting it out or surfacing
+			 * the already-correct timeout error that VamanaWorkerWaitUntilAvailable
+			 * throws.
+			 */
+			VamanaWorkerWaitUntilAvailable(relid, "build");
+
 			VamanaReadMetaPage(index, &meta);
 			config = VamanaAssembleBuildConfig(index, (int) meta.numVectors, NULL);
 
@@ -946,7 +966,7 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 					 */
 					ereport(WARNING,
 							(errmsg("vamana index \"%s\": background worker load failed; "
-									"index will be adopted by the worker on startup",
+									"index will be loaded on its next access",
 									RelationGetRelationName(index))));
 				}
 
@@ -960,10 +980,16 @@ vamanabuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			}
 			else
 			{
-				/* Same HANDOFF reasoning as the load-failure branch above. */
+				/*
+				 * Same HANDOFF reasoning as the load-failure branch above.
+				 * VamanaWorkerWaitUntilAvailable above already blocked until
+				 * the worker was live or threw; reaching here means the
+				 * worker died again in that narrow window, not that it was
+				 * never waited for.
+				 */
 				ereport(WARNING,
-						(errmsg("vamana index \"%s\": background worker not yet available; "
-								"index will be adopted by the worker on startup",
+						(errmsg("vamana index \"%s\": background worker not available; "
+								"index will be loaded on its next access",
 								RelationGetRelationName(index))));
 			}
 		}

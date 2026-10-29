@@ -23,6 +23,12 @@ BEGIN
 	END LOOP;
 END $$;
 
+-- A database is granted search threads only once it has a vamana index, so
+-- give this one an index for the grant assertions below.
+CREATE TABLE cpu_governance_seed (id serial PRIMARY KEY, val vector(3));
+INSERT INTO cpu_governance_seed (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+CREATE INDEX cpu_governance_seed_idx ON cpu_governance_seed USING vamana (val vector_l2_ops);
+
 -- Unconfigured default: search_num_threads NULL and svs.search_num_threads at
 -- its compiled default (0 = auto) must resolve desired to 1, not
 -- nproc-1/max_parallel_workers.  The regression config pins
@@ -380,6 +386,8 @@ BEGIN
 		PERFORM pg_sleep(0.1);
 	END LOOP;
 END $$;
+
+DROP TABLE cpu_governance_seed;
 
 -- Restore this database's own row to its pre-test configuration, so later
 -- regression files that share contrib_regression don't inherit this file's

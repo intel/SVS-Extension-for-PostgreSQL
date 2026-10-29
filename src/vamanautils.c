@@ -18,6 +18,7 @@
 
 #include <math.h>
 
+#include "svs_memory.h"
 #include "vamana.h"
 
 #include "access/amapi.h"
@@ -422,6 +423,69 @@ VamanaReadMetaPage(Relation index, VamanaMetaPageData * meta)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("vamana index \"%s\" was built with an incompatible on-disk format",
 						RelationGetRelationName(index)),
+				 errhint("REINDEX this index.")));
+}
+
+/*
+ * Validate the counters that drive a TID-map load before anything is
+ * allocated with them. Both callers read these from a source this process
+ * does not fully trust: an on-disk metapage after a restart or eviction, or
+ * a load-slot IPC payload. Raises ERROR on the first failed check:
+ *
+ *  1. Type ceiling: every downstream consumer casts these counters to int
+ *     (vamanascan.c, vamanacache.c, VamanaIndexCache), so a value above
+ *     VAMANA_MAX_TID_MAPPING_CAPACITY is already mishandled before this
+ *     check existed, and a count above INT_MAX could previously load
+ *     silently with a capacity that disagreed with the metapage.
+ *  2. Internal consistency: numVectors, numDeleted, and nextExternalId
+ *     (when capacity is nonzero) cannot exceed tidMappingCapacity. Build,
+ *     insert growth, delete, consolidate/compact, and rebuild all maintain
+ *     this; a violation means the counters were not produced by this code.
+ *  3. External anchor: a TID map sized to the whole database's residency
+ *     budget cannot belong to a loadable index, since the index's own
+ *     graph (at least VAMANA_MIN_GRAPH_DEGREE * 4 bytes per point) would
+ *     already exceed that budget. This bounds the one case the first two
+ *     checks cannot: an in-range but absurdly large capacity. Skipped when
+ *     checkResidencyBudget is false, for callers that are not necessarily
+ *     running inside an admitted worker (SvsMemoryResidencyBudget ERRORs if
+ *     the database has not completed admission yet).
+ *
+ * Uses ERRCODE_DATA_CORRUPTED throughout, matching the magic-number check
+ * above (same metapage, same failure class, same REINDEX remedy). Not
+ * ERRCODE_OUT_OF_MEMORY for check 3: VamanaResidencyRefusedError() treats
+ * that code as a transient residency refusal and re-throws it to callers
+ * that opted in, which would misreport a corrupt metapage as "retry, or
+ * raise svs.max_residency_memory."
+ */
+void
+VamanaValidateMetaCounts(Oid relid, uint32 tidMappingCapacity, uint32 numVectors,
+						 uint32 numDeleted, uint64 nextExternalId,
+						 bool checkResidencyBudget)
+{
+	if (tidMappingCapacity > VAMANA_MAX_TID_MAPPING_CAPACITY ||
+		numVectors > VAMANA_MAX_TID_MAPPING_CAPACITY ||
+		numDeleted > VAMANA_MAX_TID_MAPPING_CAPACITY)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index %u: metapage slot count exceeds the supported maximum",
+						relid),
+				 errhint("REINDEX this index.")));
+
+	if (numVectors > tidMappingCapacity ||
+		numDeleted > tidMappingCapacity ||
+		(tidMappingCapacity > 0 && nextExternalId > tidMappingCapacity))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index %u: metapage slot counts are inconsistent",
+						relid),
+				 errhint("REINDEX this index.")));
+
+	if (checkResidencyBudget &&
+		(uint64) tidMappingCapacity * sizeof(ItemPointerData) > SvsMemoryResidencyBudget(MyDatabaseId))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index %u: metapage TID-map capacity exceeds this database's residency budget",
+						relid),
 				 errhint("REINDEX this index.")));
 }
 
@@ -932,6 +996,54 @@ vamanavalidate(Oid opclassoid)
 	ReleaseSysCache(classtup);
 
 	return result;
+}
+
+/*
+ * Check that the opfamily's strategy-1 (ordering) operator implements the
+ * same distance metric as the one derived from support function 1. An
+ * opclass that pairs, for example, <=> with an L2 support function builds
+ * successfully with no error, but the index then serves ORDER BY <=> from
+ * an L2 graph with no recheck, returning neighbours in the wrong order.
+ * Name-based, like the rest of the metric mapping in VamanaGetDistanceMetric;
+ * that is a known property of this code, not something this check
+ * introduces.
+ */
+bool
+VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric)
+{
+	Oid			orderOpOid;
+	Oid			orderFuncOid;
+	char	   *orderFuncName;
+	bool		matches = false;
+
+	orderOpOid = get_opfamily_member(opfamilyoid, inputTypeOid, inputTypeOid, 1);
+	if (!OidIsValid(orderOpOid))
+		return false;
+
+	orderFuncOid = get_opcode(orderOpOid);
+	if (!OidIsValid(orderFuncOid))
+		return false;
+
+	orderFuncName = get_func_name(orderFuncOid);
+	if (orderFuncName == NULL)
+		return false;
+
+	switch (metric)
+	{
+		case SVS_DISTANCE_L2:
+			matches = (strcmp(orderFuncName, "l2_distance") == 0);
+			break;
+		case SVS_DISTANCE_IP:
+			matches = (strcmp(orderFuncName, "vector_negative_inner_product") == 0 ||
+					   strcmp(orderFuncName, "halfvec_negative_inner_product") == 0);
+			break;
+		case SVS_DISTANCE_COSINE:
+			matches = (strcmp(orderFuncName, "cosine_distance") == 0);
+			break;
+	}
+
+	pfree(orderFuncName);
+	return matches;
 }
 
 /*

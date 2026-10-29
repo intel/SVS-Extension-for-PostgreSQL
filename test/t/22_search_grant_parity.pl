@@ -361,6 +361,15 @@ $node->stop;
 			VALUES ('postgres', true, 5, 2);
 	));
 	wait_for_worker($primary);
+
+	# The primary grants search threads only to a database with a vamana
+	# index; the standby, which cannot count indexes, always does.
+	$primary->safe_psql('postgres', qq(
+		CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+		INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+		CREATE INDEX t_idx ON t USING vamana (val vector_l2_ops);
+	));
+
 	is(wait_for_granted($primary, 'postgres', 5), '5',
 		'primary reaches the expected grant before comparing to the standby');
 
@@ -433,6 +442,18 @@ $node->stop;
 
 	wait_for_worker_db($node2, 'sgi_a', 30);
 	wait_for_worker_db($node2, 'sgi_b', 30);
+
+	# Grants are held only by a database with a vamana index.
+	$node2->safe_psql('sgi_a', qq(
+		CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+		INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+		CREATE INDEX t_idx ON t USING vamana (val vector_l2_ops);
+	));
+	$node2->safe_psql('sgi_b', qq(
+		CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+		INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+		CREATE INDEX t_idx ON t USING vamana (val vector_l2_ops);
+	));
 
 	is(wait_for_granted($node2, 'sgi_a', 3), '3',
 		'sgi_a gets its own grant (3), not its sibling\'s');

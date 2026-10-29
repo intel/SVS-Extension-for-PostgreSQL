@@ -317,6 +317,19 @@ VamanaLauncherMain(Datum main_arg)
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
+	/*
+	 * wal_level is PGC_POSTMASTER: it cannot change while the server runs, so
+	 * it is knowable once, here, for every database at once. Checking it in
+	 * the launcher instead of in each per-database worker (VamanaWorkerMain)
+	 * means a misconfigured instance gets one named FATAL instead of a
+	 * perpetual crash loop of unattributed worker FATALs, one per enabled
+	 * database per backoff cycle.
+	 */
+	if (wal_level < WAL_LEVEL_LOGICAL)
+		ereport(FATAL,
+				(errmsg("vamana launcher requires wal_level = logical"),
+				 errhint("Set wal_level = logical in postgresql.conf and restart.")));
+
 	BackgroundWorkerInitializeConnection(vamana_launcher_database, NULL, 0);
 
 	/*
@@ -1003,12 +1016,20 @@ PublishCpuGrants(List *rows)
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlotGeneration(db->dbOid, &generation);
 		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
 
+		/*
+		 * A standby never maintains indexCount, so it keeps its search claim
+		 * regardless of what the counter reads.
+		 */
+		bool		hasIndexes = !VamanaIndexCountIsMaintained() ||
+			(entry != NULL && pg_atomic_read_u32(&entry->indexCount) > 0);
+
 		entries[i].dbOid = db->dbOid;
 		entries[i].entry = entry;
 		entries[i].generation = generation;
 
 		dbs[i].dbOid = db->dbOid;
 		dbs[i].live = live;
+		dbs[i].hasIndexes = hasIndexes;
 		dbs[i].searchNumThreads = db->cpu.searchNumThreads;
 		dbs[i].searchThreadsReserved = db->cpu.searchThreadsReserved;
 		i++;

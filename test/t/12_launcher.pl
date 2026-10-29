@@ -510,6 +510,7 @@ sub wait_for_worker_count
     $node->init;
     $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
     $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
+    $node->append_conf('postgresql.conf', "wal_level = logical");
     $node->start;
 
     $node->safe_psql('postgres', "CREATE EXTENSION vector;");

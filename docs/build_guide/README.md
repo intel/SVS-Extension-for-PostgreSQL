@@ -4,31 +4,9 @@
 
 - Linux x86-64
 - GCC 11+
-- CMake >= 3.24 (see note below)
 - Git
+- curl
 - OpenMP (`libgomp`, included with GCC)
-
-### Note: CMake version
-
-CMake 3.24 is required by SVS's `FetchContent` URL handling.
-
-> **Note:** This requirement is expected to be removed soon once the upstream `FetchContent` dependency is eliminated, enabling compatibility with older CMake versions.
-
-If your system ships an older version, you can upgrade via pip:
-
-```bash
-pip install cmake --upgrade
-```
-
-Or via Kitware's APT repository:
-
-```bash
-wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc | sudo apt-key add -
-sudo apt-add-repository 'deb https://apt.kitware.com/ubuntu/ jammy main'
-sudo apt-get update && sudo apt-get install cmake
-```
-
-
 
 ## Setup
 
@@ -56,7 +34,7 @@ Otherwise:
 ./build_svs.sh
 ```
 
-Builds the SVS C API library and installs it to `SVS_INSTALL_DIR`.
+Downloads the prebuilt SVS C API release (`SVS_TAG` in `config`) and extracts it to `SVS_INSTALL_DIR`.
 
 ### 3. Vanilla pgvector
 
@@ -89,3 +67,34 @@ repository. Otherwise the script builds from the source tree at `SVS_EXT_DIR`
 
 Runs all steps in order. Skips `install_postgres.sh` if `PG_CONFIG` already points
 to an existing binary.
+
+## Required PostgreSQL settings
+
+Add these to `postgresql.conf` and restart the server:
+
+```
+shared_preload_libraries = 'svs'
+wal_level = logical
+max_replication_slots = 10
+```
+
+`wal_level = logical` is required. Without it the launcher stops at startup and no worker starts.
+The extension creates one logical replication slot for each Vamana index. Set `max_replication_slots` to the number of Vamana indexes plus the slots other features use (for example physical replicas), and keep some spare. The default of 10 allows about 10 indexes in the whole cluster.
+
+pgvector must be installed. In each database that hosts Vamana indexes, run `CREATE EXTENSION vector;` before `CREATE EXTENSION svs;`.
+
+Then enroll each database that hosts Vamana indexes. The `vamana_databases` table exists only in a database where `CREATE EXTENSION svs` has run. First create the extensions in the launcher database (`svs.launcher_database`, default `postgres`):
+
+```sql
+CREATE EXTENSION vector;
+CREATE EXTENSION svs;
+```
+
+Then run this in the launcher database:
+
+```sql
+CREATE DATABASE mydb;
+INSERT INTO vamana_databases (datname) VALUES ('mydb');
+```
+
+See the [user guide](../USER_GUIDE.md#2-prerequisites) for details.

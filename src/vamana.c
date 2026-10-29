@@ -92,7 +92,7 @@ VamanaInit(void)
 	add_int_reloption(vamana_relopt_kind, "build_window_size", "Build window size (-1 = 2 * graph_degree)",
 					  VAMANA_DEFAULT_BUILD_WINDOW, VAMANA_MIN_BUILD_WINDOW, VAMANA_MAX_BUILD_WINDOW,
 					  AccessExclusiveLock);
-	add_int_reloption(vamana_relopt_kind, "search_window_size", "Search window size for build and query (-1 = 100)",
+	add_int_reloption(vamana_relopt_kind, "search_window_size", "Search window size (default 100, not currently used; svs.search_window_size governs)",
 					  VAMANA_DEFAULT_SEARCH_WINDOW, VAMANA_MIN_SEARCH_WINDOW, VAMANA_MAX_SEARCH_WINDOW,
 					  AccessExclusiveLock);
 	add_bool_reloption(vamana_relopt_kind, "use_search_history", "Maintain visited set during search (default true)",
@@ -276,7 +276,7 @@ VamanaInit(void)
 							"disables that credit the same way it disables VACUUM's own compacts.",
 							&vamana_compact_threshold_pct,
 							10, 0, 100,
-							PGC_USERSET,
+							PGC_SUSET,
 							0,
 							NULL, NULL, NULL);
 

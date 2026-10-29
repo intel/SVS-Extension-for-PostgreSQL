@@ -129,6 +129,10 @@ TRUNCATE vamana_databases;
 RESET ROLE;
 DROP ROLE vamana_databases_test_nonowner;
 
+-- Owning this table is superuser-equivalent; the comment must say so
+SELECT obj_description('vamana_databases'::regclass, 'pg_class')
+	LIKE '%superuser-equivalent%' AS owner_warning_present;
+
 -- Unlike residency_memory, search_work_mem has no decrease-validation
 -- trigger at all: nothing about this axis is durable or crash-sensitive, so
 -- a lower value has nothing to make unsafe.
@@ -428,6 +432,12 @@ RESET client_min_messages;
 DELETE FROM vamana_databases WHERE datname = current_database();
 SELECT count(*) FROM vamana_databases WHERE datname = current_database();
 
+-- TRUNCATE must be rejected for the identical reason: a row-level BEFORE
+-- DELETE trigger alone cannot stop it (TRUNCATE never fires row triggers),
+-- so this needs its own BEFORE TRUNCATE guard.
+TRUNCATE vamana_databases;
+SELECT count(*) FROM vamana_databases WHERE datname = current_database();
+
 -- After teardown the count is zero, so the same DELETE is allowed.  Rolled
 -- back to keep this database enabled for the remaining regression files.
 SELECT dropped FROM svs_teardown_database();
@@ -435,6 +445,13 @@ SELECT DISTINCT index_count FROM pg_stat_vamana_worker
 	WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 BEGIN;
 DELETE FROM vamana_databases WHERE datname = current_database();
+ROLLBACK;
+
+-- TRUNCATE is allowed once no indexes remain, same as DELETE above.  Rolled
+-- back for the same reason: keep this database enabled for the rest of the
+-- suite.
+BEGIN;
+TRUNCATE vamana_databases;
 ROLLBACK;
 DROP TABLE vamana_gate_t;
 
