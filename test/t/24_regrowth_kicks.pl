@@ -226,6 +226,13 @@ sub settle
 # never cached anything, so there is nothing for that cascade to reach.
 # ---------------------------------------------------------------------------
 {
+	# The first index in a database kicks the launcher on commit, so give
+	# idle_db one that is never queried (hence never cached) before the case
+	# starts; only the empty-table build below is then under test.
+	$node->safe_psql('idle_db', qq(
+		CREATE TABLE rk_seed_tbl (id serial PRIMARY KEY, val vector($dim));
+		CREATE INDEX rk_seed_idx ON rk_seed_tbl USING vamana (val vector_l2_ops);
+	));
 	settle();
 	$node->safe_psql('postgres',
 		"SELECT injection_points_attach('svs-build-thread-grant-publish', 'wait');");

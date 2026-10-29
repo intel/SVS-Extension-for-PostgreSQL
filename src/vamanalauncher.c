@@ -1016,12 +1016,20 @@ PublishCpuGrants(List *rows)
 		VamanaWorkerShmem *entry = VamanaWorkerLookupSlotGeneration(db->dbOid, &generation);
 		bool		live = (entry != NULL && VamanaWorkerEntryIsLive(entry));
 
+		/*
+		 * A standby never maintains indexCount, so it keeps its search claim
+		 * regardless of what the counter reads.
+		 */
+		bool		hasIndexes = !VamanaIndexCountIsMaintained() ||
+			(entry != NULL && pg_atomic_read_u32(&entry->indexCount) > 0);
+
 		entries[i].dbOid = db->dbOid;
 		entries[i].entry = entry;
 		entries[i].generation = generation;
 
 		dbs[i].dbOid = db->dbOid;
 		dbs[i].live = live;
+		dbs[i].hasIndexes = hasIndexes;
 		dbs[i].searchNumThreads = db->cpu.searchNumThreads;
 		dbs[i].searchThreadsReserved = db->cpu.searchThreadsReserved;
 		i++;

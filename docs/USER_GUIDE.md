@@ -1,7 +1,5 @@
 # User Guide: SVS Vamana Index and Vector Compression
 
-> **⚠️ Disclaimer:** This is a prototype. The implementation is functional but further improvements, additional features, and production hardening are actively in progress. Interfaces, parameters, and behaviors are subject to change in future releases.
-
 ## Table of Contents
 
 1. [Overview](#1-overview)
@@ -26,26 +24,46 @@
    - 7.2 [TRUNCATE](#truncate)
    - 7.3 [Security and Deployment Notes](#security-and-deployment-notes)
 8. [Monitoring](#8-monitoring)
-   - 8.1 [Worker Status](#worker-status)
-   - 8.2 [Server Log Messages](#server-log-messages)
+   - 8.1 [Build Progress](#81-build-progress)
+   - 8.2 [Worker Status](#82-worker-status)
+   - 8.3 [Server Log Messages](#83-server-log-messages)
+   - 8.4 [Index Size](#84-index-size)
+   - 8.5 [Inspect Index Options](#85-inspect-index-options)
+   - 8.6 [Write and Vacuum Activity](#86-write-and-vacuum-activity)
 9. [Troubleshooting](#9-troubleshooting)
+   - 9.1 [Symptom: index not being used by the planner](#91-symptom-index-not-being-used-by-the-planner)
+   - 9.2 [Error: invalid compression_primary value: X](#92-error-invalid-compression_primary-value-x)
+   - 9.3 [Error: invalid compression_secondary value: X](#93-error-invalid-compression_secondary-value-x)
+   - 9.4 [Error: compression_primary (8-bit) cannot have higher precision than compression_secondary (4-bit)](#94-error-compression_primary-8-bit-cannot-have-higher-precision-than-compression_secondary-4-bit)
+   - 9.5 [Error: unsupported LVQ configuration: 8-bit primary with 8-bit residual](#95-error-unsupported-lvq-configuration-8-bit-primary-with-8-bit-residual)
+   - 9.6 [Error: LeanVec compression is not supported on this CPU / LVQ compression is not supported on this CPU](#96-error-leanvec-compression-is-not-supported-on-this-cpu--lvq-compression-is-not-supported-on-this-cpu)
+   - 9.7 [Error: value X out of bounds for option "compression_type"](#97-error-value-x-out-of-bounds-for-option-compression_type)
+   - 9.8 [Error: insert into index "X" would exceed svs.undo_log_max_entries](#98-error-insert-into-index-x-would-exceed-svsundo_log_max_entries)
+   - 9.9 [Symptom: unexpected recall with large leanvec_dims](#99-symptom-unexpected-recall-with-large-leanvec_dims)
+   - 9.10 [Symptom: new rows not appearing in search results after INSERT](#910-symptom-new-rows-not-appearing-in-search-results-after-insert)
+   - 9.11 [Symptom: low recall after compression](#911-symptom-low-recall-after-compression)
+   - 9.12 [Symptom: slow first query after restart](#912-symptom-slow-first-query-after-restart)
+   - 9.13 [Symptom: INSERT does not appear in a SELECT from another session](#913-symptom-insert-does-not-appear-in-a-select-from-another-session)
+   - 9.14 [Symptom: SELECT returns fewer than LIMIT rows after many DELETEs](#914-symptom-select-returns-fewer-than-limit-rows-after-many-deletes)
+   - 9.15 [Symptom: INSERT throughput drops at high concurrency](#915-symptom-insert-throughput-drops-at-high-concurrency)
+   - 9.16 [Warning: SVSAddPoints failure in server log](#916-warning-svsaddpoints-failure-in-server-log)
+   - 9.17 [Warning: vamana index "X": background worker unavailable; dead vector removal skipped during VACUUM](#917-warning-vamana-index-x-background-worker-unavailable-dead-vector-removal-skipped-during-vacuum)
 10. [Appendix: Vamana vs. HNSW Comparison](#10-appendix-vamana-vs-hnsw-comparison)
 11. [Reference: Parameter Summary](#11-reference-parameter-summary)
 
-See also: [Resource Sizing for Operators](RESOURCE_SIZING.md), a separate document.
+See also: [Resource Sizing for Operators](RESOURCE_SIZING.md), a separate document, and the [Known Limitations](dev/ARCHITECTURE.md#84-known-limitations).
 
 ---
 
 ## 1. Overview
 
-This guide covers the **Vamana** index access method and the two vector compression schemes — **LeanVec** and **LVQ** — that have been added to the pgvector extension. These features are powered by Intel's **Scalable Vector Search (SVS)** library.
+This guide covers the **Vamana** index access method and the two vector compression schemes — **LeanVec** and **LVQ** — that compress Vamana indexes. The `svs` extension provides them in addition to pgvector's own search capability, and they are powered by Intel's **Scalable Vector Search (SVS)** library.
 
 ### What is the Vamana Index?
 
 The Vamana index is a graph-based approximate nearest neighbor (ANN) index, similar in concept to HNSW but using a different graph construction strategy (originating from Microsoft Research's DiskANN). Key properties:
 
 - **High recall** at competitive query latencies
-- **AVX-512 optimized** — delivers best throughput on Intel Xeon processors (such as those in AWS `r7i` and `c7i` instance families)
 - **Dynamic index** — the index is built from the initial table data and supports incremental updates: INSERT adds vectors to the live graph immediately via `SVSAddPoints`, and DELETE + VACUUM removes vectors via `SVSDeletePoints` with automatic graph consolidation (see [Section 7](#7-operational-considerations))
 - **On-disk persistence** — the SVS graph and TID mappings are serialized directly to files on the filesystem (via the SVS `save`/`load` API and atomic checkpoint sequence). Both are reloaded automatically on restart
 
@@ -68,9 +86,10 @@ LeanVec is ideal when your vectors have high dimensionality (e.g., 1536D from Op
 
 Before enrolling databases, size `max_worker_processes` and `max_parallel_workers` for your deployment; see [Resource Sizing](RESOURCE_SIZING.md).
 
-- The `svs` extension (version **0.1.0 or later**) installed and enabled. This also installs the `vector` extension as a dependency:
+- The `vector` (pgvector) and `svs` extensions (version **0.1.0 or later**) installed and enabled:
 
 ```sql
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS svs;
 ```
 
@@ -81,7 +100,7 @@ SELECT extversion FROM pg_extension WHERE extname = 'svs';
 -- Expected: 0.1.0
 ```
 
-- An Intel Xeon processor instance is strongly recommended to benefit from AVX-512 optimizations. On AWS, the `r7i`, `c7i`, and `m7i` instance families qualify.
+- An Intel Xeon processor with AVX-512 is strongly recommended for best performance. The Vamana index runs on x86-64 CPUs from any vendor. LeanVec and LVQ compression are supported only on Intel CPUs; on other CPUs, creating a compressed index fails with an error.
 
 - **Required — Background Workers:** Background workers must be running for all Vamana operations (search, INSERT, DELETE+VACUUM). Add `svs` to `shared_preload_libraries` in `postgresql.conf` and restart the server:
 
@@ -90,6 +109,8 @@ SELECT extversion FROM pg_extension WHERE extname = 'svs';
   ```
 
   This is required because the extension registers shared memory segments and a supervisor process (the *launcher*) at server start — actions that cannot be performed after the server is already running. Without this, no workers start and all index reads and writes will return an error.
+
+- **Required — WAL level:** The launcher needs `wal_level = logical` in `postgresql.conf`. Without it the launcher stops at startup with `vamana launcher requires wal_level = logical`, and no worker starts. See [Required PostgreSQL settings](build_guide/README.md#required-postgresql-settings) for the full list of server settings.
 
 - **Required — Enable your database:** Each database that hosts Vamana indexes must be enrolled in the `vamana_databases` table so the launcher spawns a worker for it. Enrollment takes effect immediately, with no restart:
 
@@ -144,7 +165,7 @@ LIMIT 5;
 **Edge cases to know about:**
 
 - Indexes are loaded on demand, not eagerly at worker startup. The first `SELECT`, `INSERT`, or `VACUUM` touching a given index after a server restart pays that index's load cost; subsequent operations serve from the warm cache. To pre-warm deliberately, call `svs_warmup_index()` or `svs_warmup_database()` (see [Section 6.1](#61-background-workers-and-per-database-enablement-advanced)).
-- Writes are serialized per index inside the worker. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
+- Writes are serialized per database inside the worker. For high-concurrency ingest, batch rows in multi-row `INSERT` statements from a single backend to reduce contention.
 - Deletes are soft: `VACUUM` marks entries deleted, patches graph edges, and compacts when deletion pressure exceeds `svs.compact_threshold_pct` (default 10%).
 - External IDs are never reused for the life of the index. `REINDEX` resets the counter.
 
@@ -159,15 +180,13 @@ LIMIT 5;
 | `vector`    | `vector_l2_ops`     | `vector_ip_ops`      | `vector_cosine_ops`     |
 | `halfvec`   | `halfvec_l2_ops`    | `halfvec_ip_ops`     | `halfvec_cosine_ops`    |
 
-> **Maximum dimensions:** 2000 for the Vamana index.
+**Maximum dimensions:** 2000 for the Vamana index.
 
-> **Storage format:** An uncompressed `halfvec` index is stored as float16, so it occupies roughly half the resident bytes of the same data in a `vector` column. Under `compression_type` 1 or 2 the compressed format governs the stored size for both column types.
+**Storage format:** An uncompressed `halfvec` index is stored as float16, so it occupies roughly half the resident bytes of the same data in a `vector` column. Under `compression_type` 1 or 2 the compressed format governs the stored size for both column types.
 
-> **Upgrading:** A `halfvec` index built before this release was stored as float32. It will not load under the float16 format and will be rebuilt from the table on first use, correctly, but with a warning in the log and the cost of a full rebuild. `REINDEX` such indexes to avoid that, and re-run any query whose results were recorded from one, as the answers may have changed. See [Upgrading the Extension](#upgrading-the-extension) for on-disk format changes in general.
+**NULL vectors:** Rows with a `NULL` value in the indexed column are silently skipped at index build and insert time — they are not added to the graph. A `NULL` query vector returns zero results immediately without scanning the index.
 
-> **NULL vectors:** Rows with a `NULL` value in the indexed column are silently skipped at index build and insert time — they are not added to the graph. A `NULL` query vector returns zero results immediately without scanning the index.
-
-> **Zero vectors and cosine distance:** A zero vector has no direction, so cosine distance (which normalizes by the vector's magnitude) produces `NaN` when either the stored or query vector is all zeros. Avoid storing or querying with zero vectors when using `vector_cosine_ops` or `halfvec_cosine_ops`.
+**Zero vectors and cosine distance:** A zero vector has no direction, so cosine distance (which normalizes by the vector's magnitude) produces `NaN` when either the stored or query vector is all zeros. Avoid storing or querying with zero vectors when using `vector_cosine_ops` or `halfvec_cosine_ops`.
 
 ### 4.2 Index Build Parameters
 
@@ -176,9 +195,9 @@ These parameters are specified in the `WITH (...)` clause of `CREATE INDEX` and 
 | Parameter | Type | Default | Range | Description |
 |-----------|------|---------|-------|-------------|
 | `graph_degree` | integer | `64` | 16 – 256 | Maximum number of neighbors per graph node. Higher values improve recall but increase build time and memory. |
-| `alpha` | integer | `-1` | -1 – 200 | Graph pruning aggressiveness, stored as `alpha × 100` (e.g., `120` = α 1.20). `-1` uses the SVS library default (~1.2). |
+| `alpha` | integer | `-1` | -1 – 200 | Graph pruning aggressiveness, stored as `alpha × 100` (e.g., `120` = α 1.20). `-1` uses the SVS default: 1.2 for L2, 0.95 for inner product and cosine. SVS rejects other values at build time unless they fit the metric: L2 needs 100 or more; inner product and cosine need 100 or less. |
 | `build_window_size` | integer | `-1` | -1 – 1000 | Search window used during graph construction. `-1` defaults to `2 × graph_degree`. |
-| `search_window_size` | integer | `100` | 10 – 10000 | Stored with the index. At query time the `svs.search_window_size` GUC always governs behavior; because the GUC minimum is 10, this reloption is not used as a query-time fallback in the current implementation. |
+| `search_window_size` | integer | `100` | 10 – 10000 | Stored with the index but not currently used. The `svs.search_window_size` GUC (default 100) always sets the search window, at query time and at build time. |
 | `use_search_history` | boolean | `true` | — | Maintain a visited-node set during graph search. Keeping this enabled (`true`) improves recall; disabling it may reduce per-query memory usage at some recall cost. Not changeable at query time — must be set at index creation. |
 | `compression_type` | integer | `0` | 0 – 2 | `0` = none, `1` = LeanVec, `2` = LVQ. |
 | `compression_primary` | integer | `4` | see §5.2 | Primary quantization precision, under either scheme. |
@@ -210,7 +229,7 @@ COMMIT;
 |-----|---------|-------|-------------|
 | `svs.search_window_size` | `100` | 10 – 10000 | Number of candidates examined during a search. Higher = better recall, higher latency. |
 
-> The session GUC takes precedence over the `search_window_size` index reloption whenever it is set. There is currently no special "disable" value (such as `0`); to stop overriding and return to the default behavior, use `RESET svs.search_window_size`.
+> The `search_window_size` index reloption is not currently used. The GUC always applies. `RESET svs.search_window_size` returns it to 100, not to a reloption value.
 
 ### 4.4 Creating an Index
 
@@ -228,8 +247,7 @@ CREATE INDEX my_idx
     USING vamana (embedding vector_cosine_ops)
     WITH (
         graph_degree = 96,           -- denser graph for higher recall
-        build_window_size = 192,     -- wider search window during build
-        search_window_size = 150     -- default query window
+        build_window_size = 192      -- wider search window during build
     );
 ```
 
@@ -237,7 +255,7 @@ CREATE INDEX my_idx
 - With no override and `max_parallel_maintenance_workers = 0` (the PostgreSQL default), the build requests 1 thread.
 - With no override and `max_parallel_maintenance_workers` set to a positive value, that value is requested.
 
-The requested count is not used directly: the build blocks on a grant from the launcher, which caps it against the database's CPU budget alongside search's thread grants. If no grant arrives before the launcher's timeout, `CREATE INDEX` fails with an error naming the launcher rather than falling back to an ungoverned thread count.
+The requested count is not used directly: the build blocks on a grant from the launcher, which caps it against the database's CPU budget alongside search's thread grants. If no grant arrives within `svs.worker_timeout_ms` (default 5000 ms), `CREATE INDEX` fails with an error naming the launcher rather than falling back to an ungoverned thread count.
 
 ```sql
 -- No override, max_parallel_maintenance_workers = 0: build requests 1 thread
@@ -251,7 +269,7 @@ CREATE INDEX my_idx ON my_table USING vamana (embedding vector_l2_ops);
 UPDATE vamana_databases SET maintenance_num_threads = 4 WHERE datname = current_database();
 ```
 
-> **Note (prototype limitation):** `maintenance_work_mem` does not currently affect Vamana index builds; SVS manages its own memory allocation internally. A future release will pass `maintenance_work_mem` to the SVS API so that builds respect the configured memory limit.
+> **Note:** `maintenance_work_mem` does not affect Vamana index builds; SVS manages its own memory allocation internally. Build memory is bounded cluster-wide by `svs.max_build_memory`.
 
 ### 4.5 Running Queries
 
@@ -371,7 +389,7 @@ For LVQ an 8-bit primary carries no residual, so `compression_primary = 8` requi
 | Value | Meaning |
 |-------|---------|
 | `-1`  | Automatically use `original_dimensions / 2` |
-| `1` to `2000` | Explicit reduced dimension count (must be < original dimensions) |
+| `1` to `2000` | Explicit reduced dimension count (should be less than the original dimensions; the server does not check this) |
 
 More aggressive reduction (smaller `leanvec_dims`) saves more memory but may reduce recall. The default of `D/2` is a good starting point for most embedding models.
 
@@ -384,14 +402,16 @@ For a 1536-dimensional `vector` column:
 | Configuration | Bytes per vector | Compression ratio (vs raw float32) |
 |---------------|-----------------|-------------------------------------|
 | No compression (float32) | 6,144 | 1× |
-| UINT8 + UINT8, leanvec_dims=768 | ~1,536 | ~4× |
-| UINT4 + UINT8, leanvec_dims=768 | ~1,152 | ~5.3× |
-| UINT4 + UINT4, leanvec_dims=768 | ~768   | ~8× |
-| UINT4 + UINT4, leanvec_dims=256 | ~256   | ~24× |
+| UINT8 + UINT8, leanvec_dims=768 | ~2,322 | ~2.6× |
+| UINT4 + UINT8, leanvec_dims=768 | ~1,938 | ~3.2× |
+| UINT4 + UINT4, leanvec_dims=768 | ~1,170 | ~5.3× |
+| UINT4 + UINT4, leanvec_dims=256 | ~914   | ~6.7× |
 
 > These are approximate index-side storage estimates. The PostgreSQL heap row storing the full vector is not compressed.
+>
+> LeanVec stores the primary level at `leanvec_dims` dimensions and the secondary level at the full dimension D. Per vector it uses about `leanvec_dims × primary_bits / 8 + 9` plus `D × secondary_bits / 8 + 9` bytes. The 9 bytes in each term are a per-level header.
 
-LVQ keeps all D dimensions, so at a given primary bit width it stores more per vector than LeanVec, which quantizes only `leanvec_dims` values. Adding a residual increases the per-vector size further. Measure your own workload rather than extrapolating from the LeanVec figures above.
+LVQ keeps all D dimensions. Per vector it uses about `D × primary_bits / 8 + 9` bytes, plus `D × residual_bits / 8` bytes for the residual (no residual: none). For D=1536: LVQ 8-bit about 1,545 B; LVQ 4-bit about 777 B; 4+4 about 1,545 B; 4+8 about 2,313 B. Alignment padding can add a few bytes.
 
 ### 5.4 Choosing a Compression Configuration
 
@@ -400,7 +420,7 @@ LVQ keeps all D dimensions, so at a given primary bit width it stores more per v
 | Baseline — minimal memory reduction with negligible accuracy loss | `compression_type=1`, `compression_primary=8`, `compression_secondary=8` |
 | Balanced — good memory savings, acceptable recall trade-off | `compression_type=1`, `compression_primary=4`, `compression_secondary=8` |
 | Maximum compression — smallest index, higher recall trade-off | `compression_type=1`, `compression_primary=4`, `compression_secondary=4`, `leanvec_dims=256` |
-| Large embeddings (≥2048D), targeting ~4× reduction | `compression_type=1`, `compression_primary=8`, `compression_secondary=8`, `leanvec_dims=-1` |
+| Large embeddings (≥2048D), targeting ~2.6× reduction | `compression_type=1`, `compression_primary=8`, `compression_secondary=8`, `leanvec_dims=-1` |
 
 The rows above cover LeanVec only. This guide deliberately makes no recommendation between LeanVec and LVQ, or among the LVQ configurations: that trade-off has not been characterized here. §5.2 lists what each scheme accepts; settle the choice by measuring recall and index size on your own data.
 
@@ -424,7 +444,7 @@ CREATE INDEX ON docs USING vamana (embedding vector_cosine_ops)
 --           recall may be poor (recommend >= 100000, minimum 10000)
 ```
 
-The same WARNING fires during cold-start index rebuilds from the heap.
+A similar WARNING fires during cold-start rebuilds from the heap. It starts with "rebuilding", for example "rebuilding LeanVec index with only N vectors…".
 
 ### 5.5 Creating a Compressed Index
 
@@ -556,9 +576,11 @@ SET svs.search_window_size = 200;  -- slower, higher recall
 
 | `graph_degree` | `build_window_size`  | Recall | Build time |
 |---------------|---------------------|--------|------------|
-| 32            | 64 (default)        | Moderate | Fast |
-| 64 (default)  | 128 (default)       | Good     | Moderate |
-| 96            | 192                 | High     | Slow |
+| 32            | 64 (2×)             | Moderate | Fast |
+| 64 (default)  | 128 (2×)            | Good     | Moderate |
+| 96            | 192 (2×)            | High     | Slow |
+
+The default `build_window_size = -1` gives 2 × `graph_degree`.
 
 **General guidance:**
 - For interactive search (`p99 < 10 ms`): start with `graph_degree=64`, `search_window_size=100` and tune up.
@@ -572,7 +594,7 @@ SVS manages its own internal thread pool for index builds. The requested thread 
 - With no override, `0` (PostgreSQL default) → the build requests 1 thread.
 - With no override, positive value → that value is requested.
 
-The request is not granted directly: it blocks until the launcher grants it from the database's CPU budget, alongside search's grants. If no grant arrives before the launcher's timeout, `CREATE INDEX` fails naming the launcher rather than degrading to an ungoverned thread count.
+The request is not granted directly: it blocks until the launcher grants it from the database's CPU budget, alongside search's grants. If no grant arrives within `svs.worker_timeout_ms` (default 5000 ms), `CREATE INDEX` fails naming the launcher rather than degrading to an ungoverned thread count.
 
 ```sql
 -- No override, default 0: build requests 1 thread
@@ -614,7 +636,7 @@ shared_preload_libraries = 'svs'
 
 #### Enabling and disabling a database
 
-Enablement lives in the `vamana_databases` table in the launcher's home database (`svs.launcher_database`, default `postgres`). The launcher reacts to changes within a fraction of a second.
+Enablement lives in the `vamana_databases` table in the launcher's home database (`svs.launcher_database`, default `postgres`). The launcher wakes as soon as a change commits. It does not wait for its 180 s fallback poll.
 
 ```sql
 -- Enable Vamana for a database (no restart). A worker is spawned within moments.
@@ -636,11 +658,13 @@ Enrollment reserves the database's worker slot **synchronously** at commit, so a
 
 To bounce one database's worker without taking the database offline — for example, to force a clean checkpoint and replication-slot advance right now rather than waiting for the debounced checkpoint policy:
 
+Run it in the launcher's database (`svs.launcher_database`). Enrollment must run in the launcher database. Rows written to `vamana_databases` in any other database have no effect.
+
 ```sql
 SELECT svs_restart_worker('mydb');
 ```
 
-This drains and cleanly stops the worker (checkpointing every cached index first) and respawns it. It raises an error if the named database is paused or not configured. Only enabled databases can be restarted. Internally it increments the row's `restart_generation` column; the launcher observes the change through its normal reconcile pass and bounces that worker.
+This drains and cleanly stops the worker (checkpointing cached indexes, best effort, until `svs.shutdown_drain_budget_ms` runs out) and respawns it. It raises an error if the named database is paused or not configured. Only enabled databases can be restarted. Internally it increments the row's `restart_generation` column; the launcher observes the change through its normal reconcile pass and bounces that worker.
 
 #### Removing a database permanently
 
@@ -673,7 +697,7 @@ SELECT svs_warmup_database();                      -- every Vamana index in this
 
 ```
 ERROR: cannot enable database "mydb": svs.max_databases (8) already reached
-HINT:  increase svs.max_databases and restart, or disable another database first
+HINT:  Increase svs.max_databases and restart, or disable another database first.
 ```
 
 Plan for your expected number of Vamana-enabled databases plus headroom, since changing this limit requires a server restart.
@@ -692,12 +716,12 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 
 | GUC | Default | Range | Description |
 |-----|---------|-------|-------------|
-| `svs.search_num_threads` | `0` | 0 – 1024 | Cluster-wide default search-thread count. `0` = auto (resolves to `1`). Overridable per database via the `vamana_databases.search_num_threads` catalog column. Superuser-only; no session `SET`. |
-| `svs.max_search_threads_per_db` | `0` | 0 – 1024 | Ceiling on one database's search-thread grant. `0` = follow `max_parallel_workers`. Superuser-only; no session `SET`. |
-| `svs.max_total_search_threads` | `0` | 0 – 1024 | Cluster-wide ceiling on search threads summed across all databases. `0` = follow `max_parallel_workers`; never exceeds it regardless of this setting. Superuser-only; no session `SET`. |
+| `svs.search_num_threads` | `0` | 0 – 1024 | Cluster-wide default search-thread count. `0` = auto (resolves to `1`). Overridable per database via the `vamana_databases.search_num_threads` catalog column. Reload only (`PGC_SIGHUP`); no session `SET`. |
+| `svs.max_search_threads_per_db` | `0` | 0 – 1024 | Ceiling on one database's search-thread grant. `0` = follow `max_parallel_workers`. Reload only (`PGC_SIGHUP`); no session `SET`. |
+| `svs.max_total_search_threads` | `0` | 0 – 1024 | Cluster-wide ceiling on search threads summed across all databases. `0` = follow `max_parallel_workers`; never exceeds it regardless of this setting. Reload only (`PGC_SIGHUP`); no session `SET`. |
 | `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. |
 | `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. |
-| `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. |
+| `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. The delay doubles on each repeated crash, up to 60000 ms. It resets after the worker stays up for 10 s. |
 | `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends`. |
 | `svs.shutdown_drain_budget_ms` | `30000` | 0 – 600000 | Time budget for the worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
 | `svs.worker_stop_timeout_ms` | `30000` | 0 – 600000 | Milliseconds the launcher waits for a restarting worker to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
@@ -764,9 +788,9 @@ Disabling a database and removing it are different operations with different, we
 | Catalog row | Kept | Removed |
 | Resumable? | Yes — re-enable and the worker resumes | No — indexes must be rebuilt |
 
-**Pause** means "stop serving this database for now, but I may come back": a maintenance window, a cost-driven scale-down, a database quiet on weekends. When you set `enabled = false`, the worker checkpoints every cached index (flushing to disk and advancing the replication slot), then stops. At rest, no worker runs; the on-disk saves are current; the replication slot is present, inactive, and not accumulating WAL. Re-enabling later replays little or nothing. Nothing ever escalates a pause into removal — a long-paused database stays exactly paused until you act.
+**Pause** means "stop serving this database for now, but I may come back": a maintenance window, a cost-driven scale-down, a database quiet on weekends. When you set `enabled = false`, the worker checkpoints cached indexes (flushing to disk and advancing the replication slot), within the time limit `svs.shutdown_drain_budget_ms`, then stops. An index not reached in that time keeps its last checkpoint, and this is logged. At rest, no worker runs; the replication slot is present and inactive. Re-enabling later replays the changes since each index's last checkpoint, which is little or nothing for indexes that were checkpointed. Nothing ever escalates a pause into removal — a long-paused database stays exactly paused until you act.
 
-While paused, any query or write against a Vamana index in that database fails (after the startup timeout), rather than queuing quietly.
+While paused, any query or write against a Vamana index in that database fails at once with an error that says the database is not enabled, rather than queuing quietly.
 
 **Permanent removal** means "I am done with Vamana in this database." It is a deliberate two-step action, run in the two databases it affects (PostgreSQL has no cross-database DDL):
 
@@ -785,15 +809,15 @@ DELETE FROM vamana_databases WHERE datname = 'mydb';
 **Order matters, and the wrong order is rejected.** Running step 2 first — `DELETE` while Vamana indexes still exist — fails immediately:
 
 ```
-ERROR: cannot remove "mydb" from vamana_databases: 3 Vamana index(es) still exist in that database
+ERROR: cannot remove "mydb" from vamana_databases: 3 vamana index(es) still exist in that database
 HINT:  run svs_teardown_database() in "mydb" first
 ```
 
-This guarantees on-disk save directories and replication slots are never orphaned with no catalog row pointing at them.
+This check prevents most orphaned save directories and replication slots. It reads a shared-memory counter, so a concurrent `CREATE INDEX` can pass it.
 
-**Forgetting step 2 is safe, not harmful.** If you run teardown but never remove the row, the real cleanup already happened; what remains is only an idle worker serving zero indexes. It is wasteful (it holds one worker slot) but harmless, and it is surfaced via `pg_stat_vamana_worker` (`index_count = 0`) and a one-time server-log hint. The launcher deliberately does not auto-remove the row, since a database with zero indexes right now may simply be between `CREATE INDEX` calls.
+**Forgetting step 2 is safe, not harmful.** If you run teardown but never remove the row, the real cleanup already happened; what remains is only an idle worker serving zero indexes. It is wasteful (it holds one worker slot) but harmless, and it is visible in `pg_stat_vamana_worker` (`index_count = 0`). The launcher deliberately does not auto-remove the row, since a database with zero indexes right now may simply be between `CREATE INDEX` calls.
 
-> `TRUNCATE vamana_databases` is revoked from `PUBLIC` (the owner or a superuser retains it) because it would bypass the removal-safety check on every row at once. Use the two-step removal per database instead.
+> `TRUNCATE vamana_databases` is revoked from `PUBLIC`. A trigger also rejects it for every role, including the owner and superusers, while Vamana indexes exist in any listed database (enabled or not). The error has the same hint as `DELETE`. Use the two-step removal per database instead.
 
 ### TRUNCATE
 
@@ -878,11 +902,11 @@ VACUUM ANALYZE documents;
 The Vamana index graph and TID mappings are serialized directly to files on the filesystem. Disk space usage approximately scales as:
 
 ```
-Disk ≈ N × graph_degree × 8 bytes (neighbor list)
-     + N × D × sizeof(stored_element)
+Disk ≈ N × (graph_degree + 1) × 4 bytes (graph, padded to full degree)
+     + N × bytes_per_vector (see Section 5.3)
 ```
 
-With LeanVec compression the stored element size is much smaller than `D × 4 bytes`, and the `D` in the second term becomes `leanvec_dims`. With LVQ, `D` stays as it is and only the element size shrinks.
+Without compression, `bytes_per_vector` is `D × 4` for `vector` and `D × 2` for `halfvec`.
 
 ### PostgreSQL Restart / Crash Recovery
 
@@ -898,17 +922,17 @@ The serialized SVS index directory (`$PGDATA/vamana_indexes/<dboid>/<relid>/`) c
 
 - **Directories** (`vamana_indexes/`, `vamana_indexes/<dboid>/` and `vamana_indexes/<dboid>/<relid>/`) are created through `MakePGDirectory`, which applies `pg_dir_create_mode`: `0700`, or `0750` on a cluster initialized with group access (`initdb -g`).
 - **The TID map** (`tidmap.bin`) is created with `pg_file_create_mode` — `0600`, or `0640` with group access — and that mode is applied to the file descriptor before any data is written, so the published file's mode is exactly the requested one rather than a umask-reduced approximation of it. There is no execute bit in either case.
-- **The SVS payload** (the `config/`, `data/` and `graph/` subdirectories and their contents) is created entirely by the Intel SVS library, whose save call takes no mode from the extension. The library requests `0777` for those subdirectories and `0666` for the files in them. They still land at `0700` and `0600` (`0750` and `0640` with group access), but only because the server's process umask is `pg_mode_mask` — the extension does not enforce their mode itself.
+- **The SVS payload** (the `config/`, `data/` and `graph/` subdirectories and their contents): the extension creates the three subdirectories with `pg_dir_create_mode`. The Intel SVS library creates the files inside them, and its save call takes no mode from the extension. The library requests `0666` for the files. They still land at `0600` (`0640` with group access), but only because the server's process umask is `pg_mode_mask` — the extension does not enforce their mode itself.
 
-Temporary files are removed as soon as they are no longer needed. `tidmap.bin` is published by writing `tidmap.bin.tmp` and renaming it into place; the temp file is removed on every error path, and any leftover is removed before a new one is created. A temp file orphaned by a crash between the write and the rename is removed at the next load or save of that index.
+Temporary files are removed as soon as they are no longer needed. `tidmap.bin` is published by writing `tidmap.bin.tmp` and renaming it into place; the temp file is removed on every error path, and each save removes a leftover temp file before it creates a new one. A load removes a leftover only if it is older than the postmaster start, so a temp file left by a crash during the current server run stays until the next save of that index.
 
-**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The extension serializes index data directly to the filesystem under `$PGDATA`, bypassing PostgreSQL's tablespace indirection. `ALTER INDEX ... SET TABLESPACE`, `CREATE INDEX ... TABLESPACE`, and `default_tablespace` are all a **silent no-op** for Vamana indexes in the current release (v0.1): `pg_class` reports the index as living in the chosen tablespace, but its vector data still lands under `$PGDATA` regardless of which tablespace was requested. This limitation is tracked for resolution in v0.2.
+**Important:** A separately-encrypted tablespace volume does **not** protect the Vamana index files. The index relation's own pages, including the metapage, follow the requested tablespace (`ALTER INDEX ... SET TABLESPACE`, `CREATE INDEX ... TABLESPACE`, `default_tablespace`). The serialized graph and vectors always go under `$PGDATA/vamana_indexes/`, whatever tablespace you choose. `pg_class` reports the chosen tablespace, but the vector data does not live there.
 
 Operators who require encryption-at-rest for embedding data should use full-disk or volume-level encryption on the filesystem backing `$PGDATA`.
 
 #### WAL Configuration Requirement
 
-Background workers require `wal_level = logical` in `postgresql.conf`. If `wal_level` is set to a lower value (`replica` or `minimal`), each per-database worker emits `FATAL` at startup; the launcher respawns it with escalating backoff (`svs.worker_restart_backoff`), so it enters a backoff-limited crash loop rather than restarting every few seconds. The postmaster and launcher are not affected, but all Vamana index operations (search, insert, delete) will fail with "background worker unavailable" errors until the configuration is corrected and the server is restarted.
+Vamana requires `wal_level = logical` in `postgresql.conf`. If `wal_level` is lower (`replica` or `minimal`), the launcher emits `FATAL` at startup. The postmaster restarts it after `svs.worker_restart_time` seconds (default 5), and it fails again. No worker starts. All Vamana index operations (search, insert, delete) fail with "background worker unavailable" errors until you correct the setting and restart the server.
 
 ```
 # Required in postgresql.conf
@@ -944,27 +968,28 @@ Any role with CONNECT privilege can call `pg_notify('vamana_databases_changed', 
 
 The table also enforces CHECK constraints on its per-database resource columns: `graph_memory_mb > 0`, `search_num_threads BETWEEN 1 AND 1024`, `residency_memory > 0`, `search_work_mem > 0`, `search_threads_reserved BETWEEN 0 AND 1024`, and `maintenance_num_threads BETWEEN 0 AND 1024`. These reject out-of-range values at write time (a NULL means "use the GUC default"), so a bad row cannot reach the launcher.
 
-Beyond those CHECK constraints, two triggers reject writes based on live state rather than the value alone. Lowering `residency_memory` on an `UPDATE` is rejected if the new value is below the database's currently committed resident bytes — read from shared memory if its worker is live, or from `svs_index_residency` if it isn't, so a worker that's down doesn't let a shrink through that would fail the next reload. Raising or setting `search_work_mem` on an `INSERT` or `UPDATE` is rejected if the resulting cluster-wide sum across all enabled databases would exceed `svs.max_search_work_mem`.
+Beyond those CHECK constraints, two triggers reject writes based on live state rather than the value alone. Lowering `residency_memory` on an `UPDATE` is rejected if the new value is below the database's currently committed resident bytes — read from shared memory if its worker is live, or from `svs_index_residency` if it isn't, so a worker that's down doesn't let a shrink through that would fail the next reload. Any `INSERT` or `UPDATE` is rejected if the resulting cluster-wide sum of `search_work_mem` would exceed `svs.max_search_work_mem`. The sum counts all rows, including disabled databases, and a NULL counts as `svs.default_search_work_mem`.
 
 ---
 
 ## 8. Monitoring
 
-### Build Progress
+### 8.1 Build Progress
 
 ```sql
 -- Monitor index build progress (poll every few seconds)
-SELECT phase, blocks_done, blocks_total,
-       tuples_done, tuples_total
+SELECT phase, blocks_done, blocks_total
 FROM pg_stat_progress_create_index
 WHERE relid = 'documents'::regclass;
 ```
+
+`blocks_done` and `blocks_total` come from the heap scan. Vamana does not set `tuples_done` and `tuples_total`.
 
 Phases:
 - `initializing` — setting up build state
 - `loading tuples` — buffering vectors from heap
 
-### Worker Status
+### 8.2 Worker Status
 
 `pg_stat_vamana_worker` reports one row per enabled database — including databases whose worker is starting, backing off after a crash, or serving zero indexes — mirroring how `pg_stat_replication` shows slots regardless of transient state:
 
@@ -978,11 +1003,12 @@ FROM pg_stat_vamana_worker;
 |---|---|
 | `db_oid` | OID of the enabled database |
 | `worker_pid` | The worker's PID, or NULL if no worker is currently running (starting, or crashed and awaiting respawn) |
-| `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive`, or `replica` (serving a hot standby) |
+| `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive` (the worker process is alive but its heartbeat is stale), or `replica` (this server is in recovery, serving a hot standby) |
 | `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)). NULL on a standby, where the counter is not maintained. |
 | `evict_all` | `true` while the worker is draining every cached index (e.g. during a restart or shutdown); normally `false` |
 | `heartbeat_ts` | Last time the worker updated its heartbeat |
 | `residency_bytes_committed` | Live shared-memory total of resident index bytes for this database; NULL if the database has never been admitted |
+| `residency_bytes_reclaimable` | SVS memory held by aborted inserts, above the committed total and not yet compacted; NULL if the database has never been admitted |
 | `build_bytes_committed` | Live shared-memory total reserved for in-progress `CREATE INDEX`/`REINDEX` builds; NULL if the database has never been admitted |
 | `residency_memory_limit` | The resolved residency budget in effect for this database (its `residency_memory` override, or `svs.default_residency_memory`); NULL if the database has never been admitted |
 | `residency_drift` | `residency_bytes_committed` minus the durable sum from `svs_index_residency`; nonzero briefly during a load/unload race, persistently nonzero is a bug |
@@ -991,14 +1017,14 @@ FROM pg_stat_vamana_worker;
 | `search_threads_desired` | The thread count this database's search would use with no contention, before any cluster-wide sharing is applied |
 | `search_threads_granted` | The thread count the launcher has actually granted this database's search, after floors and elastic-remainder sharing across all enabled databases; what search uses right now |
 | `search_threads_reserved` | This database's reserved search-thread floor (`vamana_databases.search_threads_reserved`, or `0`/no floor if unset) |
-| `search_slots_registered` | Number of parked search-thread slots currently registered for this database, used to realize `search_threads_granted` as real, PostgreSQL-visible parallel workers |
+| `search_slots_registered` | Number of parked search-thread slots currently registered for this database, used to realize `search_threads_granted` as real, PostgreSQL-visible parallel workers; `0` until the database has at least one vamana index |
 | `max_search_threads_per_db` | The resolved per-database ceiling in effect (`svs.max_search_threads_per_db`, or the per-database override) |
 
 `pg_stat_vamana_worker_slot` reports one row per worker request slot per visible database — including idle (`empty`) slots, not just in-flight ones — for finer-grained diagnosis of what a worker is currently processing (`slot_status`, `slot_kind`, `index_relid`, `error_message`, `search_scratch_bytes_per_query`).
 
 > **Cross-database visibility:** both views are cluster-wide. An ordinary user sees only their own database's rows; a `pg_read_all_stats` member sees all databases. When you care about the current database only, filter by `db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`.
 
-### Server Log Messages
+### 8.3 Server Log Messages
 
 The extension emits `LOG`-level messages to the PostgreSQL server log during long operations. These appear in the server log (not in the client session) and help diagnose what is happening during slow queries or builds.
 
@@ -1022,7 +1048,7 @@ SELECT id FROM my_table ORDER BY embedding <=> '[…]' LIMIT 1;
 RESET client_min_messages;
 ```
 
-### Index Size
+### 8.4 Index Size
 
 ```sql
 SELECT pg_size_pretty(pg_relation_size('documents_vamana_idx')) AS index_size;
@@ -1034,7 +1060,7 @@ FROM pg_indexes
 WHERE tablename = 'documents';
 ```
 
-### Inspect Index Options
+### 8.5 Inspect Index Options
 
 ```sql
 -- View stored reloptions for a Vamana index
@@ -1043,36 +1069,37 @@ FROM pg_class
 WHERE relname = 'documents_vamana_idx';
 ```
 
-### Write and Vacuum Activity
+### 8.6 Write and Vacuum Activity
 
 | What | How |
 |---|---|
 | Live vs. deleted vector count | No SQL-level view currently; monitor via server log messages below. |
-| Worker state per database | Query `pg_stat_vamana_worker` (see [Worker Status](#worker-status) above). |
+| Worker state per database | Query `pg_stat_vamana_worker` (see [Worker Status](#82-worker-status) above). |
 | Write serialization pressure | `vamana_index_rwlock` is only held inside the worker process, not by backends; backends instead block on their own IPC slot latch. Query `pg_stat_vamana_worker_slot` for rows with `slot_status = 'pending'` or `'processing'` to see queued work. |
 | Rebuild frequency | Look for `rebuilding vamana index from table data` in server logs. A healthy dynamic index sees this only on worker cold start after a restart or REINDEX. |
-| Checkpoint activity | Look for slot advance log messages; infrequent checkpoints indicate low write volume. |
+| Checkpoint activity | Set `log_min_messages = debug1` and look for "checkpoint complete, slot advanced to". The message is DEBUG1, so a default log does not show it. Infrequent checkpoints indicate low write volume. |
 
 ---
 
 ## 9. Troubleshooting
 
-### Index not being used by the planner
+For behavior that is a design limit and not a fault, see [Known Limitations](dev/ARCHITECTURE.md#84-known-limitations).
+
+### 9.1 Symptom: index not being used by the planner
 
 **Cause:** The Vamana index only supports `ORDER BY … LIMIT` queries (nearest-neighbor scans). PostgreSQL will use a sequential scan instead if:
 - There is no `LIMIT` clause
 - The query does not use a supported distance operator (`<->`, `<#>`, `<=>`)
 - The planner estimates a sequential scan is cheaper (common on small tables)
 
-**Diagnose:**
+**Fix:** Run `EXPLAIN` and look for "Index Scan using ..."; if it is absent, the index is not being used:
 
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT id FROM my_table ORDER BY embedding <=> '[...]' LIMIT 10;
--- Look for "Index Scan using ..." — if absent, the index is not being used
 ```
 
-**Fix:** Force index use to confirm it works, then investigate the planner's cost estimate:
+Then force index use to confirm it works, and investigate the planner's cost estimate:
 
 ```sql
 SET enable_seqscan = off;
@@ -1080,64 +1107,59 @@ SELECT id FROM my_table ORDER BY embedding <=> '[...]' LIMIT 10;
 RESET enable_seqscan;
 ```
 
-### Error: `invalid compression_primary value: X`
+### 9.2 Error: `invalid compression_primary value: X`
 
 **Cause:** `compression_primary` is not one of the four allowed values.  
 **Fix:** Use only `4` (UINT4), `-4` (INT4), `8` (UINT8), or `-8` (INT8).
 
-### Error: `invalid compression_secondary value: X`
+### 9.3 Error: `invalid compression_secondary value: X`
 
 **Cause:** Same as above. Note that `0` — no residual — is additionally allowed under `compression_type = 2`, and only there.  
 **Fix:** Use `4`, `-4`, `8`, `-8`, or, for LVQ only, `0`.
 
-### Error: `compression_primary (8-bit) cannot have higher precision than compression_secondary (4-bit)`
+### 9.4 Error: `compression_primary (8-bit) cannot have higher precision than compression_secondary (4-bit)`
 
 **Cause:** `abs(compression_primary) > abs(compression_secondary)` under LeanVec.  
 **Fix:** Ensure primary precision ≤ secondary precision, e.g., primary=`4`, secondary=`8`.
 
-### Error: `unsupported LVQ configuration: 8-bit primary with 8-bit residual`
+### 9.5 Error: `unsupported LVQ configuration: 8-bit primary with 8-bit residual`
 
 **Cause:** The `(compression_primary, compression_secondary)` pair is not one SVS compiles an LVQ specialization for. The supported pairs, by bit width, are (4, 0), (8, 0), (4, 4) and (4, 8) — so an 8-bit primary must be paired with `compression_secondary = 0`.  
 **Fix:** Either drop the residual (`compression_secondary = 0`) or drop the primary to 4 bits.
 
-### Error: `LeanVec compression is not supported on this CPU` / `LVQ compression is not supported on this CPU`
+### 9.6 Error: `LeanVec compression is not supported on this CPU` / `LVQ compression is not supported on this CPU`
 
-**Cause:** LVQ and LeanVec need CPU instructions (e.g. AVX512) that this build of SVS supports but this machine's processor does not have — common when an index built on one host is loaded on another with an older or different CPU. SVS detects this at build/load time and refuses rather than running on an unsupported code path.  
-**Fix:** `REINDEX` with `compression_type = 0` (no compression), or run this database on hardware with the required CPU instructions.
+**Cause:** LeanVec and LVQ compression are supported only on Intel CPUs. SVS checks the CPU vendor at build/load time, so other vendors fail even if the CPU supports AVX-512. SVS refuses rather than running on an unsupported code path. This is common when an index built on an Intel host is loaded on a host with a different CPU.  
+**Fix:** `REINDEX` with `compression_type = 0` (no compression), or run this database on an Intel CPU.
 
 A `CREATE INDEX`/`REINDEX` that hits this directly on the backend shows the full error, including the hint above. The same failure reached through the background worker (an on-disk load, a first insert into an empty-table index, or a heap rebuild) shows only the message naming the compression type; the worker's error channel to the backend does not carry the hint. This is an existing limitation of that channel, not specific to this error.
 
-### Error: `value X out of bounds for option "compression_type"`
+### 9.7 Error: `value X out of bounds for option "compression_type"`
 
 **Cause:** `compression_type` is outside `[0, 2]`.  
 **Fix:** Use `0` (none), `1` (leanvec), or `2` (lvq).
 
-### Error: `insert into index "X" would exceed svs.undo_log_max_entries`
+### 9.8 Error: `insert into index "X" would exceed svs.undo_log_max_entries`
 
-**Cause:** The current transaction has recorded `svs.undo_log_max_entries` undo entries (one per Vamana index insert, counted even for rows later undone by `ROLLBACK TO SAVEPOINT`) and the next insert would exceed it. This is a dedicated, budget-independent cap on per-transaction undo memory, separate from `svs.max_residency_memory`.  
+**Cause:** The current transaction has recorded `svs.undo_log_max_entries` undo entries (one per Vamana index insert, entries from a subtransaction rolled back with `ROLLBACK TO SAVEPOINT` are removed from the count, provided the worker is available) and the next insert would exceed it. This is a dedicated, budget-independent cap on per-transaction undo memory, separate from `svs.max_residency_memory`.  
 **Fix:** Commit in smaller batches, or have a superuser raise `svs.undo_log_max_entries` for the session (`SET svs.undo_log_max_entries = ...`) or cluster-wide (`postgresql.conf` + reload).
 
-### Error: `vamana index "X" was built with an incompatible on-disk format`
-
-**Cause:** The index was built by an older build of the extension that used a different on-disk format. It is refused rather than read with the wrong layout.  
-**Fix:** `REINDEX INDEX X;`. See [Upgrading the Extension](#upgrading-the-extension) to rebuild every Vamana index in a database at once.
-
-### Unexpected recall with large `leanvec_dims`
+### 9.9 Symptom: unexpected recall with large `leanvec_dims`
 
 **Cause:** `leanvec_dims` is not validated against the actual vector dimension at index creation time. If you set `leanvec_dims` to a value ≥ your vector dimension, the SVS library will receive that value and may behave unexpectedly.
 **Fix:** Set `leanvec_dims` to a value strictly less than your vector dimension, or use `-1` for automatic (`dimensions / 2`).
 
-### New rows not appearing in search results after INSERT
+### 9.10 Symptom: new rows not appearing in search results after INSERT
 
 **Cause:** The database's worker must be running before it can accept inserts. If no worker is available, the backend returns an ERROR rather than silently dropping the insert. The two common reasons are: the database is not enabled in `vamana_databases`, or the worker is still starting after a restart.
 **Fix:** Confirm the database's worker is running (`SELECT worker_state FROM pg_stat_vamana_worker WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())`) — if there is no row at all, the database is not enabled in `vamana_databases` (checking the row directly requires the table owner or a superuser, since `SELECT` on `vamana_databases` is not granted to `PUBLIC`). Ensure `shared_preload_libraries = 'svs'`. If the server just restarted, the first operation waits until the worker finishes startup (controlled by `svs.worker_startup_timeout_ms`); if the timeout is exceeded, increase it or investigate slow startup.
 
-### Low recall after compression
+### 9.11 Symptom: low recall after compression
 
 **Cause:** Aggressive compression (small `leanvec_dims` or 4-bit quantization) can reduce recall.  
 **Fix:** Increase `search_window_size` at query time, or rebuild with less aggressive compression settings (larger `leanvec_dims`, or switch to 8-bit).
 
-### Slow first query after restart
+### 9.12 Symptom: slow first query after restart
 
 **Cause:** Indexes load on demand, so the first query against a given index after a restart pays that index's load-and-replay cost. This is per index, not a single upfront load of the whole database.
 **Fix:** Warm the cache deliberately after the server is ready, rather than paying the cost on the first real query:
@@ -1148,7 +1170,7 @@ SELECT svs_warmup_database();   -- warm every Vamana index in this database
 SELECT svs_warmup_index('documents_vamana_idx');
 ```
 
-### INSERT does not appear in a SELECT from another session
+### 9.13 Symptom: INSERT does not appear in a SELECT from another session
 
 **Cause:** All inserts go through the worker synchronously — the inserting session blocks until the worker ACKs. If a SELECT in another session does not return the inserted row, the most likely cause is that this database's worker is not running.
 
@@ -1160,26 +1182,28 @@ WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
 
 **Fix:** ensure the database is enabled in `vamana_databases` and its `worker_state` is `running`. If the worker is running and rows are still missing, force a rebuild with `REINDEX INDEX CONCURRENTLY <idx>`.
 
-### SELECT returns fewer than `LIMIT` rows after many DELETEs
+### 9.14 Symptom: SELECT returns fewer than `LIMIT` rows after many DELETEs
 
 **Cause:** Deleted vectors are soft-deleted and filtered at query time. The returned count can be less than `k` until VACUUM runs consolidation.
-**Fix:** Run `VACUUM` to trigger consolidate. If underfill persists after VACUUM, check server logs for `SVS consolidate failed` warnings. If consolidation keeps failing, run `REINDEX INDEX CONCURRENTLY <idx>`.
+**Fix:** Run `VACUUM` to trigger consolidate. If underfill persists after VACUUM, check server logs for `SVS dynamic consolidate failed` or `BGW consolidate failed during vacuum cleanup` warnings. If consolidation keeps failing, run `REINDEX INDEX CONCURRENTLY <idx>`.
 
-### INSERT throughput drops at high concurrency
+### 9.15 Symptom: INSERT throughput drops at high concurrency
 
-**Cause:** Writes are serialized per index inside the BGW. Throughput is bounded by single-threaded SVS add.
+**Cause:** One worker serves every Vamana index in a database, so writes are serialized per database inside the BGW. Throughput is bounded by single-threaded SVS add.
 
 **Fix:**
 - Batch rows in multi-row `INSERT` statements from a single backend.
-- Consider splitting logically independent datasets across multiple table partitions — each partition has its own index and its own serialization domain.
+- Splitting into partitions in the same database does not spread write load, because they share one worker. To scale writes, place independent datasets in separate databases (one worker each).
 
-### SVSAddPoints failure warning in server log
+### 9.16 Warning: `SVSAddPoints` failure in server log
 
-When `SVSAddPoints` fails, the insert invalidates the cache and returns success to the client, so no user-visible error is raised. If you see `WARNING: SVS dynamic add points failed` frequently in the server log, read the SVS error text from the `DETAIL:` line that follows it. It typically indicates dimension mismatch or an out-of-memory condition.
+**Cause:** SVS rejected the add. The INSERT fails with `ERROR: vamana worker insert failed: ...` and the statement aborts. The server log also has `WARNING: SVS dynamic add points failed`.  
+**Fix:** Read the SVS error text on the `DETAIL:` line that follows the WARNING. Correct the cause it names.
 
-### "background worker unavailable; dead vector removal skipped" WARNING during VACUUM
+### 9.17 Warning: `vamana index "X": background worker unavailable; dead vector removal skipped` during VACUUM
 
-This warning fires when VACUUM runs but the database's worker is not available (e.g., immediately after a server restart, or while the worker is backing off after a crash). Dead vectors accumulate in the index graph until the worker is running again and VACUUM runs again; this is a temporary recall-quality issue, not a correctness issue. If you see this warning persistently, verify the database is enabled and its worker is running (`pg_stat_vamana_worker`), and check server logs for startup errors.
+**Cause:** VACUUM ran while the database's worker was not available (e.g., immediately after a server restart, or while the worker is backing off after a crash). Dead vectors accumulate in the index graph until the worker is running again and VACUUM runs again; this is a temporary recall-quality issue, not a correctness issue.  
+**Fix:** Verify the database is enabled and its `worker_state` is `running` (`pg_stat_vamana_worker`), then run `VACUUM` again. If the warning persists, check server logs for startup errors.
 
 ---
 
@@ -1190,42 +1214,25 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | Feature | HNSW | Vamana |
 |---------|------|--------|
 | Graph structure | Hierarchical multi-layer | Single-layer |
-| Memory (uncompressed) | High | Medium |
-| Memory (compressed) | Not supported | Low — with LeanVec or LVQ |
+| Memory (compressed) | No built in graph compression | Reduced with LeanVec or LVQ (see [§5.3](#53-memory-savings-estimates)) |
 | Parallel build model | PostgreSQL worker processes | SVS-managed OS threads |
-| Shared memory required for build | Yes | No |
+| Build memory limit | `maintenance_work_mem` | `svs.max_build_memory` (`maintenance_work_mem` has no effect) |
 | Incremental inserts update graph | Yes | Yes (via SVS dynamic API) |
 | Intel AVX-512 optimization | No | Yes |
 | Supported distance metrics | L2, inner product, cosine, L1 | L2, inner product, cosine |
-| Max dimensions | 2000 | 2000 |
+| Max dimensions | 2000 (`vector`), 4000 (`halfvec`) | 2000 (`vector` and `halfvec`) |
 
-### Expected Performance Characteristics
+### Benchmarks
 
-> **Note:** The figures below are indicative estimates based on internal benchmarks on Intel Xeon hardware. Actual results will vary by instance type, dataset, and configuration.
-
-| Metric | Estimate vs. HNSW baseline |
-|--------|----------------------------|
-| Build time | ~30–50% faster |
-| Query latency (same recall) | ~15–30% lower |
-| Memory footprint with LeanVec | ~40–60% reduction |
-| Query throughput on Intel Xeon | ~2–3× higher QPS |
-
-**Build time breakdown** (approximate, 1 million 1536D vectors, 4 threads):
-
-| Phase | Estimated time |
-|-------|----------------|
-| Table scan + vector buffering | ~30 s |
-| SVS graph construction | ~90 s |
-| Serialize index to disk | ~20 s |
-| **Total** | **~140 s** |
+For benchmark results, see the [project wiki](https://github.com/intel/SVS-Extension-for-PostgreSQL/wiki).
 
 ### Parameter Migration from HNSW
 
 | HNSW parameter | Vamana equivalent | Notes |
 |----------------|-------------------|-------|
-| `m` | `graph_degree` | Max neighbors per node |
+| `m` | `graph_degree` | Max neighbors per node. HNSW default 16, range 2 to 100; Vamana default 64, range 16 to 256. Do not copy the value directly |
 | `ef_construction` | `build_window_size` | Search window during build |
-| `hnsw.ef_search` (GUC) | `svs.search_window_size` (GUC) | Runtime query beam width |
+| `hnsw.ef_search` (GUC) | `svs.search_window_size` (GUC) | Runtime query beam width. HNSW default 40, range 1 to 1000; Vamana default 100, range 10 to 10000 |
 
 ---
 
@@ -1236,13 +1243,13 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | Parameter | Default | Min | Max | Notes |
 |-----------|---------|-----|-----|-------|
 | `graph_degree` | `64` | `16` | `256` | Max neighbors per node |
-| `alpha` | `-1` | `-1` | `200` | Pruning factor × 100; -1 = SVS default |
+| `alpha` | `-1` | `-1` | `200` | Pruning factor × 100; -1 = SVS default (1.2 for L2, 0.95 for inner product and cosine). L2 needs 100 or more; inner product and cosine need 100 or less |
 | `build_window_size` | `-1` | `-1` | `1000` | Build search window; -1 = 2×graph_degree |
-| `search_window_size` | `100` | `10` | `10000` | Default query window (always governed by `svs.search_window_size` GUC at runtime) |
+| `search_window_size` | `100` | `10` | `10000` | Stored with the index but not currently used; the `svs.search_window_size` GUC always sets the search window (see section 4.2) |
 | `use_search_history` | `true` | — | — | Maintain visited-node set during search; improves recall |
 | `compression_type` | `0` | `0` | `2` | 0=none, 1=leanvec, 2=lvq |
-| `compression_primary` | `4` | — | — | One of: 4, -4, 8, -8 |
-| `compression_secondary` | `8` | — | — | One of: 4, -4, 8, -8, plus 0 (no residual, LVQ only). LeanVec: ≥ primary precision. LVQ: pairs (4,0), (8,0), (4,4), (4,8) only |
+| `compression_primary` | `4` | `-8` | `8` | One of: 4, -4, 8, -8 (the server checks the allowed set at build time) |
+| `compression_secondary` | `8` | `-8` | `8` | One of: 4, -4, 8, -8, plus 0 (no residual, LVQ only). LeanVec: ≥ primary precision. LVQ: pairs (4,0), (8,0), (4,4), (4,8) only |
 | `leanvec_dims` | `-1` | `-1` | `2000` | Reduced dims; -1 = dimensions/2. LeanVec only |
 
 ### Session GUC Parameters (`SET …`)
@@ -1250,15 +1257,17 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.search_window_size` | `100` | `10` | `10000` | Governs query-time search window size; always takes effect (the `search_window_size` index reloption is not used as a fallback in the current implementation) |
-| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact. Superuser-only: it also bounds database-wide residency accounting, not just the caller's own session |
 
 ### Superuser-Settable GUC Parameters (`SET …`, superuser only; also settable in `postgresql.conf` + reload)
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
 | `svs.undo_log_max_entries` | `1048576` | `16` | `16777216` | Per-transaction cap on undo-log entries recorded for the BGW write path. Counted per index insert, not per heap row: a table with two Vamana indexes uses two entries per row. Bounds per-backend undo memory to roughly `entries * 40 bytes`, independent of residency and build-memory budgets. A non-superuser cannot raise it, but is still bound by it. |
+| `svs.compact_threshold_pct` | `10` | `0` | `100` | Percent-deleted threshold that triggers SVS compact during VACUUM; `0` = compact on every VACUUM with pending deletes, `100` = disable compact. It also bounds database-wide residency accounting, not just the caller's own session |
 
 ### Server GUC Parameters (require restart — `postgresql.conf` only, `PGC_POSTMASTER`)
+
+These GUCs are `PGC_POSTMASTER` only when `svs` is in `shared_preload_libraries`. Otherwise they are `PGC_SIGHUP`.
 
 | GUC | Default | Notes |
 |-----|---------|-------|
@@ -1270,32 +1279,32 @@ If your workload already uses the HNSW index, this table helps you decide whethe
 
 | GUC | Default | Min | Max | Notes |
 |-----|---------|-----|-----|-------|
-| `svs.search_num_threads` | `0` | `0` | `1024` | Cluster-wide default search-thread count; 0 = auto (resolves to 1). Overridable per database via `vamana_databases.search_num_threads`. Superuser-only; no session `SET` |
-| `svs.max_search_threads_per_db` | `0` | `0` | `1024` | Ceiling on one database's search-thread grant; 0 = follow `max_parallel_workers`. Superuser-only; no session `SET` |
-| `svs.max_total_search_threads` | `0` | `0` | `1024` | Cluster-wide ceiling on search threads summed across all databases; 0 = follow `max_parallel_workers`, and never exceeds it regardless of this setting. Superuser-only; no session `SET` |
+| `svs.search_num_threads` | `0` | `0` | `1024` | Cluster-wide default search-thread count; 0 = auto (resolves to 1). Overridable per database via `vamana_databases.search_num_threads`. Reload only; no session `SET` |
+| `svs.max_search_threads_per_db` | `0` | `0` | `1024` | Ceiling on one database's search-thread grant; 0 = follow `max_parallel_workers`. Reload only; no session `SET` |
+| `svs.max_total_search_threads` | `0` | `0` | `1024` | Cluster-wide ceiling on search threads summed across all databases; 0 = follow `max_parallel_workers`, and never exceeds it regardless of this setting. Reload only; no session `SET` |
 | `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker (ms); exceeded → error |
 | `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms); exceeded → error |
-| `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; escalates on repeated crashes |
+| `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; doubles on repeated crashes, up to 60000 ms; resets after 10 s of uptime |
 | `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
 | `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |
 | `svs.worker_stop_timeout_ms` | `30000` | `0` | `600000` | Wait for a restarting worker to report stopped before giving up; does not force-kill |
-| `svs.max_slot_wal_size` | `10GB` | — | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
+| `svs.max_slot_wal_size` | `10GB` | `64MB` | — | If WAL retained by the replication slot exceeds this, the slot is dropped and the index is rebuilt from the heap |
 | `svs.max_build_memory` | `4096MB` | `1MB` | — | Cluster-wide ceiling on the sum of every in-progress `CREATE INDEX`/`REINDEX` build's peak memory |
 | `svs.max_residency_memory` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved residency budget; checked at `vamana_databases` enrollment |
 | `svs.default_residency_memory` | `100MB` | `1MB` | — | Residency budget for a database whose `vamana_databases.residency_memory` is `NULL`; independent of `svs.max_residency_memory` |
 | `svs.max_search_work_mem` | `100MB` | `1MB` | — | Cluster-wide ceiling on the sum of every database's resolved search-scratch budget; checked as a catalog aggregate at `vamana_databases` insert/update time |
 | `svs.default_search_work_mem` | `100MB` | `1MB` | — | Search-scratch budget for a database whose `vamana_databases.search_work_mem` is `NULL`; independent of `svs.max_search_work_mem` |
-| `svs.checkpoint_debounce_window` | `300s` | — | — | Quiet-period wait after a write burst before triggering a checkpoint |
-| `svs.checkpoint_max_interval` | `3600s` | — | — | Maximum time between checkpoints; safety net for constant-write workloads |
-| `svs.checkpoint_min_ops` | `10000` | — | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
-| `svs.checkpoint_operations` | `-1` (off) | — | — | Legacy op-count checkpoint trigger; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
-| `svs.checkpoint_interval` | `-1` (off) | — | — | Legacy time-based checkpoint trigger in seconds; activates simple mode when set, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_debounce_window` | `300s` | `0` | `86400s` | Quiet-period wait after a write burst before triggering a checkpoint |
+| `svs.checkpoint_max_interval` | `3600s` | `1s` | `86400s` | Maximum time between checkpoints; safety net for constant-write workloads |
+| `svs.checkpoint_min_ops` | `10000` | `0` | — | Minimum number of write operations required before a checkpoint is considered (AND-logic filter) |
+| `svs.checkpoint_operations` | `-1` (off) | `-1` | — | Simple op-count checkpoint trigger; activates simple mode for a positive value, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
+| `svs.checkpoint_interval` | `-1` (off) | `-1` | `86400` | Simple time-based checkpoint trigger in seconds; activates simple mode for a positive value, which replaces the debounce logic entirely, including the `svs.checkpoint_max_interval` safety net (WAL growth is instead bounded by `svs.max_slot_wal_size`) |
 
 ### SQL Functions
 
 | Function | Runs in | Requires | Purpose |
 |----------|---------|----------|---------|
-| `svs_restart_worker(dbname name)` | launcher's database | `UPDATE` on `vamana_databases` (owner or superuser) | Drain, stop, and respawn one enabled database's worker on demand |
+| `svs_restart_worker(dbname name)` | launcher's database | `UPDATE` on `vamana_databases` (revoked from `PUBLIC`; owner, superuser, or a role granted `UPDATE`) | Drain, stop, and respawn one enabled database's worker on demand |
 | `svs_teardown_database()` | target database | Ownership of each index dropped (checked per-index) | Drop every Vamana index in the current database (step 1 of permanent removal); returns one row per index |
 | `svs_warmup_index(regclass)` | target database | `SELECT` on the index's table | Load one Vamana index into the worker cache |
 | `svs_warmup_database()` | target database | `SELECT` on each index's table (unreadable indexes are skipped, not an error) | Load every Vamana index in the current database; returns the count warmed |

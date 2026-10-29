@@ -22,6 +22,8 @@
 PG_MODULE_MAGIC;
 
 #define SVS_CPU_BUDGET_TEST_COLS 7
+#define SVS_CPU_BUDGET_TEST_REQUIRED_ARGS 11
+#define SVS_CPU_BUDGET_TEST_HAS_INDEXES_ARG 11
 
 static int32 *
 DeconstructInt4Array(ArrayType *arr, int *nelems)
@@ -111,6 +113,7 @@ svs_cpu_budget_test(PG_FUNCTION_ARGS)
 	Oid		   *dbOids,
 			   *buildDbOids;
 	bool	   *dbLive;
+	bool	   *dbHasIndexes = NULL;
 	int32	   *dbSearchNumThreads,
 			   *dbSearchThreadsReserved,
 			   *buildRequestPids,
@@ -119,6 +122,13 @@ svs_cpu_budget_test(PG_FUNCTION_ARGS)
 				nbuilds,
 				n;
 	int			i;
+
+	/* Only db_has_indexes may be NULL. */
+	for (i = 0; i < SVS_CPU_BUDGET_TEST_REQUIRED_ARGS; i++)
+	{
+		if (PG_ARGISNULL(i))
+			ereport(ERROR, (errmsg("argument %d must not be NULL", i + 1)));
+	}
 
 	InitMaterializedSRF(fcinfo, 0);
 	Assert(rsinfo->setDesc->natts == SVS_CPU_BUDGET_TEST_COLS);
@@ -147,11 +157,18 @@ svs_cpu_budget_test(PG_FUNCTION_ARGS)
 	buildMaintenanceNumThreads = DeconstructInt4Array(PG_GETARG_ARRAYTYPE_P(10), &n);
 	CheckSameLength(nbuilds, n, "build_maintenance_num_threads");
 
+	if (!PG_ARGISNULL(SVS_CPU_BUDGET_TEST_HAS_INDEXES_ARG))
+	{
+		dbHasIndexes = DeconstructBoolArray(PG_GETARG_ARRAYTYPE_P(SVS_CPU_BUDGET_TEST_HAS_INDEXES_ARG), &n);
+		CheckSameLength(ndbs, n, "db_has_indexes");
+	}
+
 	dbs = palloc(sizeof(SvsDbCpuRequest) * ndbs);
 	for (i = 0; i < ndbs; i++)
 	{
 		dbs[i].dbOid = dbOids[i];
 		dbs[i].live = dbLive[i];
+		dbs[i].hasIndexes = (dbHasIndexes == NULL) || dbHasIndexes[i];
 		dbs[i].searchNumThreads = dbSearchNumThreads[i];
 		dbs[i].searchThreadsReserved = dbSearchThreadsReserved[i];
 	}
