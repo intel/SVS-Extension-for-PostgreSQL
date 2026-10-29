@@ -121,6 +121,20 @@ LoadIndexFromPages(Relation index)
 		return NULL;
 
 	/*
+	 * The graph/data/config just loaded must come from the same save as the
+	 * metapage: a crash between SVSSaveIndex and VamanaMarkIndexSaved can
+	 * leave a newer graph beside an older, otherwise-valid TID map and
+	 * metapage (or vice versa).  Checked before trusting any of
+	 * meta's save-derived fields below.
+	 */
+	if (!VamanaCheckSaveGeneration(MyDatabaseId, relid, meta.saveGeneration))
+	{
+		SVSFreeIndex(svsIndex);
+		VamanaDeleteSaveDir(MyDatabaseId, relid);
+		return NULL;
+	}
+
+	/*
 	 * Restore the TID mapping from the sidecar file written at save time.
 	 * The capacity includes holes for soft-deleted entries.
 	 */
@@ -133,7 +147,8 @@ LoadIndexFromPages(Relation index)
 				(errmsg("vamana index %u: loading TID map for %u vectors (%u slots total)",
 						relid, meta.numVectors, tidMappingCapacity)));
 
-		if (!VamanaLoadTidMap(MyDatabaseId, relid, tidMapping, (int) tidMappingCapacity))
+		if (!VamanaLoadTidMap(MyDatabaseId, relid, tidMapping, (int) tidMappingCapacity,
+							  meta.saveGeneration))
 		{
 			ereport(WARNING,
 					(errmsg("vamana index %u: TID map missing or corrupt, rebuilding",

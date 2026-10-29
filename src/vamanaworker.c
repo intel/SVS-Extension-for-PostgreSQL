@@ -2419,7 +2419,8 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 					   int distance_type, int data_type,
 					   int numVectors, int tidMappingCapacity,
 					   uint64 nextExternalId, int numDeleted,
-					   Oid heapRelid, int vectorAttNum)
+					   Oid heapRelid, int vectorAttNum,
+					   TimestampTz saveGeneration)
 {
 	VamanaWorkerShmem *entry;
 	VamanaWorkerSlot *slot;
@@ -2451,6 +2452,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 	params->numDeleted			= numDeleted;
 	params->heapRelid			= heapRelid;
 	params->vectorAttNum		= vectorAttNum;
+	params->saveGeneration		= saveGeneration;
 
 	slot->slotKind = VAMANA_SLOTKIND_LOAD;
 
