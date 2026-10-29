@@ -953,42 +953,20 @@ vamanavalidate(Oid opclassoid)
 	 * support function 1 maps to. This is the check that catches an
 	 * opclass pairing (for example) <=> with an L2 support function 1: the
 	 * build serves ORDER BY <=> from an L2 graph, with no recheck, which
-	 * returns the wrong nearest neighbours rather than erroring. Name-based,
-	 * like the rest of the metric mapping; that is a known property of this
-	 * code, not something this check introduces.
+	 * returns the wrong nearest neighbours rather than erroring.
+	 * CREATE INDEX rejects this outright via VamanaOrderOperatorMatchesMetric;
+	 * reused here rather than re-implementing the same name mapping, so the
+	 * two checks cannot drift apart on what counts as a match.
 	 */
-	if (haveMetric && OidIsValid(orderOpOid))
+	if (haveMetric && OidIsValid(orderOpOid) &&
+		!VamanaOrderOperatorMatchesMetric(opfamilyoid, opcintype, metric))
 	{
-		Oid			orderFuncOid = get_opcode(orderOpOid);
-		char	   *orderFuncName = OidIsValid(orderFuncOid) ? get_func_name(orderFuncOid) : NULL;
-		bool		matches = false;
-
-		if (orderFuncName != NULL)
-		{
-			switch (metric)
-			{
-				case SVS_DISTANCE_L2:
-					matches = (strcmp(orderFuncName, "l2_distance") == 0);
-					break;
-				case SVS_DISTANCE_IP:
-					matches = (strcmp(orderFuncName, "vector_negative_inner_product") == 0 ||
-							   strcmp(orderFuncName, "halfvec_negative_inner_product") == 0);
-					break;
-				case SVS_DISTANCE_COSINE:
-					matches = (strcmp(orderFuncName, "cosine_distance") == 0);
-					break;
-			}
-		}
-
-		if (!matches)
-		{
-			ereport(INFO,
-					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-					 errmsg("operator family \"%s\" of access method %s has an ordering operator %s that does not match its distance metric",
-							opfamilyname, "vamana",
-							format_operator(orderOpOid))));
-			result = false;
-		}
+		ereport(INFO,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator family \"%s\" of access method %s has an ordering operator %s that does not match its distance metric",
+						opfamilyname, "vamana",
+						format_operator(orderOpOid))));
+		result = false;
 	}
 
 	ReleaseCatCacheList(proclist);
