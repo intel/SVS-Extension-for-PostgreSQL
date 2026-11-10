@@ -325,10 +325,8 @@ VamanaUpdateMetaPage(Relation index, BlockNumber indexDataBlkno,
 }
 
 /*
- * Raise ERRCODE_DATA_CORRUPTED for a metapage field outside [lo, hi].  Uses
- * int64 so an unsigned field read back out of range (e.g. a uint32
- * underflowed to 0xFFFFFFFF) is reported as the large positive value it
- * actually holds, not as a negative number.
+ * Raise ERRCODE_DATA_CORRUPTED for a metapage field outside [lo, hi]. Uses
+ * int64 so an unsigned field is reported as the value it actually holds.
  */
 static void
 CheckMetaField(Relation index, const char *field, int64 value, int64 lo, int64 hi)
@@ -338,9 +336,10 @@ CheckMetaField(Relation index, const char *field, int64 value, int64 lo, int64 h
 
 	ereport(ERROR,
 			(errcode(ERRCODE_DATA_CORRUPTED),
-			 errmsg("vamana index \"%s\" has an invalid %s value %lld in its metapage",
-					RelationGetRelationName(index), field, (long long) value),
-			 errdetail("Valid range is %lld to %lld.", (long long) lo, (long long) hi),
+			 errmsg("vamana index \"%s\" has an invalid metapage field",
+					RelationGetRelationName(index)),
+			 errdetail("%s value %lld is out of range; valid range is %lld to %lld.",
+					   field, (long long) value, (long long) lo, (long long) hi),
 			 errhint("REINDEX this index.")));
 }
 
@@ -349,22 +348,33 @@ CheckMetaField(Relation index, const char *field, int64 value, int64 lo, int64 h
  * bounds CREATE INDEX enforces on the corresponding reloptions, so a
  * metapage corrupted after a successful build is rejected rather than
  * trusted. Called only after the magic-number check has already passed.
+ * Checks run in the order the fields appear in VamanaMetaPageData.
+ *
+ * dimensions and compression_type have no separate range check: dimensions
+ * only needs the equality check against the column's atttypmod, since
+ * atttypmod is already bounded to the same range CREATE INDEX enforces, so
+ * equality implies range; compression_type's only valid values are the
+ * three VamanaCompressionConfigIsValid already recognizes, so a range
+ * check would just duplicate what that predicate already rejects.
  */
 static void
 ValidateMetaPageConfig(Relation index, const VamanaMetaPageData * meta)
 {
 	int32		column_dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
 
+	if (meta->dimensions != column_dim)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("vamana index \"%s\" has a metapage dimensions value that does not match its column",
+						RelationGetRelationName(index)),
+				 errdetail("Metapage dimensions %u do not match column dimensions %d.",
+						   meta->dimensions, column_dim),
+				 errhint("REINDEX this index.")));
+
 	CheckMetaField(index, "graph_degree", meta->graph_degree,
 				  VAMANA_MIN_GRAPH_DEGREE, VAMANA_MAX_GRAPH_DEGREE);
 	CheckMetaField(index, "alpha", meta->alpha,
 				  VAMANA_MIN_ALPHA, VAMANA_MAX_ALPHA);
-	CheckMetaField(index, "build_window_size", meta->build_window_size,
-				  VAMANA_MIN_BUILD_WINDOW, VAMANA_MAX_BUILD_WINDOW);
-	CheckMetaField(index, "leanvec_dims", meta->leanvec_dims,
-				  VAMANA_MIN_LEANVEC_DIMS, VAMANA_MAX_LEANVEC_DIMS);
-	CheckMetaField(index, "compression_type", meta->compression_type,
-				  VAMANA_COMPRESSION_NONE, VAMANA_COMPRESSION_LVQ);
 
 	if (!VamanaCompressionConfigIsValid(meta->compression_type,
 									   meta->compression_primary,
@@ -378,16 +388,10 @@ ValidateMetaPageConfig(Relation index, const VamanaMetaPageData * meta)
 						   meta->compression_secondary),
 				 errhint("REINDEX this index.")));
 
-	CheckMetaField(index, "dimensions", meta->dimensions, 1, VAMANA_MAX_DIM);
-
-	if (meta->dimensions != column_dim)
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("vamana index \"%s\" has a metapage dimensions value that does not match its column",
-						RelationGetRelationName(index)),
-				 errdetail("Metapage dimensions %u do not match column dimensions %d.",
-						   meta->dimensions, column_dim),
-				 errhint("REINDEX this index.")));
+	CheckMetaField(index, "leanvec_dims", meta->leanvec_dims,
+				  VAMANA_MIN_LEANVEC_DIMS, VAMANA_MAX_LEANVEC_DIMS);
+	CheckMetaField(index, "build_window_size", meta->build_window_size,
+				  VAMANA_MIN_BUILD_WINDOW, VAMANA_MAX_BUILD_WINDOW);
 }
 
 /*

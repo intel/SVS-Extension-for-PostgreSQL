@@ -20,6 +20,7 @@ OBJS = src/svs.o \
        src/vamana_subxact_guard.o \
        src/svs_vector_buffer.o \
        src/vamanabuild.o \
+       src/vamana_compression_rules.o \
        src/svs_parallel_build.o \
        src/svs_build_thread_grant.o \
        src/svs_build_request_protocol.o \

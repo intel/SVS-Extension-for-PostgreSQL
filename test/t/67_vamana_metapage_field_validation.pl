@@ -92,13 +92,13 @@ my @cases = (
         name    => 'dim_oor',
         with    => '',
         pokes   => [ [ 'dimensions', 2001 ] ],
-        pattern => qr/invalid dimensions value 2001/,
+        pattern => qr/metapage dimensions value that does not match its column/,
     },
     {
         name    => 'dim_zero',
         with    => '',
         pokes   => [ [ 'dimensions', 0 ] ],
-        pattern => qr/invalid dimensions value 0/,
+        pattern => qr/metapage dimensions value that does not match its column/,
     },
     {
         name    => 'dim_mismatch',
@@ -110,31 +110,55 @@ my @cases = (
         name    => 'graph_degree',
         with    => '',
         pokes   => [ [ 'graph_degree', 300 ] ],
-        pattern => qr/invalid graph_degree value 300/,
+        pattern => qr/graph_degree value 300 is out of range/,
+    },
+    {
+        name    => 'graph_degree_below_min',
+        with    => '',
+        pokes   => [ [ 'graph_degree', 15 ] ],
+        pattern => qr/graph_degree value 15 is out of range/,
     },
     {
         name    => 'alpha',
         with    => '',
         pokes   => [ [ 'alpha', -5 ] ],
-        pattern => qr/invalid alpha value -5/,
+        pattern => qr/alpha value -5 is out of range/,
+    },
+    {
+        name    => 'alpha_below_min',
+        with    => '',
+        pokes   => [ [ 'alpha', -2 ] ],
+        pattern => qr/alpha value -2 is out of range/,
     },
     {
         name    => 'build_window_size',
         with    => '',
         pokes   => [ [ 'build_window_size', 2000 ] ],
-        pattern => qr/invalid build_window_size value 2000/,
+        pattern => qr/build_window_size value 2000 is out of range/,
+    },
+    {
+        name    => 'build_window_below_min',
+        with    => '',
+        pokes   => [ [ 'build_window_size', -2 ] ],
+        pattern => qr/build_window_size value -2 is out of range/,
     },
     {
         name    => 'leanvec_dims',
         with    => '',
         pokes   => [ [ 'leanvec_dims', 5000 ] ],
-        pattern => qr/invalid leanvec_dims value 5000/,
+        pattern => qr/leanvec_dims value 5000 is out of range/,
+    },
+    {
+        name    => 'leanvec_dims_below_min',
+        with    => '',
+        pokes   => [ [ 'leanvec_dims', -2 ] ],
+        pattern => qr/leanvec_dims value -2 is out of range/,
     },
     {
         name    => 'compression_type',
         with    => '',
         pokes   => [ [ 'compression_type', 3 ] ],
-        pattern => qr/invalid compression_type value 3/,
+        pattern => qr/invalid compression configuration/,
     },
     {
         name    => 'lvq_bad_primary',
@@ -156,16 +180,31 @@ my @cases = (
     },
 );
 
+# Boundary cases: the min and max values CheckMetaField accepts must not be
+# mistaken for out of range (an off by one error in the bounds would reject
+# a legitimate index). These are expected to build and scan cleanly, unlike
+# every case above.
+my @boundary_valid_cases = (
+    { name => 'graph_degree_min', with => '', pokes => [ [ 'graph_degree', 16 ] ] },
+    { name => 'graph_degree_max', with => '', pokes => [ [ 'graph_degree', 256 ] ] },
+    { name => 'alpha_min', with => '', pokes => [ [ 'alpha', -1 ] ] },
+    { name => 'alpha_max', with => '', pokes => [ [ 'alpha', 200 ] ] },
+    { name => 'build_window_min', with => '', pokes => [ [ 'build_window_size', -1 ] ] },
+    { name => 'build_window_max', with => '', pokes => [ [ 'build_window_size', 1000 ] ] },
+    { name => 'leanvec_dims_min', with => '', pokes => [ [ 'leanvec_dims', -1 ] ] },
+    { name => 'leanvec_dims_max', with => '', pokes => [ [ 'leanvec_dims', 2000 ] ] },
+);
+
 sub create_case_objects
 {
-    for my $case (@cases)
+    for my $case (@cases, @boundary_valid_cases)
     {
         my $tbl = "mp_$case->{name}_tbl";
         my $idx = "mp_$case->{name}_idx";
         $node->safe_psql('postgres', qq{
             CREATE TABLE $tbl (id serial PRIMARY KEY, val vector($dim));
             INSERT INTO $tbl (val)
-                SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200);
+                SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
             CREATE INDEX $idx ON $tbl USING vamana (val vector_l2_ops) $case->{with};
         });
         $case->{table} = $tbl;
@@ -175,11 +214,11 @@ sub create_case_objects
     $node->safe_psql('postgres', qq{
         CREATE TABLE mp_control_tbl (id serial PRIMARY KEY, val vector($dim));
         INSERT INTO mp_control_tbl (val)
-            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 200);
+            SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
         CREATE INDEX mp_control_idx ON mp_control_tbl USING vamana (val vector_l2_ops);
     });
 
-    for my $case (@cases)
+    for my $case (@cases, @boundary_valid_cases)
     {
         my $relpath = $node->safe_psql('postgres',
             "SELECT pg_relation_filepath('$case->{index}');");
@@ -204,7 +243,7 @@ if (!eval { create_case_objects(); 1 })
 
 $node->stop;
 
-for my $case (@cases)
+for my $case (@cases, @boundary_valid_cases)
 {
     for my $poke (@{ $case->{pokes} })
     {
@@ -233,6 +272,24 @@ for my $case (@cases)
 }
 
 # ===========================================================================
+# Boundary values: the min and max values each range check accepts must not
+# be rejected. INSERT and a scan must both succeed on these.
+# ===========================================================================
+for my $case (@boundary_valid_cases)
+{
+    $node->safe_psql('postgres',
+        "INSERT INTO $case->{table} (val) VALUES (ARRAY[$array_sql]::vector);");
+    my $out = $node->safe_psql('postgres', qq(
+        SET enable_seqscan = off;
+        SELECT count(*) FROM (
+            SELECT id FROM $case->{table} ORDER BY val <-> '[$query_sql]' LIMIT 100
+        ) s;
+    ));
+    chomp $out;
+    is($out, '51', "$case->{name}: boundary value is accepted, INSERT and scan both succeed");
+}
+
+# ===========================================================================
 # VACUUM goes through the same backend-side metapage read and must fail the
 # same way.
 # ===========================================================================
@@ -253,16 +310,6 @@ for my $case (@cases)
 # worker, and the server log must carry the same field-specific detail.
 # Checked on a representative subset; INSERT above already covers every
 # field's message text.
-#
-# The worker currently cannot forward its own captured load error (real
-# SQLSTATE, message, and hint) through to the scan client; the client
-# only ever sees a generic failure, while the field-specific detail lands
-# in the server log via the worker's WARNING. Once the worker gains a way
-# to surface that captured error to the client instead of only logging
-# it, these three assertions should tighten to check the SQLSTATE,
-# field-specific message, and REINDEX hint directly in the client's
-# error output, the same way the INSERT/VACUUM assertions above already
-# do for the backend path.
 # ===========================================================================
 for my $name (qw(dim_mismatch compression_type lvq_bad_pair))
 {
@@ -286,19 +333,6 @@ for my $name (qw(dim_mismatch compression_type lvq_bad_pair))
 is(wait_for_worker($node, 10), $worker_pid, 'worker survives every scan-path load failure');
 
 # ===========================================================================
-# Reload-queue path (VamanaWorkerProcessReloads) is not reachable by this
-# test's corruption method: VamanaWorkerSignalReload only fires for an index
-# the worker already has cached (vamanaworker.c, VamanaRelcacheCallback's
-# "wasCached" gate), and every corrupted index here fails its very first
-# load, so it can never become cached. VamanaWorkerProcessReloads calls
-# VamanaWorkerGetOrLoadIndex the same way the cold-load path above does
-# (propagateResidencyRefusal = false), so it is caught by the same
-# VamanaRunInSubXact absorption already exercised by every scan-path case;
-# confirmed by reading src/vamanaworker.c around its PG_CATCH/PG_RE_THROW,
-# which wraps that call rather than the load itself.
-# ===========================================================================
-
-# ===========================================================================
 # Control index is untouched and must still work correctly throughout.
 # ===========================================================================
 {
@@ -309,7 +343,7 @@ is(wait_for_worker($node, 10), $worker_pid, 'worker survives every scan-path loa
         ) s;
     ));
     chomp $out;
-    is($out, '100', 'untouched control index still returns correct results');
+    is($out, '50', 'untouched control index still returns correct results');
 }
 
 # ===========================================================================
@@ -325,7 +359,7 @@ is(wait_for_worker($node, 10), $worker_pid, 'worker survives every scan-path loa
         ) s;
     ));
     chomp $out;
-    is($out, '100', 'REINDEX recovers a corrupted index and a scan then works');
+    is($out, '50', 'REINDEX recovers a corrupted index and a scan then works');
 }
 
 # ===========================================================================
