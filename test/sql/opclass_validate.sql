@@ -157,10 +157,7 @@ DROP OPERATOR FAMILY vamana_test_l2_with_norm_ops USING vamana CASCADE;
 -- Operator/metric mismatch: the ordering operator is <=> (cosine) but
 -- support function 1 is the L2 distance. CREATE INDEX builds this as an L2
 -- graph and serves ORDER BY <=> from it with no recheck, returning the
--- wrong nearest neighbours rather than erroring. Confirmed separately by
--- building an index on this shape and comparing its ORDER BY <=> result to
--- the true cosine order; the fix for that is this validator catching the
--- shape at amvalidate() time, not a change to the scan itself.
+-- wrong nearest neighbours rather than erroring.
 CREATE OPERATOR CLASS vamana_test_metric_mismatch_ops
 	FOR TYPE vector USING vamana AS
 	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
@@ -171,3 +168,46 @@ SELECT amvalidate(oid) FROM pg_opclass
    AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
 
 DROP OPERATOR FAMILY vamana_test_metric_mismatch_ops USING vamana CASCADE;
+
+-- A halfvec defect case: every defect case above uses vector, so this
+-- confirms the checks are type-generic rather than vector-specific.
+CREATE OPERATOR CLASS vamana_test_halfvec_missing_proc1_ops
+	FOR TYPE halfvec USING vamana AS
+	OPERATOR 1 <-> (halfvec, halfvec) FOR ORDER BY float_ops;
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_halfvec_missing_proc1_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_halfvec_missing_proc1_ops USING vamana CASCADE;
+
+-- Ordering operator with the wrong signature: "=" returns bool, not float8,
+-- but nothing stops it from being declared FOR ORDER BY.
+CREATE OPERATOR CLASS vamana_test_wrong_opr_sig_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 = (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_l2_squared_distance(vector, vector);
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_wrong_opr_sig_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_wrong_opr_sig_ops USING vamana CASCADE;
+
+-- A valid opclass plus a support function registered for a type pair other
+-- than its own (added directly via ALTER OPERATOR FAMILY, since no DDL path
+-- reaches this through CREATE OPERATOR CLASS alone): that group's signature
+-- is not this opclass's concern and must not be flagged.
+CREATE OPERATOR CLASS vamana_test_foreign_group_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_l2_squared_distance(vector, vector);
+
+ALTER OPERATOR FAMILY vamana_test_foreign_group_ops USING vamana
+	ADD FUNCTION 1 (halfvec, halfvec) vector_dims(vector);
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_foreign_group_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_foreign_group_ops USING vamana CASCADE;
