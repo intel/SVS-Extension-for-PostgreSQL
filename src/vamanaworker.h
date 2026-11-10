@@ -141,6 +141,7 @@ typedef struct VamanaWorkerSlot
 	int				searchWindowSize;
 	int				numResults;		/* results written by worker (SEARCH / DELETE count) */
 	char			errorMessage[512]; /* set on VAMANA_SLOT_ERROR */
+	char			errorHint[256]; /* optional; empty if the error has no hint */
 	uint8			errorCategory;	/* VAMANA_ERR_* set by BGW on VAMANA_SLOT_ERROR */
 	Latch			latch;			/* InitSharedLatch'd; backend owns while waiting */
 
@@ -653,7 +654,8 @@ PGDLLEXPORT bool SvsSlotOwnerIsAlive(Oid dbOid, pid_t ownerPid);
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
 int		VamanaSlotErrcode(uint8 category);
-void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 category);
+void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, const char *hint,
+							uint8 category);
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;

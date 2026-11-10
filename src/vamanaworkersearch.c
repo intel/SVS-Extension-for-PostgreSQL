@@ -123,11 +123,7 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 				VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
 
 				slot->numResults = 0;
-				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-						 "%s", loadErrMsg);
-				slot->errorCategory = VAMANA_ERR_INTERNAL;
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+				VamanaWorkerFailSlot(slot, loadErrMsg, NULL, VAMANA_ERR_INTERNAL);
 			}
 			return;
 		}
@@ -149,14 +145,9 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 			VamanaWorkerGetLastLoadError(&loadErrSqlerrcode, &loadErrMessage, &loadErrHint);
 		char		notLoadedMsg[512];
 
-		if (hasLoadErr)
-		{
-			if (loadErrHint != NULL)
-				snprintf(notLoadedMsg, sizeof(notLoadedMsg), "%s %s",
-						 loadErrMessage, loadErrHint);
-			else
-				snprintf(notLoadedMsg, sizeof(notLoadedMsg), "%s", loadErrMessage);
-		}
+		if (!hasLoadErr)
+			snprintf(notLoadedMsg, sizeof(notLoadedMsg),
+					 "vamana worker: index %u not loaded", relid);
 
 		for (int i = 0; i < n; i++)
 		{
@@ -166,21 +157,16 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 			if (!isEmpty)
 			{
 				if (hasLoadErr)
-				{
-					snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-							 "%s", notLoadedMsg);
-					slot->errorCategory = VAMANA_ERR_DATA;
-				}
+					VamanaWorkerFailSlot(slot, loadErrMessage, loadErrHint,
+										 VamanaCategorizeSQLState(loadErrSqlerrcode));
 				else
-				{
-					snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-							 "vamana worker: index %u not loaded", relid);
-					slot->errorCategory = VAMANA_ERR_INTERNAL;
-				}
+					VamanaWorkerFailSlot(slot, notLoadedMsg, NULL, VAMANA_ERR_INTERNAL);
 			}
-			pg_write_barrier();
-			pg_atomic_write_u32(&slot->status,
-								isEmpty ? VAMANA_SLOT_DONE : VAMANA_SLOT_ERROR);
+			else
+			{
+				pg_write_barrier();
+				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+			}
 		}
 		return;
 	}
@@ -204,19 +190,20 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 		isOverride = VamanaWorkerShmemPtr->searchWorkMemMbOverride > 0;
 		LWLockRelease(header->lock);
 
+		char		scratchErrMsg[512];
+
+		snprintf(scratchErrMsg, sizeof(scratchErrMsg),
+				 "vamana worker: batch against index %u exceeds this database's "
+				 "search-scratch budget of %llu bytes%s",
+				 relid, (unsigned long long) resolvedLimit,
+				 isOverride ? " (search_work_mem override)" : " (svs.default_search_work_mem)");
+
 		for (int i = 0; i < n; i++)
 		{
 			VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
 
 			slot->numResults = 0;
-			snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-					 "vamana worker: batch against index %u exceeds this database's "
-					 "search-scratch budget of %llu bytes%s",
-					 relid, (unsigned long long) resolvedLimit,
-					 isOverride ? " (search_work_mem override)" : " (svs.default_search_work_mem)");
-			slot->errorCategory = VAMANA_ERR_OOM;
-			pg_write_barrier();
-			pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+			VamanaWorkerFailSlot(slot, scratchErrMsg, NULL, VAMANA_ERR_OOM);
 		}
 		return;
 	}
@@ -370,11 +357,8 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 						else
 						{
 							slot->numResults = 0;
-							snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-									 "SVS batch search failed");
-							slot->errorCategory = VAMANA_ERR_INTERNAL;
-							pg_write_barrier();
-							pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+							VamanaWorkerFailSlot(slot, "SVS batch search failed", NULL,
+												 VAMANA_ERR_INTERNAL);
 						}
 					}
 
@@ -417,14 +401,17 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 
 					if (nr < 0)
 					{
-						snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-								 "SVS search failed with code %d", nr);
-						slot->errorCategory = VAMANA_ERR_INTERNAL;
-					}
+						char		seqErrMsg[64];
 
-					pg_write_barrier();
-					pg_atomic_write_u32(&slot->status,
-										(nr >= 0) ? VAMANA_SLOT_DONE : VAMANA_SLOT_ERROR);
+						snprintf(seqErrMsg, sizeof(seqErrMsg),
+								 "SVS search failed with code %d", nr);
+						VamanaWorkerFailSlot(slot, seqErrMsg, NULL, VAMANA_ERR_INTERNAL);
+					}
+					else
+					{
+						pg_write_barrier();
+						pg_atomic_write_u32(&slot->status, VAMANA_SLOT_DONE);
+					}
 				}
 			}
 
@@ -452,16 +439,19 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 							relid, edata->message ? edata->message : "unknown")));
 			FreeErrorData(edata);
 
-			for (int i = 0; i < n; i++)
 			{
-				VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+				char		catchErrMsg[128];
 
-				slot->numResults = 0;
-				snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+				snprintf(catchErrMsg, sizeof(catchErrMsg),
 						 "vamana worker: search error on index %u", relid);
-				slot->errorCategory = VAMANA_ERR_INTERNAL;
-				pg_write_barrier();
-				pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);
+
+				for (int i = 0; i < n; i++)
+				{
+					VamanaWorkerSlot *slot = &VamanaWorkerShmemPtr->slots[slotIdxs[i]];
+
+					slot->numResults = 0;
+					VamanaWorkerFailSlot(slot, catchErrMsg, NULL, VAMANA_ERR_INTERNAL);
+				}
 			}
 		}
 		PG_END_TRY();

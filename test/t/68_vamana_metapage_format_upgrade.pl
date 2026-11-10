@@ -120,6 +120,8 @@ my $reindex_hint_re = qr/REINDEX this index\./;
     isnt($ret, 0, 'SELECT against a stale-format index fails');
     like($err, $format_err_re, 'SELECT reports the incompatible-format error to the client');
     like($err, $reindex_hint_re, 'SELECT carries the REINDEX hint to the client');
+    like($err, qr/^HINT:\s*REINDEX this index\.$/m,
+        'SELECT carries the hint as a structured HINT, not flattened into the message');
     like($log, $format_err_re, 'the incompatible-format detail also reaches the server log');
 
     my (undef, undef, $sqlstate_err) = $node->psql('postgres', qq{
@@ -132,8 +134,8 @@ my $reindex_hint_re = qr/REINDEX this index\./;
         END
         \$do\$;
     });
-    like($sqlstate_err, qr/sqlstate=22000/,
-        'SELECT raises a data-exception SQLSTATE, not an internal-error one');
+    like($sqlstate_err, qr/sqlstate=XX000/,
+        'SELECT raises the real error\'s SQLSTATE class, not an unrelated one');
 }
 
 # --- No crash: worker pid unchanged, no fatal lines in the log since restart ---

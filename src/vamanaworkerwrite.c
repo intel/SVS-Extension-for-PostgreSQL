@@ -576,7 +576,7 @@ VamanaWorkerProcessWriteSlot(int slotIdx)
 		RESUME_INTERRUPTS();
 
 		VamanaWorkerFailSlot(slot, edata->message ? edata->message : "unknown error",
-							 VamanaCategorizeSQLState(edata->sqlerrcode));
+							 NULL, VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
 
 		vamana_eviction_suppressed = prevSuppressed;
@@ -774,7 +774,7 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		FlushErrorState();
 
 		VamanaWorkerFailSlot(slot, edata->message ? edata->message : "unknown error",
-							 VamanaCategorizeSQLState(edata->sqlerrcode));
+							 NULL, VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -850,7 +850,7 @@ VamanaWorkerProcessWarmupSlot(int slotIdx)
 		FlushErrorState();
 
 		VamanaWorkerFailSlot(slot, edata->message ? edata->message : "unknown error",
-							 VamanaCategorizeSQLState(edata->sqlerrcode));
+							 NULL, VamanaCategorizeSQLState(edata->sqlerrcode));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
