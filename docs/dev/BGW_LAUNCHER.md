@@ -25,8 +25,6 @@ A Vamana index is not self-contained in the way a B-tree or an HNSW index is. It
 
 This document describes the mechanism that manages those workers: a single supervisor process (the *launcher*) that starts, stops, restarts, and tracks one *per-database worker* for each database an operator has enabled for Vamana. The design lets an operator enable Vamana for a new database, pause it, restart its worker, or remove it permanently, all by changing rows in a configuration table, with no server restart and no edits to `postgresql.conf`.
 
-The model replaces an earlier single-worker design in which one statically registered worker served exactly one database named by a configuration parameter. That earlier model gave a hard error for Vamana indexes in any other database, and changing the target database required editing the configuration file and restarting the server.
-
 ---
 
 ## 2. Process Model
@@ -45,7 +43,7 @@ postmaster
 
 The launcher is a supervisor, not a data-plane process. It never serves index queries, never holds graph state, and never allocates shared memory. Its single responsibility is to keep the set of running per-database workers in agreement with the set of enabled databases in the configuration catalog, and to bring workers back when they die.
 
-Each per-database worker is bound to its database for its whole lifetime. It owns the in-memory SVS graph state for every Vamana index in that database, processes IPC requests from backends (search, insert, delete, maintenance), owns that database's replication slot, and performs the periodic checkpoints that persist graph state to disk. Nothing about a worker's data-plane responsibilities changed with the move to the launcher model; what changed is that there is now one worker per database, spawned on demand, rather than one worker for the whole cluster.
+Each per-database worker is bound to its database for its whole lifetime. It owns the in-memory SVS graph state for every Vamana index in that database, processes IPC requests from backends (search, insert, delete, maintenance), owns the replication slot of each index in that database, and performs the periodic checkpoints that persist graph state to disk. There is one worker per database, spawned on demand by the launcher.
 
 ---
 
@@ -72,7 +70,7 @@ Wholesale truncation of the table is blocked by revoking the truncate privilege 
 
 Backends and workers coordinate through a fixed-size array of per-database control structures in shared memory, sized at postmaster startup by a postmaster-level parameter (`svs.max_databases`). The array cannot grow at runtime; PostgreSQL has no native mechanism for growing a shared-memory region after allocation. Exhausting it is handled explicitly (see [Section 5](#5-enabling-a-database-the-reservation-handshake)).
 
-The layout separates two concerns that used to share one variable-length structure:
+The layout separates two concerns:
 
 - A small, fixed-stride control structure per database. This holds the database OID that identifies the slot, the worker's process ID (its readiness claim), an atomic index counter, the worker's latch and heartbeat, and the launcher's own crash-backoff state. Because each entry is fixed size, these entries form the array that backends scan.
 - Separate flat buffers holding the large backend-IPC region (the per-backend request slots and their query-vector, result-TID, and distance areas). These are sized by `svs.max_databases` multiplied by the per-database backend-scaled size. Each control entry points into its database's region of these buffers, stitched together once at shared-memory startup.
@@ -235,7 +233,7 @@ Instead, each fiction worker detects its own owner's death using the same livene
 
 A per-database worker is spawned with its database OID as its argument. On startup it connects to that database, publishes its process ID immediately to unblock waiting backends, and then serves requests.
 
-Loading is **demand-driven**. The worker does not eagerly load every index in the database at startup. The first request for a given index loads that index on demand; subsequent requests find it cached. This replaced an earlier eager-preload model in which backends stayed blocked until every index in the database had been loaded before the worker declared itself available. Under demand-driven loading, startup cost no longer scales with the number or size of indexes; a worker becomes available as soon as it connects, and pays per-index load cost lazily on first use.
+Loading is **demand-driven**. The worker does not eagerly load every index in the database at startup. The first request for a given index loads that index on demand; subsequent requests find it cached. Startup cost does not scale with the number or size of indexes; a worker becomes available as soon as it connects, and pays per-index load cost lazily on first use.
 
 A corollary is that a dropped cache entry (for example, one evicted because a bounded reload queue overflowed) is recovered exactly like any other cache miss: the next request for it loads it. There is no separate full-reload path.
 
@@ -335,7 +333,7 @@ The configuration question and the liveness question are answered by two separat
 - The **configuration** check asks "is this database enabled?" It either returns or hard-errors; it never spins. It treats "no slot" as authoritative only after the launcher's initial-scan flag is set; before that, it returns without erroring, because a valid database is briefly indistinguishable from an unconfigured one in the pre-publish window.
 - The **liveness** wait asks "is a worker live and serving now?" It tolerates the startup window in which the slot exists but the worker process ID is not yet set. It re-checks configuration on each iteration, so that the instant the initial-scan flag flips with no slot present, it fails fast with a crisp configuration error instead of spinning to the startup timeout.
 
-Keeping these two separate is what prevents a regression that an earlier design hit: keying the configuration question on slot presence (a liveness artifact) made every operation in a correctly configured database hard-error during the worker's startup window.
+Keeping these two separate matters: keying the configuration question on slot presence (a liveness artifact) would make every operation in a correctly configured database hard-error during the worker's startup window.
 
 ### The disable-side race is accepted, not closed
 
@@ -364,7 +362,7 @@ Because the view is cross-database, a query that cares about the current databas
 |---|---|---|
 | `svs.launcher_database` | postmaster | The database the launcher connects to in order to read the configuration catalog. The only remaining parameter that names a specific database; a one-time install choice. |
 | `svs.max_databases` | postmaster | Sizes the per-database shared-memory array. Cannot change without a restart. Default sized for a typical number of Vamana-enabled databases plus headroom. |
-| `svs.worker_restart_time` | postmaster | Governs the launcher's *own* crash-restart interval (via its static registration). No longer read by any per-database worker. |
+| `svs.worker_restart_time` | postmaster | Governs the launcher's *own* crash-restart interval (via its static registration). Read only by the launcher, not by per-database workers. |
 | `svs.worker_restart_backoff` | reloadable | The base interval the launcher uses for per-database worker crash-restart backoff. Read only by the launcher's own restart logic. Deliberately separate from `svs.worker_restart_time`, because the two govern different restart policies (a fixed interval for the launcher itself, versus escalating backoff for per-database workers) that merely share a plausible default. |
 | `svs.worker_startup_timeout_ms` | reloadable | Cluster-wide bound on the wait for a worker that is enabled but not yet available. No per-database override. |
 | `svs.worker_timeout_ms` | reloadable | Cluster-wide bound on an individual IPC request. No per-database override. |

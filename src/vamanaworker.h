@@ -42,6 +42,7 @@ typedef void *SVSIndexHandle;
 #define VAMANA_ERR_DATA         2	/* ERRCODE_DATA_EXCEPTION (dim mismatch etc.) */
 #define VAMANA_ERR_IO           3	/* ERRCODE_IO_ERROR */
 #define VAMANA_ERR_INTERNAL     4	/* ERRCODE_INTERNAL_ERROR */
+#define VAMANA_ERR_UNSUPPORTED  5	/* ERRCODE_FEATURE_NOT_SUPPORTED */
 
 /* -----------------------------------------------------------------------
  * Slot kind: what operation this slot carries
@@ -472,6 +473,16 @@ typedef struct VamanaWorkerShmemHeader
 	 */
 	uint64			totalResidencyCommittedGlobal;
 	uint64			totalBuildCommittedGlobal;
+
+	/*
+	 * Cluster-wide last LSN and timestamp at which any vamana worker called
+	 * LogStandbySnapshot to keep future running-xacts gaps small for every
+	 * primary's catch-up slices (VamanaReplicationMaybeEmitRunningXactsStride).
+	 * CAS-claimed on lastRunningXactsLsn so N database workers crossing the
+	 * stride at once cost one LogStandbySnapshot call, not N.
+	 */
+	pg_atomic_uint64 lastRunningXactsLsn;
+	pg_atomic_uint64 lastRunningXactsEmitTs;	/* TimestampTz stored as uint64 */
 
 	VamanaWorkerShmem slots[FLEXIBLE_ARRAY_MEMBER];
 } VamanaWorkerShmemHeader;

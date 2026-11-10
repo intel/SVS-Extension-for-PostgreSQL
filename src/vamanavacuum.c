@@ -68,6 +68,17 @@ vamanabulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	}
 
 	VamanaReadMetaPage(index, &meta);
+
+	/*
+	 * Residency-budget check skipped here: this runs in a backend, which is
+	 * not guaranteed to have an admitted worker entry in scope the way the
+	 * worker's own load paths do. palloc0/palloc below are already
+	 * MaxAllocSize-capped, so the only gap this closes is the same
+	 * corruption message checks 1-2 give the load paths.
+	 */
+	VamanaValidateMetaCounts(relid, meta.tidMappingCapacity, meta.numVectors,
+							 meta.numDeleted, meta.nextExternalId, false);
+
 	tidMappingCapacity = (int) meta.tidMappingCapacity;
 
 	if (tidMappingCapacity <= 0)

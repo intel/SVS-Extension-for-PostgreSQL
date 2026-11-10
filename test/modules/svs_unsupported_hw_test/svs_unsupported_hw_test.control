@@ -1,0 +1,5 @@
+# svs_unsupported_hw_test extension
+comment = 'Standalone test harness for SVSReportUnsupportedHardware'
+default_version = '1.0'
+module_pathname = '$libdir/svs_unsupported_hw_test'
+relocatable = true

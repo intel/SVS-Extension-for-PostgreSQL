@@ -1,0 +1,5 @@
+# svs_multi_insert_bounds_test extension
+comment = 'Standalone test harness for VamanaMultiInsertCountsValid'
+default_version = '1.0'
+module_pathname = '$libdir/svs_multi_insert_bounds_test'
+relocatable = true

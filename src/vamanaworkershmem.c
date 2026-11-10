@@ -346,6 +346,8 @@ VamanaWorkerShmemStartup(void)
 			&(GetNamedLWLockTranche(VamanaWorkerHeaderLockName))->lock;
 		VamanaWorkerShmemHeaderPtr->numSlots = max_vamana_databases;
 		VamanaWorkerShmemHeaderPtr->numActive = 0;
+		pg_atomic_init_u64(&VamanaWorkerShmemHeaderPtr->lastRunningXactsLsn, 0);
+		pg_atomic_init_u64(&VamanaWorkerShmemHeaderPtr->lastRunningXactsEmitTs, 0);
 
 		for (int db = 0; db < max_vamana_databases; db++)
 			VamanaWorkerInitSlot(&VamanaWorkerShmemHeaderPtr->slots[db],
@@ -739,15 +741,31 @@ VamanaWorkerIndexCountSnapshot(Oid dbOid, uint32 *count)
 	return true;
 }
 
+typedef struct IndexCountDeltaCtx
+{
+	int			delta;
+	bool		crossedZero;	/* out: counter went 0 -> nonzero or back */
+} IndexCountDeltaCtx;
+
 static void
 ApplyIndexCountDeltaCb(VamanaWorkerShmem *entry, void *ctx)
 {
-	int			delta = *((int *) ctx);
+	IndexCountDeltaCtx *dctx = (IndexCountDeltaCtx *) ctx;
+	uint32		before;
+	uint32		after;
 
-	if (delta > 0)
-		pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) delta);	// NOLINT(bugprone-narrowing-conversions): already-explicit cast; the flagged narrowing is inside PostgreSQL's own atomics implementation, not this call
+	if (dctx->delta > 0)
+	{
+		before = pg_atomic_fetch_add_u32(&entry->indexCount, (uint32) dctx->delta);	// NOLINT(bugprone-narrowing-conversions): already-explicit cast; the flagged narrowing is inside PostgreSQL's own atomics implementation, not this call
+		after = before + (uint32) dctx->delta;
+	}
 	else
-		pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-delta));	// NOLINT(bugprone-narrowing-conversions): same as above
+	{
+		before = pg_atomic_fetch_sub_u32(&entry->indexCount, (uint32) (-dctx->delta));	// NOLINT(bugprone-narrowing-conversions): same as above
+		after = before - (uint32) (-dctx->delta);
+	}
+
+	dctx->crossedZero = (before == 0) != (after == 0);
 }
 
 /*
@@ -756,14 +774,26 @@ ApplyIndexCountDeltaCb(VamanaWorkerShmem *entry, void *ctx)
  * write untorn, but only the lock keeps it aimed at this database, and a delta
  * landing on another tenant's counter would move the gate on removing that
  * database's row.
+ *
+ * The launcher grants search threads only to a database with an index, so it
+ * is kicked when the counter crosses zero.  The kick comes after the header
+ * lock is released: SvsWakeBackend takes ProcArrayLock, and the two must not
+ * nest.
  */
 static void
 ApplyIndexCountDelta(Oid dbOid, int delta)
 {
+	IndexCountDeltaCtx dctx;
+
 	if (delta == 0)
 		return;
 
-	(void) VamanaWorkerWithEntry(dbOid, ApplyIndexCountDeltaCb, &delta);
+	dctx.delta = delta;
+	dctx.crossedZero = false;
+
+	if (VamanaWorkerWithEntry(dbOid, ApplyIndexCountDeltaCb, &dctx) &&
+		dctx.crossedZero)
+		SvsKickLauncher();
 }
 
 /*
@@ -1368,6 +1398,8 @@ VamanaCategorizeSQLState(int sqlerrcode)
 {
 	if (sqlerrcode == ERRCODE_OUT_OF_MEMORY)
 		return VAMANA_ERR_OOM;
+	if (sqlerrcode == ERRCODE_FEATURE_NOT_SUPPORTED)
+		return VAMANA_ERR_UNSUPPORTED;
 	if (ERRCODE_TO_CATEGORY(sqlerrcode) == ERRCODE_TO_CATEGORY(ERRCODE_DATA_EXCEPTION))
 		return VAMANA_ERR_DATA;
 	if (ERRCODE_TO_CATEGORY(sqlerrcode) == ERRCODE_TO_CATEGORY(ERRCODE_IO_ERROR))
@@ -1380,10 +1412,11 @@ VamanaSlotErrcode(uint8 category)
 {
 	switch (category)
 	{
-		case VAMANA_ERR_OOM:	return ERRCODE_OUT_OF_MEMORY;
-		case VAMANA_ERR_DATA:	return ERRCODE_DATA_EXCEPTION;
-		case VAMANA_ERR_IO:		return ERRCODE_IO_ERROR;
-		default:				return ERRCODE_INTERNAL_ERROR;
+		case VAMANA_ERR_OOM:			return ERRCODE_OUT_OF_MEMORY;
+		case VAMANA_ERR_DATA:			return ERRCODE_DATA_EXCEPTION;
+		case VAMANA_ERR_IO:				return ERRCODE_IO_ERROR;
+		case VAMANA_ERR_UNSUPPORTED:	return ERRCODE_FEATURE_NOT_SUPPORTED;
+		default:						return ERRCODE_INTERNAL_ERROR;
 	}
 }
 

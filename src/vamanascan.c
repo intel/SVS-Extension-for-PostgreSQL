@@ -50,6 +50,9 @@ LoadIndexFromPages(Relation index)
 
 	VamanaReadMetaPage(index, &meta);
 
+	VamanaValidateMetaCounts(relid, meta.tidMappingCapacity, meta.numVectors,
+							 meta.numDeleted, meta.nextExternalId, true);
+
 	if (!meta.hasSavedIndex)
 	{
 		ereport(DEBUG1,

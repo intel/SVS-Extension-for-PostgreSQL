@@ -31,14 +31,6 @@ jobs:
       # (or clobbering) that job's non-assert install.
       PG_CONFIGURE_EXTRA_ARGS: "--enable-debug --enable-cassert --enable-injection-points --enable-tap-tests"
       CFLAGS: "-Og -g3 -fno-omit-frame-pointer"
-      # Same pin build-and-test.yml uses, so a warm SVS cache can be shared
-      # between the two jobs; see ci/build_and_test.sh's own comment on why
-      # SVS_BRANCH=main can drift ahead of this tarball's bindings/c API.
-      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
-      # SVS_COMMIT must be the exact SVS_REPO commit SVS_URL's tarball was
-      # built from; see docs/build_guide/config. Update both together
-      # whenever SVS_URL is bumped to a newer nightly.
-      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: docs/build_guide/svs_install
-          key: svs-ubuntu-24.04-${{ env.CC }}-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
+          key: svs-ubuntu-24.04-${{ env.CC }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
 
       - name: deps
         run: ci/build_and_test.sh deps
@@ -127,13 +119,14 @@ jobs:
           classify_rc="${PIPESTATUS[0]}"
           pg_version="$(docs/build_guide/pgsql_install/bin/pg_config --version 2>/dev/null || echo unknown)"
           configure_flags="$(docs/build_guide/pgsql_install/bin/pg_config --configure 2>/dev/null || echo unknown)"
+          source docs/build_guide/config
           {
             echo "## Assert-build summary"
             echo
             echo "- PostgreSQL: ${pg_version}"
             echo "- Configure flags: ${configure_flags}"
             echo "- Extension git SHA: \`${GITHUB_SHA}\`"
-            echo "- SVS library: \`${SVS_URL}\`"
+            echo "- SVS release: \`${SVS_TAG}\`"
             echo "- Canary: debug_assertions=${CANARY_DEBUG_ASSERTIONS:-unknown}, injection_points extension created ok"
             echo
             echo '```'

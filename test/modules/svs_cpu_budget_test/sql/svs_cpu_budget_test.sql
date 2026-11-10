@@ -54,3 +54,19 @@ SELECT * FROM svs_cpu_budget_test(
     ARRAY[100,200]::oid[], ARRAY[false,true], ARRAY[6,1], ARRAY[4,0],
     ARRAY[]::oid[], ARRAY[]::int4[], ARRAY[]::int4[])
 ORDER BY kind, db_oid;
+
+-- A database with no vamana index holds no search claim, floor or otherwise.
+SELECT * FROM svs_cpu_budget_test(
+    8, 0, 0, 0,
+    ARRAY[100,200]::oid[], ARRAY[true,true], ARRAY[6,1], ARRAY[4,0],
+    ARRAY[]::oid[], ARRAY[]::int4[], ARRAY[]::int4[],
+    ARRAY[false,true])
+ORDER BY kind, db_oid;
+
+-- Its first build gets the full pool, as nothing is parked against it.
+SELECT * FROM svs_cpu_budget_test(
+    8, 0, 0, 0,
+    ARRAY[100]::oid[], ARRAY[true], ARRAY[6], ARRAY[4],
+    ARRAY[100]::oid[], ARRAY[555], ARRAY[8],
+    ARRAY[false])
+ORDER BY kind, db_oid;

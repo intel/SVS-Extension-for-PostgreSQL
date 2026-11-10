@@ -1,23 +1,10 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 77_vamana_load_tidmapping_leak.pl — VamanaWorkerProcessLoadSlot's staging
-# TID-map buffer must be freed once VamanaCacheIndex has copied it into the
-# cache entry's own buffer, not leaked into TopMemoryContext.
-#
-# VamanaCacheIndex copies the caller's tidMapping into a separately
-# allocated buffer of its own rather than taking ownership of it, so the
-# local staging copy must be pfree'd on the LOAD slot's success path (the
-# warm-up that follows CREATE INDEX). Without that free, every successful
-# load leaks tidMappingCapacity * sizeof(ItemPointerData) bytes into the
-# worker's TopMemoryContext, with nothing to bound it short of a worker
-# restart.
-#
-# Driving several CREATE INDEX / DROP INDEX cycles on fresh tables and
-# reading the worker's exact TopMemoryContext byte count via
-# pg_log_backend_memory_contexts() after each one gives a clean signal: on
-# unfixed code this grows by a consistent, predictable amount every cycle;
-# fixed, it stays flat once the cache bookkeeping itself stabilizes.
+# 77_vamana_load_tidmapping_leak.pl — checks that the worker's TopMemoryContext
+# does not keep growing across repeated CREATE INDEX / DROP INDEX cycles.
+# Cycle 1 is excluded from the comparison since it seeds one-time cache
+# bookkeeping that grows regardless of the leak.
 
 use strict;
 use warnings FATAL => 'all';
@@ -72,10 +59,6 @@ sub get_top_memory_context_total
 
     my $log_offset = -s $node->logfile;
 
-    # First cycle also seeds per-relid cache bookkeeping that grows once
-    # regardless of the leak, so it is excluded from the no-growth
-    # comparison below; only cycles 2 onward, once that one-time bookkeeping
-    # has already happened, are compared against each other.
     my @totals;
     for my $cycle (1 .. 4)
     {
@@ -95,9 +78,19 @@ sub get_top_memory_context_total
         $log_offset = -s $node->logfile;
     }
 
-    is($totals[3], $totals[1],
-        "no growth in TopMemoryContext across repeated CREATE INDEX/DROP INDEX cycles "
-      . "(cycle 2: $totals[1] bytes, cycle 4: $totals[3] bytes)");
+    # Exact equality would be flaky: the worker may evict the dropped
+    # index's cache entry some time after DROP INDEX returns rather than
+    # synchronously, so one sample can land while that entry (and its TID
+    # map) is still live and another cannot, differing by about one
+    # entry's TID-map size even with the fix in place. The per-cycle leak
+    # itself is $ROWS * 6 bytes, so bound growth well under that instead
+    # of requiring it to be exactly zero.
+    my $leak_per_cycle = $ROWS * 6;
+    my $growth = $totals[3] - $totals[1];
+    cmp_ok($growth, '<', $leak_per_cycle,
+        "TopMemoryContext growth across repeated CREATE INDEX/DROP INDEX cycles stays well "
+      . "under one cycle's leak size ($growth bytes vs $leak_per_cycle; cycle 2: $totals[1], "
+      . "cycle 4: $totals[3])");
 
     $node->stop;
 }

@@ -13,7 +13,8 @@ CREATE FUNCTION svs_cpu_budget_test(
     db_search_threads_reserved int4[],
     build_db_oid oid[],
     build_request_pid int4[],
-    build_maintenance_num_threads int4[]
+    build_maintenance_num_threads int4[],
+    db_has_indexes boolean[] DEFAULT NULL
 ) RETURNS TABLE (
     kind text,
     db_oid oid,
@@ -23,4 +24,4 @@ CREATE FUNCTION svs_cpu_budget_test(
     reserved int4,
     reserved_floors_exceed_pool boolean
 )
-AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+AS 'MODULE_PATHNAME' LANGUAGE C;

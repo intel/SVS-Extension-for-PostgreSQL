@@ -624,6 +624,11 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 
 	PG_TRY();
 	{
+		VamanaValidateMetaCounts(relid, (uint32) params->tidMappingCapacity,
+								 (uint32) params->numVectors,
+								 (uint32) params->numDeleted,
+								 params->nextExternalId, true);
+
 		VamanaGetIndexSavePath(VamanaWorkerShmemPtr->dbOid, relid, savepath, sizeof(savepath));
 
 		config.dimensions			= params->dimensions;

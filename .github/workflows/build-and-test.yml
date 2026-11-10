@@ -39,14 +39,6 @@ jobs:
       # the flags into the cache key below means a flag change invalidates
       # the cache instead of silently reusing a non-TAP-enabled install.
       PG_CONFIGURE_EXTRA_ARGS: "--enable-tap-tests --enable-injection-points"
-      # Pinned nightly SVS release tarball; keep in sync with the
-      # DEFAULT_SVS_URL in ci/build_and_test.sh so the cache key below
-      # invalidates whenever the pin changes.
-      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
-      # SVS_COMMIT must be the exact SVS_REPO commit SVS_URL's tarball was
-      # built from; see docs/build_guide/config. Update both together
-      # whenever SVS_URL is bumped to a newer nightly.
-      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +64,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: docs/build_guide/svs_install
-          key: svs-${{ matrix.runner }}-${{ matrix.cc }}-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
+          key: svs-${{ matrix.runner }}-${{ matrix.cc }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
 
       - name: deps
         run: ci/build_and_test.sh deps
@@ -114,6 +106,7 @@ jobs:
             regression.out
             results/
             tmp_check/log/
+            log/
             ci/.workdir/postgres.log
           if-no-files-found: ignore
           retention-days: 7

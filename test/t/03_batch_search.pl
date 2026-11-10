@@ -7,6 +7,15 @@
 # detects n > 1 with uniform k/dimensions, packs all query vectors into a
 # single contiguous buffer, and calls svs_index_search once.  Heterogeneous
 # search_window_size falls back to a sequential per-query loop.
+#
+# "Submitted together" does not mean "collected in one worker pass": the
+# worker can scan PENDING slots between two backends' publishes, which turns
+# a would-be batch into N one-at-a-time dispatches. On builds with injection
+# points, run_parked_batch pins the worker at
+# vamana-worker-before-collect-requests before the barrier releases, so all
+# N publishes land before the worker's next scan, making the batch log
+# assertions below deterministic. Builds without injection points fall back
+# to the undeterministic run_synchronized and skip the log assertion.
 
 use strict;
 use warnings FATAL => 'all';
@@ -28,6 +37,8 @@ sub make_search_sql
     );
 }
 
+my $have_injection_points = (($ENV{enable_injection_points} // 'no') eq 'yes');
+
 {
     my $node = PostgreSQL::Test::Cluster->new('vamana_batch');
     $node->init;
@@ -36,10 +47,15 @@ sub make_search_sql
     $node->append_conf('postgresql.conf', "max_replication_slots = 10");
     $node->append_conf('postgresql.conf', "max_wal_senders = 10");
     $node->append_conf('postgresql.conf', "log_min_messages = 'debug1'");
+    # Headroom for the worker to stay parked at the injection point on slow
+    # cassert runners without a backend's claim going stale.
+    $node->append_conf('postgresql.conf', "svs.worker_timeout_ms = 30000");
     $node->start;
 
     $node->safe_psql("postgres", "CREATE EXTENSION vector;");
     $node->safe_psql("postgres", "CREATE EXTENSION svs;");
+    $node->safe_psql("postgres", "CREATE EXTENSION injection_points;")
+      if $have_injection_points;
     $node->safe_psql("postgres",
         "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
     wait_for_worker($node);
@@ -89,14 +105,26 @@ sub make_search_sql
 
     my $log_pos_before_batch = length($node->log_content());
 
-    my @synced_results = run_synchronized(
-        $node, "postgres", $N,
-        sub { "SET enable_seqscan = off;\n" },
-        sub {
-            my $q = $query_vecs[ $_[0] ];
-            "SELECT id FROM batch_tbl ORDER BY val <-> '[$q]' LIMIT 5;\n";
-        }
-    );
+    my $pre_sql  = sub { "SET enable_seqscan = off;\n" };
+    my $search_sql = sub {
+        my $q = $query_vecs[ $_[0] ];
+        "SELECT id FROM batch_tbl ORDER BY val <-> '[$q]' LIMIT 5;\n";
+    };
+
+    my @synced_results;
+    if ($have_injection_points)
+    {
+        my ($results_ref, $pending_seen) = run_parked_batch(
+            $node, "postgres", $N, $pre_sql, $search_sql, 'batch_idx');
+        @synced_results = @$results_ref;
+        is($pending_seen, $N,
+            "all $N searches were pending together before the worker's collect pass");
+    }
+    else
+    {
+        @synced_results = run_synchronized(
+            $node, "postgres", $N, $pre_sql, $search_sql);
+    }
 
     for my $i (0 .. $N - 1)
     {
@@ -105,9 +133,16 @@ sub make_search_sql
     }
 
     my $batch_log = substr($node->log_content(), $log_pos_before_batch);
-    like($batch_log,
-        qr/vamana worker: native batch search for [2-9]\d* queries/,
-        "worker log confirms native batch path for synchronized concurrent queries");
+    SKIP: {
+        skip 'batching cannot be forced without injection points', 1
+          if !$have_injection_points;
+        like($batch_log,
+            qr/vamana worker: dispatching $N search \+ 0 write/,
+            "worker log confirms all $N searches dispatched in one pass");
+        like($batch_log,
+            qr/vamana worker: native batch search for $N queries/,
+            "worker log confirms native batch path for synchronized concurrent queries");
+    }
 
     $node->stop;
     $node->append_conf('postgresql.conf', "svs.max_batch_size = 2");
@@ -151,29 +186,47 @@ sub make_search_sql
     isnt($base_low,  '', "heterogeneous-k baseline (sws=$sws_low) is non-empty");
     isnt($base_high, '', "heterogeneous-k baseline (sws=$sws_high) is non-empty");
 
-    my @hetero_results = run_synchronized(
-        $node, "postgres", 2,
-        sub {
-            my $i   = shift;
-            my $sws = ($i == 0) ? $sws_low : $sws_high;
-            return qq(SET enable_seqscan = off;\n)
-              . qq(SET svs.search_window_size = $sws;\n);
-        },
-        sub {
-            my $i = shift;
-            my $q = ($i == 0) ? $q0 : $q1;
-            return qq(SELECT id FROM batch_tbl ORDER BY val <-> '[$q]' LIMIT 5;\n);
-        }
-    );
+    my $hetero_pre = sub {
+        my $i   = shift;
+        my $sws = ($i == 0) ? $sws_low : $sws_high;
+        return qq(SET enable_seqscan = off;\n)
+          . qq(SET svs.search_window_size = $sws;\n);
+    };
+    my $hetero_search = sub {
+        my $i = shift;
+        my $q = ($i == 0) ? $q0 : $q1;
+        return qq(SELECT id FROM batch_tbl ORDER BY val <-> '[$q]' LIMIT 5;\n);
+    };
+
+    my $hetero_log_pos = length($node->log_content());
+    my @hetero_results;
+    if ($have_injection_points)
+    {
+        my ($results_ref, $pending_seen) = run_parked_batch(
+            $node, "postgres", 2, $hetero_pre, $hetero_search, 'batch_idx');
+        @hetero_results = @$results_ref;
+        is($pending_seen, 2,
+            "both heterogeneous-k searches were pending together before the worker's collect pass");
+    }
+    else
+    {
+        @hetero_results = run_synchronized(
+            $node, "postgres", 2, $hetero_pre, $hetero_search);
+    }
 
     is($hetero_results[0], $base_low,
         "heterogeneous-k client 0 (sws=$sws_low) results match baseline");
     is($hetero_results[1], $base_high,
         "heterogeneous-k client 1 (sws=$sws_high) results match baseline");
 
-    # Sub-millisecond co-arrival cannot be guaranteed in TAP, so correctness
-    # is validated by result comparison rather than log inspection.
-    pass("heterogeneous-k fallback correctness verified by result comparison");
+    my $hetero_log = substr($node->log_content(), $hetero_log_pos);
+    SKIP: {
+        skip 'batching cannot be forced without injection points', 1
+          if !$have_injection_points;
+        like($hetero_log,
+            qr/vamana worker: sequential search for 2 queries \(heterogeneous k\/dims\)/,
+            "worker log confirms sequential fallback for heterogeneous search_window_size");
+    }
 
     $node->stop;
 }

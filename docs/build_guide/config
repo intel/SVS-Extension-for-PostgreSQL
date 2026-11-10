@@ -12,28 +12,14 @@ PGSQL_INSTALL_DIR=${BASE_DIR}/pgsql_install
 PG_CONFIG=${PGSQL_INSTALL_DIR}/bin/pg_config
 
 # ── SVS library ───────────────────────────────────────────────────────────────
-SVS_REPO=https://github.com/intel/ScalableVectorSearch.git
-# main is the maintained integration branch; use a short-lived dev/* branch
-# here only deliberately, since those get deleted once merged or abandoned.
-SVS_BRANCH=main
-SVS_SRC_DIR=${BASE_DIR}/ScalableVectorSearch
-SVS_BUILD_DIR=${SVS_SRC_DIR}/build
+# SVS has shipped its C API as a ready-to-use prebuilt release asset
+# (svs-c-api.tar.gz, containing lib/ and include/svs/c/) since v0.5.0;
+# build_svs.sh just downloads and extracts it — no compiler involved.
+# SVS_TAG picks the release; SVS_URL is derived from it and only needs
+# overriding directly for a one-off, non-tagged asset.
+SVS_TAG=${SVS_TAG:-"v0.5.0"}
+SVS_URL=${SVS_URL:-"https://github.com/intel/ScalableVectorSearch/releases/download/${SVS_TAG}/svs-c-api.tar.gz"}
 SVS_INSTALL_DIR=${BASE_DIR}/svs_install
-# SVS_URL overrides bindings/c/CMakeLists.txt's own default fetch of the
-# prebuilt LVQ/LeanVec core library. SVS_COMMIT is the SVS_REPO commit that
-# tarball was built from, and pins bindings/c (checked out at SVS_BRANCH, a
-# moving branch) to that same commit. The two must always be updated
-# together: upstream's own default fetch, or any SVS_URL left unpaired with
-# a matching SVS_COMMIT, can fall behind bindings/c's current API and fail
-# to compile against it (the failure this pair exists to prevent).
-#
-# SVS has tagged releases, but none yet include the features this project
-# depends on, so these default to a pinned nightly tarball and its matching
-# commit as an interim stand-in; once a release with those features exists,
-# point both at that release's tag and tarball instead.
-# Overridable via environment for a one-off bump without editing this file.
-SVS_URL=${SVS_URL:-"https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"}
-SVS_COMMIT=${SVS_COMMIT:-"1cd0df27c4bf54c4b963ad02112c873fba21a6ef"}
 
 # ── vanilla pgvector (provides vector/halfvec types) ─────────────────────────
 PGV_VANILLA_REPO=https://github.com/pgvector/pgvector.git

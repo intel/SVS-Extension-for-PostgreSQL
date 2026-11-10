@@ -47,6 +47,20 @@ sub db_oid
 	return $oid;
 }
 
+# A database holds parked search slots only once it has a vamana index, so
+# every database below needs one before its slots can be observed.
+sub add_vamana_index
+{
+	my ($node, $db) = @_;
+	$node->safe_psql($db, q(
+		CREATE EXTENSION IF NOT EXISTS vector;
+		CREATE EXTENSION IF NOT EXISTS svs;
+		CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+		INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,1,1]');
+		CREATE INDEX t_idx ON t USING vamana (val vector_l2_ops);
+	));
+}
+
 sub wait_for_granted
 {
 	my ($node, $dboid, $want, $attempts) = @_;
@@ -112,6 +126,7 @@ $node->safe_psql('postgres',
   . "VALUES ('postgres', true, 1);");
 my $worker_pid = wait_for_worker($node);
 ok($worker_pid =~ /^\d+$/, 'worker is running before the checks below');
+add_vamana_index($node, 'postgres');
 
 my $pg_oid = db_oid($node, 'postgres');
 my $pg_granted = wait_for_granted($node, $pg_oid, 1, 40);
@@ -156,6 +171,7 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 		"INSERT INTO vamana_databases (datname, enabled, search_num_threads) "
 	  . "VALUES ('$longdb', true, 1);");
 	wait_for_worker_db($node, $longdb);
+	add_vamana_index($node, $longdb);
 	my $long_oid = db_oid($node, $longdb);
 	my $granted = wait_for_granted($node, $long_oid, 1, 40);
 	is($granted, '1', "${longdb}'s search_threads_granted reaches 1");
@@ -183,6 +199,7 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 		"INSERT INTO vamana_databases (datname, enabled, search_num_threads) "
 	  . "VALUES (E'$nl_lit', true, 1);");
 	wait_for_worker_db($node, $nl_raw);
+	add_vamana_index($node, $nl_raw);
 	my $nl_oid = db_oid($node, $nl_raw);
 	my $granted = wait_for_granted($node, $nl_oid, 1, 40);
 	is($granted, '1', "the newline-named database's search_threads_granted reaches 1");
@@ -207,6 +224,7 @@ is($pg_granted, '1', "postgres's search_threads_granted reaches 1");
 		"INSERT INTO vamana_databases (datname, enabled, search_num_threads) "
 	  . "VALUES ('$pctdb', true, 1);");
 	wait_for_worker_db($node, $pctdb);
+	add_vamana_index($node, $pctdb);
 	my $pct_oid = db_oid($node, $pctdb);
 	my $granted = wait_for_granted($node, $pct_oid, 1, 40);
 	is($granted, '1', "${pctdb}'s search_threads_granted reaches 1");

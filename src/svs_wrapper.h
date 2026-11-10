@@ -100,6 +100,14 @@ SVSStorageHandle SVSCreateLeanVecStorage(int dimensions, int leanvec_dims, int p
 SVSStorageHandle SVSCreateLVQStorage(int primary_param, int residual_param);
 
 /*
+ * Client-visible report for an SVS_ERROR_UNSUPPORTED_HW failure: this build
+ * has LVQ/LeanVec compiled in for CPU instructions this machine's processor
+ * lacks. Exported (plain strings, no SVS types) so a unit test module can
+ * exercise its exact errcode/message/detail/hint shape directly.
+ */
+void		SVSReportUnsupportedHardware(const char *message, const char *compressionName);
+
+/*
  * Dispatch on compression_type.  Preferred over the three constructors above:
  * build and load must agree on the storage spec, so they should share one
  * decision.  data_type is used only when compression_type selects no

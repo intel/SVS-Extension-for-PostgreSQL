@@ -71,22 +71,20 @@ LookupEntryOrError(Oid dbOid)
  * responses. One is genuinely transient: admission runs as a backend-local
  * pre-commit callback keyed off the enrolling INSERT into vamana_databases,
  * so a slot can exist for a handful of statements, in the enrolling
- * backend's own transaction, before that callback lands. The other is a
- * standing misconfiguration: enrolling (an INSERT into vamana_databases, or
- * svs_restart_worker()) while connected to a database other than
- * svs.launcher_database still runs that same pre-commit callback and still
- * sets residencyBudget, from the enrolling backend's own connection, so it
- * does not actually leave this check at 0 -- the enrolled database's worker
- * simply never spawns, because the launcher only ever reads vamana_databases
- * from svs.launcher_database's copy of that table, and the enrolling row
- * lands in a different database's copy instead. dbOid carries no record of
- * which database its own enrolment ran from, so this function cannot detect
- * that failure; it can only warn about it. The warning is keyed on dbOid
- * itself not being svs.launcher_database, which is also the ordinary,
- * healthy shape of most enrolled databases, so it fires on both the rare
- * misconfiguration and the common transient window whenever dbOid is not
- * the launcher database. It is phrased as a follow-up to try if retrying
- * does not resolve the wait, not as a diagnosis.
+ * backend's own transaction, before that callback lands.
+ *
+ * The other is a database that will never spawn a worker because the
+ * launcher never saw its enrolling row: the launcher only ever reads
+ * vamana_databases from svs.launcher_database's copy of that table, and
+ * vamana_databases_queue_reservation (vamana_databases.c) rejects an
+ * enrolling INSERT/UPDATE made from any other database unless dbOid
+ * already has a reserved slot -- so a *first* enrollment from the wrong
+ * database cannot strand one. The "else" branch below is defense-in-depth
+ * for the cases that guard cannot see: shmem state that predates it (an
+ * unclean restart mid-upgrade), or dbOid carrying no record of which
+ * database its own enrolment ran from in general. It is phrased as a
+ * follow-up to try if retrying does not resolve the wait, not as a
+ * diagnosis.
  */
 static void
 RequireAdmitted(VamanaWorkerShmem *entry, Oid dbOid)
