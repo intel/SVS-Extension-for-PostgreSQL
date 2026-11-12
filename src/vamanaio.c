@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "vamana.h"
+#include "vamana_replication.h"
 #include "vamanaworker.h"
 #include "svs_wrapper.h"
 
@@ -481,7 +482,8 @@ VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, in
  * or stamped with a save generation that disagrees with
  * expectedSaveGeneration (the metapage's own saveGeneration) -- the latter
  * is a torn save: a self-consistent, well-formed TID map left over from a
- * generation older or newer than the graph/data/config on disk.
+ * generation older or newer than the graph/data/config on disk.  The
+ * generation is not compared on a standby.
  *
  * tidMapping must be pre-allocated with at least tidMappingCapacity elements.
  */
@@ -571,8 +573,13 @@ VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappi
 	 * the metapage's: the mismatch itself is the only evidence, since the
 	 * file is otherwise complete and internally consistent.  See
 	 * VamanaWriteSaveGeneration for which crash windows this catches.
+	 *
+	 * Not compared on a standby: the metapage's stamp replicates but the TID
+	 * map is a plain file that does not, so the two disagree there without
+	 * any save having been torn.
 	 */
-	if (header.generation != expectedSaveGeneration)
+	if (VamanaGetReplayRole()->persists_index &&
+		header.generation != expectedSaveGeneration)
 	{
 		FreeFile(f);
 		ereport(WARNING,
@@ -615,7 +622,8 @@ VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappi
  * is absent, unreadable, malformed, or stamped with a different generation
  * than expected.  Returns true only when the marker and the metapage agree,
  * meaning the on-disk graph/data/config and the metapage come from the same
- * completed save.
+ * completed save.  On a standby it returns true without looking, since the
+ * two cannot be compared there.
  */
 bool
 VamanaCheckSaveGeneration(Oid dboid, Oid relid, TimestampTz expectedSaveGeneration)
@@ -627,17 +635,27 @@ VamanaCheckSaveGeneration(Oid dboid, Oid relid, TimestampTz expectedSaveGenerati
 	FILE	   *f;
 	VamanaSaveGenHeader header;
 
+	/*
+	 * A standby never saves, and the marker is a plain file that does not
+	 * replicate while the metapage's stamp does, so the two can differ there
+	 * without any save having been torn.  Treating that as a torn save would
+	 * log a corruption warning on a healthy standby; its copy of the save
+	 * directory is discarded by the slot-consistency check regardless.
+	 */
+	if (!VamanaGetReplayRole()->persists_index)
+		return true;
+
 	VamanaGetIndexSavePath(dboid, relid, indexdir, sizeof(indexdir));
 	VamanaGetSaveGenPath(indexdir, genpath, sizeof(genpath));
 
 	/*
-	 * Same orphan-temp-file hygiene as VamanaLoadTidMap; see its comment.
-	 * Checked via an open file descriptor rather than lstat-by-path so the
-	 * mtime/mode this decides on belongs to the exact file the unlink below
-	 * removes, not to whatever a later rename or recreation leaves at that
-	 * path in between: a plain stat-then-unlink-by-name would let a
-	 * concurrent writer's own temp-file replace land in that window and be
-	 * removed instead of the orphan actually checked.
+	 * Same orphan-temp-file sweep as VamanaLoadTidMap; see its comment.
+	 * The type and mtime are read through an open descriptor, so they
+	 * describe one file rather than whatever the path names a moment later.
+	 * The unlink still resolves the path again, since POSIX has no unlink by
+	 * descriptor, so a temp file recreated between the fstat and the unlink
+	 * would be removed instead.  That narrows the window rather than closing
+	 * it; the worst case is that a concurrent save fails and is retried.
 	 */
 	VamanaGetSaveGenTmpPath(indexdir, gentmp, sizeof(gentmp));
 	tmpfd = OpenTransientFile(gentmp, O_RDONLY | PG_BINARY);
