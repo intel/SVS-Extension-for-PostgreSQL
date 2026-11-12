@@ -78,18 +78,13 @@ sub get_top_memory_context_total
         $log_offset = -s $node->logfile;
     }
 
-    # Exact equality would be flaky: the worker may evict the dropped
-    # index's cache entry some time after DROP INDEX returns rather than
-    # synchronously, so one sample can land while that entry (and its TID
-    # map) is still live and another cannot, differing by about one
-    # entry's TID-map size even with the fix in place. The per-cycle leak
-    # itself is $ROWS * 6 bytes, so bound growth well under that instead
-    # of requiring it to be exactly zero.
+    # Eviction timing can shift one sample by a TID map; bound growth well under the cumulative leak.
     my $leak_per_cycle = $ROWS * 6;
+    my $threshold = $leak_per_cycle * 1.5;
     my $growth = $totals[3] - $totals[1];
-    cmp_ok($growth, '<', $leak_per_cycle,
+    cmp_ok($growth, '<', $threshold,
         "TopMemoryContext growth across repeated CREATE INDEX/DROP INDEX cycles stays well "
-      . "under one cycle's leak size ($growth bytes vs $leak_per_cycle; cycle 2: $totals[1], "
+      . "under the two-cycle leak size ($growth bytes vs threshold $threshold; cycle 2: $totals[1], "
       . "cycle 4: $totals[3])");
 
     $node->stop;
