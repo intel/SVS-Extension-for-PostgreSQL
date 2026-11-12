@@ -217,6 +217,27 @@ sub workers_launched
     return defined($n) ? $n : 0;
 }
 
+# Whether a $backend_type process parked on injection point $point.
+# wait_for_event dies on timeout, which would end the script and skip every
+# later case, so the timeout is turned into a false return instead.
+sub wait_for_hold
+{
+    my ($node, $backend_type, $point) = @_;
+    my $held = eval { $node->wait_for_event($backend_type, $point); 1 };
+    diag("$backend_type never reached injection point $point: $@") if !$held;
+    return $held ? 1 : 0;
+}
+
+# Detach $point and wake whatever is parked on it.  The wakeup may fail:
+# injection_points_wakeup errors when nothing waits on the point, which is
+# the case after wait_for_hold timed out.
+sub release_hold
+{
+    my ($node, $point) = @_;
+    $node->safe_psql('postgres', "SELECT injection_points_detach('$point');");
+    $node->psql('postgres', "SELECT injection_points_wakeup('$point');");
+}
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -424,32 +445,36 @@ is($pid_after_12, $pg_worker_pid,
         "UPDATE vamana_databases SET enabled = true WHERE datname = 'fresh_db';");
 
     SKIP: {
-        skip 'server not built with --enable-injection-points', 2
+        skip 'server not built with --enable-injection-points', 3
           if !$hold_worker;
 
-        $node->wait_for_event('vamana worker', 'vamana-worker-before-publish-pid');
+        my $held = wait_for_hold($node, 'vamana worker',
+            'vamana-worker-before-publish-pid');
+        ok($held, "case 3: the spawned worker parks before publishing its pid");
 
-        # A disabled database's row keeps its last grant of 5, so a 0 here
-        # was published by the re-enable's own reconcile.
-        is(granted_for_db($node, $fresh_oid), '0',
-            "case 3: the published grant is 0 while the spawned worker is not yet live");
+        SKIP: {
+            skip 'the spawned worker never parked, so the window was not held', 2
+              if !$held;
 
-        # The held worker has already converged its slots on that 0 grant.
-        # Read the worker's own count, not pg_stat_activity: a slot parked
-        # before workerPid is published fails its first owner check and
-        # exits at once, so an activity count of 0 cannot tell "parked none"
-        # from "parked one that already exited".
-        my $registered = $node->safe_psql('postgres',
-            "SELECT search_slots_registered FROM pg_stat_vamana_worker "
-          . "WHERE db_oid = $fresh_oid;");
-        is($registered, '0',
-            "case 3: the not-yet-live worker parks no slot, "
-          . "never the eventual grant of 5");
+            # A disabled database's row keeps its last grant of 5, so a 0 here
+            # was published by the re-enable's own reconcile.
+            is(granted_for_db($node, $fresh_oid), '0',
+                "case 3: the published grant is 0 while the spawned worker is not yet live");
 
-        $node->safe_psql('postgres',
-            "SELECT injection_points_detach('vamana-worker-before-publish-pid');");
-        $node->safe_psql('postgres',
-            "SELECT injection_points_wakeup('vamana-worker-before-publish-pid');");
+            # The held worker has already converged its slots on that 0 grant.
+            # Read the worker's own count, not pg_stat_activity: a slot parked
+            # before workerPid is published fails its first owner check and
+            # exits at once, so an activity count of 0 cannot tell "parked none"
+            # from "parked one that already exited".
+            my $registered = $node->safe_psql('postgres',
+                "SELECT search_slots_registered FROM pg_stat_vamana_worker "
+              . "WHERE db_oid = $fresh_oid;");
+            is($registered, '0',
+                "case 3: the not-yet-live worker parks no slot, "
+              . "never the eventual grant of 5");
+        }
+
+        release_hold($node, 'vamana-worker-before-publish-pid');
     }
 
     # Now wait, bounded well under the 180s naptime, for convergence to the
@@ -859,7 +884,9 @@ if (($ENV{enable_injection_points} // 'no') eq 'yes')
         "SELECT injection_points_attach('vamana-launcher-before-reconcile', 'wait');");
     $node->safe_psql('postgres',
         "UPDATE vamana_databases SET search_num_threads = 3 WHERE datname = 'postgres';");
-    $node->wait_for_event('vamana launcher', 'vamana-launcher-before-reconcile');
+    my $launcher_held = wait_for_hold($node, 'vamana launcher',
+        'vamana-launcher-before-reconcile');
+    ok($launcher_held, "case 13: the launcher parks before the crash");
 
     $node->safe_psql('postgres',
         "SELECT injection_points_attach('vamana-search-slot-release-crash', 'error');");
@@ -874,16 +901,18 @@ if (($ENV{enable_injection_points} // 'no') eq 'yes')
     $node->safe_psql('postgres',
         "SELECT injection_points_detach('vamana-search-slot-release-crash');");
 
-    my @survivors_right_after_crash =
-        grep { $pre13_slot_pids{$_} } search_slot_pids($node, 'postgres');
-    ok(scalar(@survivors_right_after_crash) > 0,
-        "case 13: the crashed worker's search slots outlive it when its own "
-      . "release-on-exit callback fails");
+    SKIP: {
+        skip 'the launcher never parked, so the orphans could already be gone', 1
+          if !$launcher_held;
 
-    $node->safe_psql('postgres',
-        "SELECT injection_points_detach('vamana-launcher-before-reconcile');");
-    $node->safe_psql('postgres',
-        "SELECT injection_points_wakeup('vamana-launcher-before-reconcile');");
+        my @survivors_right_after_crash =
+            grep { $pre13_slot_pids{$_} } search_slot_pids($node, 'postgres');
+        ok(scalar(@survivors_right_after_crash) > 0,
+            "case 13: the crashed worker's search slots outlive it when its own "
+          . "release-on-exit callback fails");
+    }
+
+    release_hold($node, 'vamana-launcher-before-reconcile');
 
     my $all_pre13_gone = '';
     for (1 .. 60)    # up to 30s: bounded by SVS_PARKED_SLOT_OWNER_POLL_MS
