@@ -32,6 +32,14 @@ An Intel Xeon processor with AVX-512 is recommended for best performance. The Va
 
 See the [build guide](docs/build_guide/README.md) for the full sequence, prerequisites, and an all-in-one build script.
 
+To install from PGXN, first install the SVS C API (step 2 of the build guide), then run:
+
+```bash
+SVS_INSTALL=/path/to/svs pgxn install svs
+```
+
+Add `--pg_config /path/to/pg_config` if more than one PostgreSQL is installed.
+
 Coverage instrumentation is opt-in and off by default; build with `make COVERAGE=1` to enable it. See the [coverage guide](docs/dev/CODE_COVERAGE.md).
 
 ## Quick Start
