@@ -184,13 +184,12 @@ VamanaWorkerRunBatch(Oid relid, int *slotIdxs, int n)
 		VamanaWorkerShmemHeader *header = VamanaWorkerHeader();
 		uint64		resolvedLimit;
 		bool		isOverride;
+		char		scratchErrMsg[512];
 
 		LWLockAcquire(header->lock, LW_SHARED);
 		resolvedLimit = SvsMemoryResolveSearchWorkMem(VamanaWorkerShmemPtr);
 		isOverride = VamanaWorkerShmemPtr->searchWorkMemMbOverride > 0;
 		LWLockRelease(header->lock);
-
-		char		scratchErrMsg[512];
 
 		snprintf(scratchErrMsg, sizeof(scratchErrMsg),
 				 "vamana worker: batch against index %u exceeds this database's "
