@@ -1458,8 +1458,9 @@ VamanaOpenDecoderFastForward(void)
 /*
  * Per-slice wall-clock budget for VamanaReplicationCatchUpSlot's decode
  * loop.  deadline is computed once per call from the caller's budgetMs;
- * sinceCheck/exhausted are callback-private bookkeeping.  recordsDecoded is
- * for the slice's own progress log, not the budget decision.
+ * sinceCheck/exhausted are callback-private bookkeeping.  recordsDecoded and
+ * runningXactsTime are for the slice's own progress log, not the budget
+ * decision.
  */
 typedef struct VamanaCatchUpBudget
 {
@@ -1467,6 +1468,7 @@ typedef struct VamanaCatchUpBudget
 	uint32		sinceCheck;
 	bool		exhausted;
 	uint64		recordsDecoded;
+	instr_time	runningXactsTime;
 } VamanaCatchUpBudget;
 
 /*
@@ -1489,7 +1491,29 @@ DiscardRecordCallback(LogicalDecodingContext *ctx, void *arg)
 	VamanaCatchUpBudget *budget = (VamanaCatchUpBudget *) arg;
 
 	INJECTION_POINT("vamana-slot-advance-discard-decode", NULL);
-	LogicalDecodingProcessRecord(ctx, ctx->reader);
+
+	/*
+	 * A RUNNING_XACTS record is the one record whose fast-forward decode does
+	 * synchronous file I/O: core serializes the snapshot to
+	 * pg_logical/snapshots and saves the slot's new restart point to
+	 * pg_replslot.  No budget check can interrupt that I/O, so time it
+	 * separately; the slice log then shows how much of the elapsed time was
+	 * core I/O rather than decode work the budget governs.
+	 */
+	if (XLogRecGetRmid(ctx->reader) == RM_STANDBY_ID &&
+		(XLogRecGetInfo(ctx->reader) & ~XLR_INFO_MASK) == XLOG_RUNNING_XACTS)
+	{
+		instr_time	start;
+		instr_time	duration;
+
+		INSTR_TIME_SET_CURRENT(start);
+		LogicalDecodingProcessRecord(ctx, ctx->reader);
+		INSTR_TIME_SET_CURRENT(duration);
+		INSTR_TIME_SUBTRACT(duration, start);
+		INSTR_TIME_ADD(budget->runningXactsTime, duration);
+	}
+	else
+		LogicalDecodingProcessRecord(ctx, ctx->reader);
 	budget->recordsDecoded++;
 
 	if (++budget->sinceCheck < VAMANA_CATCHUP_CHECK_STRIDE)
@@ -1532,6 +1556,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 	uint64 volatile		recordsDecoded = 0;
 	XLogRecPtr volatile	endRecPtr = InvalidXLogRecPtr;
 	bool volatile		budgetExhausted = false;
+	int64 volatile runningXactsUs = 0;
 
 	SlotName(VamanaWorkerShmemPtr->dbOid, indexRelid, slotName);
 
@@ -1564,6 +1589,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 			budget.sinceCheck = 0;
 			budget.exhausted = false;
 			budget.recordsDecoded = 0;
+			INSTR_TIME_SET_ZERO(budget.runningXactsTime);
 
 			VamanaRunDecodeLoop(ctx, confirmedFlush, "vamana catch-up",
 								DiscardRecordCallback, &budget);
@@ -1571,6 +1597,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 			endRecPtr = ctx->reader->EndRecPtr;
 			recordsDecoded = budget.recordsDecoded;
 			budgetExhausted = budget.exhausted;
+			runningXactsUs = INSTR_TIME_GET_MICROSEC(budget.runningXactsTime);
 
 			FreeDecodingContext(ctx);
 		}
@@ -1589,7 +1616,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 				(errmsg("vamana catch-up: slot \"%s\" start_restart=%X/%X "
 						"exit_recptr=%X/%X end_restart=%X/%X confirmed_flush=%X/%X "
 						"records=" UINT64_FORMAT " elapsed_us=" INT64_FORMAT " budget_exhausted=%d "
-						"skipped_no_lag=%d",
+						"skipped_no_lag=%d running_xacts_us=" INT64_FORMAT,
 						slotName,
 						LSN_FORMAT_ARGS(result->startRestartLsn),
 						LSN_FORMAT_ARGS(result->endRecPtr),
@@ -1598,7 +1625,8 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 						result->recordsDecoded,
 						INSTR_TIME_GET_MICROSEC(elapsed),
 						(int) result->budgetExhausted,
-						(int) result->skippedNoLag)));
+						(int) result->skippedNoLag,
+						runningXactsUs)));
 
 		ReplicationSlotRelease();
 	}
