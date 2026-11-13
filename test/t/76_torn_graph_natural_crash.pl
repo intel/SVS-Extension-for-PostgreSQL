@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PostgreSQL
 
 # 76_torn_graph_natural_crash.pl: a real `kill -9` mid-save reproduction of
-# a torn checkpoint save, complementing 75_torn_graph_offline.pl's splicing
+# a torn checkpoint save, complementing 79_torn_graph_offline.pl's splicing
 # approach with an actual crash at the two points one can land on inside
 # VamanaSaveIndexToDisk's save sequence.
 #

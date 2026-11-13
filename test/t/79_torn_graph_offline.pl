@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 75_torn_graph_offline.pl: offline reproduction of a torn checkpoint save.
+# 79_torn_graph_offline.pl: offline reproduction of a torn checkpoint save.
 #
 # VamanaSaveIndexToDisk writes one save generation in steps: SVSSaveIndex
 # overwrites graph/data/config in place, VamanaSaveTidMapAtomically replaces
@@ -39,6 +39,9 @@
 #       with the metapage is rejected and rebuilt.
 #   An absent save-directory generation marker (e.g. a save made before this
 #       fix existed) is rejected and rebuilt, not treated as trustworthy.
+#   An index saved before generation stamps existed (no marker, and a metapage
+#       whose layout stops short of the stamp) is rebuilt without being called
+#       a torn save, and the stamp its next save writes survives a crash.
 
 use strict;
 use warnings FATAL => 'all';
@@ -58,11 +61,12 @@ my $SAVEGEN_MAGIC   = 0x53565347;    # "SVSG"
 my $SAVEGEN_VERSION = 1;
 
 my $node = PostgreSQL::Test::Cluster->new('vamana_torn_offline');
-$node->init;
+# Checksums off: the last test rewrites a metapage on disk by hand.
+$node->init(extra => ['--no-data-checksums']);
 $node->append_conf('postgresql.conf', "shared_preload_libraries = 'svs'");
 $node->append_conf('postgresql.conf', "wal_level = logical");
-$node->append_conf('postgresql.conf', "max_replication_slots = 4");
-$node->append_conf('postgresql.conf', "max_wal_senders = 4");
+$node->append_conf('postgresql.conf', "max_replication_slots = 10");
+$node->append_conf('postgresql.conf', "max_wal_senders = 10");
 $node->append_conf('postgresql.conf', "svs.launcher_database = 'postgres'");
 $node->append_conf('postgresql.conf', "svs.checkpoint_min_ops = 1");
 $node->append_conf('postgresql.conf', "svs.checkpoint_debounce_window = 1");
@@ -288,6 +292,73 @@ sub build_two_generations
     my $log = substr($node->log_content(), $log_pos);
     like($log, qr/save-generation marker missing, torn save detected/,
         'an absent generation marker is rejected as a torn save');
+}
+
+# ===========================================================================
+# Test: an index saved before generation stamps existed.
+#
+# Such an index has no marker, and its metapage was laid out before the stamp
+# field, so pd_lower stops short of it.  Generic WAL only logs the part of a
+# page below pd_lower, so unless the next save extends pd_lower, the stamp it
+# writes is lost in crash recovery and every crash after an upgrade would look
+# like a torn save.
+# ===========================================================================
+{
+    my ($tidmap, $marker) = build_two_generations('legacy_tbl', 'legacy_idx');
+
+    my $relpath = $node->safe_psql('postgres',
+        "SELECT pg_relation_filepath('legacy_idx');");
+    chomp $relpath;
+
+    $node->stop;
+
+    # Put the metapage back as the earlier layout left it: pd_lower ends at the
+    # old struct (24-byte page header plus 64 bytes) and the stamp bytes after
+    # it are zero.
+    my $file = $node->data_dir . "/$relpath";
+    open(my $fh, '+<:raw', $file) or die "open $file: $!";
+    seek($fh, 12, 0) or die "seek: $!";
+    print $fh pack('v', 24 + 64);
+    seek($fh, 24 + 64, 0) or die "seek: $!";
+    print $fh pack('x8');
+    close($fh) or die "close $file: $!";
+    unlink($marker) or die "unlink $marker: $!";
+
+    my $log_pos = length($node->log_content());
+    $node->start;
+    wait_for_worker($node, 30);
+
+    assert_full_recall('legacy_tbl', 'after loading a save that predates generation stamps');
+
+    my $log = substr($node->log_content(), $log_pos);
+    like($log, qr/saved copy predates save-generation stamps/,
+        'a save without a marker or stamp is reported as predating them');
+    unlike($log, qr/torn save detected/,
+        'a save that predates generation stamps is not called a torn save');
+
+    # The rebuild saves again and writes a marker; wait for it, then crash.
+    my $saved = 0;
+    for (1 .. 60)
+    {
+        if (-f $marker) { $saved = 1; last; }
+        usleep(500_000);
+    }
+    ok($saved, 'the rebuild saved the index again, writing a generation marker');
+    usleep(2_000_000);    # let the save finish updating the metapage
+
+    $node->stop('immediate');
+
+    $log_pos = length($node->log_content());
+    $node->start;
+    wait_for_worker($node, 30);
+
+    assert_full_recall('legacy_tbl', 'after crash recovery of an upgraded index');
+
+    $log = substr($node->log_content(), $log_pos);
+    unlike($log, qr/torn save detected/,
+        'the stamp written after the upgrade survives crash recovery');
+    like($log, qr/loaded from disk/,
+        'the upgraded index is loaded from disk after the crash');
 }
 
 $node->stop;

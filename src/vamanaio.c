@@ -687,10 +687,17 @@ VamanaCheckSaveGeneration(Oid dboid, Oid relid, TimestampTz expectedSaveGenerati
 	{
 		if (errno == ENOENT)
 		{
-			ereport(WARNING,
-					(errmsg("vamana index %u: save-generation marker missing, torn save detected, will rebuild",
-							relid),
-					 errdetail_log("Path: \"%s\".", genpath)));
+			/* A metapage that was never stamped belongs to an older build. */
+			if (expectedSaveGeneration == 0)
+				ereport(LOG,
+						(errmsg("vamana index %u: saved copy predates save-generation stamps, will rebuild",
+								relid),
+						 errdetail_log("Path: \"%s\".", genpath)));
+			else
+				ereport(WARNING,
+						(errmsg("vamana index %u: save-generation marker missing, torn save detected, will rebuild",
+								relid),
+						 errdetail_log("Path: \"%s\".", genpath)));
 			return false;
 		}
 		ereport(WARNING,
@@ -792,6 +799,19 @@ VamanaMarkIndexSaved(Relation index, ForkNumber forkNum, const VamanaIndexCache 
 	state = GenericXLogStart(index);
 	page = GenericXLogRegisterBuffer(state, buf, 0);
 	metap = VamanaPageGetMeta(page);
+
+	/*
+	 * A metapage laid out before saveGeneration existed ends short of it.
+	 * Generic WAL logs only the part of a page below pd_lower, so extend it
+	 * over the field, or the stamp would not survive crash recovery.
+	 */
+	{
+		PageHeader	phdr = (PageHeader) page;
+		Size		metaEnd = (char *) metap + sizeof(VamanaMetaPageData) - (char *) page;
+
+		if (phdr->pd_lower < metaEnd)
+			phdr->pd_lower = metaEnd;
+	}
 
 	metap->hasSavedIndex = true;
 	metap->indexDataBlkno = VAMANA_HEAD_BLKNO;
