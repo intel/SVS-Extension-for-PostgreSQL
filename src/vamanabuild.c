@@ -146,38 +146,6 @@ SerializeIndexToPages(VamanaBuildState * buildstate, SVSIndexHandle svsIndex)
 	VamanaSaveIndexToDisk(buildstate->index, svsIndex, buildstate->forkNum, &meta, NULL);
 }
 
-/* Valid compression values; used only in this file */
-static const int VAMANA_VALID_COMPRESSION_VALUES[] = {
-	VAMANA_LEANVEC_UINT4,
-	VAMANA_LEANVEC_INT4,
-	VAMANA_LEANVEC_UINT8,
-	VAMANA_LEANVEC_INT8
-};
-#define VAMANA_NUM_COMPRESSION_VALUES \
-	(sizeof(VAMANA_VALID_COMPRESSION_VALUES) / sizeof(VAMANA_VALID_COMPRESSION_VALUES[0]))
-
-/*
- * (primary bits, residual bits) pairs SVS compiles LVQ specializations for.
- * A pair outside this set fails deep inside the library when the loader looks
- * for a matching specialization, so it is rejected here instead.  Widen this
- * table if an SVS build ever adds specializations; the rule itself does not
- * need rewriting.
- */
-typedef struct VamanaLVQPair
-{
-	int			primary_bits;
-	int			residual_bits;
-}			VamanaLVQPair;
-
-static const VamanaLVQPair VAMANA_VALID_LVQ_PAIRS[] = {
-	{4, 0},
-	{8, 0},
-	{4, 4},
-	{4, 8}
-};
-#define VAMANA_NUM_LVQ_PAIRS \
-	(sizeof(VAMANA_VALID_LVQ_PAIRS) / sizeof(VAMANA_VALID_LVQ_PAIRS[0]))
-
 /*
  * Validate compression parameter (must be one of the valid values).  allow_none
  * additionally accepts 0; pass it only for LVQ's residual, the one parameter
@@ -186,19 +154,12 @@ static const VamanaLVQPair VAMANA_VALID_LVQ_PAIRS[] = {
 static void
 ValidateCompressionParam(int value, const char *param_name, bool allow_none)
 {
-	bool		is_valid = false;
+	bool		is_valid;
 
 	if (allow_none && value == VAMANA_COMPRESSION_NO_RESIDUAL)
 		return;
 
-	for (size_t i = 0; i < VAMANA_NUM_COMPRESSION_VALUES; i++)
-	{
-		if (value == VAMANA_VALID_COMPRESSION_VALUES[i])
-		{
-			is_valid = true;
-			break;
-		}
-	}
+	is_valid = VamanaCompressionValueIsValid(value);
 
 	if (!is_valid)
 	{
@@ -217,6 +178,11 @@ ValidateCompressionParam(int value, const char *param_name, bool allow_none)
  * scheme other than the one selected are ignored rather than rejected, which
  * is how the other irrelevant-parameter cases behave (leanvec_dims under LVQ,
  * every compression parameter under compression_type = none).
+ *
+ * Defers the yes/no decision entirely to VamanaCompressionConfigIsValid, so
+ * there is one place that decides validity; the per-parameter and pair/order
+ * checks below only run once that predicate has already said the
+ * combination is invalid, purely to work out which specific error to raise.
  */
 static void
 ValidateCompressionOptions(int compression_type, int compression_primary,
@@ -225,46 +191,40 @@ ValidateCompressionOptions(int compression_type, int compression_primary,
 	int			primary_bits = abs(compression_primary);
 	int			secondary_bits = abs(compression_secondary);
 
+	if (VamanaCompressionConfigIsValid(compression_type, compression_primary,
+									   compression_secondary))
+		return;
+
 	if (compression_type == VAMANA_COMPRESSION_LEANVEC)
 	{
 		ValidateCompressionParam(compression_primary, "compression_primary", false);
 		ValidateCompressionParam(compression_secondary, "compression_secondary", false);
 
-		if (primary_bits > secondary_bits)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("compression_primary (%d-bit) cannot have higher precision than compression_secondary (%d-bit)",
-							primary_bits, secondary_bits),
-					 errhint("Primary quantization must be <= secondary precision (e.g., 4-bit primary with 8-bit secondary is valid)")));
-		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("compression_primary (%d-bit) cannot have higher precision than compression_secondary (%d-bit)",
+						primary_bits, secondary_bits),
+				 errhint("Primary quantization must be <= secondary precision (e.g., 4-bit primary with 8-bit secondary is valid)")));
 	}
 	else if (compression_type == VAMANA_COMPRESSION_LVQ)
 	{
-		bool		is_valid = false;
-
 		ValidateCompressionParam(compression_primary, "compression_primary", false);
 		ValidateCompressionParam(compression_secondary, "compression_secondary", true);
 
-		for (size_t i = 0; i < VAMANA_NUM_LVQ_PAIRS; i++)
-		{
-			if (primary_bits == VAMANA_VALID_LVQ_PAIRS[i].primary_bits &&
-				secondary_bits == VAMANA_VALID_LVQ_PAIRS[i].residual_bits)
-			{
-				is_valid = true;
-				break;
-			}
-		}
-
-		if (!is_valid)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("unsupported LVQ configuration: %d-bit primary with %d-bit residual",
-							primary_bits, secondary_bits),
-					 errhint("Supported LVQ configurations are 4- or 8-bit primary with no residual (compression_secondary = 0), or 4-bit primary with a 4- or 8-bit residual.")));
-		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unsupported LVQ configuration: %d-bit primary with %d-bit residual",
+						primary_bits, secondary_bits),
+				 errhint("Supported LVQ configurations are 4- or 8-bit primary with no residual (compression_secondary = 0), or 4-bit primary with a 4- or 8-bit residual.")));
 	}
+
+	/*
+	 * Reloption bounds keep compression_type to none/leanvec/lvq, so this is
+	 * unreachable today. Guards against a future rule change silently
+	 * accepting an invalid config if that bound is ever widened without the
+	 * branches above being updated to match.
+	 */
+	elog(ERROR, "unexpected compression configuration");
 }
 
 /*
