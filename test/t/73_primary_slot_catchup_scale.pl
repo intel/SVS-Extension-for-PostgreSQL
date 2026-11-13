@@ -82,6 +82,32 @@ sub slot_row
 	return split /\|/, $row;
 }
 
+# SIGKILL of the postmaster does not wait for its children: each one notices
+# the postmaster's death on its own and exits, still attached to the old
+# shared memory segment until it does, and a start before the last of them
+# is gone fails with "pre-existing shared memory block ... is still in use".
+# Retry the start the way src/test/recovery/t/017_shm.pl does.
+sub poll_start
+{
+	my ($node) = @_;
+
+	my $max_attempts = 10 * $PostgreSQL::Test::Utils::timeout_default;
+
+	for (my $attempts = 0; $attempts < $max_attempts; $attempts++)
+	{
+		return if $node->start(fail_ok => 1);
+
+		usleep(100_000);
+
+		# Clean up in case the start attempt just timed out or some such.
+		$node->stop('fast', fail_ok => 1);
+	}
+
+	# Try one last time without fail_ok, which will BAIL_OUT unless it
+	# succeeds.
+	$node->start;
+}
+
 my $consistent = 0;
 for (1 .. 60)
 {
@@ -264,14 +290,32 @@ is($i1_violations, 0, "catchup scale: restart_lsn never advanced past a decoded 
 
 # The slice time budget: B = Min(1000, svs.worker_timeout_ms / 5) = 200 ms
 # here.  Each slice's own elapsed_us (measured inside C around the decode
-# loop, not inferred from log timestamps) must stay within B plus the
-# itemised overshoot margin the budget design allows for (150 ms covers it).
+# loop, not inferred from log timestamps), less the time spent decoding
+# RUNNING_XACTS records (running_xacts_decode_us, which includes file I/O that
+# no budget check can interrupt and which a slow disk stretches without
+# bound), must stay within B plus 150 ms of scheduling slack.
 my $budget_ms = 200;
-my @elapsed_values = ($log_content =~ /vamana catch-up:.*?elapsed_us=(\d+(?:\.\d+)?)/g);
+my @slice_lines = ($log_content =~ /vamana catch-up:.*$/mg);
+my $slice_checked = 0;
 my $slow_slices = 0;
-$slow_slices++ for grep { $_ / 1000 > $budget_ms + 150 } @elapsed_values;
+my $inconsistent_slices = 0;
+foreach my $line (@slice_lines)
+{
+	next
+	  unless $line =~ /elapsed_us=(\d+).*running_xacts_decode_us=(\d+)/;
+	my ($elapsed_us, $decode_us) = ($1, $2);
+
+	$slice_checked++;
+	$inconsistent_slices++ if $decode_us > $elapsed_us;
+	$slow_slices++
+	  if ($elapsed_us - $decode_us) / 1000 > $budget_ms + 150;
+}
 is($slow_slices, 0,
-	"catchup scale: every slice's elapsed time stayed within B + 150 ms (" . scalar(@elapsed_values) . " slices checked)");
+	"catchup scale: every slice's decode time stayed within B + 150 ms ($slice_checked slices checked)");
+ok(@slice_lines > 0 && $slice_checked == @slice_lines,
+	"catchup scale: every catch-up slice line reports elapsed_us and running_xacts_decode_us");
+is($inconsistent_slices, 0,
+	"catchup scale: running_xacts_decode_us never exceeds elapsed_us");
 
 # ---------------------------------------------------------------------------
 # The durability invariant end to end: a hard kill mid-write, then restart,
@@ -281,8 +325,7 @@ my $expected_count = $node->safe_psql('postgres', "SELECT count(*) FROM scale_tb
 chomp $expected_count;
 
 $node->kill9;
-unlink($node->data_dir . '/postmaster.pid');
-$node->start;
+poll_start($node);
 
 wait_for_worker_db($node, 'postgres', 30);
 
