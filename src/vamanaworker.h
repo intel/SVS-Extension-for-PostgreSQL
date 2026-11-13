@@ -141,6 +141,7 @@ typedef struct VamanaWorkerSlot
 	int				searchWindowSize;
 	int				numResults;		/* results written by worker (SEARCH / DELETE count) */
 	char			errorMessage[512]; /* set on VAMANA_SLOT_ERROR */
+	char			errorHint[256]; /* optional; empty if the error has no hint */
 	uint8			errorCategory;	/* VAMANA_ERR_* set by BGW on VAMANA_SLOT_ERROR */
 	Latch			latch;			/* InitSharedLatch'd; backend owns while waiting */
 
@@ -653,7 +654,8 @@ PGDLLEXPORT bool SvsSlotOwnerIsAlive(Oid dbOid, pid_t ownerPid);
 LWLock *VamanaGetIndexLock(VamanaWorkerShmem *entry, Oid relid);
 uint8	VamanaCategorizeSQLState(int sqlerrcode);
 int		VamanaSlotErrcode(uint8 category);
-void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 category);
+void	VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, const char *hint,
+							uint8 category);
 
 /* vamanaworker.c */
 extern bool vamana_eviction_suppressed;
@@ -725,6 +727,16 @@ SVSIndexHandle VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk,
 										  bool propagateResidencyRefusal);
 SVSIndexHandle VamanaWorkerEnsureIndexCurrent(Oid relid, bool propagateResidencyRefusal);
 void	VamanaWorkerResetStaleSlots(void);
+
+/*
+ * Returns the error from the most recent VamanaWorkerGetOrLoadIndex() call
+ * that failed with an ereport-able error, or false if that call returned
+ * NULL for some other reason (for example, a DDL lock skip). Valid only
+ * immediately after such a call returns NULL, before any other load is
+ * attempted.
+ */
+bool	VamanaWorkerGetLastLoadError(int *sqlerrcode, const char **message,
+									const char **hint);
 
 /* Converges a standby's cache onto targetRelids; returns true once every relid has a live slot. */
 bool	VamanaReconcileStandbyCache(List *targetRelids,

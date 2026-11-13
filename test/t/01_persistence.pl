@@ -1006,8 +1006,8 @@ use VamanaTestUtils qw(:all);
     my $rc = $node->psql('postgres', $query,
         stdout => \$out, stderr => \$err);
     isnt($rc, 0, 'query fails while the heap holds a non-finite value');
-    like($err, qr/not loaded/,
-        'backend reports the index could not be loaded');
+    like($err, qr/invalid floating-point value/,
+        'backend reports the actual rebuild failure, not a generic load error');
 
     my $log = substr($node->log_content(), $log_pos);
     like($log, qr/rebuilding vamana index from table data/,

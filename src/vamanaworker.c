@@ -252,7 +252,7 @@ VamanaWorkerProcessRequests(void)
 		else
 			VamanaWorkerFailSlot(slot,
 								 "write requests are not accepted on a standby",
-								 VAMANA_ERR_INTERNAL);
+								 NULL, VAMANA_ERR_INTERNAL);
 	}
 
 	if (numTotal == 0)
@@ -2250,9 +2250,15 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 			return nr;
 
 		case VAMANA_WAIT_ERROR:
-			ereport(ERROR,
-					(errcode(VamanaSlotErrcode(slot->errorCategory)),
-					 errmsg("vamana worker error: %s", slot->errorMessage)));
+			if (slot->errorHint[0] != '\0')
+				ereport(ERROR,
+						(errcode(VamanaSlotErrcode(slot->errorCategory)),
+						 errmsg("vamana worker error: %s", slot->errorMessage),
+						 errhint("%s", slot->errorHint)));
+			else
+				ereport(ERROR,
+						(errcode(VamanaSlotErrcode(slot->errorCategory)),
+						 errmsg("vamana worker error: %s", slot->errorMessage)));
 			pg_unreachable();
 
 		case VAMANA_WAIT_TIMEOUT:
