@@ -56,7 +56,7 @@ static const VamanaLVQPair VAMANA_VALID_LVQ_PAIRS[] = {
  * VAMANA_VALID_COMPRESSION_VALUES, independent of allow_none handling.
  */
 bool
-CompressionValueInSet(int value)
+VamanaCompressionValueIsValid(int value)
 {
 	for (size_t i = 0; i < VAMANA_NUM_COMPRESSION_VALUES; i++)
 	{
@@ -92,8 +92,8 @@ VamanaCompressionConfigIsValid(int compression_type, int compression_primary,
 
 	if (compression_type == VAMANA_COMPRESSION_LEANVEC)
 	{
-		if (!CompressionValueInSet(compression_primary) ||
-			!CompressionValueInSet(compression_secondary))
+		if (!VamanaCompressionValueIsValid(compression_primary) ||
+			!VamanaCompressionValueIsValid(compression_secondary))
 			return false;
 
 		return primary_bits <= secondary_bits;
@@ -103,11 +103,11 @@ VamanaCompressionConfigIsValid(int compression_type, int compression_primary,
 	{
 		bool		secondary_ok;
 
-		if (!CompressionValueInSet(compression_primary))
+		if (!VamanaCompressionValueIsValid(compression_primary))
 			return false;
 
 		secondary_ok = (compression_secondary == VAMANA_COMPRESSION_NO_RESIDUAL) ||
-			CompressionValueInSet(compression_secondary);
+			VamanaCompressionValueIsValid(compression_secondary);
 		if (!secondary_ok)
 			return false;
 

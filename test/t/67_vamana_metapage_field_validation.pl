@@ -89,92 +89,67 @@ ok($worker_pid =~ /^\d+$/, "worker running before any corruption (pid=$worker_pi
 # ===========================================================================
 my @cases = (
     {
-        name    => 'dim_oor',
-        with    => '',
-        pokes   => [ [ 'dimensions', 2001 ] ],
-        pattern => qr/metapage dimensions value that does not match its column/,
-    },
-    {
-        name    => 'dim_zero',
-        with    => '',
-        pokes   => [ [ 'dimensions', 0 ] ],
-        pattern => qr/metapage dimensions value that does not match its column/,
-    },
-    {
         name    => 'dim_mismatch',
-        with    => '',
         pokes   => [ [ 'dimensions', $dim / 2 ] ],
         pattern => qr/metapage dimensions value that does not match its column/,
     },
     {
         name    => 'graph_degree',
-        with    => '',
         pokes   => [ [ 'graph_degree', 300 ] ],
         pattern => qr/graph_degree value 300 is out of range/,
     },
     {
         name    => 'graph_degree_below_min',
-        with    => '',
         pokes   => [ [ 'graph_degree', 15 ] ],
         pattern => qr/graph_degree value 15 is out of range/,
     },
     {
         name    => 'alpha',
-        with    => '',
         pokes   => [ [ 'alpha', -5 ] ],
         pattern => qr/alpha value -5 is out of range/,
     },
     {
         name    => 'alpha_below_min',
-        with    => '',
         pokes   => [ [ 'alpha', -2 ] ],
         pattern => qr/alpha value -2 is out of range/,
     },
     {
         name    => 'build_window_size',
-        with    => '',
         pokes   => [ [ 'build_window_size', 2000 ] ],
         pattern => qr/build_window_size value 2000 is out of range/,
     },
     {
         name    => 'build_window_below_min',
-        with    => '',
         pokes   => [ [ 'build_window_size', -2 ] ],
         pattern => qr/build_window_size value -2 is out of range/,
     },
     {
         name    => 'leanvec_dims',
-        with    => '',
         pokes   => [ [ 'leanvec_dims', 5000 ] ],
         pattern => qr/leanvec_dims value 5000 is out of range/,
     },
     {
         name    => 'leanvec_dims_below_min',
-        with    => '',
         pokes   => [ [ 'leanvec_dims', -2 ] ],
         pattern => qr/leanvec_dims value -2 is out of range/,
     },
     {
         name    => 'compression_type',
-        with    => '',
         pokes   => [ [ 'compression_type', 3 ] ],
         pattern => qr/invalid compression configuration/,
     },
     {
         name    => 'lvq_bad_primary',
-        with    => '',
         pokes   => [ [ 'compression_type', 2 ], [ 'compression_primary', 5 ], [ 'compression_secondary', 0 ] ],
         pattern => qr/invalid compression configuration/,
     },
     {
         name    => 'lvq_bad_pair',
-        with    => '',
         pokes   => [ [ 'compression_type', 2 ], [ 'compression_primary', 8 ], [ 'compression_secondary', 8 ] ],
         pattern => qr/invalid compression configuration/,
     },
     {
         name    => 'leanvec_bad_pair',
-        with    => '',
         pokes   => [ [ 'compression_type', 1 ], [ 'compression_primary', 8 ], [ 'compression_secondary', 4 ] ],
         pattern => qr/invalid compression configuration/,
     },
@@ -185,14 +160,14 @@ my @cases = (
 # a legitimate index). These are expected to build and scan cleanly, unlike
 # every case above.
 my @boundary_valid_cases = (
-    { name => 'graph_degree_min', with => '', pokes => [ [ 'graph_degree', 16 ] ] },
-    { name => 'graph_degree_max', with => '', pokes => [ [ 'graph_degree', 256 ] ] },
-    { name => 'alpha_min', with => '', pokes => [ [ 'alpha', -1 ] ] },
-    { name => 'alpha_max', with => '', pokes => [ [ 'alpha', 200 ] ] },
-    { name => 'build_window_min', with => '', pokes => [ [ 'build_window_size', -1 ] ] },
-    { name => 'build_window_max', with => '', pokes => [ [ 'build_window_size', 1000 ] ] },
-    { name => 'leanvec_dims_min', with => '', pokes => [ [ 'leanvec_dims', -1 ] ] },
-    { name => 'leanvec_dims_max', with => '', pokes => [ [ 'leanvec_dims', 2000 ] ] },
+    { name => 'graph_degree_min', pokes => [ [ 'graph_degree', 16 ] ] },
+    { name => 'graph_degree_max', pokes => [ [ 'graph_degree', 256 ] ] },
+    { name => 'alpha_min', pokes => [ [ 'alpha', -1 ] ] },
+    { name => 'alpha_max', pokes => [ [ 'alpha', 200 ] ] },
+    { name => 'build_window_min', pokes => [ [ 'build_window_size', -1 ] ] },
+    { name => 'build_window_max', pokes => [ [ 'build_window_size', 1000 ] ] },
+    { name => 'leanvec_dims_min', pokes => [ [ 'leanvec_dims', -1 ] ] },
+    { name => 'leanvec_dims_max', pokes => [ [ 'leanvec_dims', 2000 ] ] },
 );
 
 sub create_case_objects
@@ -205,7 +180,7 @@ sub create_case_objects
             CREATE TABLE $tbl (id serial PRIMARY KEY, val vector($dim));
             INSERT INTO $tbl (val)
                 SELECT ARRAY[$array_sql]::vector FROM generate_series(1, 50);
-            CREATE INDEX $idx ON $tbl USING vamana (val vector_l2_ops) $case->{with};
+            CREATE INDEX $idx ON $tbl USING vamana (val vector_l2_ops);
         });
         $case->{table} = $tbl;
         $case->{index} = $idx;

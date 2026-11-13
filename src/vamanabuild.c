@@ -159,7 +159,7 @@ ValidateCompressionParam(int value, const char *param_name, bool allow_none)
 	if (allow_none && value == VAMANA_COMPRESSION_NO_RESIDUAL)
 		return;
 
-	is_valid = CompressionValueInSet(value);
+	is_valid = VamanaCompressionValueIsValid(value);
 
 	if (!is_valid)
 	{
@@ -217,6 +217,14 @@ ValidateCompressionOptions(int compression_type, int compression_primary,
 						primary_bits, secondary_bits),
 				 errhint("Supported LVQ configurations are 4- or 8-bit primary with no residual (compression_secondary = 0), or 4-bit primary with a 4- or 8-bit residual.")));
 	}
+
+	/*
+	 * Reloption bounds keep compression_type to none/leanvec/lvq, so this is
+	 * unreachable today. Guards against a future rule change silently
+	 * accepting an invalid config if that bound is ever widened without the
+	 * branches above being updated to match.
+	 */
+	elog(ERROR, "unexpected compression configuration");
 }
 
 /*

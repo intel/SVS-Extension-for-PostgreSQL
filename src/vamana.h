@@ -387,7 +387,7 @@ const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
 bool		VamanaCompressionConfigIsValid(int compression_type, int compression_primary,
 										   int compression_secondary);
-bool		CompressionValueInSet(int value);
+bool		VamanaCompressionValueIsValid(int value);
 void		VamanaValidateMetaCounts(Oid relid, uint32 tidMappingCapacity,
 									  uint32 numVectors, uint32 numDeleted,
 									  uint64 nextExternalId,

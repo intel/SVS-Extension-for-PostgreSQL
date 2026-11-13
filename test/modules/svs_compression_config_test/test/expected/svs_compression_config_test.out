@@ -64,6 +64,14 @@ SELECT svs_compression_config_test_is_valid(1, 5, 8) AS leanvec_bad_primary_valu
  f
 (1 row)
 
+-- leanvec: invalid, secondary = 0 is LVQ's no-residual value, not a valid
+-- leanvec encoding; leanvec has no such mode.
+SELECT svs_compression_config_test_is_valid(1, 4, 0) AS leanvec_secondary_zero;
+ leanvec_secondary_zero 
+------------------------
+ f
+(1 row)
+
 -- lvq: valid (primary bits, residual bits) pairs: (4,0), (8,0), (4,4), (4,8).
 SELECT svs_compression_config_test_is_valid(2, 4, 0) AS lvq_4_0;
  lvq_4_0 
@@ -114,10 +122,17 @@ SELECT svs_compression_config_test_is_valid(2, 8, 4) AS lvq_bad_pair_8_4;
  f
 (1 row)
 
--- lvq: invalid, primary is not one of the valid encodings.
+-- lvq: invalid, primary is not one of the valid encodings. Unlike secondary,
+-- primary never gets the no-residual exception; 0 is not a valid primary.
 SELECT svs_compression_config_test_is_valid(2, 5, 0) AS lvq_bad_primary_value;
  lvq_bad_primary_value 
 -----------------------
+ f
+(1 row)
+
+SELECT svs_compression_config_test_is_valid(2, 0, 0) AS lvq_primary_zero;
+ lvq_primary_zero 
+------------------
  f
 (1 row)
 
