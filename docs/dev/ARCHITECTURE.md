@@ -651,7 +651,7 @@ Logical decoding encounters transactions that span multiple WAL records. The reo
 - Delivering only committed, complete transactions
 - Filtering aborted transactions
 
-We never set `restart_lsn` directly: it is advanced only by PostgreSQL's logical decoding. The worker reads it to measure WAL lag, and `VamanaReplicationCatchUpSlot` decodes the slot forward so that `restart_lsn` can move.
+We never set `restart_lsn` directly: it is advanced only by PostgreSQL's logical decoding. The worker reads it to measure WAL lag, and `VamanaReplicationCatchUpSlot` decodes the slot forward so that `restart_lsn` can move. Each slice runs for a wall-clock budget of `Min(1000, svs.worker_timeout_ms / 5)` ms, and the budget is checked every 32 records and right after each RUNNING_XACTS record. A slice can therefore overrun the budget by one RUNNING_XACTS decode, because core writes a snapshot file and saves the slot inside that decode. On slow storage that overrun has no fixed bound, and the worker serves no IPC until the slice returns.
 
 #### WAL Retention Implications
 

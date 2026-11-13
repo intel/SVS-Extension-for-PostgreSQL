@@ -1480,6 +1480,30 @@ typedef struct VamanaCatchUpBudget
 } VamanaCatchUpBudget;
 
 /*
+ * Decode one RUNNING_XACTS record and add its wall time to the budget's
+ * runningXactsDecodeTime.  Decoding such a record on a consistent slot
+ * serializes the snapshot to pg_logical/snapshots and saves the slot's new
+ * restart point to pg_replslot.  That synchronous file I/O happens inside the
+ * one LogicalDecodingProcessRecord call, so no budget check can interrupt it.
+ * The slice log shows how much of the elapsed time went to these records
+ * rather than to the cheap records the budget governs.  The timer covers the
+ * whole decode of the record, CPU included.
+ */
+static void
+DecodeRunningXactsRecord(LogicalDecodingContext *ctx, VamanaCatchUpBudget *budget)
+{
+	instr_time	start;
+	instr_time	duration;
+
+	INSTR_TIME_SET_CURRENT(start);
+	LogicalDecodingProcessRecord(ctx, ctx->reader);
+	INJECTION_POINT("vamana-catchup-running-xacts-decoded", NULL);
+	INSTR_TIME_SET_CURRENT(duration);
+	INSTR_TIME_SUBTRACT(duration, start);
+	INSTR_TIME_ADD(budget->runningXactsDecodeTime, duration);
+}
+
+/*
  * Process first, check second, so ctx->reader->EndRecPtr at loop exit is
  * always the end of a record that was actually passed to
  * LogicalDecodingProcessRecord: returning true before processing (as
@@ -1501,33 +1525,14 @@ DiscardRecordCallback(LogicalDecodingContext *ctx, void *arg)
 {
 	VamanaCatchUpBudget *budget = (VamanaCatchUpBudget *) arg;
 	bool		runningXacts;
-	instr_time	start;
 
 	INJECTION_POINT("vamana-slot-advance-discard-decode", NULL);
 
-	/*
-	 * Decoding a RUNNING_XACTS record on a consistent slot serializes the
-	 * snapshot to pg_logical/snapshots and saves the slot's new restart point
-	 * to pg_replslot.  That synchronous file I/O happens inside the one
-	 * LogicalDecodingProcessRecord call, so no budget check can interrupt it.
-	 * Time these records separately; the slice log then shows how much of the
-	 * elapsed time went to them rather than to the cheap records the budget
-	 * governs.  The timer covers the whole decode of the record, CPU
-	 * included.
-	 */
 	runningXacts = IsRunningXactsRecord(ctx->reader);
-	INSTR_TIME_SET_ZERO(start);
 	if (runningXacts)
-		INSTR_TIME_SET_CURRENT(start);
-	LogicalDecodingProcessRecord(ctx, ctx->reader);
-	if (runningXacts)
-	{
-		instr_time	duration;
-
-		INSTR_TIME_SET_CURRENT(duration);
-		INSTR_TIME_SUBTRACT(duration, start);
-		INSTR_TIME_ADD(budget->runningXactsDecodeTime, duration);
-	}
+		DecodeRunningXactsRecord(ctx, budget);
+	else
+		LogicalDecodingProcessRecord(ctx, ctx->reader);
 	budget->recordsDecoded++;
 
 	if (!runningXacts && ++budget->sinceCheck < VAMANA_CATCHUP_CHECK_STRIDE)
@@ -1585,9 +1590,9 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 	{
 		instr_time	startTime;
 		instr_time	elapsed;
+		int64		runningXactsDecodeUs = 0;
 
 		INSTR_TIME_SET_CURRENT(startTime);
-		result->runningXactsDecodeUs = 0;
 
 		startRestartLsn = MyReplicationSlot->data.restart_lsn;
 		confirmedFlush = MyReplicationSlot->data.confirmed_flush;
@@ -1616,7 +1621,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 			endRecPtr = ctx->reader->EndRecPtr;
 			recordsDecoded = budget.recordsDecoded;
 			budgetExhausted = budget.exhausted;
-			result->runningXactsDecodeUs =
+			runningXactsDecodeUs =
 				INSTR_TIME_GET_MICROSEC(budget.runningXactsDecodeTime);
 
 			FreeDecodingContext(ctx);
@@ -1646,7 +1651,7 @@ VamanaReplicationCatchUpSlot(Oid indexRelid, int budgetMs, VamanaCatchUpResult *
 						INSTR_TIME_GET_MICROSEC(elapsed),
 						(int) result->budgetExhausted,
 						(int) result->skippedNoLag,
-						result->runningXactsDecodeUs)));
+						runningXactsDecodeUs)));
 
 		ReplicationSlotRelease();
 	}
