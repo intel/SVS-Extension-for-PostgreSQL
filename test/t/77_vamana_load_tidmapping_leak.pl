@@ -1,10 +1,8 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: PostgreSQL
 
-# 77_vamana_load_tidmapping_leak.pl — checks that the worker's TopMemoryContext
-# does not keep growing across repeated CREATE INDEX / DROP INDEX cycles.
-# Cycle 1 is excluded from the comparison since it seeds one-time cache
-# bookkeeping that grows regardless of the leak.
+# 77_vamana_load_tidmapping_leak.pl — TopMemoryContext stays flat across
+# CREATE INDEX / DROP INDEX cycles; cycle 1 is skipped to avoid one-time setup.
 
 use strict;
 use warnings FATAL => 'all';
