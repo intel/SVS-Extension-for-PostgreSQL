@@ -120,6 +120,7 @@ typedef struct VamanaCatchUpResult
 	uint64		recordsDecoded;
 	bool		budgetExhausted;
 	bool		skippedNoLag;
+	int64		runningXactsDecodeUs;
 } VamanaCatchUpResult;
 
 /*
