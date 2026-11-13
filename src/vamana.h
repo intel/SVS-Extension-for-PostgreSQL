@@ -375,6 +375,7 @@ Buffer		VamanaNewBuffer(Relation index, ForkNumber forkNum);
 void		VamanaInitPage(Buffer buf, Page page);
 void		VamanaInit(void);
 const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
+void		VamanaCheckIndexedTypeProvenance(Relation index);
 const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);

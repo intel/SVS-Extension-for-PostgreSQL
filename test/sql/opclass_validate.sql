@@ -211,3 +211,102 @@ SELECT amvalidate(oid) FROM pg_opclass
    AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
 
 DROP OPERATOR FAMILY vamana_test_foreign_group_ops USING vamana CASCADE;
+
+-- An ordering operator whose only stated defect is its sort family, but
+-- whose function also genuinely computes a different metric than support
+-- function 1. Gating the metric-mismatch check on every operator check
+-- (not just the signature check) means this real, independent second
+-- defect goes unreported here: a known, accepted tradeoff of the broader
+-- gate, pinned by this test rather than left undocumented.
+CREATE OPERATOR CLASS vamana_test_sortfamily_and_metric_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 <=> (vector, vector) FOR ORDER BY integer_ops,
+	FUNCTION 1 vector_l2_squared_distance(vector, vector);
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_sortfamily_and_metric_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_sortfamily_and_metric_ops USING vamana CASCADE;
+
+-- A malformed support function 2 on a cosine opclass: proc 1 is the
+-- inner-product name, which only becomes cosine when proc 2 is present.
+-- A malformed proc 2 is reported once, by its own signature check, and
+-- must not also produce a metric-mismatch message derived from treating
+-- it as present.
+CREATE OPERATOR CLASS vamana_test_cosine_bad_norm_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_negative_inner_product(vector, vector),
+	FUNCTION 2 vector_dims(vector);
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_cosine_bad_norm_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_cosine_bad_norm_ops USING vamana CASCADE;
+
+-- A malformed support function 2 on an L2 opclass: same rule as above,
+-- applied to the other message a malformed proc 2 could otherwise
+-- trigger (proc 2 shouldn't exist on an L2 opclass at all).
+CREATE OPERATOR CLASS vamana_test_l2_bad_norm_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vector_l2_squared_distance(vector, vector),
+	FUNCTION 2 vector_dims(vector);
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_l2_bad_norm_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_l2_bad_norm_ops USING vamana CASCADE;
+
+-- A type merely named "vector", not provided by the real vector extension:
+-- the name check alone would accept it, same as CREATE INDEX does today
+-- for the runtime path. amvalidate additionally checks provenance.
+CREATE SCHEMA vamana_test_fake;
+
+CREATE FUNCTION vamana_test_fake.vector_in(cstring, oid, integer)
+	RETURNS vamana_test_fake.vector
+	AS '$libdir/vector', 'vector_in' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector)
+	RETURNS cstring
+	AS '$libdir/vector', 'vector_out' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION vamana_test_fake.vector_typmod_in(cstring[])
+	RETURNS integer
+	AS '$libdir/vector', 'vector_typmod_in' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE TYPE vamana_test_fake.vector (
+	INPUT = vamana_test_fake.vector_in,
+	OUTPUT = vamana_test_fake.vector_out,
+	TYPMOD_IN = vamana_test_fake.vector_typmod_in,
+	STORAGE = external,
+	INTERNALLENGTH = VARIABLE
+);
+
+CREATE FUNCTION vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector)
+	RETURNS float8
+	AS '$libdir/vector', 'vector_l2_squared_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION vamana_test_fake.l2_distance(vamana_test_fake.vector, vamana_test_fake.vector)
+	RETURNS float8
+	AS '$libdir/vector', 'l2_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OPERATOR vamana_test_fake.<-> (
+	LEFTARG = vamana_test_fake.vector, RIGHTARG = vamana_test_fake.vector,
+	PROCEDURE = vamana_test_fake.l2_distance
+);
+
+CREATE OPERATOR CLASS vamana_test_fake_vector_ops
+	FOR TYPE vamana_test_fake.vector USING vamana AS
+	OPERATOR 1 vamana_test_fake.<-> (vamana_test_fake.vector, vamana_test_fake.vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector);
+
+SELECT amvalidate(oid) FROM pg_opclass
+ WHERE opcname = 'vamana_test_fake_vector_ops'
+   AND opcmethod = (SELECT oid FROM pg_am WHERE amname = 'vamana');
+
+DROP OPERATOR FAMILY vamana_test_fake_vector_ops USING vamana CASCADE;
+DROP SCHEMA vamana_test_fake CASCADE;

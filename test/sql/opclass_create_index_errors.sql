@@ -40,3 +40,52 @@ CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
 CREATE INDEX ON t USING vamana (val vamana_test_create_index_unmapped_proc1_ops);
 DROP TABLE t;
 DROP OPERATOR CLASS vamana_test_create_index_unmapped_proc1_ops USING vamana;
+
+-- A type merely named "vector", not provided by the real vector extension.
+-- VamanaCheckIndexedTypeProvenance rejects this once per build, so the
+-- runtime path and amvalidate agree on this opclass (see opclass_validate.sql).
+CREATE SCHEMA vamana_test_fake;
+
+CREATE FUNCTION vamana_test_fake.vector_in(cstring, oid, integer)
+	RETURNS vamana_test_fake.vector
+	AS '$libdir/vector', 'vector_in' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector)
+	RETURNS cstring
+	AS '$libdir/vector', 'vector_out' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE FUNCTION vamana_test_fake.vector_typmod_in(cstring[])
+	RETURNS integer
+	AS '$libdir/vector', 'vector_typmod_in' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE TYPE vamana_test_fake.vector (
+	INPUT = vamana_test_fake.vector_in,
+	OUTPUT = vamana_test_fake.vector_out,
+	TYPMOD_IN = vamana_test_fake.vector_typmod_in,
+	STORAGE = external,
+	INTERNALLENGTH = VARIABLE
+);
+
+CREATE FUNCTION vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector)
+	RETURNS float8
+	AS '$libdir/vector', 'vector_l2_squared_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE FUNCTION vamana_test_fake.l2_distance(vamana_test_fake.vector, vamana_test_fake.vector)
+	RETURNS float8
+	AS '$libdir/vector', 'l2_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OPERATOR vamana_test_fake.<-> (
+	LEFTARG = vamana_test_fake.vector, RIGHTARG = vamana_test_fake.vector,
+	PROCEDURE = vamana_test_fake.l2_distance
+);
+
+CREATE OPERATOR CLASS vamana_test_fake_vector_ops
+	FOR TYPE vamana_test_fake.vector USING vamana AS
+	OPERATOR 1 vamana_test_fake.<-> (vamana_test_fake.vector, vamana_test_fake.vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector);
+
+CREATE TABLE t (id serial PRIMARY KEY, val vamana_test_fake.vector);
+CREATE INDEX ON t USING vamana (val vamana_test_fake_vector_ops);
+DROP TABLE t;
+DROP OPERATOR FAMILY vamana_test_fake_vector_ops USING vamana CASCADE;
+DROP SCHEMA vamana_test_fake CASCADE;

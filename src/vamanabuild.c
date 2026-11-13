@@ -281,6 +281,7 @@ InitBuildState(VamanaBuildState * buildstate, Relation heap, Relation index,
 	buildstate->indexInfo = indexInfo;
 	buildstate->forkNum = forkNum;
 	buildstate->typeInfo = VamanaGetTypeInfo(index);
+	VamanaCheckIndexedTypeProvenance(index);
 
 	buildstate->graph_degree = opts ? opts->graph_degree : VAMANA_DEFAULT_GRAPH_DEGREE;
 	/* If alpha = -1, SVS uses its internal default (1.2 for L2) */
