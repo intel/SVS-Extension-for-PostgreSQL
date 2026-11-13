@@ -22,17 +22,26 @@
 #include "vamana.h"
 
 #include "access/amapi.h"
+#include "access/amvalidate.h"
 #include "access/generic_xlog.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "catalog/dependency.h"
+#include "catalog/pg_amop.h"
+#include "catalog/pg_amproc.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_type_d.h"
+#include "commands/extension.h"
 #include "commands/progress.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/selfuncs.h"
@@ -50,28 +59,20 @@ static const VamanaTypeInfo halfvec_info = {
 };
 
 /*
- * Get type-specific information for the indexed column.
- *
- * Resolved from the attribute's type rather than assumed, because vector and
- * halfvec share an identical varlena header and differ only in element width:
- * reading one as the other is not caught by any size check the datum itself
- * carries.
- *
- * Compared by name through the syscache rather than by OID: pgvector's type
- * OIDs are assigned at CREATE EXTENSION and are not fixed, and format_type_be
- * may return a schema-qualified name.
+ * Classify a type OID as one of the types a vamana index can store, or
+ * NULL if it is neither. Compared by name rather than by OID, since
+ * pgvector's type OIDs are assigned at CREATE EXTENSION and are not fixed.
  */
-const		VamanaTypeInfo *
-VamanaGetTypeInfo(Relation index)
+static const VamanaTypeInfo *
+VamanaClassifyIndexedType(Oid typeOid)
 {
-	Oid			atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
 	HeapTuple	typeTup;
 	char	   *typname;
-	const VamanaTypeInfo *result;
+	const VamanaTypeInfo *result = NULL;
 
-	typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(atttypid));
+	typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typeOid));
 	if (!HeapTupleIsValid(typeTup))
-		elog(ERROR, "cache lookup failed for type %u", atttypid);
+		elog(ERROR, "cache lookup failed for type %u", typeOid);
 
 	typname = NameStr(((Form_pg_type) GETSTRUCT(typeTup))->typname);
 
@@ -79,20 +80,92 @@ VamanaGetTypeInfo(Relation index)
 		result = &vector_info;
 	else if (strcmp(typname, "halfvec") == 0)
 		result = &halfvec_info;
-	else
-	{
-		char	   *unsupported = pstrdup(typname);
-
-		ReleaseSysCache(typeTup);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("unsupported type for vamana index: %s", unsupported),
-				 errhint("A vamana index supports the vector and halfvec types.")));
-	}
 
 	ReleaseSysCache(typeTup);
 
 	return result;
+}
+
+/*
+ * Look up the catalog name of a type OID, for error messages on paths where
+ * VamanaClassifyIndexedType has already returned NULL.
+ */
+static char *
+VamanaTypeName(Oid typeOid)
+{
+	HeapTuple	typeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typeOid));
+	char	   *name;
+
+	if (!HeapTupleIsValid(typeTup))
+		elog(ERROR, "cache lookup failed for type %u", typeOid);
+
+	name = pstrdup(NameStr(((Form_pg_type) GETSTRUCT(typeTup))->typname));
+	ReleaseSysCache(typeTup);
+
+	return name;
+}
+
+/*
+ * Get type-specific information for the indexed column.
+ *
+ * Resolved from the attribute's type rather than assumed, because vector and
+ * halfvec share an identical varlena header and differ only in element width:
+ * reading one as the other is not caught by any size check the datum itself
+ * carries.
+ */
+const		VamanaTypeInfo *
+VamanaGetTypeInfo(Relation index)
+{
+	Oid			atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
+	const VamanaTypeInfo *result = VamanaClassifyIndexedType(atttypid);
+
+	if (result == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported type for vamana index: %s", VamanaTypeName(atttypid)),
+				 errhint("A vamana index supports the vector and halfvec types.")));
+
+	return result;
+}
+
+/*
+ * True if typeOid is owned by the vector extension, not just named like
+ * one of its types.
+ */
+static bool
+VamanaTypeIsFromVectorExtension(Oid typeOid)
+{
+	Oid			vectorExtOid = get_extension_oid("vector", true);
+
+	if (!OidIsValid(vectorExtOid))
+		return false;
+
+	return getExtensionOfObject(TypeRelationId, typeOid) == vectorExtOid;
+}
+
+/*
+ * Reject an index whose column type merely has the right name
+ * (vector/halfvec) but did not come from the real vector extension: a
+ * same-named type with a different memory layout read as pgvector's would
+ * be an out-of-bounds read, not just a wrong answer. Checked once per
+ * build/REINDEX, where the index comes into existence; insert, scan, and
+ * the worker all rely on an index having already passed this at build
+ * time, so they stay name-only (VamanaClassifyIndexedType) rather than
+ * paying this lookup on every row.
+ *
+ * atttypid is the same OID VamanaGetTypeInfo already classified by name,
+ * so call this only after that call has succeeded.
+ */
+void
+VamanaCheckIndexedTypeProvenance(Relation index)
+{
+	Oid			atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
+
+	if (!VamanaTypeIsFromVectorExtension(atttypid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("type %s is not provided by the vector extension", format_type_be(atttypid)),
+				 errhint("A vamana index supports the vector and halfvec types.")));
 }
 
 /*
@@ -553,17 +626,34 @@ vamanabuildphasename(int64 phaseNum)
 }
 
 /*
- * Validate index definition
- */
-bool
-vamanavalidate(Oid opclassoid)
-{
-	return true;
-}
-
-/*
  * Distance metric helper
  */
+
+/*
+ * Map a proc-1 name to a metric; shared by VamanaGetDistanceMetric and
+ * vamanavalidate so the two cannot drift. hasNormProc selects cosine over
+ * inner product by presence alone: normprocinfo is never actually called.
+ */
+static bool
+VamanaClassifyDistanceMetric(const char *distFuncName, bool hasNormProc,
+							  SVSDistanceType *metric)
+{
+	if (strcmp(distFuncName, "vector_l2_squared_distance") == 0 ||
+		strcmp(distFuncName, "halfvec_l2_squared_distance") == 0)
+	{
+		*metric = SVS_DISTANCE_L2;
+		return true;
+	}
+
+	if (strcmp(distFuncName, "vector_negative_inner_product") == 0 ||
+		strcmp(distFuncName, "halfvec_negative_inner_product") == 0)
+	{
+		*metric = hasNormProc ? SVS_DISTANCE_COSINE : SVS_DISTANCE_IP;
+		return true;
+	}
+
+	return false;
+}
 
 /*
  * Determine the SVS distance metric from the index's operator class.
@@ -572,82 +662,276 @@ vamanavalidate(Oid opclassoid)
 SVSDistanceType
 VamanaGetDistanceMetric(Relation index)
 {
-	Oid			opfamilyoid;
-	Oid			inputTypeOid;
-	Oid			distanceFuncOid;
-	char	   *funcName;
+	Oid			opfamilyoid = index->rd_opfamily[0];
+	Oid			inputTypeOid = index->rd_opcintype[0];
+	Oid			distFuncOid;
+	char	   *distFuncName;
+	bool		hasNormProc;
+	SVSDistanceType result;
 
-	opfamilyoid = index->rd_opfamily[0];
-	inputTypeOid = index->rd_opcintype[0];
-
-	distanceFuncOid = get_opfamily_proc(opfamilyoid, inputTypeOid, inputTypeOid,
-										VAMANA_DISTANCE_PROC);
-	if (!OidIsValid(distanceFuncOid))
+	distFuncOid = get_opfamily_proc(opfamilyoid, inputTypeOid, inputTypeOid,
+									VAMANA_DISTANCE_PROC);
+	if (!OidIsValid(distFuncOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("no distance function found for vamana index"),
 				 errhint("Ensure you are using vector_l2_ops, vector_ip_ops, or vector_cosine_ops")));
 
-	funcName = get_func_name(distanceFuncOid);
-	if (funcName == NULL)
+	distFuncName = get_func_name(distFuncOid);
+	if (distFuncName == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not determine distance function name")));
 
-	if (strcmp(funcName, "vector_l2_squared_distance") == 0 ||
-		strcmp(funcName, "halfvec_l2_squared_distance") == 0)
-	{
-		pfree(funcName);
-		return SVS_DISTANCE_L2;
-	}
+	hasNormProc = OidIsValid(get_opfamily_proc(opfamilyoid, inputTypeOid,
+												   inputTypeOid, VAMANA_NORM_PROC));
 
-	if (strcmp(funcName, "vector_negative_inner_product") == 0 ||
-		strcmp(funcName, "halfvec_negative_inner_product") == 0)
-	{
-		/*
-		 * Inner-product op class doubles as cosine when a norm function is
-		 * registered (support function 2).
-		 */
-		Oid			normFuncOid = get_opfamily_proc(opfamilyoid, inputTypeOid,
-													inputTypeOid,
-													VAMANA_NORM_PROC);
-		SVSDistanceType result;
+	if (!VamanaClassifyDistanceMetric(distFuncName, hasNormProc, &result))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported distance function for vamana index: %s", distFuncName),
+				 errhint("Use vector_l2_ops, vector_ip_ops, or vector_cosine_ops")));
 
-		result = OidIsValid(normFuncOid) ? SVS_DISTANCE_COSINE : SVS_DISTANCE_IP;
-		pfree(funcName);
-		return result;
-	}
-
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("unsupported distance function for vamana index: %s", funcName),
-			 errhint("Use vector_l2_ops, vector_ip_ops, or vector_cosine_ops")));
-	return SVS_DISTANCE_L2;		/* unreachable */
+	return result;
 }
 
 /*
- * Check that the opfamily's strategy-1 (ordering) operator implements the
- * same distance metric as the one derived from support function 1. An
- * opclass that pairs, for example, <=> with an L2 support function builds
- * successfully with no error, but the index then serves ORDER BY <=> from
- * an L2 graph with no recheck, returning neighbours in the wrong order.
- * Name-based, like the rest of the metric mapping in VamanaGetDistanceMetric;
- * that is a known property of this code, not something this check
- * introduces.
+ * The opclass shape the validator's stages collect as they go, so later
+ * stages (the metric checks) can tell a real inner-product/cosine
+ * distinction or a genuine ordering operator from one that merely exists
+ * with the wrong signature, without re-deriving it from the catalog.
  */
-bool
-VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric)
+typedef struct VamanaOpclassShape
 {
-	Oid			orderOpOid;
-	Oid			orderFuncOid;
+	Oid			distFuncOid;	/* proc 1 for (opcintype, opcintype), or InvalidOid */
+	bool		distSignatureOk;
+	bool		normPresent;	/* proc 2 registered for (opcintype, opcintype) */
+	bool		normSignatureOk;
+	Oid			orderOpOid;		/* strategy-1 order op for (opcintype, opcintype)
+								 * that passed every operator check, or InvalidOid */
+} VamanaOpclassShape;
+
+/*
+ * Check every support function; signatures only for this opclass's own
+ * (opcintype, opcintype) group, as gistvalidate does.
+ */
+static bool
+VamanaValidateSupportFunctions(const char *opfamilyname, Oid opcintype, CatCList *proclist,
+								VamanaOpclassShape *shape)
+{
+	bool		result = true;
+	int			i;
+
+	for (i = 0; i < proclist->n_members; i++)
+	{
+		HeapTuple	proctup = &proclist->members[i]->tuple;
+		Form_pg_amproc procform = (Form_pg_amproc) GETSTRUCT(proctup);
+		bool		ok;
+
+		if (procform->amproclefttype != procform->amprocrighttype)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s contains support function %s with different left and right input types",
+							opfamilyname, "vamana",
+							format_procedure(procform->amproc))));
+			result = false;
+		}
+
+		if (procform->amproclefttype != opcintype || procform->amprocrighttype != opcintype)
+			continue;
+
+		switch (procform->amprocnum)
+		{
+			case VAMANA_DISTANCE_PROC:
+				ok = check_amproc_signature(procform->amproc, FLOAT8OID, true,
+											2, 2, opcintype, opcintype);
+				shape->distFuncOid = procform->amproc;
+				shape->distSignatureOk = ok;
+				break;
+			case VAMANA_NORM_PROC:
+				ok = check_amproc_signature(procform->amproc, FLOAT8OID, true,
+											1, 1, opcintype);
+				shape->normPresent = true;
+				shape->normSignatureOk = ok;
+				break;
+			case VAMANA_TYPE_INFO_PROC:
+				ereport(INFO,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("operator family \"%s\" of access method %s contains function %s registered as support number %d, which access method %s does not use",
+								opfamilyname, "vamana",
+								format_procedure(procform->amproc),
+								VAMANA_TYPE_INFO_PROC, "vamana")));
+				result = false;
+				continue;		/* don't want additional message */
+			default:
+				ereport(INFO,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("operator family \"%s\" of access method %s contains function %s with invalid support number %d",
+								opfamilyname, "vamana",
+								format_procedure(procform->amproc),
+								procform->amprocnum)));
+				result = false;
+				continue;		/* don't want additional message */
+		}
+
+		if (!ok)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s contains function %s with wrong signature for support number %d",
+							opfamilyname, "vamana",
+							format_procedure(procform->amproc),
+							procform->amprocnum)));
+			result = false;
+		}
+	}
+
+	return result;
+}
+
+/*
+ * Check every operator. shape->orderOpOid is set only for a strategy-1,
+ * order-purpose operator on (opcintype, opcintype) that passed every
+ * check here, since get_opfamily_member cannot tell purpose apart and a
+ * malformed operator has nothing meaningful to compare against the metric.
+ */
+static bool
+VamanaValidateOperators(const char *opfamilyname, Oid opcintype, CatCList *oprlist,
+						 VamanaOpclassShape *shape)
+{
+	bool		result = true;
+	int			i;
+
+	for (i = 0; i < oprlist->n_members; i++)
+	{
+		HeapTuple	oprtup = &oprlist->members[i]->tuple;
+		Form_pg_amop oprform = (Form_pg_amop) GETSTRUCT(oprtup);
+		bool		opOk = true;
+
+		if (oprform->amoppurpose != AMOP_ORDER)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s contains search operator %s, but access method %s only supports ordering operators",
+							opfamilyname, "vamana",
+							format_operator(oprform->amopopr), "vamana")));
+			result = false;
+			continue;
+		}
+
+		if (oprform->amopstrategy != VAMANA_ORDER_STRATEGY)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s contains operator %s with invalid strategy number %d",
+							opfamilyname, "vamana",
+							format_operator(oprform->amopopr),
+							oprform->amopstrategy)));
+			result = false;
+			opOk = false;
+		}
+
+		if (!opfamily_can_sort_type(oprform->amopsortfamily, get_op_rettype(oprform->amopopr)))
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s contains incorrect ORDER BY opfamily specification for operator %s",
+							opfamilyname, "vamana",
+							format_operator(oprform->amopopr))));
+			result = false;
+			opOk = false;
+		}
+
+		if (!check_amop_signature(oprform->amopopr, FLOAT8OID,
+								  oprform->amoplefttype, oprform->amoprighttype))
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s contains operator %s with wrong signature",
+							opfamilyname, "vamana",
+							format_operator(oprform->amopopr))));
+			result = false;
+			opOk = false;
+		}
+
+		if (opOk &&
+			oprform->amopstrategy == VAMANA_ORDER_STRATEGY &&
+			oprform->amoplefttype == opcintype &&
+			oprform->amoprighttype == opcintype)
+			shape->orderOpOid = oprform->amopopr;
+	}
+
+	return result;
+}
+
+/* True if member is set in a functionset/operatorset bitmask from identify_opfamily_groups. */
+static inline bool
+VamanaOpFamilyGroupHasMember(uint64 bitset, int member)
+{
+	return (bitset & (((uint64) 1) << member)) != 0;
+}
+
+/*
+ * Check that the opclass's own (opcintype, opcintype) group has support
+ * function VAMANA_DISTANCE_PROC and an ordering operator at
+ * VAMANA_ORDER_STRATEGY. Support function VAMANA_NORM_PROC is optional.
+ */
+static bool
+VamanaValidateOpclassCompleteness(const char *opclassname, Oid opcintype,
+								   CatCList *oprlist, CatCList *proclist)
+{
+	bool		result = true;
+	List	   *grouplist = identify_opfamily_groups(oprlist, proclist);
+	OpFamilyOpFuncGroup *opclassgroup = NULL;
+	ListCell   *lc;
+
+	foreach(lc, grouplist)
+	{
+		OpFamilyOpFuncGroup *thisgroup = (OpFamilyOpFuncGroup *) lfirst(lc);
+
+		if (thisgroup->lefttype == opcintype && thisgroup->righttype == opcintype)
+			opclassgroup = thisgroup;
+	}
+
+	if (!opclassgroup ||
+		!VamanaOpFamilyGroupHasMember(opclassgroup->functionset, VAMANA_DISTANCE_PROC))
+	{
+		ereport(INFO,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator class \"%s\" of access method %s is missing support function %d",
+						opclassname, "vamana", VAMANA_DISTANCE_PROC)));
+		result = false;
+	}
+
+	if (!opclassgroup ||
+		!VamanaOpFamilyGroupHasMember(opclassgroup->operatorset, VAMANA_ORDER_STRATEGY))
+	{
+		ereport(INFO,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator class \"%s\" of access method %s is missing an ordering operator at strategy %d",
+						opclassname, "vamana", VAMANA_ORDER_STRATEGY)));
+		result = false;
+	}
+
+	return result;
+}
+
+/*
+ * Check whether orderOpOid's own function computes the given distance
+ * metric. An opclass that pairs, for example, <=> with an L2 support
+ * function builds successfully with no error, but the index then serves
+ * ORDER BY <=> from an L2 graph with no recheck, returning neighbours in
+ * the wrong order; this is the check that catches that. Name-based, like
+ * the rest of the metric mapping in VamanaGetDistanceMetric.
+ */
+static bool
+VamanaOperatorImplementsMetric(Oid orderOpOid, SVSDistanceType metric)
+{
+	Oid			orderFuncOid = get_opcode(orderOpOid);
 	char	   *orderFuncName;
 	bool		matches = false;
 
-	orderOpOid = get_opfamily_member(opfamilyoid, inputTypeOid, inputTypeOid, 1);
-	if (!OidIsValid(orderOpOid))
-		return false;
-
-	orderFuncOid = get_opcode(orderOpOid);
 	if (!OidIsValid(orderFuncOid))
 		return false;
 
@@ -671,6 +955,147 @@ VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceT
 
 	pfree(orderFuncName);
 	return matches;
+}
+
+/*
+ * Check the proc-1 metric against proc 2 and the ordering operator.
+ * Skipped parts would only restate a defect another stage already
+ * reported: an unusable shape (bad type, bad proc 1 signature, no valid
+ * order op, or a malformed proc 2) is never compared against the metric.
+ */
+static bool
+VamanaValidateMetric(const char *opfamilyname, const VamanaOpclassShape *shape)
+{
+	bool		result = true;
+	char	   *distFuncName = get_func_name(shape->distFuncOid);
+	SVSDistanceType metric;
+	bool		normUsable = !shape->normPresent || shape->normSignatureOk;
+
+	if (!VamanaClassifyDistanceMetric(distFuncName, shape->normPresent, &metric))
+	{
+		ereport(INFO,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator family \"%s\" of access method %s contains unsupported distance function %s",
+						opfamilyname, "vamana", distFuncName)));
+		result = false;
+	}
+	else
+	{
+		if (normUsable && metric == SVS_DISTANCE_L2 && shape->normPresent)
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s has support function %d, but its distance metric is not inner-product or cosine",
+							opfamilyname, "vamana", VAMANA_NORM_PROC)));
+			result = false;
+		}
+
+		if (normUsable && OidIsValid(shape->orderOpOid) &&
+			!VamanaOperatorImplementsMetric(shape->orderOpOid, metric))
+		{
+			ereport(INFO,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("operator family \"%s\" of access method %s has an ordering operator %s that does not match its distance metric",
+							opfamilyname, "vamana",
+							format_operator(shape->orderOpOid))));
+			result = false;
+		}
+	}
+
+	pfree(distFuncName);
+	return result;
+}
+
+/*
+ * Validator for a vamana opclass, modelled on gistvalidate: GiST is the
+ * only core access method with the same ordering-operator semantics.
+ * Reports problems as INFO and returns false rather than erroring, so
+ * SELECT oid, opcname FROM pg_opclass WHERE NOT amvalidate(oid) works the
+ * same way it does for every other access method.
+ *
+ * The type and metric checks share logic with CREATE INDEX via
+ * VamanaClassifyIndexedType and VamanaClassifyDistanceMetric, and the type
+ * check additionally runs VamanaTypeIsFromVectorExtension, which CREATE
+ * INDEX also runs once per build via VamanaCheckIndexedTypeProvenance.
+ */
+bool
+vamanavalidate(Oid opclassoid)
+{
+	bool		result = true;
+	bool		typeOk;
+	HeapTuple	classtup;
+	Form_pg_opclass classform;
+	Oid			opfamilyoid;
+	Oid			opcintype;
+	char	   *opclassname;
+	char	   *opfamilyname;
+	CatCList   *proclist;
+	CatCList   *oprlist;
+	VamanaOpclassShape shape = {InvalidOid, false, false, false, InvalidOid};
+
+	classtup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
+	if (!HeapTupleIsValid(classtup))
+		elog(ERROR, "cache lookup failed for operator class %u", opclassoid);
+	classform = (Form_pg_opclass) GETSTRUCT(classtup);
+
+	opfamilyoid = classform->opcfamily;
+	opcintype = classform->opcintype;
+	opclassname = NameStr(classform->opcname);
+
+	opfamilyname = get_opfamily_name(opfamilyoid, false);
+
+	oprlist = SearchSysCacheList1(AMOPSTRATEGY, ObjectIdGetDatum(opfamilyoid));
+	proclist = SearchSysCacheList1(AMPROCNUM, ObjectIdGetDatum(opfamilyoid));
+
+	typeOk = (VamanaClassifyIndexedType(opcintype) != NULL);
+	if (!typeOk)
+	{
+		ereport(INFO,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator family \"%s\" of access method %s does not support type %s",
+						opfamilyname, "vamana", format_type_be(opcintype))));
+		result = false;
+	}
+	else if (!VamanaTypeIsFromVectorExtension(opcintype))
+	{
+		ereport(INFO,
+				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+				 errmsg("operator family \"%s\" of access method %s indexes type %s, which is not provided by the vector extension",
+						opfamilyname, "vamana", format_type_be(opcintype))));
+		result = false;
+	}
+
+	if (!VamanaValidateSupportFunctions(opfamilyname, opcintype, proclist, &shape))
+		result = false;
+
+	if (!VamanaValidateOperators(opfamilyname, opcintype, oprlist, &shape))
+		result = false;
+
+	if (!VamanaValidateOpclassCompleteness(opclassname, opcintype, oprlist, proclist))
+		result = false;
+
+	if (typeOk && shape.distSignatureOk &&
+		!VamanaValidateMetric(opfamilyname, &shape))
+		result = false;
+
+	ReleaseCatCacheList(proclist);
+	ReleaseCatCacheList(oprlist);
+	ReleaseSysCache(classtup);
+
+	return result;
+}
+
+/*
+ * Thin wrapper over VamanaOperatorImplementsMetric for callers (vamanabuild.c)
+ * that have an opfamily/type rather than an already-resolved operator OID.
+ */
+bool
+VamanaOrderOperatorMatchesMetric(Oid opfamilyoid, Oid inputTypeOid, SVSDistanceType metric)
+{
+	Oid			orderOpOid = get_opfamily_member(opfamilyoid, inputTypeOid, inputTypeOid,
+												  VAMANA_ORDER_STRATEGY);
+
+	return OidIsValid(orderOpOid) && VamanaOperatorImplementsMetric(orderOpOid, metric);
 }
 
 /*

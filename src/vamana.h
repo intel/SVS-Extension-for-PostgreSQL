@@ -29,6 +29,10 @@
 #define VAMANA_NORM_PROC 2
 #define VAMANA_TYPE_INFO_PROC 3
 
+/* The only strategy any shipped opclass uses; amstrategies = 0, so this is
+ * not enforced by DDL and vamanavalidate checks for it explicitly. */
+#define VAMANA_ORDER_STRATEGY 1
+
 #define VAMANA_MAGIC_NUMBER 0xA954A955
 #define VAMANA_PAGE_ID	0xFF91
 
@@ -371,6 +375,7 @@ Buffer		VamanaNewBuffer(Relation index, ForkNumber forkNum);
 void		VamanaInitPage(Buffer buf, Page page);
 void		VamanaInit(void);
 const		VamanaTypeInfo *VamanaGetTypeInfo(Relation index);
+void		VamanaCheckIndexedTypeProvenance(Relation index);
 const		VamanaTypeInfo *VamanaGetTypeInfoForDataType(SVSDType dataType);
 void		VamanaGetMetaPageInfo(Relation index, int *graph_degree, int *dimensions);
 void		VamanaReadMetaPage(Relation index, VamanaMetaPageData *meta);
