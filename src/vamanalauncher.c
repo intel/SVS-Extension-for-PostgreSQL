@@ -387,6 +387,12 @@ VamanaLauncherMain(Datum main_arg)
 		 */
 		ProcessNotifyInterrupt(false);
 
+		/*
+		 * Test hook: holds the launcher before it reconciles, so a crashed
+		 * worker's entry keeps its pid until the test releases it.
+		 */
+		INJECTION_POINT("vamana-launcher-before-reconcile", NULL);
+
 		SvsMemoryReapDeadReservations();
 
 		naptime = VamanaLauncherReconcileWorkers();

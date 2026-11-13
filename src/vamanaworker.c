@@ -1336,6 +1336,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		(void) VamanaReconcileStandbyCache(relids, VamanaStandbyActivateSlotBlocking);
 	}
 
+	/*
+	 * Test hook: holds a started worker short of liveness, with its search
+	 * slots already converged on the grant published before it was spawned.
+	 */
+	INJECTION_POINT("vamana-worker-before-publish-pid", NULL);
+
 	/* Non-zero pid marks the worker available to backends. */
 	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 1);
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
