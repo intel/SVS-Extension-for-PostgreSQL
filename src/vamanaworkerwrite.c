@@ -693,8 +693,10 @@ VamanaWorkerProcessLoadSlot(int slotIdx)
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		/* Ownership passed to the cache entry; a later error must not free these. */
+		/* The cache entry owns svsIndex. It keeps its own copy of tidMapping. */
 		svsIndex = NULL;
+		if (tidMapping != NULL)
+			pfree(tidMapping);
 		tidMapping = NULL;
 
 		{
