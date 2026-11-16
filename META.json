@@ -1,0 +1,52 @@
+{
+  "name": "svs",
+  "abstract": "SVS Vamana index access method for pgvector",
+  "description": "Adds the Vamana approximate nearest neighbor index access method, built on the Intel Scalable Vector Search (SVS) library, to pgvector. Requires the Intel SVS C API library; set SVS_INSTALL to its install prefix.",
+  "version": "0.1.0",
+  "maintainer": [
+    "Kelly McKeighan <kelly.l.mckeighan@intel.com>",
+    "Matt Welch <matt.welch@intel.com>",
+    "Soji Denloye <olasoji.denloye@intel.com>"
+  ],
+  "license": "postgresql",
+  "provides": {
+    "svs": {
+      "file": "sql/svs--0.1.0.sql",
+      "docfile": "docs/USER_GUIDE.md",
+      "version": "0.1.0"
+    }
+  },
+  "prereqs": {
+    "runtime": {
+      "requires": {
+        "PostgreSQL": "18.1.0",
+        "vector": "0.8.2"
+      }
+    }
+  },
+  "resources": {
+    "homepage": "https://github.com/intel/SVS-Extension-for-PostgreSQL",
+    "bugtracker": {
+      "web": "https://github.com/intel/SVS-Extension-for-PostgreSQL/issues"
+    },
+    "repository": {
+      "url": "https://github.com/intel/SVS-Extension-for-PostgreSQL.git",
+      "web": "https://github.com/intel/SVS-Extension-for-PostgreSQL",
+      "type": "git"
+    }
+  },
+  "meta-spec": {
+    "version": "1.0.0",
+    "url": "https://pgxn.org/meta/spec.txt"
+  },
+  "tags": [
+    "SVS",
+    "svs",
+    "vector",
+    "pgvector",
+    "index",
+    "vamana",
+    "ann",
+    "similarity search"
+  ]
+}
