@@ -1421,13 +1421,18 @@ VamanaSlotErrcode(uint8 category)
 }
 
 /*
- * Sole writer of a slot's terminal error state: message, category, then the
- * status transition that publishes both to the waiting backend.
+ * Sole writer of a slot's terminal error state: message, hint, category,
+ * then the status transition that publishes all three to the waiting
+ * backend. hint may be NULL; errorHint is always written (cleared when
+ * there is none) so a slot never carries a hint left over from an earlier,
+ * unrelated failure on the same pool entry.
  */
 void
-VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, uint8 category)
+VamanaWorkerFailSlot(VamanaWorkerSlot *slot, const char *message, const char *hint,
+					 uint8 category)
 {
 	snprintf(slot->errorMessage, sizeof(slot->errorMessage), "%s", message);
+	snprintf(slot->errorHint, sizeof(slot->errorHint), "%s", hint ? hint : "");
 	slot->errorCategory = category;
 	pg_write_barrier();
 	pg_atomic_write_u32(&slot->status, VAMANA_SLOT_ERROR);

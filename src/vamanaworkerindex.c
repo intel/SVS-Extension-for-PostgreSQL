@@ -33,6 +33,30 @@
  * Worker-internal helpers
  * ----------------------------------------------------------------------- */
 
+/*
+ * The worker is single-threaded, so at most one load attempt is ever in
+ * flight. VamanaWorkerGetOrLoadIndex records the error it just logged here
+ * before freeing it, so a caller that gets NULL back from the same call can
+ * forward the real error instead of a generic one. Cleared at the start of
+ * every call, so a NULL return with no error recorded (for example, the
+ * DDL-lock-skip case) is never mistaken for one that failed with an error.
+ */
+static int	VamanaLastLoadErrSqlerrcode = 0;
+static char VamanaLastLoadErrMessage[512];
+static char VamanaLastLoadErrHint[256];
+
+bool
+VamanaWorkerGetLastLoadError(int *sqlerrcode, const char **message, const char **hint)
+{
+	if (VamanaLastLoadErrSqlerrcode == 0)
+		return false;
+
+	*sqlerrcode = VamanaLastLoadErrSqlerrcode;
+	*message = VamanaLastLoadErrMessage;
+	*hint = (VamanaLastLoadErrHint[0] != '\0') ? VamanaLastLoadErrHint : NULL;
+	return true;
+}
+
 typedef struct SaveAfterRebuildArgs
 {
 	Relation	indexRel;
@@ -456,6 +480,8 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateReside
 	GetOrLoadIndexArgs args;
 	VamanaSubXactResult result;
 
+	VamanaLastLoadErrSqlerrcode = 0;
+
 	if (loadedFromDisk != NULL)
 		*loadedFromDisk = false;
 
@@ -552,6 +578,16 @@ VamanaWorkerGetOrLoadIndex(Oid relid, bool *loadedFromDisk, bool propagateReside
 	ereport(WARNING,
 			(errmsg("vamana worker: failed to load index %u", relid),
 			 errdetail("%s", result.edata->message)));
+
+	VamanaLastLoadErrSqlerrcode = result.edata->sqlerrcode;
+	snprintf(VamanaLastLoadErrMessage, sizeof(VamanaLastLoadErrMessage),
+			 "%s", result.edata->message);
+	if (result.edata->hint != NULL)
+		snprintf(VamanaLastLoadErrHint, sizeof(VamanaLastLoadErrHint),
+				 "%s", result.edata->hint);
+	else
+		VamanaLastLoadErrHint[0] = '\0';
+
 	FreeErrorData(result.edata);
 
 	return NULL;
