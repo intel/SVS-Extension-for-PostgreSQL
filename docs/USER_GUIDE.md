@@ -719,8 +719,8 @@ Plan for your expected number of Vamana-enabled databases plus headroom, since c
 | `svs.search_num_threads` | `0` | 0 – 1024 | Cluster-wide default search-thread count. `0` = auto (resolves to `1`). Overridable per database via the `vamana_databases.search_num_threads` catalog column. Reload only (`PGC_SIGHUP`); no session `SET`. |
 | `svs.max_search_threads_per_db` | `0` | 0 – 1024 | Ceiling on one database's search-thread grant. `0` = follow `max_parallel_workers`. Reload only (`PGC_SIGHUP`); no session `SET`. |
 | `svs.max_total_search_threads` | `0` | 0 – 1024 | Cluster-wide ceiling on search threads summed across all databases. `0` = follow `max_parallel_workers`; never exceeds it regardless of this setting. Reload only (`PGC_SIGHUP`); no session `SET`. |
-| `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. |
-| `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. |
+| `svs.worker_startup_timeout_ms` | `60000` | 1000 – 300000 | Milliseconds a backend waits for a worker that is enabled but not yet started before returning an error. Also bounds how long a request waits while the worker saves an index to disk (the worker serves no request during a save); past it, the request fails with `timed out ... waiting for an index save to finish`. |
+| `svs.worker_timeout_ms` | `5000` | 100 – 60000 | Milliseconds a backend waits for a worker IPC response before returning an error. Time the worker spends saving an index is not counted; see `svs.worker_startup_timeout_ms`. |
 | `svs.worker_restart_backoff` | `1000` (ms) | 100 – 300000 | Base delay before the launcher respawns a crashed **per-database** worker, applied with escalating backoff on repeated crashes of the same database's worker. The delay doubles on each repeated crash, up to 60000 ms. It resets after the worker stays up for 10 s. |
 | `svs.max_batch_size` | `0` | 0 – 1000 | Maximum queries per SVS batch call. `0` = use `MaxBackends`. |
 | `svs.shutdown_drain_budget_ms` | `30000` | 0 – 600000 | Time budget for the worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
@@ -980,7 +980,7 @@ FROM pg_stat_vamana_worker;
 |---|---|
 | `db_oid` | OID of the enabled database |
 | `worker_pid` | The worker's PID, or NULL if no worker is currently running (starting, or crashed and awaiting respawn) |
-| `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive` (the worker process is alive but its heartbeat is stale), or `replica` (this server is in recovery, serving a hot standby) |
+| `worker_state` | `running`, `starting`, `backoff` (crash backoff), `unresponsive` (the worker process is alive but its heartbeat is stale, or an index save has run longer than `svs.worker_startup_timeout_ms`), or `replica` (this server is in recovery, serving a hot standby) |
 | `index_count` | Number of Vamana indexes in that database. `0` flags a database that may no longer need a worker (see [Section 7](#pausing-vs-removing-a-database)). NULL on a standby, where the counter is not maintained. |
 | `evict_all` | `true` while the worker is draining every cached index (e.g. during a restart or shutdown); normally `false` |
 | `heartbeat_ts` | Last time the worker updated its heartbeat |
@@ -1259,8 +1259,8 @@ These GUCs are `PGC_POSTMASTER` only when `svs` is in `shared_preload_libraries`
 | `svs.search_num_threads` | `0` | `0` | `1024` | Cluster-wide default search-thread count; 0 = auto (resolves to 1). Overridable per database via `vamana_databases.search_num_threads`. Reload only; no session `SET` |
 | `svs.max_search_threads_per_db` | `0` | `0` | `1024` | Ceiling on one database's search-thread grant; 0 = follow `max_parallel_workers`. Reload only; no session `SET` |
 | `svs.max_total_search_threads` | `0` | `0` | `1024` | Cluster-wide ceiling on search threads summed across all databases; 0 = follow `max_parallel_workers`, and never exceeds it regardless of this setting. Reload only; no session `SET` |
-| `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker (ms); exceeded → error |
-| `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms); exceeded → error |
+| `svs.worker_startup_timeout_ms` | `60000` | `1000` | `300000` | Wait for a not-yet-started worker, or for an index save in progress (ms); exceeded → error |
+| `svs.worker_timeout_ms` | `5000` | `100` | `60000` | Worker IPC response timeout (ms), not counting time spent in an index save; exceeded → error |
 | `svs.worker_restart_backoff` | `1000` (ms) | `100` | `300000` | Base delay before respawning a crashed **per-database** worker; doubles on repeated crashes, up to 60000 ms; resets after 10 s of uptime |
 | `svs.max_batch_size` | `0` | `0` | `1000` | Max queries per SVS batch call; 0 = MaxBackends |
 | `svs.shutdown_drain_budget_ms` | `30000` | `0` | `600000` | Time budget for the worker's shutdown drain, checked between indexes |

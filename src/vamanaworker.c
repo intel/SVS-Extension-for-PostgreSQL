@@ -1029,6 +1029,7 @@ VamanaWorkerDrainAndStop(void)
 	 * stays open.
 	 */
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
+	pg_atomic_write_u64(&VamanaWorkerShmemPtr->save_started_ts, 0);
 
 	DisownLatch(&VamanaWorkerShmemPtr->workerLatch);
 	proc_exit(0);
@@ -1140,11 +1141,29 @@ VamanaWorkerCheckpointDueIndexes(void)
 	foreach_oid(relid, relids)
 	{
 		VamanaIndexCache *cache = VamanaGetCache(relid);
+		bool		saved;
+		TimestampTz now;
 
 		if (cache == NULL || !ShouldCheckpoint(cache))
 			continue;
 
-		if (!VamanaTryCheckpointCachedIndex(cache))
+		pg_atomic_write_u64(&VamanaWorkerShmemPtr->save_started_ts,
+							(uint64) GetCurrentTimestamp());
+		saved = VamanaTryCheckpointCachedIndex(cache);
+
+		/*
+		 * Refresh the heartbeat as the save ends: the last one predates the
+		 * save, and would otherwise read as stale until the next loop pass.
+		 * save_ended_ts must be visible before save_started_ts clears, so a
+		 * backend never sees neither (VamanaWorkerSavedSince).
+		 */
+		now = GetCurrentTimestamp();
+		pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, (uint64) now);
+		pg_atomic_write_u64(&VamanaWorkerShmemPtr->save_ended_ts, (uint64) now);
+		pg_write_barrier();
+		pg_atomic_write_u64(&VamanaWorkerShmemPtr->save_started_ts, 0);
+
+		if (!saved)
 			ereport(LOG,
 					(errmsg("vamana checkpoint: index %u not checkpointed this cycle, will retry",
 							relid)));
@@ -1188,12 +1207,15 @@ static int			vamanaConsecutiveSaveDefers = 0;
 /*
  * VamanaWorkerCatchUpSlots
  *
- * Primary only.  Spends up to Min(1000, svs.worker_timeout_ms / 5) ms of
+ * Primary only.  Spends about Min(1000, svs.worker_timeout_ms / 5) ms of
  * wall clock catching up one cached index's replication slot
  * (VamanaReplicationCatchUpSlot), round-robinning across cached indexes one
  * per call so a single large backlog cannot starve the others.  Called at
  * most once per VAMANA_SLOT_CATCHUP_INTERVAL_MS, so the worker stays at
- * least half free for IPC while a backlog drains.  Each attempt that
+ * least half free for IPC while a backlog drains.  A slice can overrun its
+ * budget by one RUNNING_XACTS decode, which writes snapshot and slot files
+ * and so has no fixed bound on slow storage; the worker serves no IPC until
+ * the slice returns (see VamanaReplicationCatchUpSlot).  Each attempt that
  * coincides with a save in the same iteration (VamanaWorkerCheckpointDueIndexes
  * returned true) defers rather than stacking a slice's budget on top of the
  * save, up to VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS times in a row,
@@ -1335,6 +1357,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 
 		(void) VamanaReconcileStandbyCache(relids, VamanaStandbyActivateSlotBlocking);
 	}
+
+	/*
+	 * Test hook: holds a started worker short of liveness, with its search
+	 * slots already converged on the grant published before it was spawned.
+	 */
+	INJECTION_POINT("vamana-worker-before-publish-pid", NULL);
 
 	/* Non-zero pid marks the worker available to backends. */
 	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 1);
@@ -1564,6 +1592,7 @@ VamanaWorkerMain(Datum main_arg)
 	 */
 	VamanaWorkerShmemPtr->workerPid = 0;
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->heartbeat_ts, 0);
+	pg_atomic_write_u64(&VamanaWorkerShmemPtr->save_started_ts, 0);
 	pg_atomic_write_u64(&VamanaWorkerShmemPtr->searchScratchBytesInFlight, 0);
 
 	/*
@@ -1651,19 +1680,32 @@ VamanaWorkerMain(Datum main_arg)
  * ----------------------------------------------------------------------- */
 
 /*
- * VamanaHeartbeatIsStale: pure staleness test over a raw heartbeat value and a
- * reference clock.  A worker that has never beaten (rawHb == 0) is not stale;
- * otherwise it is stale once the most recent beat is older than
- * VAMANA_HEARTBEAT_STALE_MS, meaning the main loop has stopped — hung inside a
- * library call, unable to drain slots or update its timestamp.
+ * VamanaHeartbeatIsStale: pure staleness test over a raw heartbeat value, the
+ * raw start time of the index save in progress (0 if none), and a reference
+ * clock.  A worker inside a save is stale only once the save has run longer
+ * than svs.worker_startup_timeout_ms.  Otherwise, a worker that has never
+ * beaten (rawHb == 0) is not stale, and one that has is stale once the most
+ * recent beat is older than VAMANA_HEARTBEAT_STALE_MS, meaning the main loop
+ * has stopped: hung inside a library call, unable to drain slots or update
+ * its timestamp.
  *
  * One definition of "stale", shared by the live entry-path wrapper below and
  * the snapshot-path worker-state classifier.
  */
 bool
-VamanaHeartbeatIsStale(uint64 rawHb, TimestampTz now)
+VamanaHeartbeatIsStale(uint64 rawHb, uint64 rawSaveStart, TimestampTz now)
 {
 	long		age_ms;
+
+	/*
+	 * A save in progress stops the heartbeat for as long as the save runs,
+	 * which for a large index or a slow disk is far longer than
+	 * VAMANA_HEARTBEAT_STALE_MS.  Bound it the way loading an index at
+	 * startup is bounded instead.
+	 */
+	if (rawSaveStart != 0)
+		return (long) ((now - (TimestampTz) rawSaveStart) / 1000) >
+			vamana_worker_startup_timeout_ms;
 
 	if (rawHb == 0)
 		return false;
@@ -1680,6 +1722,7 @@ static bool
 VamanaWorkerHeartbeatStale(VamanaWorkerShmem *entry)
 {
 	return VamanaHeartbeatIsStale(pg_atomic_read_u64(&entry->heartbeat_ts),
+								  pg_atomic_read_u64(&entry->save_started_ts),
 								  GetCurrentTimestamp());
 }
 
@@ -1849,6 +1892,7 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 				 errhint("Enable it by updating its row in vamana_databases.")));
 
 	if (entry != NULL && VamanaHeartbeatIsStale(pg_atomic_read_u64(&entry->heartbeat_ts),
+												pg_atomic_read_u64(&entry->save_started_ts),
 												GetCurrentTimestamp()))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -2015,19 +2059,49 @@ typedef enum VamanaSlotWaitOutcome
 } VamanaSlotWaitOutcome;
 
 /*
+ * VamanaWorkerSavedSince: true if entry's worker was inside an index save on
+ * its main loop at any point since `since`: one is in progress now, or one
+ * ended after `since`.  The pid check keeps a flag left behind by a worker
+ * that died mid-save from extending anyone's wait.
+ */
+static bool
+VamanaWorkerSavedSince(VamanaWorkerShmem *entry, TimestampTz since)
+{
+	pid_t		pid = entry->workerPid;
+
+	if (pid == 0 || BackendPidGetProc(pid) == NULL)
+		return false;
+
+	if (pg_atomic_read_u64(&entry->save_started_ts) != 0)
+		return true;
+	pg_read_barrier();
+	return (TimestampTz) pg_atomic_read_u64(&entry->save_ended_ts) >= since;
+}
+
+/*
  * VamanaWorkerWaitForSlot
  *
  * Shared wait-loop used by all backend-side submit helpers.  Owns the
  * backend's slot latch, waits for the worker to write DONE or ERROR, then
- * releases the latch.  The slot is reset to EMPTY before returning; on
- * ERROR or TIMEOUT slot->errorMessage and slot->errorCategory describe the
- * failure.
+ * releases the latch.  Time entry's worker spends inside an index save is
+ * bounded by svs.worker_startup_timeout_ms instead of timeout_ms.  The slot
+ * is reset to EMPTY before returning; on ERROR or TIMEOUT slot->errorMessage
+ * and slot->errorCategory describe the failure.
  */
 static VamanaSlotWaitOutcome
-VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
+VamanaWorkerWaitForSlot(VamanaWorkerShmem *entry, VamanaWorkerSlot *slot,
+						int timeout_ms)
 {
 	uint32		status;
-	int			total_waited_ms = 0;
+
+	/*
+	 * volatile: assigned inside PG_TRY() and read after PG_END_TRY()
+	 * (-Wclobbered).
+	 */
+	volatile int total_waited_ms = 0;
+	volatile int save_waited_ms = 0;
+	volatile int waited_ms = 0;
+	volatile bool save_bound_hit = false;
 
 	PG_TRY();
 	{
@@ -2035,11 +2109,13 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
 		{
 			int			rc;
 			long		wait_ms;
+			TimestampTz tickStart;
 
 			wait_ms = Min(1000, timeout_ms - total_waited_ms);
 			if (wait_ms <= 0)
 				break;
 
+			tickStart = GetCurrentTimestamp();
 			rc = WaitLatch(&slot->latch,
 						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 						   wait_ms,
@@ -2057,9 +2133,29 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
 
 			if (rc & WL_TIMEOUT)
 			{
-				total_waited_ms += (int) wait_ms;
-				if (total_waited_ms >= timeout_ms)
-					break;
+				/*
+				 * Time the worker spends inside an index save is not time it
+				 * is failing to respond: it serves no request until the save
+				 * returns.  Count it against the startup bound instead, and
+				 * give the worker the full timeout_ms once the save is done.
+				 */
+				waited_ms += (int) wait_ms;
+				if (VamanaWorkerSavedSince(entry, tickStart))
+				{
+					save_waited_ms += (int) wait_ms;
+					total_waited_ms = 0;
+					if (save_waited_ms >= vamana_worker_startup_timeout_ms)
+					{
+						save_bound_hit = true;
+						break;
+					}
+				}
+				else
+				{
+					total_waited_ms += (int) wait_ms;
+					if (total_waited_ms >= timeout_ms)
+						break;
+				}
 			}
 		}
 	}
@@ -2099,8 +2195,13 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
 		pg_atomic_compare_exchange_u32(&slot->status, &expected,
 									   VAMANA_SLOT_EMPTY);
 	}
-	snprintf(slot->errorMessage, sizeof(slot->errorMessage),
-			 "vamana worker timed out after %d ms", total_waited_ms);
+	if (save_bound_hit)
+		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+				 "vamana worker timed out after %d ms waiting for an index save to finish",
+				 waited_ms);
+	else
+		snprintf(slot->errorMessage, sizeof(slot->errorMessage),
+				 "vamana worker timed out after %d ms", waited_ms);
 	return VAMANA_WAIT_TIMEOUT;
 }
 
@@ -2110,10 +2211,10 @@ VamanaWorkerWaitForSlot(VamanaWorkerSlot *slot, int timeout_ms)
  * degrade on the returned false.
  */
 static bool
-VamanaWorkerFinishSubmit(VamanaWorkerSlot *slot, int timeout_ms,
-						 int elevel, const char *verb)
+VamanaWorkerFinishSubmit(VamanaWorkerShmem *entry, VamanaWorkerSlot *slot,
+						 int timeout_ms, int elevel, const char *verb)
 {
-	if (VamanaWorkerWaitForSlot(slot, timeout_ms) == VAMANA_WAIT_DONE)
+	if (VamanaWorkerWaitForSlot(entry, slot, timeout_ms) == VAMANA_WAIT_DONE)
 		return true;
 
 	ereport(elevel,
@@ -2222,7 +2323,7 @@ VamanaWorkerSubmitSearch(Oid indexRelid,
 		return -1;
 	}
 
-	outcome = VamanaWorkerWaitForSlot(slot, vamana_worker_timeout_ms);
+	outcome = VamanaWorkerWaitForSlot(entry, slot, vamana_worker_timeout_ms);
 
 	switch (outcome)
 	{
@@ -2308,7 +2409,7 @@ VamanaWorkerSubmitInsert(Oid indexRelid, const float *vector,
 						indexRelid)));
 	}
 
-	VamanaWorkerFinishSubmit(slot, vamana_worker_timeout_ms, ERROR, "insert");
+	VamanaWorkerFinishSubmit(entry, slot, vamana_worker_timeout_ms, ERROR, "insert");
 
 	pg_read_barrier();
 	*externalId_out = slot->writeExternalId;
@@ -2360,7 +2461,7 @@ VamanaWorkerSubmitDelete(Oid indexRelid, const size_t *externalIds, int nIds)
 		return false;
 	}
 
-	return VamanaWorkerFinishSubmit(slot, vamana_worker_timeout_ms, WARNING,
+	return VamanaWorkerFinishSubmit(entry, slot, vamana_worker_timeout_ms, WARNING,
 									"delete");
 }
 
@@ -2389,7 +2490,7 @@ VamanaWorkerSubmitMaintenance(Oid indexRelid, uint8 op)
 		return false;
 	}
 
-	return VamanaWorkerFinishSubmit(slot, vamana_worker_timeout_ms, WARNING,
+	return VamanaWorkerFinishSubmit(entry, slot, vamana_worker_timeout_ms, WARNING,
 									"maintenance");
 }
 
@@ -2460,7 +2561,7 @@ VamanaWorkerSubmitLoad(Oid indexRelid,
 		return false;
 	}
 
-	return VamanaWorkerFinishSubmit(slot, vamana_worker_startup_timeout_ms,
+	return VamanaWorkerFinishSubmit(entry, slot, vamana_worker_startup_timeout_ms,
 									WARNING, "load");
 }
 
@@ -2490,6 +2591,6 @@ VamanaWorkerSubmitWarmup(Oid indexRelid)
 		return false;
 	}
 
-	return VamanaWorkerFinishSubmit(slot, vamana_worker_startup_timeout_ms,
+	return VamanaWorkerFinishSubmit(entry, slot, vamana_worker_startup_timeout_ms,
 									WARNING, "warmup");
 }

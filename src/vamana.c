@@ -247,7 +247,9 @@ VamanaInit(void)
 
 	DefineCustomIntVariable("svs.worker_startup_timeout_ms",
 							"Milliseconds to wait for the background worker to finish startup before erroring",
-							"Increase this if the server has many large indexes or slow disk.",
+							"Also bounds how long a request waits while the worker saves an "
+							"index to disk.  Increase this if the server has many large indexes "
+							"or slow disk.",
 							&vamana_worker_startup_timeout_ms,
 							60000, 1000, 300000,
 							PGC_SIGHUP,

@@ -77,6 +77,7 @@ typedef struct VamanaWorkerSnapshot
 	bool		backingOff;
 	bool		evictAll;
 	uint64		heartbeatRaw;
+	uint64		saveStartRaw;
 	uint32		indexCount;
 	uint64		searchWorkMemLimitBytes;
 	uint64		searchScratchBytesInFlight;
@@ -107,7 +108,7 @@ VamanaClassifyWorkerState(const VamanaWorkerSnapshot *s, TimestampTz now,
 	if (!isPrimary)
 		return VAMANA_WORKER_REPLICA;
 
-	stale = VamanaHeartbeatIsStale(s->heartbeatRaw, now);
+	stale = VamanaHeartbeatIsStale(s->heartbeatRaw, s->saveStartRaw, now);
 
 	if (s->workerPid != 0 && !stale)
 		return VAMANA_WORKER_RUNNING;
@@ -227,6 +228,7 @@ VamanaWorkerHydrateCb(VamanaWorkerShmem *entry, void *ctxArg)
 	snap->backingOff = VamanaWorkerIsBackingOff(entry);
 	snap->evictAll = (pg_atomic_read_u32(&entry->evict_all) != 0);
 	snap->heartbeatRaw = pg_atomic_read_u64(&entry->heartbeat_ts);
+	snap->saveStartRaw = pg_atomic_read_u64(&entry->save_started_ts);
 	snap->indexCount = pg_atomic_read_u32(&entry->indexCount);
 
 	/*

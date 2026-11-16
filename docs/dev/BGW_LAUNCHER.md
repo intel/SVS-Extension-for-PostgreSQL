@@ -364,8 +364,8 @@ Because the view is cross-database, a query that cares about the current databas
 | `svs.max_databases` | postmaster | Sizes the per-database shared-memory array. Cannot change without a restart. Default sized for a typical number of Vamana-enabled databases plus headroom. |
 | `svs.worker_restart_time` | postmaster | Governs the launcher's *own* crash-restart interval (via its static registration). Read only by the launcher, not by per-database workers. |
 | `svs.worker_restart_backoff` | reloadable | The base interval the launcher uses for per-database worker crash-restart backoff. Read only by the launcher's own restart logic. Deliberately separate from `svs.worker_restart_time`, because the two govern different restart policies (a fixed interval for the launcher itself, versus escalating backoff for per-database workers) that merely share a plausible default. |
-| `svs.worker_startup_timeout_ms` | reloadable | Cluster-wide bound on the wait for a worker that is enabled but not yet available. No per-database override. |
-| `svs.worker_timeout_ms` | reloadable | Cluster-wide bound on an individual IPC request. No per-database override. |
+| `svs.worker_startup_timeout_ms` | reloadable | Cluster-wide bound on the wait for a worker that is enabled but not yet available, and on the wait for an index save in progress on the worker's main loop. No per-database override. |
+| `svs.worker_timeout_ms` | reloadable | Cluster-wide bound on an individual IPC request. Time the worker spends saving an index is not counted. No per-database override. |
 | `svs.shutdown_drain_budget_ms` | reloadable | Time budget for a worker's shutdown drain, checked between indexes. A single in-progress checkpoint is not preemptible, so the real bound is this budget plus one checkpoint's worst case. |
 | `svs.worker_stop_timeout_ms` | reloadable | How long the launcher waits for a restarting worker's handle to report stopped before giving up. Does not force-kill; the restart stays pending until the worker exits naturally. |
 
