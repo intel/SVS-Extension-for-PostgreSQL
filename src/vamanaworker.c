@@ -1188,12 +1188,15 @@ static int			vamanaConsecutiveSaveDefers = 0;
 /*
  * VamanaWorkerCatchUpSlots
  *
- * Primary only.  Spends up to Min(1000, svs.worker_timeout_ms / 5) ms of
+ * Primary only.  Spends about Min(1000, svs.worker_timeout_ms / 5) ms of
  * wall clock catching up one cached index's replication slot
  * (VamanaReplicationCatchUpSlot), round-robinning across cached indexes one
  * per call so a single large backlog cannot starve the others.  Called at
  * most once per VAMANA_SLOT_CATCHUP_INTERVAL_MS, so the worker stays at
- * least half free for IPC while a backlog drains.  Each attempt that
+ * least half free for IPC while a backlog drains.  A slice can overrun its
+ * budget by one RUNNING_XACTS decode, which writes snapshot and slot files
+ * and so has no fixed bound on slow storage; the worker serves no IPC until
+ * the slice returns (see VamanaReplicationCatchUpSlot).  Each attempt that
  * coincides with a save in the same iteration (VamanaWorkerCheckpointDueIndexes
  * returned true) defers rather than stacking a slice's budget on top of the
  * save, up to VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS times in a row,
@@ -1335,6 +1338,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 
 		(void) VamanaReconcileStandbyCache(relids, VamanaStandbyActivateSlotBlocking);
 	}
+
+	/*
+	 * Test hook: holds a started worker short of liveness, with its search
+	 * slots already converged on the grant published before it was spawned.
+	 */
+	INJECTION_POINT("vamana-worker-before-publish-pid", NULL);
 
 	/* Non-zero pid marks the worker available to backends. */
 	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 1);
