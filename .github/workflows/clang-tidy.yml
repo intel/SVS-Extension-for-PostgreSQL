@@ -41,8 +41,6 @@ jobs:
       # keys below are byte-identical and this job restores that leg's
       # PostgreSQL/SVS installs instead of building its own.
       PG_CONFIGURE_EXTRA_ARGS: "--enable-tap-tests --enable-injection-points"
-      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
-      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +54,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: docs/build_guide/svs_install
-          key: svs-ubuntu-24.04-gcc-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
+          key: svs-ubuntu-24.04-gcc-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/build_svs.sh') }}-v1
 
       - name: deps
         run: ci/build_and_test.sh deps

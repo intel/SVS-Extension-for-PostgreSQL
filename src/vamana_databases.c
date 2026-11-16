@@ -33,6 +33,7 @@
 #include "commands/extension.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
@@ -139,6 +140,7 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 	int64		restart_generation;
 	bool		residencyMemoryIsNull;
 	bool		searchWorkMemIsNull;
+	char		safeDatname[NAMEDATALEN * 4];
 
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		elog(ERROR, "vamana_databases_queue_reservation: not called by trigger manager");
@@ -162,6 +164,80 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 		elog(ERROR, "vamana_databases_queue_reservation: datname is null");
 	datname = DatumGetName(datnameDatum);
 
+	dbOid = get_database_oid(NameStr(*datname), false);
+
+	/*
+	 * Only the launcher's own connected database's copy of this table is
+	 * ever read (ReadDatabaseRows, via SvsDatabasesQualifiedName). A row
+	 * written from any other database's copy would otherwise still reach
+	 * ReserveSlotsForEnabledEntries below and reserve a real shmem slot,
+	 * making VamanaWorkerAssertDatabase believe the database is configured
+	 * while no worker is ever spawned for it.
+	 *
+	 * Two cases below are not enrollment attempts at all and must not be
+	 * confused with one: dbOid naming the writer's own database (this
+	 * connection's own local-only config, e.g. svs_restart_worker()'s
+	 * UPDATE or a maintenance_num_threads override) and dbOid naming some
+	 * other database entirely (e.g. a pg_dump/restore replay of a row
+	 * enrolled elsewhere, landing in a differently-named database here).
+	 */
+	{
+		Oid			launcherDbOid = get_database_oid(vamana_launcher_database, true);
+
+		if (OidIsValid(launcherDbOid) && MyDatabaseId != launcherDbOid)
+		{
+			if (dbOid != MyDatabaseId)
+			{
+				/*
+				 * A row naming a database other than the one writing it --
+				 * most commonly a pg_dump/restore replay, since the dumped
+				 * datname is whatever the source database was, not the
+				 * target this INSERT/COPY is running against. Let the row
+				 * sit in this database's own copy (dump/restore needs the
+				 * write itself to succeed), but never queue it: that would
+				 * apply this row's overrides to dbOid's live shared-memory
+				 * state via ReserveSlotsForEnabledEntries even though dbOid
+				 * never saw this write and nothing here was ever meant to
+				 * reach it. A row naming dbOid's own database handles that
+				 * correctly below; this is the only path that must not.
+				 */
+				return PointerGetDatum(NULL);
+			}
+
+			/*
+			 * dbOid is the writer's own database. Reject only when that
+			 * would be a new problem: a slot already reserved for dbOid
+			 * means it was already properly enrolled from the launcher
+			 * database at some point (this trigger is the only path that
+			 * ever reserves one, and it has rejected every out-of-band
+			 * attempt since this guard existed), so a second, local-only
+			 * write from the same database -- svs_restart_worker()'s
+			 * UPDATE or a maintenance_num_threads override -- is a
+			 * harmless, idempotent no-op for enrollment purposes: it does
+			 * not change what the launcher's own copy says, so it cannot
+			 * strand anything.
+			 */
+			if (VamanaWorkerLookupSlot(dbOid) == NULL)
+			{
+				char		safeLauncherDatname[NAMEDATALEN * 4];
+
+				CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(*datname));
+				CopySanitizedDatname(safeLauncherDatname, sizeof(safeLauncherDatname),
+									 vamana_launcher_database);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("cannot enroll \"%s\" into vamana_databases from this database",
+								safeDatname),
+						 errdetail("vamana_databases is only read by the launcher from \"%s\" "
+								   "(svs.launcher_database); a row inserted or updated from any "
+								   "other database's copy of this table is never seen by it.",
+								   safeLauncherDatname),
+						 errhint("Run this INSERT/UPDATE while connected to \"%s\" instead.",
+								 safeLauncherDatname)));
+			}
+		}
+	}
+
 	enabledDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_ENABLED, tupdesc, &isnull);
 	if (isnull)
 		elog(ERROR, "vamana_databases_queue_reservation: enabled is null");
@@ -175,8 +251,6 @@ vamana_databases_queue_reservation(PG_FUNCTION_ARGS)
 										 &residencyMemoryIsNull);
 	searchWorkMemDatum = heap_getattr(tuple, VAMANA_DATABASES_ATTNUM_SEARCH_WORK_MEM, tupdesc,
 									   &searchWorkMemIsNull);
-
-	dbOid = get_database_oid(NameStr(*datname), false);
 
 	/* Resolved here, not in the PRE_COMMIT callback that drains this queue: only this trigger has an active snapshot. */
 	QueueReservationEntry(datname, dbOid, DatumGetBool(enabledDatum), restart_generation,
@@ -333,6 +407,90 @@ vamana_databases_reject_delete_with_live_indexes(PG_FUNCTION_ARGS)
 	}
 
 	return PointerGetDatum(trigdata->tg_trigtuple);
+}
+
+/*
+ * BEFORE TRUNCATE, FOR EACH STATEMENT (the only shape Postgres allows for a
+ * TRUNCATE trigger -- there is no per-row data to read, so trigdata carries
+ * no tuple): reject truncating the table while any row's database still has
+ * vamana indexes, the same guarantee vamana_databases_reject_delete_with_live_indexes
+ * gives DELETE.  TRUNCATE bypasses row-level triggers entirely, which is why
+ * that guard alone cannot stop it.
+ *
+ * Checks every row regardless of its enabled flag, matching the DELETE
+ * guard's own invariant: disabling a database pauses its worker without
+ * dropping its indexes, so a disabled row can still have indexCount > 0.
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(vamana_databases_reject_truncate_with_live_indexes);
+Datum
+vamana_databases_reject_truncate_with_live_indexes(PG_FUNCTION_ARGS)
+{
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	char	   *qualifiedName;
+	int			ret;
+	uint64		i;
+	char		safeDatname[NAMEDATALEN * 4];
+
+	if (!CALLED_AS_TRIGGER(fcinfo))
+		elog(ERROR, "vamana_databases_reject_truncate_with_live_indexes: not called by trigger manager");
+
+	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event) ||
+		!TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event) ||
+		!TRIGGER_FIRED_BY_TRUNCATE(trigdata->tg_event))
+		elog(ERROR, "vamana_databases_reject_truncate_with_live_indexes: must be a BEFORE TRUNCATE FOR EACH STATEMENT trigger");
+
+	qualifiedName = SvsDatabasesQualifiedName();
+	if (qualifiedName == NULL)
+		elog(ERROR, "vamana_databases_reject_truncate_with_live_indexes: vamana_databases not found in search path");
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "vamana_databases_reject_truncate_with_live_indexes: SPI_connect failed");
+
+	ret = SPI_execute(psprintf("SELECT datname FROM %s", qualifiedName), true, 0);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "vamana_databases_reject_truncate_with_live_indexes: select failed");
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		Datum		datnameDatum = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+		Name		datname;
+		Oid			dbOid;
+		uint32		indexCount;
+
+		if (isnull)
+			continue;
+
+		datname = DatumGetName(datnameDatum);
+
+		/* Already-dropped database: tolerated the same way the DELETE guard tolerates it. */
+		dbOid = get_database_oid(NameStr(*datname), true);
+		if (!OidIsValid(dbOid))
+			continue;
+
+		(void) VamanaWorkerIndexCountSnapshot(dbOid, &indexCount);
+
+		if (indexCount > 0)
+		{
+			/*
+			 * Copy out of the SPI tuple before SPI_finish(), which frees the
+			 * memory context backing SPI_tuptable.
+			 */
+			CopySanitizedDatname(safeDatname, sizeof(safeDatname), NameStr(*datname));
+			SPI_finish();
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("cannot truncate vamana_databases: "
+							"%u vamana index(es) still exist in database \"%s\"",
+							indexCount, safeDatname),
+					 errhint("run svs_teardown_database() in \"%s\" first",
+							 safeDatname)));
+		}
+	}
+
+	SPI_finish();
+
+	return PointerGetDatum(NULL);
 }
 
 static void

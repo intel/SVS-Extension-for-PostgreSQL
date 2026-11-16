@@ -1,5 +1,4 @@
 postgres/
 pgsql_install/
-ScalableVectorSearch/
 svs_install/
 pgvector-vanilla/

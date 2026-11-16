@@ -16,8 +16,8 @@
 #                   TAP and injection points enabled, plus the
 #                   injection_points test module (needed by TAP, not
 #                   installed by docs/build_guide's own install)
-#   build-svs       build the SVS C API bindings via docs/build_guide,
-#                   pinned to a known-good nightly release tarball
+#   build-svs       download the prebuilt SVS C API release via
+#                   docs/build_guide (SVS_TAG in docs/build_guide/config)
 #   build-pgvector  build and install vanilla pgvector via docs/build_guide
 #   build-extension build and install this extension via docs/build_guide
 #                   (WERROR=1)
@@ -32,23 +32,17 @@
 #   PROVE_FLAGS              extra flags passed to 'prove' (e.g. '-j4')
 #   PG_CONFIGURE_EXTRA_ARGS  configure flags for build-postgres
 #                            (default: --enable-tap-tests --enable-injection-points)
-#   SVS_URL                  SVS release tarball for build-svs (default: pinned nightly)
 #
-# All dependency install locations (PostgreSQL, SVS, pgvector) are controlled
-# by docs/build_guide/config, not by anything in this script. Edit that file,
-# or export PG_CONFIG/SVS_URL/etc before sourcing it, to change them.
+# All dependency install locations and pins (PostgreSQL, SVS, pgvector) are
+# controlled by docs/build_guide/config, not by anything in this script. Edit
+# that file, or export PG_CONFIG/SVS_TAG/SVS_URL/etc before sourcing it, to
+# change them.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_GUIDE_DIR="${REPO_ROOT}/docs/build_guide"
-
-# Pinned nightly SVS release tarball. bindings/c at SVS_BRANCH (see
-# docs/build_guide/config) calls a core-library method that the CMakeLists'
-# own default download predates, so that default fails to compile; this pin
-# is a known-good match. Overridable via SVS_URL for a one-off bump.
-DEFAULT_SVS_URL="https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
 
 # CI-specific test-run scratch: the running data directory and log for
 # test-sql. Dependency install locations are owned by docs/build_guide/config,
@@ -117,7 +111,7 @@ step_build_svs() {
 		echo "found existing SVS install at ${SVS_INSTALL_DIR}, skipping build"
 		return 0
 	fi
-	SVS_URL="${SVS_URL:-${DEFAULT_SVS_URL}}" bash "${BUILD_GUIDE_DIR}/build_svs.sh"
+	bash "${BUILD_GUIDE_DIR}/build_svs.sh"
 }
 
 step_build_pgvector() {

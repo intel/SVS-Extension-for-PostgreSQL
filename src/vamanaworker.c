@@ -215,6 +215,10 @@ VamanaWorkerProcessRequests(void)
 	int		   *allPending;
 	bool		acceptsWrites = VamanaGetReplayRole()->processes_write_ipc;
 
+	/* Test hook: TAP parks the worker here so concurrently submitted searches
+	 * accumulate as PENDING and are collected in one pass. */
+	INJECTION_POINT("vamana-worker-before-collect-requests", NULL);
+
 	maxBatch = (vamana_max_batch_size > 0) ? vamana_max_batch_size : MaxBackends;
 
 	searchPending = palloc(MaxBackends * sizeof(int));
@@ -1184,12 +1188,15 @@ static int			vamanaConsecutiveSaveDefers = 0;
 /*
  * VamanaWorkerCatchUpSlots
  *
- * Primary only.  Spends up to Min(1000, svs.worker_timeout_ms / 5) ms of
+ * Primary only.  Spends about Min(1000, svs.worker_timeout_ms / 5) ms of
  * wall clock catching up one cached index's replication slot
  * (VamanaReplicationCatchUpSlot), round-robinning across cached indexes one
  * per call so a single large backlog cannot starve the others.  Called at
  * most once per VAMANA_SLOT_CATCHUP_INTERVAL_MS, so the worker stays at
- * least half free for IPC while a backlog drains.  Each attempt that
+ * least half free for IPC while a backlog drains.  A slice can overrun its
+ * budget by one RUNNING_XACTS decode, which writes snapshot and slot files
+ * and so has no fixed bound on slow storage; the worker serves no IPC until
+ * the slice returns (see VamanaReplicationCatchUpSlot).  Each attempt that
  * coincides with a save in the same iteration (VamanaWorkerCheckpointDueIndexes
  * returned true) defers rather than stacking a slice's budget on top of the
  * save, up to VAMANA_CATCHUP_MAX_CONSECUTIVE_SAVE_DEFERS times in a row,
@@ -1301,7 +1308,8 @@ VamanaWorkerCatchUpSlots(bool savedThisIteration)
 static void
 VamanaWorkerConvergeSearchSlots(void)
 {
-	int held = SvsSlotSetResize(VamanaWorkerSearchSlots, SvsCurrentSearchGrant());
+	int			grant = (int) pg_atomic_read_u32(&VamanaWorkerShmemPtr->grantedSearchThreads);
+	int			held = SvsSlotSetResize(VamanaWorkerSearchSlots, grant);
 
 	pg_atomic_write_u32(&VamanaWorkerShmemPtr->registeredSearchSlots, (uint32) held);
 }
@@ -1331,6 +1339,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		(void) VamanaReconcileStandbyCache(relids, VamanaStandbyActivateSlotBlocking);
 	}
 
+	/*
+	 * Test hook: holds a started worker short of liveness, with its search
+	 * slots already converged on the grant published before it was spawned.
+	 */
+	INJECTION_POINT("vamana-worker-before-publish-pid", NULL);
+
 	/* Non-zero pid marks the worker available to backends. */
 	pg_atomic_write_membarrier_u32(&VamanaWorkerShmemPtr->accepting, 1);
 	VamanaWorkerShmemPtr->workerPid = MyProcPid;
@@ -1340,8 +1354,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 	 * spawn loop ran, and the postmaster's SIGUSR1 on worker start fires
 	 * before workerPid above is set, so neither event wakes the launcher on
 	 * this worker's 0-to-nonzero liveness transition. Nothing else shortens
-	 * naptime, so without this kick a freshly enabled database would serve
-	 * at its zero-clamped-to-one grant for up to VAMANA_LAUNCHER_NAPTIME_MS.
+	 * naptime, so without this kick a freshly enabled database would wait up
+	 * to VAMANA_LAUNCHER_NAPTIME_MS for its grant. The reconcile it triggers
+	 * also completes the database's memory admission, which the startup
+	 * transaction's residency seed needs, so this kick must precede that
+	 * transaction.
+	 *
 	 * Safe here: VamanaWorkerEntryIsLive only needs a non-zero workerPid and
 	 * a non-stale heartbeat, and VamanaHeartbeatIsStale treats a never-beaten
 	 * worker as live.
@@ -1349,6 +1367,14 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 	SvsKickLauncher();
 
 	VamanaWorkerRunStartupTransaction(zeroIndexState, datname);
+
+	/*
+	 * The kick above can be served before the startup transaction has seeded
+	 * indexCount, in which case the launcher sees 0 after a restart and
+	 * withholds the search claim from a database that has indexes. Kick again
+	 * so a reconcile reads the seeded count.
+	 */
+	SvsKickLauncher();
 
 	wasReplayingWal = VamanaGetReplayRole()->creates_slot_on_load;
 
@@ -1418,10 +1444,12 @@ VamanaWorkerServe(VamanaZeroIndexState *zeroIndexState, char *datname)
 		 * then hold zero slots indefinitely after such a restart. Do not
 		 * remove this poll in favor of relying on the kick alone.
 		 *
-		 * Resize to exactly what SvsCurrentSearchGrant() returns, with no
-		 * clamp of our own. The launcher owns the ceiling; a grant can never
-		 * exceed MAX_PARALLEL_WORKER_LIMIT (1024) in the first place, so
-		 * there is nothing here for a second clamp to guard against.
+		 * Resize to exactly the published grant, which may be 0 for a
+		 * database with no index yet; SvsCurrentSearchGrant()'s floor of 1
+		 * is for search threads, not for parked slots.  No clamp of our own.
+		 * The launcher owns the ceiling; a grant can never exceed
+		 * MAX_PARALLEL_WORKER_LIMIT (1024) in the first place, so there is
+		 * nothing here for a second clamp to guard against.
 		 */
 		VamanaWorkerConvergeSearchSlots();
 

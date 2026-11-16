@@ -51,6 +51,8 @@ SvsRunGovernedBuild(SvsGovernedBuildFn buildFn, void *context)
 	int32		requested = ResolveRequestedBuildThreads();
 	int32		granted;
 	ParallelContext * volatile pcxt = NULL;
+	int			started;
+	int			threads;
 
 	req = SvsClaimBuildRequestSlot(requested);
 	if (req == NULL)
@@ -78,7 +80,21 @@ SvsRunGovernedBuild(SvsGovernedBuildFn buildFn, void *context)
 
 		INJECTION_POINT("svs-build-thread-grant-acquired", NULL);
 
-		buildFn(pcxt == NULL ? 1 : Min(granted, pcxt->nworkers_launched), context);
+		started = (pcxt == NULL) ? 0 : pcxt->nworkers_launched;
+		threads = (pcxt == NULL) ? 1 : Min(granted, started);
+
+		if (granted > 0 && started < granted)
+			ereport(WARNING,
+					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					 errmsg("vamana index build started %d of %d granted parallel workers",
+							started, granted),
+					 errdetail_plural("The build will use %d thread; max_parallel_workers is %d.",
+									  "The build will use %d threads; max_parallel_workers is %d.",
+									  threads, threads, max_parallel_workers),
+					 errhint("Parked vamana search slots and other parallel workers count against max_parallel_workers. "
+							 "Consider raising it, for the session, the role, or the server, or raising max_worker_processes.")));
+
+		buildFn(threads, context);
 	}
 	PG_FINALLY();
 	{

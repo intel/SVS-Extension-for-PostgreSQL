@@ -20,9 +20,10 @@ on:
   schedule:
     - cron: '40 3 * * 4'
 
-# A cold-cache run rebuilds PostgreSQL, SVS, and pgvector from source (up to
-# the 180-minute timeout below), so a superseded run on the same ref is
-# cancelled rather than left to run to completion alongside its replacement.
+# A cold-cache run rebuilds PostgreSQL and pgvector from source and downloads
+# SVS's prebuilt release (up to the 180-minute timeout below), so a
+# superseded run on the same ref is cancelled rather than left to run to
+# completion alongside its replacement.
 concurrency:
   group: codeql-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -36,19 +37,9 @@ jobs:
     #   - https://gh.io/using-larger-runners (GitHub.com only)
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     runs-on: ubuntu-latest
-    # Cold-cache runs build PostgreSQL and the SVS library from source; the
-    # timeout keeps a hung dependency build from consuming the 6 hour default.
+    # Cold-cache runs build PostgreSQL from source; the timeout keeps a hung
+    # dependency build from consuming the 6 hour default.
     timeout-minutes: 180
-    env:
-      # Pin SVS_URL/SVS_COMMIT here, side by side, matching the defaults in
-      # docs/build_guide/config, so CI's build is reproducible. SVS_COMMIT
-      # must be the exact SVS_REPO commit SVS_URL's tarball was built from:
-      # SVS_BRANCH is a moving branch, and without SVS_COMMIT pinning
-      # bindings/c to match, it drifts ahead of the tarball's API and fails
-      # to compile. Update both together whenever SVS_URL is bumped to a
-      # newer nightly.
-      SVS_URL: "https://github.com/intel/ScalableVectorSearch/releases/download/nightly/svs-shared-library-nightly-2026-09-15-1529.tar.gz"
-      SVS_COMMIT: "1cd0df27c4bf54c4b963ad02112c873fba21a6ef"
     permissions:
       # required for all workflows
       security-events: write
@@ -119,7 +110,7 @@ jobs:
         path: |
           ${{ runner.temp }}/build_guide/pgsql_install
           ${{ runner.temp }}/build_guide/svs_install
-        key: svs-deps-${{ runner.os }}-${{ env.SVS_URL }}-${{ env.SVS_COMMIT }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
+        key: svs-deps-${{ runner.os }}-${{ hashFiles('docs/build_guide/config', 'docs/build_guide/install_postgres.sh', 'docs/build_guide/build_svs.sh', 'docs/build_guide/build_pgvector_vanilla.sh') }}
 
     - name: Build PostgreSQL
       if: steps.deps-cache.outputs.cache-hit != 'true'

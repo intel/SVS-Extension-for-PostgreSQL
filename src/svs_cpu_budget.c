@@ -12,6 +12,9 @@
  * database's search workload gets and how many threads each pending build
  * gets, all bounded by the shared max_parallel_workers pool.
  *
+ * A database with no vamana index holds no search claim, so its first build
+ * is not starved by search slots that have nothing to search.
+ *
  * Pure: no catalog, shmem, GUC, or latch access.  The caller collects 
  * the inputs and applies the outputs.
  *
@@ -87,7 +90,7 @@ ComputeEffectiveDesired(const SvsDbCpuRequest *req, const SvsCpuGucs *gucs,
 	int32		clusterDefault;
 	int32		requested;
 
-	if (!req->live)
+	if (!req->live || !req->hasIndexes)
 		return 0;
 
 	clusterDefault = ResolveOrFallback(gucs->searchNumThreadsDefault, 1);
