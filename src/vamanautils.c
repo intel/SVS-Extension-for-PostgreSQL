@@ -144,28 +144,31 @@ VamanaTypeIsFromVectorExtension(Oid typeOid)
 }
 
 /*
- * Reject an index whose column type merely has the right name
- * (vector/halfvec) but did not come from the real vector extension: a
- * same-named type with a different memory layout read as pgvector's would
- * be an out-of-bounds read, not just a wrong answer. Checked once per
- * build/REINDEX, where the index comes into existence; insert, scan, and
- * the worker all rely on an index having already passed this at build
- * time, so they stay name-only (VamanaClassifyIndexedType) rather than
- * paying this lookup on every row.
- *
- * atttypid is the same OID VamanaGetTypeInfo already classified by name,
- * so call this only after that call has succeeded.
+ * A same-named type with a different layout read as pgvector's would be
+ * an out-of-bounds read. Checked only at build/REINDEX; other paths stay name-only.
  */
-void
-VamanaCheckIndexedTypeProvenance(Relation index)
+static void
+VamanaCheckIndexedTypeProvenance(Oid atttypid)
 {
-	Oid			atttypid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
-
 	if (!VamanaTypeIsFromVectorExtension(atttypid))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("type %s is not provided by the vector extension", format_type_be(atttypid)),
 				 errhint("A vamana index supports the vector and halfvec types.")));
+}
+
+/*
+ * VamanaGetTypeInfo plus VamanaCheckIndexedTypeProvenance, combined so a
+ * build-time caller cannot run one without the other.
+ */
+const		VamanaTypeInfo *
+VamanaGetTypeInfoForBuild(Relation index)
+{
+	const VamanaTypeInfo *typeInfo = VamanaGetTypeInfo(index);
+
+	VamanaCheckIndexedTypeProvenance(TupleDescAttr(RelationGetDescr(index), 0)->atttypid);
+
+	return typeInfo;
 }
 
 /*
@@ -1031,7 +1034,7 @@ vamanavalidate(Oid opclassoid)
 	char	   *opfamilyname;
 	CatCList   *proclist;
 	CatCList   *oprlist;
-	VamanaOpclassShape shape = {InvalidOid, false, false, false, InvalidOid};
+	VamanaOpclassShape shape = {0};
 
 	classtup = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclassoid));
 	if (!HeapTupleIsValid(classtup))

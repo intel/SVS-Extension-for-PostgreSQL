@@ -44,35 +44,26 @@ DROP OPERATOR CLASS vamana_test_create_index_unmapped_proc1_ops USING vamana;
 -- A type merely named "vector", not provided by the real vector extension.
 -- VamanaCheckIndexedTypeProvenance rejects this once per build, so the
 -- runtime path and amvalidate agree on this opclass (see opclass_validate.sql).
+-- The type's own I/O reuses core's textin/textout; only the catalog shape
+-- matters here, not any actual value.
 CREATE SCHEMA vamana_test_fake;
 
-CREATE FUNCTION vamana_test_fake.vector_in(cstring, oid, integer)
-	RETURNS vamana_test_fake.vector
-	AS '$libdir/vector', 'vector_in' LANGUAGE C IMMUTABLE STRICT;
-
-CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector)
-	RETURNS cstring
-	AS '$libdir/vector', 'vector_out' LANGUAGE C IMMUTABLE STRICT;
-
-CREATE FUNCTION vamana_test_fake.vector_typmod_in(cstring[])
-	RETURNS integer
-	AS '$libdir/vector', 'vector_typmod_in' LANGUAGE C IMMUTABLE STRICT;
+CREATE FUNCTION vamana_test_fake.vector_in(cstring) RETURNS vamana_test_fake.vector
+	AS 'textin' LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector) RETURNS cstring
+	AS 'textout' LANGUAGE internal IMMUTABLE STRICT;
 
 CREATE TYPE vamana_test_fake.vector (
 	INPUT = vamana_test_fake.vector_in,
 	OUTPUT = vamana_test_fake.vector_out,
-	TYPMOD_IN = vamana_test_fake.vector_typmod_in,
-	STORAGE = external,
-	INTERNALLENGTH = VARIABLE
+	INTERNALLENGTH = VARIABLE,
+	STORAGE = extended
 );
 
 CREATE FUNCTION vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector)
-	RETURNS float8
-	AS '$libdir/vector', 'vector_l2_squared_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-
+	RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0';
 CREATE FUNCTION vamana_test_fake.l2_distance(vamana_test_fake.vector, vamana_test_fake.vector)
-	RETURNS float8
-	AS '$libdir/vector', 'l2_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+	RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0';
 
 CREATE OPERATOR vamana_test_fake.<-> (
 	LEFTARG = vamana_test_fake.vector, RIGHTARG = vamana_test_fake.vector,

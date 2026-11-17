@@ -262,37 +262,28 @@ SELECT amvalidate(oid) FROM pg_opclass
 DROP OPERATOR FAMILY vamana_test_l2_bad_norm_ops USING vamana CASCADE;
 
 -- A type merely named "vector", not provided by the real vector extension:
--- the name check alone would accept it, same as CREATE INDEX does today
--- for the runtime path. amvalidate additionally checks provenance.
+-- the name check alone would accept it, but CREATE INDEX now also rejects
+-- it via VamanaCheckIndexedTypeProvenance, and amvalidate checks the same
+-- thing. The type's own I/O reuses core's textin/textout since nothing
+-- here reads or writes an actual value; only the catalog shape matters.
 CREATE SCHEMA vamana_test_fake;
 
-CREATE FUNCTION vamana_test_fake.vector_in(cstring, oid, integer)
-	RETURNS vamana_test_fake.vector
-	AS '$libdir/vector', 'vector_in' LANGUAGE C IMMUTABLE STRICT;
-
-CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector)
-	RETURNS cstring
-	AS '$libdir/vector', 'vector_out' LANGUAGE C IMMUTABLE STRICT;
-
-CREATE FUNCTION vamana_test_fake.vector_typmod_in(cstring[])
-	RETURNS integer
-	AS '$libdir/vector', 'vector_typmod_in' LANGUAGE C IMMUTABLE STRICT;
+CREATE FUNCTION vamana_test_fake.vector_in(cstring) RETURNS vamana_test_fake.vector
+	AS 'textin' LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector) RETURNS cstring
+	AS 'textout' LANGUAGE internal IMMUTABLE STRICT;
 
 CREATE TYPE vamana_test_fake.vector (
 	INPUT = vamana_test_fake.vector_in,
 	OUTPUT = vamana_test_fake.vector_out,
-	TYPMOD_IN = vamana_test_fake.vector_typmod_in,
-	STORAGE = external,
-	INTERNALLENGTH = VARIABLE
+	INTERNALLENGTH = VARIABLE,
+	STORAGE = extended
 );
 
 CREATE FUNCTION vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector)
-	RETURNS float8
-	AS '$libdir/vector', 'vector_l2_squared_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
-
+	RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0';
 CREATE FUNCTION vamana_test_fake.l2_distance(vamana_test_fake.vector, vamana_test_fake.vector)
-	RETURNS float8
-	AS '$libdir/vector', 'l2_distance' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+	RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0';
 
 CREATE OPERATOR vamana_test_fake.<-> (
 	LEFTARG = vamana_test_fake.vector, RIGHTARG = vamana_test_fake.vector,
