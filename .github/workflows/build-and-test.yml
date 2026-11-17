@@ -105,6 +105,7 @@ jobs:
             regression.diffs
             regression.out
             results/
+            log/
             tmp_check/log/
             log/
             ci/.workdir/postgres.log

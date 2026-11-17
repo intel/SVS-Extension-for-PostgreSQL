@@ -81,8 +81,8 @@ jobs:
           compiledb -n make PG_CONFIG="$PG_CONFIG" SVS_INSTALL="$SVS_INSTALL_DIR"
           count=$(python3 -c "import json; print(len(json.load(open('compile_commands.json'))))")
           echo "compile_commands.json has $count entries"
-          if [ "$count" -ne 35 ]; then
-            echo "error: expected 35 compile_commands.json entries (one per OBJS member), got $count" >&2
+          if [ "$count" -ne 36 ]; then
+            echo "error: expected 36 compile_commands.json entries (one per OBJS member), got $count" >&2
             echo "This usually means compiledb's dry-run parser misread the Makefile; see docs/build_guide for the bear -- make fallback." >&2
             exit 1
           fi
