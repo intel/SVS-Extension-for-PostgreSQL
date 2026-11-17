@@ -1,0 +1,82 @@
+-- Copyright (C) 2026 Intel Corporation
+-- SPDX-License-Identifier: PostgreSQL
+--
+-- CREATE INDEX error text for the type and distance-metric checks vamanautils.c
+-- shares with vamanavalidate. Covers error paths opclass_validate.sql cannot
+-- reach without an actual index build. The operator/metric mismatch error has
+-- its own test file, test/sql/opclass_metric_mismatch.sql.
+
+-- Unsupported type.
+CREATE OPERATOR CLASS vamana_test_create_index_point_ops
+	FOR TYPE point USING vamana AS
+	OPERATOR 1 <-> (point, point) FOR ORDER BY float_ops,
+	FUNCTION 1 point_distance(point, point);
+
+CREATE TABLE t (id serial PRIMARY KEY, val point);
+CREATE INDEX ON t USING vamana (val vamana_test_create_index_point_ops);
+DROP TABLE t;
+DROP OPERATOR CLASS vamana_test_create_index_point_ops USING vamana;
+
+-- No distance function at all: core's own index_getprocinfo() in
+-- VamanaInitSupport rejects this before VamanaGetDistanceMetric's own
+-- "no distance function found" check is ever reached, so the observed
+-- error is core's generic missing-support-function text, not ours.
+CREATE OPERATOR CLASS vamana_test_create_index_no_proc1_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops;
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vamana_test_create_index_no_proc1_ops);
+DROP TABLE t;
+DROP OPERATOR CLASS vamana_test_create_index_no_proc1_ops USING vamana;
+
+-- Right signature, unmapped name.
+CREATE OPERATOR CLASS vamana_test_create_index_unmapped_proc1_ops
+	FOR TYPE vector USING vamana AS
+	OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
+	FUNCTION 1 l2_distance(vector, vector);
+
+CREATE TABLE t (id serial PRIMARY KEY, val vector(3));
+CREATE INDEX ON t USING vamana (val vamana_test_create_index_unmapped_proc1_ops);
+DROP TABLE t;
+DROP OPERATOR CLASS vamana_test_create_index_unmapped_proc1_ops USING vamana;
+
+-- A type merely named "vector", not provided by the real vector extension.
+-- VamanaCheckIndexedTypeProvenance rejects this once per build, so the
+-- runtime path and amvalidate agree on this opclass (see opclass_validate.sql).
+-- The type's own I/O reuses core's textin/textout; only the catalog shape
+-- matters here, not any actual value.
+CREATE SCHEMA vamana_test_fake;
+
+CREATE FUNCTION vamana_test_fake.vector_in(cstring) RETURNS vamana_test_fake.vector
+	AS 'textin' LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION vamana_test_fake.vector_out(vamana_test_fake.vector) RETURNS cstring
+	AS 'textout' LANGUAGE internal IMMUTABLE STRICT;
+
+CREATE TYPE vamana_test_fake.vector (
+	INPUT = vamana_test_fake.vector_in,
+	OUTPUT = vamana_test_fake.vector_out,
+	INTERNALLENGTH = VARIABLE,
+	STORAGE = extended
+);
+
+CREATE FUNCTION vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector)
+	RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0';
+CREATE FUNCTION vamana_test_fake.l2_distance(vamana_test_fake.vector, vamana_test_fake.vector)
+	RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT 0.0';
+
+CREATE OPERATOR vamana_test_fake.<-> (
+	LEFTARG = vamana_test_fake.vector, RIGHTARG = vamana_test_fake.vector,
+	PROCEDURE = vamana_test_fake.l2_distance
+);
+
+CREATE OPERATOR CLASS vamana_test_fake_vector_ops
+	FOR TYPE vamana_test_fake.vector USING vamana AS
+	OPERATOR 1 vamana_test_fake.<-> (vamana_test_fake.vector, vamana_test_fake.vector) FOR ORDER BY float_ops,
+	FUNCTION 1 vamana_test_fake.vector_l2_squared_distance(vamana_test_fake.vector, vamana_test_fake.vector);
+
+CREATE TABLE t (id serial PRIMARY KEY, val vamana_test_fake.vector);
+CREATE INDEX ON t USING vamana (val vamana_test_fake_vector_ops);
+DROP TABLE t;
+DROP OPERATOR FAMILY vamana_test_fake_vector_ops USING vamana CASCADE;
+DROP SCHEMA vamana_test_fake CASCADE;
