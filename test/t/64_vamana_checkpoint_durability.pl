@@ -56,11 +56,12 @@ use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
 
 # On-disk layout of the sidecar TID map, from VamanaTidMapHeader in
-# src/vamanaio.c: four uint32 fields followed by one 6-byte ItemPointerData
-# per slot.  A file of any other size for its declared capacity is torn.
+# src/vamanaio.c: four uint32 fields followed by a TimestampTz generation
+# stamp, then one 6-byte ItemPointerData per slot.  A file of any other size
+# for its declared capacity is torn.
 my $TIDMAP_MAGIC       = 0x53565354;    # "SVST"
-my $TIDMAP_VERSION     = 1;
-my $TIDMAP_HEADER_SIZE = 16;
+my $TIDMAP_VERSION     = 2;
+my $TIDMAP_HEADER_SIZE = 24;
 my $TIDMAP_SLOT_SIZE   = 6;
 
 # ---------------------------------------------------------------------------
@@ -162,15 +163,16 @@ sub read_tidmap_header
     my $data = slurp_raw($path);
     return undef unless defined $data && length($data) >= $TIDMAP_HEADER_SIZE;
 
-    my ($magic, $version, $capacity, $reserved) =
-      unpack('L4', substr($data, 0, $TIDMAP_HEADER_SIZE));
+    my ($magic, $version, $capacity, $reserved, $generation) =
+      unpack('L4q', substr($data, 0, $TIDMAP_HEADER_SIZE));
 
     return {
-        magic    => $magic,
-        version  => $version,
-        capacity => $capacity,
-        reserved => $reserved,
-        size     => length($data),
+        magic      => $magic,
+        version    => $version,
+        capacity   => $capacity,
+        reserved   => $reserved,
+        generation => $generation,
+        size       => length($data),
     };
 }
 
@@ -378,7 +380,7 @@ sub wait_for_index_count
     # Stand in for a crash partway through writing the temporary file: a valid
     # header followed by fewer slots than it claims.
     open(my $fh, '>:raw', $tmpfile) or die "open $tmpfile: $!";
-    print $fh pack('L4', $TIDMAP_MAGIC, $TIDMAP_VERSION, 51, 0);
+    print $fh pack('L4q', $TIDMAP_MAGIC, $TIDMAP_VERSION, 51, 0, 0);
     print $fh "\x00" x $TIDMAP_SLOT_SIZE;
     close($fh);
 

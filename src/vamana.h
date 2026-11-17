@@ -229,6 +229,16 @@ typedef struct VamanaMetaPageData
 	uint64		nextExternalId; /* next ID to assign on insert (authoritative) */
 	uint32		numDeleted;		/* soft-deleted entries not yet compacted */
 	uint32		tidMappingCapacity; /* allocated slots in tidMapping (>= numVectors) */
+
+	/*
+	 * Stamped with the same value written to the save directory's generation
+	 * marker and to the TID-map header at the start of the save that produced
+	 * this metapage state (see VamanaSaveIndexToDisk).  A crash partway through
+	 * a save leaves this field, the marker, and/or the TID map disagreeing;
+	 * VamanaCheckSaveGeneration and VamanaLoadTidMap's own check reject that
+	 * mismatch instead of serving a torn generation.
+	 */
+	TimestampTz saveGeneration;
 }			VamanaMetaPageData;
 
 typedef VamanaMetaPageData * VamanaMetaPage;
@@ -245,7 +255,9 @@ StaticAssertDecl(offsetof(VamanaMetaPageData, numDeleted) == 56,
 				 "VamanaMetaPageData.numDeleted offset changed — on-disk compatibility broken");
 StaticAssertDecl(offsetof(VamanaMetaPageData, tidMappingCapacity) == 60,
 				 "VamanaMetaPageData.tidMappingCapacity offset changed — on-disk compatibility broken");
-StaticAssertDecl(sizeof(VamanaMetaPageData) == 64,
+StaticAssertDecl(offsetof(VamanaMetaPageData, saveGeneration) == 64,
+				 "VamanaMetaPageData.saveGeneration offset changed, on-disk compatibility broken");
+StaticAssertDecl(sizeof(VamanaMetaPageData) == 72,
 				 "VamanaMetaPageData size changed — update readers/writers");
 
 StaticAssertDecl((uint64) VAMANA_MAX_TID_MAPPING_CAPACITY * sizeof(ItemPointerData) <= MaxAllocHugeSize,
@@ -398,8 +410,11 @@ void		VamanaEnsureSaveDir(Oid dboid, Oid relid);
 void		VamanaDeleteSaveDir(Oid dboid, Oid relid);
 void		VamanaSaveIndexToDisk(Relation index, SVSIndexHandle svsIndex, ForkNumber forkNum,
 								  const VamanaIndexCache *meta, bool volatile *compactedOut);
-bool		VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity);
-void		VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count);
+bool		VamanaLoadTidMap(Oid dboid, Oid relid, ItemPointerData *tidMapping, int tidMappingCapacity,
+							 TimestampTz expectedSaveGeneration);
+void		VamanaSaveTidMapAtomically(Oid dboid, Oid relid, ItemPointerData *tidMapping, int count,
+										TimestampTz saveGeneration);
+bool		VamanaCheckSaveGeneration(Oid dboid, Oid relid, TimestampTz expectedSaveGeneration);
 void		VamanaInstallObjectAccessHook(void);
 void		VamanaValidateVectorData(const float *data, int dim, const char *context);
 float	   *VamanaDatumToFloats(const VamanaTypeInfo *typeInfo, Datum datum,

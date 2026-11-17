@@ -33,6 +33,17 @@ use FindBin qw($Bin);
 use lib "$Bin/../perl";
 use VamanaTestUtils qw(:all);
 
+# Contents of a generation marker as hex, or 'absent'.
+sub marker_hex
+{
+    my ($path) = @_;
+    return 'absent' unless -f $path;
+    open(my $fh, '<:raw', $path) or die "open $path: $!";
+    my $data = do { local $/; <$fh> };
+    close($fh);
+    return unpack('H*', $data);
+}
+
 my $dim = 8;
 my $near_sql = join(",", ('random()') x $dim);
 my $far_sql = join(",", ('100 + random()') x $dim);
@@ -200,5 +211,131 @@ is(wait_for_far_rows($standby, 40), '40',
 
 $standby->stop;
 $primary->stop;
+
+# ---------------------------------------------------------------------------
+# A standby's first load happening after replay has passed a newer primary
+# save.
+#
+# The save directory's generation marker and TID map are plain files that
+# never replicate, while the metapage's save generation does.  A standby whose
+# first load comes after replay has applied a primary save made since the
+# backup therefore sees stamps that differ although nothing tore.  Nothing on
+# a standby ever saves, so that difference is expected there and must not be
+# reported as a torn save.
+#
+# The database is disabled when the backup is taken and replay is paused on
+# the standby, so the primary can re-enable it and save before the standby's
+# launcher starts a worker for the database.
+# ---------------------------------------------------------------------------
+{
+    my $p = PostgreSQL::Test::Cluster->new('standby_late_primary');
+    $p->init(allows_streaming => 1);
+    $p->append_conf('postgresql.conf', qq{
+shared_preload_libraries = 'svs'
+wal_level = logical
+max_replication_slots = 10
+max_wal_senders = 10
+svs.launcher_database = 'postgres'
+svs.checkpoint_min_ops = 1
+svs.checkpoint_debounce_window = 1
+});
+    $p->start;
+    $p->safe_psql('postgres', "CREATE EXTENSION vector;");
+    $p->safe_psql('postgres', "CREATE EXTENSION svs;");
+    $p->safe_psql('postgres',
+        "INSERT INTO vamana_databases (datname, enabled) VALUES ('postgres', true);");
+    $p->safe_psql('postgres',
+        "SELECT pg_create_physical_replication_slot('standby_late_phys');");
+    $p->safe_psql('postgres', qq{
+        CREATE TABLE t (id serial PRIMARY KEY, val vector($dim));
+        INSERT INTO t (val) SELECT ARRAY[$near_sql]::vector FROM generate_series(1, 200);
+        CREATE INDEX t_idx ON t USING vamana (val vector_l2_ops);
+    });
+    wait_for_worker($p, 30);
+    $p->restart;
+    wait_for_worker($p, 30);
+
+    my $late_relid = $p->safe_psql('postgres', "SELECT 't_idx'::regclass::oid;");
+    my $late_dboid = $p->safe_psql('postgres',
+        "SELECT oid FROM pg_database WHERE datname = 'postgres';");
+    my $late_dir = vamana_save_dir($p, 'postgres', $late_relid);
+
+    # Disabled for the backup, so a standby cloned from it starts no worker.
+    $p->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = false WHERE datname = 'postgres';");
+    for (1 .. 60)
+    {
+        last if $p->safe_psql('postgres',
+            "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'vamana worker';") eq '0';
+        usleep(500_000);
+    }
+    $p->backup('standby_late_backup');
+
+    my $backup_marker = marker_hex($p->backup_dir
+          . "/standby_late_backup/vamana_indexes/$late_dboid/$late_relid/generation.bin");
+    isnt($backup_marker, 'absent', 'the backup carries the saved copy');
+
+    my $s = PostgreSQL::Test::Cluster->new('standby_late_standby');
+    $s->init_from_backup($p, 'standby_late_backup', has_streaming => 1);
+    $s->append_conf('postgresql.conf', qq{
+shared_preload_libraries = 'svs'
+svs.launcher_database = 'postgres'
+svs.checkpoint_min_ops = 1
+svs.checkpoint_debounce_window = 1
+hot_standby = on
+hot_standby_feedback = on
+primary_slot_name = 'standby_late_phys'
+});
+    ok($s->start(fail_ok => 1), 'the standby starts');
+
+    my $paused;
+    for (1 .. 60)
+    {
+        $paused = try_psql($s, "SELECT pg_wal_replay_pause();");
+        last if defined $paused;
+        usleep(500_000);
+    }
+    is(try_psql($s, "SELECT pg_get_wal_replay_pause_state();") // 'query failed',
+        'paused', 'standby replay is paused before the primary saves again');
+
+    # Re-enable and save on the primary while the standby is not replaying.
+    $p->safe_psql('postgres',
+        "UPDATE vamana_databases SET enabled = true WHERE datname = 'postgres';");
+    wait_for_worker($p, 60);
+    $p->safe_psql('postgres',
+        "INSERT INTO t (val) SELECT ARRAY[$far_sql]::vector FROM generate_series(1, 20);");
+    my $now = $backup_marker;
+    for (1 .. 60)
+    {
+        $now = marker_hex("$late_dir/generation.bin");
+        last if $now ne $backup_marker;
+        usleep(500_000);
+    }
+    isnt($now, $backup_marker,
+        'the primary saved again, so its stamp is newer than the one in the standby copy');
+
+    # Replay the enable and the newer save, then have the standby launcher
+    # notice the enabled database now rather than at its next scheduled pass.
+    my $log_pos = length(slurp_file($s->logfile));
+    try_psql($s, "SELECT pg_wal_replay_resume();");
+    eval { $p->wait_for_replay_catchup($s) };
+    $p->safe_psql('postgres', "SELECT pg_log_standby_snapshot();");
+    try_psql($s, "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+          . "WHERE backend_type = 'vamana launcher';");
+
+    my $pid = wait_for_standby_worker($s, undef);
+    like($pid, qr/^\d+$/, 'the standby worker starts once the database is enabled');
+    is(wait_for_far_rows($s, 20), '20',
+        'the standby serves the rows saved after its copy was taken');
+
+    my $late_log = substr(slurp_file($s->logfile), $log_pos);
+    like($late_log, qr/loaded from disk/,
+        'the standby loaded the copy from disk, so the generation check ran');
+    unlike($late_log, qr/torn save detected/,
+        'differing stamps on a standby are not reported as a torn save');
+
+    $s->stop;
+    $p->stop;
+}
 
 done_testing();
