@@ -293,6 +293,16 @@ typedef struct VamanaWorkerShmem
 	pg_atomic_uint64 heartbeat_ts;	/* TimestampTz stored as uint64 */
 
 	/*
+	 * Start time of the index save the worker's main loop is inside right now
+	 * (TimestampTz stored as uint64), or 0.  The loop neither serves requests
+	 * nor refreshes heartbeat_ts until the save returns, so this is what lets
+	 * a backend tell a worker busy saving from a hung one.
+	 */
+	pg_atomic_uint64 save_started_ts;
+	/* End time of the most recent such save, or 0 if none yet. */
+	pg_atomic_uint64 save_ended_ts;
+
+	/*
 	 * Mirrors this database's current vamana_databases.enabled, published by
 	 * the launcher every reconcile pass.  A backend waiting for a worker
 	 * needs this to tell "disabled, no replacement is ever coming" apart
@@ -669,10 +679,11 @@ extern bool vamana_eviction_suppressed;
 bool	VamanaShutdownCancelPending(void);
 
 /*
- * Pure staleness kernel over a raw heartbeat and a reference clock; shared by
- * the live entry-path check and the snapshot-path worker-state classifier.
+ * Pure staleness kernel over a raw heartbeat, the raw start time of the index
+ * save in progress (0 if none) and a reference clock; shared by the live
+ * entry-path check and the snapshot-path worker-state classifier.
  */
-bool	VamanaHeartbeatIsStale(uint64 rawHb, TimestampTz now);
+bool		VamanaHeartbeatIsStale(uint64 rawHb, uint64 rawSaveStart, TimestampTz now);
 
 /*
  * Counter-maintenance policy: is indexCount kept current on this node?  Derived

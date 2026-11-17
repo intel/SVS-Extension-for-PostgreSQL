@@ -199,6 +199,8 @@ VamanaWorkerResetEntryState(VamanaWorkerShmem *entry)
 	pg_atomic_write_u32(&entry->accepting, 0);
 	pg_atomic_write_u32(&entry->evict_all, 0);
 	pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+	pg_atomic_write_u64(&entry->save_started_ts, 0);
+	pg_atomic_write_u64(&entry->save_ended_ts, 0);
 	pg_atomic_write_u32(&entry->dbEnabled, 1);
 	pg_atomic_write_u32(&entry->stopRequested, 0);
 	entry->servicedRestartGeneration = 0;
@@ -283,6 +285,8 @@ VamanaWorkerInitSlot(VamanaWorkerShmem *entry, char *slotRegion)
 
 	pg_atomic_init_u32(&entry->evict_all, 0);
 	pg_atomic_init_u64(&entry->heartbeat_ts, 0);
+	pg_atomic_init_u64(&entry->save_started_ts, 0);
+	pg_atomic_init_u64(&entry->save_ended_ts, 0);
 	pg_atomic_init_u32(&entry->indexCount, 0);
 	pg_atomic_init_u32(&entry->desiredSearchThreads, 0);
 	pg_atomic_init_u32(&entry->grantedSearchThreads, 0);
@@ -1274,6 +1278,8 @@ VamanaWorkerClearDeadEntry(Oid dbOid)
 	{
 		entry->workerPid = 0;
 		pg_atomic_write_u64(&entry->heartbeat_ts, 0);
+		pg_atomic_write_u64(&entry->save_started_ts, 0);
+		pg_atomic_write_u64(&entry->save_ended_ts, 0);
 		pg_atomic_write_u32(&entry->registeredSearchSlots, 0);
 	}
 
