@@ -348,14 +348,9 @@ CheckMetaField(Relation index, const char *field, int64 value, int64 lo, int64 h
  * bounds CREATE INDEX enforces on the corresponding reloptions, so a
  * metapage corrupted after a successful build is rejected rather than
  * trusted. Called only after the magic-number check has already passed.
- * Checks run in the order the fields appear in VamanaMetaPageData.
- *
- * dimensions and compression_type have no separate range check: dimensions
- * only needs the equality check against the column's atttypmod, since
- * atttypmod is already bounded to the same range CREATE INDEX enforces, so
- * equality implies range; compression_type's only valid values are the
- * three VamanaCompressionConfigIsValid already recognizes, so a range
- * check would just duplicate what that predicate already rejects.
+ * Checks run in the order the fields appear in VamanaMetaPageData. No
+ * separate range check for dimensions (equality with atttypmod implies it)
+ * or compression_type (VamanaCompressionConfigIsValid already covers it).
  */
 static void
 ValidateMetaPageConfig(Relation index, const VamanaMetaPageData * meta)

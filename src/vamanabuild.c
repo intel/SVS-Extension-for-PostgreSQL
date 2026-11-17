@@ -178,11 +178,6 @@ ValidateCompressionParam(int value, const char *param_name, bool allow_none)
  * scheme other than the one selected are ignored rather than rejected, which
  * is how the other irrelevant-parameter cases behave (leanvec_dims under LVQ,
  * every compression parameter under compression_type = none).
- *
- * Defers the yes/no decision entirely to VamanaCompressionConfigIsValid, so
- * there is one place that decides validity; the per-parameter and pair/order
- * checks below only run once that predicate has already said the
- * combination is invalid, purely to work out which specific error to raise.
  */
 static void
 ValidateCompressionOptions(int compression_type, int compression_primary,
@@ -219,10 +214,8 @@ ValidateCompressionOptions(int compression_type, int compression_primary,
 	}
 
 	/*
-	 * Reloption bounds keep compression_type to none/leanvec/lvq, so this is
-	 * unreachable today. Guards against a future rule change silently
-	 * accepting an invalid config if that bound is ever widened without the
-	 * branches above being updated to match.
+	 * Unreachable today; stops a future rule change from accepting an
+	 * invalid config silently.
 	 */
 	elog(ERROR, "unexpected compression configuration");
 }

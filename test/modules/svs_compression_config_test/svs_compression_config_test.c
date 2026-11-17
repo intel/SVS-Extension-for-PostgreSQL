@@ -6,11 +6,8 @@
 /*
  * svs_compression_config_test.c
  *
- * SQL-callable driver for VamanaCompressionConfigIsValid, standalone and
- * with no build, worker, or real index involved: links
- * vamana_compression_rules.c directly rather than the preloaded svs.so,
- * same pattern as svs_meta_counts_test. That file has no dependencies
- * beyond libc, so no stub symbols are needed here.
+ * SQL-callable driver for VamanaCompressionConfigIsValid, linking
+ * vamana_compression_rules.c directly rather than the preloaded svs.so.
  */
 
 #include "postgres.h"

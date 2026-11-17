@@ -155,10 +155,8 @@ my @cases = (
     },
 );
 
-# Boundary cases: the min and max values CheckMetaField accepts must not be
-# mistaken for out of range (an off by one error in the bounds would reject
-# a legitimate index). These are expected to build and scan cleanly, unlike
-# every case above.
+# Boundary cases: catches an off by one error in the bounds. Expected to
+# build and scan cleanly, unlike every case above.
 my @boundary_valid_cases = (
     { name => 'graph_degree_min', pokes => [ [ 'graph_degree', 16 ] ] },
     { name => 'graph_degree_max', pokes => [ [ 'graph_degree', 256 ] ] },

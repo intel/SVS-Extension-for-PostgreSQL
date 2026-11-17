@@ -7,12 +7,7 @@
  * vamana_compression_rules.c
  *
  * The compression_type/compression_primary/compression_secondary validity
- * rules, in one place with no dependencies beyond libc. CREATE INDEX's
- * reloption validation (vamanabuild.c) and the metapage reader's
- * corruption check (vamanautils.c) both decide validity through
- * VamanaCompressionConfigIsValid, so there is one set of rules rather than
- * two that could drift apart. Having no dependencies also lets a
- * standalone test module link this file directly.
+ * rules, with no dependencies beyond libc.
  */
 
 #include "postgres.h"
