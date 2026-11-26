@@ -268,7 +268,7 @@ vamanarescan(IndexScanDesc scan, ScanKey keys, int nkeys,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("vamana background worker unavailable after waiting up to %d ms; cannot scan index %u",
 								vamana_worker_timeout_ms, so->indexRelid),
-						 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
+						 errhint("Ensure the svs extension is listed in shared_preload_libraries and restart PostgreSQL.")));
 		}
 
 		pfree(queryFloats);

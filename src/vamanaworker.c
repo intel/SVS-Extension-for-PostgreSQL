@@ -1911,7 +1911,7 @@ VamanaWorkerWaitUntilAvailable(Oid indexRelid, const char *operation)
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("vamana background worker unavailable after %d ms; cannot %s index %u",
 					total_waited_ms, operation, indexRelid),
-			 errhint("Ensure vamana is in shared_preload_libraries and the server was restarted.")));
+			 errhint("Ensure the svs extension is listed in shared_preload_libraries and restart PostgreSQL.")));
 }
 
 /*
